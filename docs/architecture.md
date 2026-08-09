@@ -321,7 +321,7 @@ pub(crate) struct SurfaceContext {
       │      ├─ tool_call があれば:
       │      │  ├ ツール実行 (read-only は join_all で並列、それ以外は逐次)
       │      │  ├ 結果を messages に追加
-      │      │  └ 5e に戻る (最大 50 イテレーション、48回目に警告)
+      │      │  └ 5e に戻る (最大 50 イテレーション、48回目に警告、49〜50回目は最終回答を優先)
       │      │
       │      └─ tool_call がなければ → 最終応答
       │

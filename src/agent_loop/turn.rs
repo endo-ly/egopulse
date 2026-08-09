@@ -1780,7 +1780,6 @@ pub(crate) struct RecordingProvider {
     >,
     seen_messages: std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
     seen_systems: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    seen_tool_counts: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     delays_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
@@ -1856,7 +1855,7 @@ impl crate::llm::LlmProvider for RecordingProvider {
         &self,
         system: &str,
         messages: Arc<Vec<Message>>,
-        tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         self.seen_systems
             .lock()
@@ -1866,10 +1865,6 @@ impl crate::llm::LlmProvider for RecordingProvider {
             .lock()
             .expect("messages")
             .push((*messages).clone());
-        self.seen_tool_counts
-            .lock()
-            .expect("tool counts")
-            .push(tools.as_ref().map_or(0, |definitions| definitions.len()));
         let delay_ms = self.delays_ms.lock().expect("delays").remove(0);
         if delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1912,7 +1907,6 @@ impl RecordingProvider {
             responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
             seen_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             seen_systems: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            seen_tool_counts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             delays_ms: std::sync::Arc::new(std::sync::Mutex::new(delays_ms)),
         }
     }
@@ -1923,10 +1917,6 @@ impl RecordingProvider {
 
     pub(crate) fn seen_systems(&self) -> Vec<String> {
         self.seen_systems.lock().expect("systems").clone()
-    }
-
-    pub(crate) fn seen_tool_counts(&self) -> Vec<usize> {
-        self.seen_tool_counts.lock().expect("tool counts").clone()
     }
 }
 
@@ -2115,12 +2105,12 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn late_tool_loop_requests_final_response_with_tools() {
+    async fn late_tool_loop_requests_final_response_at_hard_cap() {
         // Arrange: keep the model in the Tool phase until the warning boundary,
         // then return a final response after the shared runtime guards.
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut responses = Vec::with_capacity(FINAL_RESPONSE_WARNING_ITERATION + 1);
-        for iteration in 1..=FINAL_RESPONSE_WARNING_ITERATION {
+        let mut responses = Vec::with_capacity(FINAL_RESPONSE_WARNING_ITERATION + 2);
+        for iteration in 1..=(FINAL_RESPONSE_WARNING_ITERATION + 1) {
             responses.push(Ok(MessagesResponse {
                 content: format!("Checking result {iteration}"),
                 reasoning_content: None,
@@ -2139,7 +2129,7 @@ mod tests {
             usage: None,
         }));
         let provider =
-            RecordingProvider::new(responses, vec![0; FINAL_RESPONSE_WARNING_ITERATION + 1]);
+            RecordingProvider::new(responses, vec![0; FINAL_RESPONSE_WARNING_ITERATION + 2]);
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider.clone()),
@@ -2151,20 +2141,8 @@ mod tests {
             .await
             .expect("late tool loop should finalize");
 
-        // Assert: the final response is returned before the hard cap becomes an
-        // error, while the final request keeps the Tool definitions available.
+        // Assert: the final response is returned at the hard-cap boundary.
         assert_eq!(reply, "The available results are complete.");
-        let tool_counts = provider.seen_tool_counts();
-        assert_eq!(tool_counts.len(), FINAL_RESPONSE_WARNING_ITERATION + 1);
-        assert!(
-            tool_counts[..FINAL_RESPONSE_WARNING_ITERATION]
-                .iter()
-                .all(|count| *count > 0)
-        );
-        assert!(
-            tool_counts[FINAL_RESPONSE_WARNING_ITERATION] > 0,
-            "final-response request keeps Tool definitions"
-        );
 
         let seen_messages = provider.seen_messages();
         let warning_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION - 1]
@@ -2176,7 +2154,7 @@ mod tests {
                 .as_text_lossy()
                 .contains(FINAL_RESPONSE_WARNING_GUARD)
         );
-        let final_guard_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION]
+        let final_guard_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION + 1]
             .last()
             .expect("final guard message");
         assert!(

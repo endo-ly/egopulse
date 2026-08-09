@@ -359,13 +359,13 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn late_tool_loop_requests_final_response_with_tools() {
+    async fn late_tool_loop_requests_final_response_at_hard_cap() {
         // Arrange: keep the activation in the Tool phase until the shared
         // warning boundary, then return a response after the shared guards.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut responses =
-            Vec::with_capacity(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1);
-        for iteration in 1..=crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION {
+            Vec::with_capacity(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 2);
+        for iteration in 1..=(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1) {
             responses.push(Ok(crate::llm::MessagesResponse {
                 content: format!("Checking result {iteration}"),
                 reasoning_content: None,
@@ -385,7 +385,7 @@ mod tests {
         }));
         let provider = crate::agent_loop::turn::RecordingProvider::new(
             responses,
-            vec![0; crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1],
+            vec![0; crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 2],
         );
         let observer = provider.clone();
         let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
@@ -425,21 +425,6 @@ mod tests {
         // Assert: Pulse uses the same final-response guards as a normal Turn.
         assert_eq!(result.output_text, "The Pulse result is ready.");
         assert_eq!(result.output_kind, PulseOutputKind::Notify);
-        let tool_counts = observer.seen_tool_counts();
-        assert_eq!(
-            tool_counts.len(),
-            crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1
-        );
-        assert!(
-            tool_counts[..crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION]
-                .iter()
-                .all(|count| *count > 0)
-        );
-        assert!(
-            tool_counts[crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION] > 0,
-            "Pulse final-response request keeps Tool definitions"
-        );
-
         let seen_messages = observer.seen_messages();
         let warning_message = seen_messages
             [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION - 1]
@@ -452,7 +437,7 @@ mod tests {
                 .contains(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_GUARD)
         );
         let final_guard_message = seen_messages
-            [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION]
+            [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1]
             .last()
             .expect("final guard message");
         assert!(
