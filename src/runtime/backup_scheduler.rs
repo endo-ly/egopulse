@@ -41,10 +41,10 @@ impl Clock for RealClock {
 ///
 /// Returns when `shutdown` is cancelled or the scheduler is disabled.
 pub(crate) async fn run_backup_scheduler_loop(
-    state: AppState,
+    state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), EgoPulseError> {
-    run_backup_scheduler_loop_with_clock(state, Arc::new(RealClock), shutdown).await
+    run_backup_scheduler_loop_with_clock(&state, Arc::new(RealClock), shutdown).await
 }
 
 /// Clock-injectable scheduler entry point used by tests.
@@ -54,7 +54,7 @@ pub(crate) async fn run_backup_scheduler_loop(
 /// Returns [`EgoPulseError`] when the underlying storage operations fail
 /// unrecoverably; transient backup failures are logged and the loop continues.
 pub(crate) async fn run_backup_scheduler_loop_with_clock(
-    state: AppState,
+    state: &AppState,
     clock: Arc<dyn Clock>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), EgoPulseError> {
@@ -101,7 +101,7 @@ pub(crate) async fn run_backup_scheduler_loop_with_clock(
             _ = sleep(delay) => {}
         }
 
-        match run_periodic_backup_once_with_config(&state, &snapshot.config, clock.now()).await {
+        match run_periodic_backup_once_with_config(state, &snapshot.config, clock.now()).await {
             Ok(outcome) if outcome.integrity_ok => {
                 info!(path = %outcome.path.display(), "backup scheduler: created");
             }
@@ -227,7 +227,7 @@ mod tests {
             time: "03:00".to_string(),
             max_generations: 12,
         };
-        let state = state_with_backup(state_root, backup);
+        let state = Arc::new(state_with_backup(state_root, backup));
         let mock_start = Utc.with_ymd_and_hms(2026, 6, 20, 2, 59, 59).unwrap()
             + chrono::Duration::milliseconds(500);
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new(mock_start));
@@ -236,11 +236,11 @@ mod tests {
         // Waiting on `db_meta.backup_last_run` (not just the file) ensures the
         // scheduler has finished its full cycle, avoiding an abort between the
         // VACUUM INTO write and the upsert.
-        let task_state = state.clone();
+        let task_state = Arc::clone(&state);
         let task_clock = Arc::clone(&clock);
         let handle = tokio::spawn(async move {
             run_backup_scheduler_loop_with_clock(
-                task_state,
+                &task_state,
                 task_clock,
                 tokio_util::sync::CancellationToken::new(),
             )
@@ -282,7 +282,7 @@ mod tests {
 
         // Act
         let result =
-            run_backup_scheduler_loop(state.clone(), tokio_util::sync::CancellationToken::new())
+            run_backup_scheduler_loop(Arc::new(state), tokio_util::sync::CancellationToken::new())
                 .await;
 
         // Assert

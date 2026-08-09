@@ -413,7 +413,7 @@ async fn load_last_success_started_at(
 /// Sleeps for the configured tick interval between scans. Runs until
 /// `shutdown` is cancelled, at which point it returns promptly.
 pub(crate) async fn run_pulse_scheduler(
-    state: AppState,
+    state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut changes = state.config_manager.subscribe();

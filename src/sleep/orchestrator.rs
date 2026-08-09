@@ -259,6 +259,7 @@ pub async fn run_events_extract(
             } else {
                 let revision = snapshot.revision;
                 state
+                    .turn_runtime()
                     .cached_provider(&resolved, revision)
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
@@ -597,6 +598,7 @@ async fn prepare_batch_context(
     } else {
         let revision = snapshot.revision;
         state
+            .turn_runtime()
             .cached_provider(&resolved, revision)
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };

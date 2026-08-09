@@ -99,16 +99,16 @@ async fn run() -> Result<(), EgoPulseError> {
     }
 
     match cli.command {
-        Some(Command::Run) => run_foreground(cli.config.as_ref()).await,
+        Some(Command::Run) => run_foreground(cli.config.as_deref()).await,
         Some(Command::Gateway { action }) => {
-            gateway::run_gateway(cli.config.as_ref(), action).await
+            gateway::run_gateway(cli.config.as_deref(), action).await
         }
         Some(Command::Update) => gateway::run_update().await,
         _ => run_with_config(&cli).await,
     }
 }
 
-async fn run_foreground(cli_config: Option<&PathBuf>) -> Result<(), EgoPulseError> {
+async fn run_foreground(cli_config: Option<&std::path::Path>) -> Result<(), EgoPulseError> {
     let resolved_config_path = match cli_config {
         Some(path) => Some(gateway::resolve_cli_config_path(path)),
         None => Config::resolve_config_path().map_err(EgoPulseError::Config)?,

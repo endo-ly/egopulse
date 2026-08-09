@@ -189,7 +189,7 @@ pub enum GatewayAction {
     Restart,
 }
 
-fn resolve_config_for_service(cli_config: Option<&PathBuf>) -> Result<PathBuf, EgoPulseError> {
+fn resolve_config_for_service(cli_config: Option<&Path>) -> Result<PathBuf, EgoPulseError> {
     if let Some(path) = cli_config {
         return Ok(resolve_cli_config_path(path));
     }
@@ -435,7 +435,7 @@ fn restart_installed_service() -> Result<(), EgoPulseError> {
     Ok(())
 }
 
-async fn fetch_live_status(cli_config: Option<&PathBuf>) -> Option<(String, Option<String>)> {
+async fn fetch_live_status(cli_config: Option<&Path>) -> Option<(String, Option<String>)> {
     let config = resolve_config_for_service(cli_config).ok()?;
     let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
     let auth_token = loaded.web_auth_token()?.to_owned();
@@ -831,7 +831,7 @@ ACTIONS:
     );
 }
 
-fn install_service(cli_config: Option<&PathBuf>) -> Result<(), EgoPulseError> {
+fn install_service(cli_config: Option<&Path>) -> Result<(), EgoPulseError> {
     let systemd = SystemdUserService::connect()?;
     let exe_path = std::env::current_exe()
         .map_err(|e| EgoPulseError::Internal(format!("failed to resolve binary path: {e}")))?;
@@ -903,10 +903,7 @@ fn uninstall_service() -> Result<(), EgoPulseError> {
     Ok(())
 }
 
-async fn show_gateway_status(
-    cli_config: Option<&PathBuf>,
-    json: bool,
-) -> Result<(), EgoPulseError> {
+async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<(), EgoPulseError> {
     let systemd = SystemdUserService::connect()?;
     let is_active_output = systemd.command(&["is-active", SERVICE_NAME])?;
     let is_active = String::from_utf8_lossy(&is_active_output.stdout).trim() == "active";
@@ -952,7 +949,7 @@ fn restart_service_action() -> Result<(), EgoPulseError> {
 
 /// Executes the requested gateway action for the EgoPulse systemd service.
 pub async fn run_gateway(
-    cli_config: Option<&PathBuf>,
+    cli_config: Option<&Path>,
     action: Option<GatewayAction>,
 ) -> Result<(), EgoPulseError> {
     let Some(action) = action else {

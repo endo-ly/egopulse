@@ -70,19 +70,20 @@ impl TurnRuntime {
     /// # Panics
     ///
     /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
-    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
+    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage {
         let snapshot = self.config_manager.current_blocking();
         let config = &snapshot.config;
         match scope {
             ConversationScope::Normal => ScopedStorage {
-                db: &self.db,
+                db: Arc::clone(&self.db),
                 archive_root: config.groups_dir(),
             },
             ConversationScope::Secret => ScopedStorage {
-                db: self
-                    .secret_db
-                    .as_ref()
-                    .expect("secret db required but not initialized"),
+                db: Arc::clone(
+                    self.secret_db
+                        .as_ref()
+                        .expect("secret db required but not initialized"),
+                ),
                 archive_root: config.runtime_dir().join("secret_groups"),
             },
         }

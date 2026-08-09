@@ -128,9 +128,9 @@ struct RuntimeTooling {
 ///
 /// Groups the database handle and archive root path so callers do not
 /// need to know scope-specific path conventions.
-pub(crate) struct ScopedStorage<'a> {
+pub(crate) struct ScopedStorage {
     /// The database handle for this scope.
-    pub db: &'a Arc<Database>,
+    pub db: Arc<Database>,
     /// Root directory for archived conversations.
     pub archive_root: PathBuf,
 }
@@ -282,20 +282,6 @@ impl AppState {
             Some(path) => Ok(Arc::new(Config::load_allow_missing_api_key(Some(path))?)),
             None => Ok(self.current_config()),
         }
-    }
-    pub(crate) fn cached_provider(
-        &self,
-        resolved: &crate::config::ResolvedLlmConfig,
-        config_revision: u64,
-    ) -> Result<Arc<dyn crate::llm::LlmProvider>, EgoPulseError> {
-        let key = resolved.cache_key_with_revision(config_revision);
-        let mut cache = self.llm_cache.lock().expect("llm_cache lock");
-        if let Some(provider) = cache.get(&key) {
-            return Ok(Arc::clone(provider));
-        }
-        let provider: Arc<dyn crate::llm::LlmProvider> = Arc::from(create_provider(resolved)?);
-        cache.insert(key, Arc::clone(&provider));
-        Ok(provider)
     }
 }
 
@@ -496,10 +482,10 @@ async fn recover_durable_state(state: &AppState) -> Result<(), EgoPulseError> {
 }
 
 fn recover_durable_state_for_db(
-    db: &Arc<Database>,
+    db: &Database,
     scope: ConversationScope,
 ) -> Result<(), EgoPulseError> {
-    match db.as_ref().recover_running_tools() {
+    match db.recover_running_tools() {
         Ok(recovered) if !recovered.is_empty() => {
             for tool in &recovered {
                 tracing::info!(
@@ -518,7 +504,7 @@ fn recover_durable_state_for_db(
             return Err(EgoPulseError::from(e));
         }
     }
-    match db.as_ref().recover_interrupted_turns() {
+    match db.recover_interrupted_turns() {
         Ok(recovered) if !recovered.is_empty() => {
             for turn in &recovered {
                 tracing::info!(
@@ -553,11 +539,11 @@ fn rehydrate_origin_tracker(state: &AppState) -> Result<(), EgoPulseError> {
 
 fn rehydrate_origin_tracker_for_db(
     state: &AppState,
-    db: &Arc<Database>,
+    db: &Database,
     scope: ConversationScope,
     ttl_secs: i64,
 ) -> Result<(), EgoPulseError> {
-    let origins = db.as_ref().recover_origin_tracker(ttl_secs)?;
+    let origins = db.recover_origin_tracker(ttl_secs)?;
     if !origins.is_empty() {
         tracing::info!(
             scope = %scope,
@@ -1129,7 +1115,7 @@ async fn begin_scheduled_turn(
     turn: &crate::agent_loop::ScheduledTurn,
     origin_id: &str,
     session_key: &str,
-    config_snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
+    config_snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> bool {
     let valid_ids: Vec<&str> = config_snapshot
         .config
@@ -1253,17 +1239,23 @@ async fn execute_and_publish_scheduled_turn(
         }
     };
     let duration = started.elapsed().as_secs_f64();
+    let is_concurrency_conflict = turn_result
+        .as_ref()
+        .err()
+        .is_some_and(|error| matches!(error, EgoPulseError::TurnConcurrencyConflict));
+    if !is_concurrency_conflict {
+        record_turn_observation(
+            &state.runtime_status,
+            &turn.context,
+            origin_id,
+            &started_at,
+            duration,
+            &turn_result,
+        );
+    }
 
     match turn_result {
         Ok(response) => {
-            state.runtime_status.push_turn(
-                &turn.context.trace_id,
-                &turn.context.agent_id,
-                &turn.context.channel,
-                &started_at,
-                duration,
-                true,
-            );
             if let Some(adapter) = adapter.as_ref() {
                 if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                     tracing::warn!(
@@ -1287,31 +1279,15 @@ async fn execute_and_publish_scheduled_turn(
             store_scheduled_turn_response(state, turn, &response).await;
         }
         Err(error) => {
-            if matches!(error, EgoPulseError::TurnConcurrencyConflict) {
+            if is_concurrency_conflict {
                 drain_next_queued_turn(state, session_key).await;
                 return;
             }
-            state.runtime_status.push_turn(
-                &turn.context.trace_id,
-                &turn.context.agent_id,
-                &turn.context.channel,
-                &started_at,
-                duration,
-                false,
-            );
             tracing::warn!(
                 agent_id = %turn.context.agent_id,
                 error = %error,
                 "scheduled turn: process_turn failed"
             );
-            state.runtime_status.push_error(
-                origin_id,
-                "turn_failure",
-                &turn.context.agent_id,
-                &turn.context.channel,
-                &error.to_string(),
-            );
-            crate::runtime::metrics::inc_turn_errors_total("turn_failure", &turn.context.agent_id);
             state
                 .turn_tracker
                 .set_terminal_reason(origin_id, turn_scheduler::StopReason::LlmFailure);
@@ -1339,11 +1315,39 @@ async fn execute_and_publish_scheduled_turn(
                     tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                 }
             }
-            send_turn_failure_to_channel(adapter.as_ref(), &external_chat_id, &error).await;
+            send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
         }
     }
 
     drain_next_queued_turn(state, session_key).await;
+}
+
+fn record_turn_observation(
+    status: &RuntimeStatus,
+    context: &crate::agent_loop::SurfaceContext,
+    error_trace_id: &str,
+    started_at: &str,
+    duration_secs: f64,
+    result: &Result<String, EgoPulseError>,
+) {
+    status.push_turn(
+        &context.trace_id,
+        &context.agent_id,
+        &context.channel,
+        started_at,
+        duration_secs,
+        result.is_ok(),
+    );
+    if let Err(error) = result {
+        status.push_error(
+            error_trace_id,
+            "turn_failure",
+            &context.agent_id,
+            &context.channel,
+            &error.to_string(),
+        );
+        crate::runtime::metrics::inc_turn_errors_total("turn_failure", &context.agent_id);
+    }
 }
 
 async fn store_scheduled_turn_response(
@@ -1417,24 +1421,14 @@ pub(crate) async fn execute_observed_turn(
     let result =
         crate::agent_loop::process_turn_with_events(&runtime, context, input, |_| {}).await;
     let duration = started.elapsed().as_secs_f64();
-    state.runtime_status.push_turn(
+    record_turn_observation(
+        &state.runtime_status,
+        context,
         &context.trace_id,
-        &context.agent_id,
-        &context.channel,
         &started_at,
         duration,
-        result.is_ok(),
+        &result,
     );
-    if let Err(error) = &result {
-        state.runtime_status.push_error(
-            &context.trace_id,
-            "turn_failure",
-            &context.agent_id,
-            &context.channel,
-            &error.to_string(),
-        );
-        crate::runtime::metrics::inc_turn_errors_total("turn_failure", &context.agent_id);
-    }
     result
 }
 
@@ -1530,7 +1524,7 @@ fn tool_progress_enabled(
 }
 
 async fn send_turn_failure_to_channel(
-    adapter: Option<&Arc<dyn crate::channels::adapter::ChannelAdapter>>,
+    adapter: Option<&dyn crate::channels::adapter::ChannelAdapter>,
     external_chat_id: &str,
     error: &EgoPulseError,
 ) {
@@ -1544,50 +1538,48 @@ async fn send_turn_failure_to_channel(
     }
 }
 
-fn spawn_mcp_reconnect_loop(
+async fn spawn_mcp_reconnect_loop(
     mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
     workspace_dir: PathBuf,
     shutdown: CancellationToken,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EgoPulseError>> + Send>> {
-    Box::pin(async move {
-        const INITIAL_RETRY_SECS: u64 = 5;
-        const MAX_RETRY_SECS: u64 = 300;
+) -> Result<(), EgoPulseError> {
+    const INITIAL_RETRY_SECS: u64 = 5;
+    const MAX_RETRY_SECS: u64 = 300;
 
-        let mut retry_secs = INITIAL_RETRY_SECS;
-        loop {
-            let has_failed_servers = {
-                let guard = mcp_manager.read().await;
-                guard.has_failed_servers()
-            };
+    let mut retry_secs = INITIAL_RETRY_SECS;
+    loop {
+        let has_failed_servers = {
+            let guard = mcp_manager.read().await;
+            guard.has_failed_servers()
+        };
 
-            let sleep_secs = if has_failed_servers {
-                retry_secs
-            } else {
-                MAX_RETRY_SECS
-            };
+        let sleep_secs = if has_failed_servers {
+            retry_secs
+        } else {
+            MAX_RETRY_SECS
+        };
 
-            tokio::select! {
-                _ = shutdown.cancelled() => return Ok(()),
-                _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
-            }
-
-            if !has_failed_servers {
-                retry_secs = INITIAL_RETRY_SECS;
-                continue;
-            }
-
-            let reconnected = {
-                let mut guard = mcp_manager.write().await;
-                guard.reconnect_failed_once(&workspace_dir).await
-            };
-
-            if reconnected > 0 {
-                retry_secs = INITIAL_RETRY_SECS;
-            } else {
-                retry_secs = (retry_secs * 2).min(MAX_RETRY_SECS);
-            }
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
         }
-    })
+
+        if !has_failed_servers {
+            retry_secs = INITIAL_RETRY_SECS;
+            continue;
+        }
+
+        let reconnected = {
+            let mut guard = mcp_manager.write().await;
+            guard.reconnect_failed_once(&workspace_dir).await
+        };
+
+        if reconnected > 0 {
+            retry_secs = INITIAL_RETRY_SECS;
+        } else {
+            retry_secs = (retry_secs * 2).min(MAX_RETRY_SECS);
+        }
+    }
 }
 
 /// Sends a single prompt to the configured LLM without session state.
@@ -1757,7 +1749,7 @@ async fn spawn_runtime_services(state: &Arc<AppState>) {
         Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
     }
 
-    let pulse_state = (**state).clone();
+    let pulse_state = Arc::clone(state);
     let token = state.supervisor.shutdown_token();
     info!("Starting pulse scheduler");
     state.supervisor.spawn_long_lived(
@@ -1773,7 +1765,7 @@ async fn spawn_runtime_services(state: &Arc<AppState>) {
     );
 
     if state.config.db.backup.scheduler_enabled() {
-        let backup_state = (**state).clone();
+        let backup_state = Arc::clone(state);
         let token = state.supervisor.shutdown_token();
         info!("Starting backup scheduler");
         state.supervisor.spawn_long_lived(
@@ -1787,7 +1779,7 @@ async fn spawn_runtime_services(state: &Arc<AppState>) {
     }
 }
 
-async fn supervise_runtime(state: &Arc<AppState>) -> Result<(), EgoPulseError> {
+async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
     state.supervisor.start_accepting();
     state.runtime_status.set_accepting_inputs(true);
     info!("Runtime active; waiting for Ctrl-C or channel failure");
