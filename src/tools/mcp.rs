@@ -5,8 +5,10 @@
 //! stdio / streamable_http 両対応で接続する。
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -25,7 +27,7 @@ use rmcp::transport::{
 };
 
 use crate::config::default_state_root;
-use crate::error::{ConfigError, McpError};
+use crate::error::{ConfigError, EgoPulseError, McpError};
 use crate::llm::ToolDefinition;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
@@ -34,11 +36,44 @@ const TOOL_NAME_MAX_LEN: usize = 64;
 
 type DynClient = RunningService<RoleClient, Box<dyn DynService<RoleClient>>>;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TransportType {
     Stdio,
     StreamableHttp,
+}
+
+impl fmt::Display for TransportType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdio => write!(f, "stdio"),
+            Self::StreamableHttp => write!(f, "streamable_http"),
+        }
+    }
+}
+
+/// Snapshot of MCP server connection state exposed by the runtime health API.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct McpStatus {
+    #[serde(default)]
+    pub connected: Vec<ConnectedMcpServer>,
+    #[serde(default)]
+    pub failed: Vec<FailedMcpServer>,
+}
+
+/// Connected MCP server information included in [`McpStatus`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ConnectedMcpServer {
+    pub name: String,
+    pub transport: TransportType,
+    pub tools: Vec<String>,
+}
+
+/// Failed MCP server information included in [`McpStatus`].
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct FailedMcpServer {
+    pub name: String,
+    pub error: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -184,13 +219,6 @@ fn sha2_short(input: &str) -> String {
     result[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn convert_transport(tt: &TransportType) -> crate::runtime::status::TransportType {
-    match tt {
-        TransportType::Stdio => crate::runtime::status::TransportType::Stdio,
-        TransportType::StreamableHttp => crate::runtime::status::TransportType::StreamableHttp,
-    }
-}
-
 impl McpManager {
     pub(crate) async fn new(workspace_dir: &Path) -> Result<Self, ConfigError> {
         let configs = load_and_merge_mcp_configs(workspace_dir)?;
@@ -296,8 +324,8 @@ impl McpManager {
     }
 
     /// 現在の接続状態をスナップショットとして返す。
-    pub(crate) fn status_snapshot(&self) -> crate::runtime::status::McpStatus {
-        let mut connected: Vec<crate::runtime::status::ConnectedMcpServer> = self
+    pub(crate) fn status_snapshot(&self) -> McpStatus {
+        let mut connected: Vec<ConnectedMcpServer> = self
             .servers
             .iter()
             .map(|server| {
@@ -306,18 +334,18 @@ impl McpManager {
                     .iter()
                     .map(|t| t.name.as_ref().to_string())
                     .collect();
-                crate::runtime::status::ConnectedMcpServer {
+                ConnectedMcpServer {
                     name: server.name.clone(),
-                    transport: convert_transport(&server.config.transport),
+                    transport: server.config.transport,
                     tools,
                 }
             })
             .collect();
 
-        let mut failed: Vec<crate::runtime::status::FailedMcpServer> = self
+        let mut failed: Vec<FailedMcpServer> = self
             .failed_servers
             .iter()
-            .map(|server| crate::runtime::status::FailedMcpServer {
+            .map(|server| FailedMcpServer {
                 name: server.name.clone(),
                 error: server.error.clone(),
             })
@@ -326,7 +354,7 @@ impl McpManager {
         connected.sort_by(|a, b| a.name.cmp(&b.name));
         failed.sort_by(|a, b| a.name.cmp(&b.name));
 
-        crate::runtime::status::McpStatus { connected, failed }
+        McpStatus { connected, failed }
     }
 
     pub(crate) fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -436,6 +464,51 @@ impl McpManager {
 
         let output = format_mcp_tool_result(result);
         Ok(truncate_to_max_bytes(output))
+    }
+}
+
+/// Runs the background retry loop for MCP servers that failed during startup.
+pub(crate) async fn run_reconnect_loop(
+    mcp_manager: Arc<tokio::sync::RwLock<McpManager>>,
+    workspace_dir: PathBuf,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), EgoPulseError> {
+    const INITIAL_RETRY_SECS: u64 = 5;
+    const MAX_RETRY_SECS: u64 = 300;
+
+    let mut retry_secs = INITIAL_RETRY_SECS;
+    loop {
+        let has_failed_servers = {
+            let guard = mcp_manager.read().await;
+            guard.has_failed_servers()
+        };
+
+        let sleep_secs = if has_failed_servers {
+            retry_secs
+        } else {
+            MAX_RETRY_SECS
+        };
+
+        tokio::select! {
+            _ = shutdown.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+        }
+
+        if !has_failed_servers {
+            retry_secs = INITIAL_RETRY_SECS;
+            continue;
+        }
+
+        let reconnected = {
+            let mut guard = mcp_manager.write().await;
+            guard.reconnect_failed_once(&workspace_dir).await
+        };
+
+        if reconnected > 0 {
+            retry_secs = INITIAL_RETRY_SECS;
+        } else {
+            retry_secs = (retry_secs * 2).min(MAX_RETRY_SECS);
+        }
     }
 }
 

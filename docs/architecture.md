@@ -86,6 +86,7 @@ src/
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, build_app_state(), start_channels()
 │   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
+│   ├── turn_dispatch.rs # durable turn の復旧・dispatch・scheduled turn 実行
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
 │   ├── backup_scheduler.rs # 定期 SQLite backup スケジューラ
@@ -94,8 +95,7 @@ src/
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
 │   ├── metrics.rs       # メトリクス初期化・ヘルパー（内部 Prometheus レコーダー）
-│   ├── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
-│   └── status.rs        # MCP ステータス型
+│   └── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
 │
 ├── agent_loop/          # エージェントループ
 │   ├── mod.rs           # SurfaceContext, process_turn()
@@ -241,12 +241,14 @@ pub struct AppState {
 
 impl AppState {
     /// スコープに応じた DB 参照を返す
-    pub(crate) fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+    pub(crate) fn db_for(&self, scope: ConversationScope) -> Arc<Database> {
         match scope {
-            ConversationScope::Secret => {
-                self.secret_db.as_ref().expect("secret db required but not initialized")
-            }
-            ConversationScope::Normal => &self.db,
+            ConversationScope::Normal => Arc::clone(&self.db),
+            ConversationScope::Secret => Arc::clone(
+                self.secret_db
+                    .as_ref()
+                    .expect("secret db required but not initialized"),
+            ),
         }
     }
 }
@@ -418,7 +420,7 @@ deadline 付きで停止する。
 | **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
 | **Sleep Batch** | `sleep/orchestrator.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
-| **Active Turn Tracker** | `runtime/mod.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
+| **Active Turn Tracker** | `runtime/turn_scheduler.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
 | **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
 | **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
