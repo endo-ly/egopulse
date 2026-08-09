@@ -890,18 +890,11 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
                     format_gateway_status_values(&status.status, Some(&status.telemetry))
                 );
             }
+            None if json => print_gateway_status_json(&systemd, &state),
             None => systemd.show_systemctl_status()?,
         }
     } else if json {
-        let status_json = serde_json::json!({
-            "ok": false,
-            "service": state,
-            "recent_logs": systemd.recent_logs(),
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&status_json).unwrap_or_default()
-        );
+        print_gateway_status_json(&systemd, &state);
     } else {
         systemd.show_systemctl_status()?;
         if let Some(logs) = systemd.recent_logs() {
@@ -909,6 +902,18 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
         }
     }
     Ok(())
+}
+
+fn print_gateway_status_json(systemd: &SystemdUserService, state: &str) {
+    let status_json = serde_json::json!({
+        "ok": false,
+        "service": state,
+        "recent_logs": systemd.recent_logs(),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&status_json).unwrap_or_default()
+    );
 }
 
 fn restart_service_action() -> Result<(), EgoPulseError> {
@@ -1452,7 +1457,8 @@ mod tests {
             ("/path with spaces", "\"/path with spaces\""),
             ("a\"b", "\"a\\\"b\""),
         ] {
-            assert_eq!(systemd_escape_env(input), expected);
+            let actual = systemd_escape_env(input);
+            assert_eq!(actual, expected);
         }
     }
 
@@ -1652,11 +1658,16 @@ mod tests {
 
     #[test]
     fn format_uptime_various() {
-        assert_eq!(format_uptime(0), "0s");
-        assert_eq!(format_uptime(45), "45s");
-        assert_eq!(format_uptime(90), "1m 30s");
-        assert_eq!(format_uptime(5400), "1h 30m 0s");
-        assert_eq!(format_uptime(90061), "1d 1h 1m");
+        for (input, expected) in [
+            (0, "0s"),
+            (45, "45s"),
+            (90, "1m 30s"),
+            (5400, "1h 30m 0s"),
+            (90061, "1d 1h 1m"),
+        ] {
+            let actual = format_uptime(input);
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

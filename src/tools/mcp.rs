@@ -321,6 +321,16 @@ impl McpManager {
         true
     }
 
+    fn update_failed_server_error(&mut self, name: &str, error: String) {
+        if let Some(server) = self
+            .failed_servers
+            .iter_mut()
+            .find(|server| server.name == name)
+        {
+            server.error = error;
+        }
+    }
+
     /// 現在の接続状態をスナップショットとして返す。
     pub(crate) fn status_snapshot(&self) -> McpStatus {
         let mut connected: Vec<ConnectedMcpServer> = self
@@ -508,7 +518,11 @@ pub(crate) async fn run_reconnect_loop(
 
         let mut reconnected = 0;
         for (name, config) in reconnect_targets {
-            match connect_server(&name, &config, &workspace_dir).await {
+            let connection_result = tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                result = connect_server(&name, &config, &workspace_dir) => result,
+            };
+            match connection_result {
                 Ok((client, tools)) => {
                     let applied = {
                         let mut guard = mcp_manager.write().await;
@@ -517,7 +531,10 @@ pub(crate) async fn run_reconnect_loop(
                     reconnected += usize::from(applied);
                 }
                 Err(error) => {
-                    warn!(server = %name, "MCP server reconnect failed: {error}");
+                    let error_text = error.to_string();
+                    warn!(server = %name, "MCP server reconnect failed: {error_text}");
+                    let mut guard = mcp_manager.write().await;
+                    guard.update_failed_server_error(&name, error_text);
                 }
             }
         }
