@@ -318,7 +318,7 @@ pub(crate) async fn resume_input_committed_turn(
     config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<String, EgoPulseError> {
     let turn_id_owned = turn_id.to_string();
-    let run = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    let run = call_blocking(state.db_for(scope), move |db| {
         db.get_turn_run(&turn_id_owned)
     })
     .await
@@ -398,7 +398,7 @@ pub(crate) async fn resume_input_committed_turn(
     // The input message this Turn committed must still exist (and belong
     // to the Turn via its deterministic id) so the session snapshot is trusted.
     let input_message_id = format!("turn:{turn_id}:input");
-    let input_exists = call_blocking(Arc::clone(state.db_for(scope)), {
+    let input_exists = call_blocking(state.db_for(scope), {
         let id = input_message_id.clone();
         move |db| db.get_message_content(&id)
     })
@@ -433,7 +433,7 @@ async fn fail_resume_permanently(
     let reason = reason.to_string();
     let turn_id_for_db = turn_id.clone();
     let reason_for_db = reason.clone();
-    if let Err(e) = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    if let Err(e) = call_blocking(state.db_for(scope), move |db| {
         db.fail_turn(
             &turn_id_for_db,
             TurnRunState::Failed,
@@ -652,7 +652,7 @@ impl TurnExecutor<'_> {
         let config_revision = snapshot.revision as i64;
         let config_fingerprint = snapshot.fingerprint.clone();
         let origin_id = self.context.origin_id.clone();
-        let run = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+        let run = call_blocking(self.state.db_for(scope), move |db| {
             db.accept_or_get_turn(crate::storage::AcceptTurnParams {
                 chat_id,
                 request_key: &request_key,
@@ -675,7 +675,7 @@ impl TurnExecutor<'_> {
                             "completed turn_run has no final_message_id".to_string(),
                         )
                     })?;
-                    let content = call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+                    let content = call_blocking(self.state.db_for(scope), move |db| {
                         db.get_message_content(&final_message_id)
                     })
                     .await?
@@ -699,7 +699,7 @@ impl TurnExecutor<'_> {
     async fn fail_turn(&self, turn_id: &str, error: &EgoPulseError) {
         let scope = self.context.scope;
         let turn_id_owned = turn_id.to_string();
-        let run = match call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+        let run = match call_blocking(self.state.db_for(scope), move |db| {
             db.get_turn_run(&turn_id_owned)
         })
         .await
@@ -728,14 +728,14 @@ impl TurnExecutor<'_> {
         // would let the dispatcher re-dispatch accepted child turns after a
         // restart).
         let result = if origin_id.is_empty() {
-            call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+            call_blocking(self.state.db_for(scope), move |db| {
                 db.fail_turn(&turn_id_for_fail, target, error_kind, &error_message)
             })
             .await
         } else {
             let terminal_reason =
                 crate::runtime::turn_scheduler::StopReason::LlmFailure.to_string();
-            call_blocking(Arc::clone(self.state.db_for(scope)), move |db| {
+            call_blocking(self.state.db_for(scope), move |db| {
                 db.fail_turn_and_terminate_origin(
                     &turn_id_for_fail,
                     target,
@@ -953,10 +953,9 @@ impl TurnExecutor<'_> {
 
     async fn mark_output_published(&self, turn_id: &str) {
         let turn_id = turn_id.to_string();
-        if let Err(e) = call_blocking(
-            Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.mark_turn_output_published(&turn_id),
-        )
+        if let Err(e) = call_blocking(self.state.db_for(self.context.scope), move |db| {
+            db.mark_turn_output_published(&turn_id)
+        })
         .await
         {
             warn!(error = %e, "failed to mark turn_run output_published");
@@ -1033,30 +1032,27 @@ impl TurnExecutor<'_> {
 
     async fn complete_model(&self, turn_id: &str) -> Result<(), EgoPulseError> {
         let turn_id = turn_id.to_string();
-        call_blocking(
-            Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.complete_turn_model(&turn_id),
-        )
+        call_blocking(self.state.db_for(self.context.scope), move |db| {
+            db.complete_turn_model(&turn_id)
+        })
         .await?;
         Ok(())
     }
 
     async fn begin_tools(&self, turn_id: &str) -> Result<(), EgoPulseError> {
         let turn_id = turn_id.to_string();
-        call_blocking(
-            Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.begin_turn_tools(&turn_id),
-        )
+        call_blocking(self.state.db_for(self.context.scope), move |db| {
+            db.begin_turn_tools(&turn_id)
+        })
         .await?;
         Ok(())
     }
 
     async fn complete_tools(&self, turn_id: &str) -> Result<(), EgoPulseError> {
         let turn_id = turn_id.to_string();
-        call_blocking(
-            Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.complete_turn_tools(&turn_id),
-        )
+        call_blocking(self.state.db_for(self.context.scope), move |db| {
+            db.complete_turn_tools(&turn_id)
+        })
         .await?;
         Ok(())
     }
@@ -1095,10 +1091,9 @@ impl TurnExecutor<'_> {
     ) -> Result<(), EgoPulseError> {
         let turn_id = turn_id.to_string();
         let final_message_id = final_message_id.to_string();
-        call_blocking(
-            Arc::clone(self.state.db_for(self.context.scope)),
-            move |db| db.complete_turn(&turn_id, &final_message_id),
-        )
+        call_blocking(self.state.db_for(self.context.scope), move |db| {
+            db.complete_turn(&turn_id, &final_message_id)
+        })
         .await?;
         Ok(())
     }
@@ -1502,7 +1497,7 @@ async fn handle_user_turn_persist_error(
 async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
     let agent_id = context.agent_id.clone();
-    let messages = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+    let messages = call_blocking(state.db_for(context.scope), move |db| {
         db.get_channel_log_messages_for_agent(log_chat_id, &agent_id, CHANNEL_CONTEXT_LIMIT)
     })
     .await
@@ -1583,7 +1578,7 @@ async fn send_model_request_with_retry(
     );
     let turn_id = turn.turn_id.clone();
     let hash_for_init = hash.clone();
-    let advanced = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+    let advanced = call_blocking(state.db_for(context.scope), move |db| {
         db.begin_turn_model_iteration(&turn_id, iteration as i64, &hash_for_init)
     })
     .await
@@ -1642,7 +1637,7 @@ async fn send_model_request_with_retry(
                 let retryable = matches!(&error, EgoPulseError::Llm(e) if e.is_retryable());
                 if retryable && !published && attempt < MAX_LLM_RETRIES {
                     let turn_id = turn.turn_id.clone();
-                    let _ = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+                    let _ = call_blocking(state.db_for(context.scope), move |db| {
                         db.increment_turn_model_attempt(&turn_id)
                     })
                     .await;

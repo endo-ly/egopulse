@@ -400,7 +400,7 @@ pub(crate) async fn log_llm_usage(
     has_tools: bool,
     failure_message: &'static str,
 ) {
-    let db = Arc::clone(state.db_for(scope));
+    let db = state.db_for(scope);
     let channel = caller_channel.to_string();
     let provider = llm.provider_name().to_string();
     let model = llm.model_name().to_string();
@@ -605,22 +605,20 @@ async fn claim_tool_slot(
     let hash_for_closure = hash;
     let tool_input_for_closure = tool_input;
     let key_for_closure = key;
-    Ok(
-        call_blocking(Arc::clone(state.db_for(tool_context.scope)), move |db| {
-            db.claim_tool_execution(ClaimParams {
-                turn_id: &turn_id,
-                chat_id,
-                message_id: &message_id,
-                tool_call_id: &tool_call_id,
-                tool_name: &tool_name,
-                tool_input: &tool_input_for_closure,
-                input_hash: &hash_for_closure,
-                idempotency_class: class,
-                idempotency_key: key_for_closure.as_deref(),
-            })
+    Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
+        db.claim_tool_execution(ClaimParams {
+            turn_id: &turn_id,
+            chat_id,
+            message_id: &message_id,
+            tool_call_id: &tool_call_id,
+            tool_name: &tool_name,
+            tool_input: &tool_input_for_closure,
+            input_hash: &hash_for_closure,
+            idempotency_class: class,
+            idempotency_key: key_for_closure.as_deref(),
         })
-        .await?,
-    )
+    })
+    .await?)
 }
 
 /// Records the Tool execution outcome (success or failure) in the ledger.
@@ -638,20 +636,16 @@ async fn record_tool_outcome(
     let tool_call_id = tool_call.id.clone();
     if result.is_error {
         let error_message = result.content.clone();
-        Ok(
-            call_blocking(Arc::clone(state.db_for(tool_context.scope)), move |db| {
-                db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
-            })
-            .await?,
-        )
+        Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
+            db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
+        })
+        .await?)
     } else {
         let payload = payload.to_string();
-        Ok(
-            call_blocking(Arc::clone(state.db_for(tool_context.scope)), move |db| {
-                db.record_tool_success(&turn_id, &tool_call_id, &payload)
-            })
-            .await?,
-        )
+        Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
+            db.record_tool_success(&turn_id, &tool_call_id, &payload)
+        })
+        .await?)
     }
 }
 

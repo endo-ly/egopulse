@@ -409,7 +409,7 @@ async fn log_summarizer_usage(
         return;
     };
 
-    let db = std::sync::Arc::clone(state.storage_for(context.scope).db);
+    let db = state.storage_for(context.scope).db;
     let channel = context.channel.clone();
     let provider = llm.provider_name().to_string();
     let model = llm.model_name().to_string();

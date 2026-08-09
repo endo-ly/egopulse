@@ -33,7 +33,7 @@ pub(crate) async fn resolve_chat_id(
     state: &TurnRuntime,
     context: &SurfaceContext,
 ) -> Result<i64, EgoPulseError> {
-    call_blocking(Arc::clone(state.db_for(context.scope)), {
+    call_blocking(state.db_for(context.scope), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
         let surface_thread = context.surface_thread.clone();
@@ -68,7 +68,7 @@ pub(crate) async fn load_session_messages(
     context: &SurfaceContext,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let chat_id = resolve_chat_id(state, context).await?;
-    let history = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+    let history = call_blocking(state.db_for(context.scope), move |db| {
         db.get_all_messages(chat_id)
     })
     .await?;
@@ -92,7 +92,7 @@ pub(crate) async fn load_messages_for_turn(
     chat_id: i64,
 ) -> Result<LoadedSession, EgoPulseError> {
     let max_history_messages = state.current_config().max_history_messages;
-    let snapshot = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    let snapshot = call_blocking(state.db_for(scope), move |db| {
         db.load_session_snapshot(chat_id, max_history_messages)
     })
     .await?;
@@ -108,7 +108,7 @@ pub(crate) async fn load_messages_for_turn_with_limit(
     chat_id: i64,
     max_history_messages: usize,
 ) -> Result<LoadedSession, EgoPulseError> {
-    let snapshot = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    let snapshot = call_blocking(state.db_for(scope), move |db| {
         db.load_session_snapshot(chat_id, max_history_messages)
     })
     .await?;
@@ -370,7 +370,7 @@ async fn store_phase_snapshot(
             EgoPulseError::Storage(storage) => storage,
             other => StorageError::TaskJoin(other.to_string()),
         })?;
-    let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    let revision = call_blocking(state.db_for(scope), move |db| {
         db.store_message_with_session(&message, &session_json, session_revision)
     })
     .await?;
@@ -398,7 +398,7 @@ async fn store_phase_snapshot_with_turn_input(
     let turn_id_owned = turn_id.to_string();
     let config_revision = config_snapshot.revision as i64;
     let config_fingerprint_owned = config_snapshot.fingerprint.clone();
-    let revision = call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    let revision = call_blocking(state.db_for(scope), move |db| {
         db.commit_turn_input_with_conversation(
             &message,
             &session_json,

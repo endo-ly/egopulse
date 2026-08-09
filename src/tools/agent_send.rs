@@ -64,13 +64,14 @@ impl AgentSendTool {
         }
     }
 
-    fn db_for(&self, scope: ConversationScope) -> &Arc<crate::storage::Database> {
+    fn db_for(&self, scope: ConversationScope) -> Arc<crate::storage::Database> {
         match scope {
-            ConversationScope::Normal => &self.db,
-            ConversationScope::Secret => self
-                .secret_db
-                .as_ref()
-                .expect("secret db required for secret mode agent_send"),
+            ConversationScope::Normal => Arc::clone(&self.db),
+            ConversationScope::Secret => Arc::clone(
+                self.secret_db
+                    .as_ref()
+                    .expect("secret db required for secret mode agent_send"),
+            ),
         }
     }
 }
@@ -265,7 +266,7 @@ impl Tool for AgentSendTool {
         stored.id = message_id;
         stored.message_kind = MessageKind::AgentSend;
 
-        if let Err(error) = call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
+        if let Err(error) = call_blocking(self.db_for(context.scope), move |db| {
             db.store_message_only(&stored)
         })
         .await
@@ -274,7 +275,7 @@ impl Tool for AgentSendTool {
         }
 
         // 2. Display in channel
-        let chat_info = call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
+        let chat_info = call_blocking(self.db_for(context.scope), move |db| {
             db.get_chat_by_id(chat_id)
         })
         .await;

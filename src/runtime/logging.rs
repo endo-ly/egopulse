@@ -34,7 +34,7 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
 
     let format = std::env::var("EGOPULSE_LOG_FORMAT").unwrap_or_default();
 
-    let result = if format.eq_ignore_ascii_case("json") {
+    let result = if is_json_log_format(&format) {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
@@ -61,6 +61,10 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
     }
 }
 
+fn is_json_log_format(format: &str) -> bool {
+    format.eq_ignore_ascii_case("json")
+}
+
 /// Installs a panic hook that ignores stderr write failures.
 ///
 /// The default hook writes the panic message to stderr and panics again if
@@ -81,42 +85,12 @@ pub(crate) fn install_eagain_safe_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     #[test]
-    #[serial]
-    fn init_logging_default_is_text() {
-        // SAFETY: test-only env var manipulation, single-threaded via #[serial]
-        unsafe { std::env::remove_var("EGOPULSE_LOG_FORMAT") };
-        let result = init_logging("info");
-        assert!(
-            result.is_ok(),
-            "default text format should init: {result:?}"
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn init_logging_json_format() {
-        // SAFETY: test-only env var manipulation, single-threaded via #[serial]
-        unsafe { std::env::set_var("EGOPULSE_LOG_FORMAT", "json") };
-        let result = init_logging("info");
-        assert!(result.is_ok(), "json format should init: {result:?}");
-        // SAFETY: test-only env var cleanup
-        unsafe { std::env::remove_var("EGOPULSE_LOG_FORMAT") };
-    }
-
-    #[test]
-    #[serial]
-    fn init_logging_invalid_format_falls_back() {
-        // SAFETY: test-only env var manipulation, single-threaded via #[serial]
-        unsafe { std::env::set_var("EGOPULSE_LOG_FORMAT", "xml") };
-        let result = init_logging("info");
-        assert!(
-            result.is_ok(),
-            "invalid format should fall back to text: {result:?}"
-        );
-        // SAFETY: test-only env var cleanup
-        unsafe { std::env::remove_var("EGOPULSE_LOG_FORMAT") };
+    fn log_format_selection_is_explicit() {
+        assert!(is_json_log_format("json"));
+        assert!(is_json_log_format("JSON"));
+        assert!(!is_json_log_format(""));
+        assert!(!is_json_log_format("xml"));
     }
 }

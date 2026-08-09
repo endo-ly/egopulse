@@ -99,13 +99,14 @@ impl SendAttachmentTool {
         }
     }
 
-    fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+    fn db_for(&self, scope: ConversationScope) -> Arc<Database> {
         match scope {
-            ConversationScope::Normal => &self.db,
-            ConversationScope::Secret => self
-                .secret_db
-                .as_ref()
-                .expect("secret db required for secret mode send_attachment"),
+            ConversationScope::Normal => Arc::clone(&self.db),
+            ConversationScope::Secret => Arc::clone(
+                self.secret_db
+                    .as_ref()
+                    .expect("secret db required for secret mode send_attachment"),
+            ),
         }
     }
 }
@@ -165,7 +166,7 @@ impl Tool for SendAttachmentTool {
         let text = params.text.filter(|s| !s.trim().is_empty());
 
         let chat_id = context.chat_id;
-        let chat_info = match call_blocking(Arc::clone(self.db_for(context.scope)), move |db| {
+        let chat_info = match call_blocking(self.db_for(context.scope), move |db| {
             db.get_chat_by_id(chat_id)
         })
         .await

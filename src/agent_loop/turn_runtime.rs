@@ -45,18 +45,19 @@ pub(crate) struct TurnRuntime {
 }
 
 impl TurnRuntime {
-    /// Returns the appropriate `Database` reference based on `scope`.
+    /// Returns an owned handle to the appropriate database for `scope`.
     ///
     /// # Panics
     ///
     /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
-    pub(crate) fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+    pub(crate) fn db_for(&self, scope: ConversationScope) -> Arc<Database> {
         match scope {
-            ConversationScope::Normal => &self.db,
-            ConversationScope::Secret => self
-                .secret_db
-                .as_ref()
-                .expect("secret db required but not initialized"),
+            ConversationScope::Normal => Arc::clone(&self.db),
+            ConversationScope::Secret => Arc::clone(
+                self.secret_db
+                    .as_ref()
+                    .expect("secret db required but not initialized"),
+            ),
         }
     }
 
@@ -70,19 +71,17 @@ impl TurnRuntime {
     /// # Panics
     ///
     /// Panics if `scope` is `Secret` but `secret_db` was not initialized.
-    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage<'_> {
+    pub(crate) fn storage_for(&self, scope: ConversationScope) -> ScopedStorage {
         let snapshot = self.config_manager.current_blocking();
         let config = &snapshot.config;
+        let db = self.db_for(scope);
         match scope {
             ConversationScope::Normal => ScopedStorage {
-                db: &self.db,
+                db,
                 archive_root: config.groups_dir(),
             },
             ConversationScope::Secret => ScopedStorage {
-                db: self
-                    .secret_db
-                    .as_ref()
-                    .expect("secret db required but not initialized"),
+                db,
                 archive_root: config.runtime_dir().join("secret_groups"),
             },
         }

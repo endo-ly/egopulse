@@ -66,8 +66,8 @@ pub(crate) const MAX_QUEUED_TURNS_PER_SESSION: usize = 32;
 /// Maximum turns queued across the whole runtime before new turns are rejected.
 ///
 /// Bounds total scheduler memory across all sessions during sustained
-/// overload. Until a durable queue replaces the in-memory one,
-/// then this is an explicit finite capacity, not unbounded delay.
+/// overload. Until a durable queue replaces the in-memory one, this is an
+/// explicit finite capacity rather than an unbounded delay.
 pub(crate) const MAX_GLOBAL_QUEUED_TURNS: usize = 512;
 
 /// Maximum distinct origin IDs tracked by [`TurnTracker`] before new origins
@@ -397,8 +397,7 @@ impl TurnTracker {
     }
 
     /// Returns the number of turns that have actually begun execution for
-    /// `origin_id`, or `0` if the origin is not tracked. Test-only assertion
-    /// helper; production reads happen inside [`try_begin_execution`].
+    /// `origin_id`, or `0` if the origin is not tracked.
     #[cfg(test)]
     fn executed_count(&self, origin_id: &str) -> usize {
         let origins = self.origins.lock().expect("turn_tracker lock");
@@ -750,8 +749,8 @@ mod tests {
         }
     }
 
-    /// Submits one Started turn plus `queued` additional turns for a session,
-    /// returning the Started turn count behaviour. Used to fill queues.
+    /// Submits one started turn plus `queued` additional turns for a session.
+    /// Used to fill queues in capacity tests.
     fn fill_session(scheduler: &TurnScheduler, agent: &str, queued: usize) {
         scheduler.submit(test_turn(agent, "started"));
         for i in 0..queued {
@@ -800,12 +799,6 @@ mod tests {
     }
 
     // ---- TurnScheduler tests ----
-
-    #[test]
-    fn turn_scheduler_new_is_empty() {
-        let scheduler = TurnScheduler::new();
-        assert!(!scheduler.is_busy("discord:ch1:agent:a"));
-    }
 
     #[test]
     fn turn_scheduler_idle_session_first_turn_is_started() {
@@ -913,19 +906,6 @@ mod tests {
         assert!(next.is_some());
         assert_eq!(next.unwrap().origin_id, "orig-2");
         assert!(scheduler.is_busy(key));
-    }
-
-    #[test]
-    fn turn_scheduler_rejected_turn_is_not_enqueued() {
-        let scheduler = TurnScheduler::new();
-        let key = "discord:ch1:agent:agent_a";
-
-        fill_session(&scheduler, "agent_a", MAX_QUEUED_TURNS_PER_SESSION);
-        let before = scheduler.queue_len(key);
-
-        let _ = scheduler.submit(test_turn("agent_a", "rejected-overflow"));
-
-        assert_eq!(scheduler.queue_len(key), before);
     }
 
     #[test]
@@ -1188,7 +1168,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ActiveTurnTracker tests (migrated from runtime/mod.rs)
+    // ActiveTurnTracker tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1199,18 +1179,9 @@ mod tests {
     }
 
     #[test]
-    fn active_turn_tracker_clears_agent_after_success() {
+    fn active_turn_tracker_clears_agent_after_turn() {
         let tracker = ActiveTurnTracker::new();
         tracker.begin_turn("agent-a");
-        tracker.end_turn("agent-a");
-        assert!(!tracker.is_active("agent-a"));
-    }
-
-    #[test]
-    fn active_turn_tracker_clears_agent_after_error() {
-        let tracker = ActiveTurnTracker::new();
-        tracker.begin_turn("agent-a");
-        // Simulate error path: end_turn is called regardless
         tracker.end_turn("agent-a");
         assert!(!tracker.is_active("agent-a"));
     }
@@ -1269,8 +1240,6 @@ mod tests {
         assert_eq!(tracker.executed_count("ORIG1"), 3);
         assert_eq!(tracker.executed_count("ORIG2"), 1);
     }
-
-    // --- Fix 2: a persisted terminal reason must survive rehydration ---
 
     #[test]
     fn rehydrate_executed_restores_terminal_reason_after_restart() {

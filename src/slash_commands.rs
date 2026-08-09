@@ -188,7 +188,7 @@ pub(crate) fn unknown_command_response() -> String {
 // ---------------------------------------------------------------------------
 
 async fn handle_new(state: &AppState, scope: ConversationScope, chat_id: i64) -> Option<String> {
-    match call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    match call_blocking(state.db_for(scope), move |db| {
         let snapshot = db.load_session_snapshot(chat_id, 1)?;
         let session_revision = match snapshot.session_revision {
             Some(rev) => rev,
@@ -256,7 +256,7 @@ async fn handle_compact(
                 Ok(j) => j,
                 Err(e) => return Some(format!("Failed to serialize compacted session: {e}")),
             };
-            match call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+            match call_blocking(state.db_for(context.scope), move |db| {
                 db.save_session(chat_id, &json)
             })
             .await
@@ -288,7 +288,7 @@ async fn handle_status(
         Err(e) => return Some(format!("Failed to resolve LLM: {e}")),
     };
 
-    let messages = call_blocking(Arc::clone(state.db_for(context.scope)), move |db| {
+    let messages = call_blocking(state.db_for(context.scope), move |db| {
         db.get_recent_messages(chat_id, 99999)
     })
     .await
