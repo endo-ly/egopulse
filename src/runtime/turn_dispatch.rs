@@ -628,9 +628,11 @@ async fn begin_scheduled_turn(
             );
             metrics::inc_turn_errors_total("stop_condition", agent_id);
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                if let Err(error) = state
-                    .db_for(turn.context.scope)
-                    .store_system_event(log_chat_id, &reason)
+                let reason_for_event = reason.clone();
+                if let Err(error) = call_blocking(state.db_for(turn.context.scope), move |db| {
+                    db.store_system_event(log_chat_id, &reason_for_event)
+                })
+                .await
                 {
                     tracing::warn!(error = %error, "failed to store system event for stop condition");
                 }
@@ -756,9 +758,11 @@ async fn execute_and_publish_scheduled_turn(
                 return;
             }
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                if let Err(db_err) = state
-                    .db_for(turn.context.scope)
-                    .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
+                let reason = turn_scheduler::StopReason::LlmFailure;
+                if let Err(db_err) = call_blocking(state.db_for(turn.context.scope), move |db| {
+                    db.store_system_event(log_chat_id, &reason)
+                })
+                .await
                 {
                     tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                 }

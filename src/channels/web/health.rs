@@ -12,6 +12,7 @@ use crate::runtime::metrics;
 use crate::runtime::runtime_status::{
     AuditError, ChannelHealth, ChannelState, StatusSnapshot, TurnRecord,
 };
+use crate::tools::mcp::McpStatus;
 
 use super::WebState;
 
@@ -47,21 +48,6 @@ pub(crate) struct DetailedStatusResponse {
 #[derive(Serialize, Deserialize)]
 pub(crate) struct DbHealth {
     ok: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct McpStatus {
-    healthy: usize,
-    failed: usize,
-    servers: Vec<McpServer>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub(crate) struct McpServer {
-    name: String,
-    connected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -272,36 +258,10 @@ fn uptime_from_snapshot(started_at: &str) -> u64 {
 
 async fn build_mcp_status(state: &WebState) -> McpStatus {
     let Some(mcp_mgr) = &state.app_state.mcp_manager else {
-        return McpStatus {
-            healthy: 0,
-            failed: 0,
-            servers: Vec::new(),
-        };
+        return McpStatus::default();
     };
 
-    let mcp_guard = mcp_mgr.read().await;
-    let mcp_snap = mcp_guard.status_snapshot();
-
-    let servers: Vec<McpServer> = mcp_snap
-        .connected
-        .iter()
-        .map(|s| McpServer {
-            name: s.name.clone(),
-            connected: true,
-            error: None,
-        })
-        .chain(mcp_snap.failed.iter().map(|s| McpServer {
-            name: s.name.clone(),
-            connected: false,
-            error: Some(s.error.clone()),
-        }))
-        .collect();
-
-    McpStatus {
-        healthy: mcp_snap.connected.len(),
-        failed: mcp_snap.failed.len(),
-        servers,
-    }
+    mcp_mgr.read().await.status_snapshot()
 }
 
 #[cfg(test)]
@@ -423,6 +383,8 @@ mod tests {
         let Json(resp) = status(State(state)).await;
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("mcp").is_some());
+        assert_eq!(json["mcp"]["connected"], serde_json::json!([]));
+        assert_eq!(json["mcp"]["failed"], serde_json::json!([]));
     }
 
     #[tokio::test]

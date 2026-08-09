@@ -1241,8 +1241,6 @@ mod tests {
         assert_eq!(tracker.executed_count("ORIG2"), 1);
     }
 
-    // A persisted terminal reason must survive rehydration.
-
     #[test]
     fn rehydrate_executed_restores_terminal_reason_after_restart() {
         let tracker = TurnTracker::new();

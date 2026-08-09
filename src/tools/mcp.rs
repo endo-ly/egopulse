@@ -274,53 +274,51 @@ impl McpManager {
         !self.failed_servers.is_empty()
     }
 
-    pub(crate) async fn reconnect_failed_once(&mut self, workspace_dir: &Path) -> usize {
-        let failed = std::mem::take(&mut self.failed_servers);
-        let mut reconnected = 0;
+    fn failed_server_configs(&self) -> Vec<(String, McpServerConfig)> {
+        self.failed_servers
+            .iter()
+            .map(|server| (server.name.clone(), server.config.clone()))
+            .collect()
+    }
 
-        for server in failed {
-            if self
-                .servers
-                .iter()
-                .any(|connected| connected.name == server.name)
-            {
-                continue;
-            }
-
-            match connect_server(&server.name, &server.config, workspace_dir).await {
-                Ok((client, tools)) => {
-                    let filtered_tools = filter_tools_for_server(&server.name, &tools);
-                    let tool_display_names: Vec<String> = filtered_tools
-                        .iter()
-                        .map(|tool| sanitize_tool_name(&server.name, tool.name.as_ref()))
-                        .collect();
-
-                    info!(
-                        server = %server.name,
-                        tools = ?tool_display_names,
-                        "MCP server reconnected"
-                    );
-                    self.servers.push(ConnectedServer {
-                        name: server.name,
-                        config: server.config,
-                        client,
-                        cached_tools: filtered_tools,
-                    });
-                    reconnected += 1;
-                }
-                Err(error) => {
-                    warn!(server = %server.name, "MCP server reconnect failed: {error}");
-                    self.failed_servers.push(FailedServer {
-                        name: server.name,
-                        config: server.config,
-                        error: error.to_string(),
-                    });
-                }
-            }
+    fn apply_reconnected_server(
+        &mut self,
+        name: String,
+        config: McpServerConfig,
+        client: DynClient,
+        tools: Vec<Tool>,
+    ) -> bool {
+        if self.servers.iter().any(|connected| connected.name == name) {
+            return false;
         }
+        let Some(failed_index) = self
+            .failed_servers
+            .iter()
+            .position(|failed| failed.name == name)
+        else {
+            return false;
+        };
 
+        let filtered_tools = filter_tools_for_server(&name, &tools);
+        let tool_display_names: Vec<String> = filtered_tools
+            .iter()
+            .map(|tool| sanitize_tool_name(&name, tool.name.as_ref()))
+            .collect();
+
+        info!(
+            server = %name,
+            tools = ?tool_display_names,
+            "MCP server reconnected"
+        );
+        self.failed_servers.remove(failed_index);
+        self.servers.push(ConnectedServer {
+            name,
+            config,
+            client,
+            cached_tools: filtered_tools,
+        });
         self.tool_name_index = build_tool_name_index(&self.servers);
-        reconnected
+        true
     }
 
     /// 現在の接続状態をスナップショットとして返す。
@@ -499,10 +497,30 @@ pub(crate) async fn run_reconnect_loop(
             continue;
         }
 
-        let reconnected = {
-            let mut guard = mcp_manager.write().await;
-            guard.reconnect_failed_once(&workspace_dir).await
+        let reconnect_targets = {
+            let guard = mcp_manager.read().await;
+            guard.failed_server_configs()
         };
+        if reconnect_targets.is_empty() {
+            retry_secs = INITIAL_RETRY_SECS;
+            continue;
+        }
+
+        let mut reconnected = 0;
+        for (name, config) in reconnect_targets {
+            match connect_server(&name, &config, &workspace_dir).await {
+                Ok((client, tools)) => {
+                    let applied = {
+                        let mut guard = mcp_manager.write().await;
+                        guard.apply_reconnected_server(name, config, client, tools)
+                    };
+                    reconnected += usize::from(applied);
+                }
+                Err(error) => {
+                    warn!(server = %name, "MCP server reconnect failed: {error}");
+                }
+            }
+        }
 
         if reconnected > 0 {
             retry_secs = INITIAL_RETRY_SECS;

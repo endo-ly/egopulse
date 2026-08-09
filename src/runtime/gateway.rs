@@ -322,18 +322,8 @@ impl SystemdUserService {
         }
     }
 
-    fn with_runtime_dir(runtime_dir: Option<&str>) -> Self {
-        Self {
-            runtime_dir: runtime_dir.map(str::to_owned),
-        }
-    }
-
-    fn runtime_dir(&self) -> Option<&str> {
-        self.runtime_dir.as_deref()
-    }
-
     fn command(&self, args: &[&str]) -> Result<std::process::Output, EgoPulseError> {
-        systemctl_cmd(args, self.runtime_dir())
+        systemctl_cmd(args, self.runtime_dir.as_deref())
     }
 
     fn ensure_success(&self, args: &[&str], action: &str) -> Result<(), EgoPulseError> {
@@ -388,7 +378,7 @@ impl SystemdUserService {
             "-n",
             &SERVICE_FAILURE_LOG_LINES.to_string(),
         ]);
-        if let Some(runtime_dir) = self.runtime_dir() {
+        if let Some(runtime_dir) = self.runtime_dir.as_deref() {
             cmd.env("XDG_RUNTIME_DIR", runtime_dir).env(
                 "DBUS_SESSION_BUS_ADDRESS",
                 format!("unix:path={runtime_dir}/bus"),
@@ -400,14 +390,16 @@ impl SystemdUserService {
     }
 
     fn restart_and_verify(&self) -> Result<(), EgoPulseError> {
-        let output = self.command(&["restart", SERVICE_NAME])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(EgoPulseError::Internal(format!(
-                "failed to restart egopulse service: {stderr}"
-            )));
-        }
+        self.ensure_success(&["restart", SERVICE_NAME], "restart egopulse service")?;
         self.verify_started()
+    }
+
+    fn show_systemctl_status(&self) -> Result<(), EgoPulseError> {
+        let output = self.command(&["status", SERVICE_NAME, "--no-pager"])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        print!("{stdout}{stderr}");
+        Ok(())
     }
 }
 
@@ -450,6 +442,7 @@ async fn fetch_live_status_at(base_url: &str, auth_token: &str) -> Option<LiveGa
         return None;
     }
     let health_text = health_resp.text().await.ok()?;
+    // Validate the health response as JSON only; it is not retained in LiveGatewayStatus.
     let _: serde_json::Value = serde_json::from_str(&health_text).ok()?;
 
     let status_resp = client
@@ -477,18 +470,6 @@ async fn fetch_live_status_at(base_url: &str, auth_token: &str) -> Option<LiveGa
     let telemetry: serde_json::Value = serde_json::from_str(&telemetry_text).ok()?;
 
     Some(LiveGatewayStatus { status, telemetry })
-}
-
-fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
-    let output = SystemdUserService::with_runtime_dir(runtime_dir).command(&[
-        "status",
-        SERVICE_NAME,
-        "--no-pager",
-    ])?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    print!("{stdout}{stderr}");
-    Ok(())
 }
 
 /// Sums all `value` fields from the array associated with `metric_name` in a
@@ -558,17 +539,6 @@ fn format_uptime(secs: u64) -> String {
     } else {
         format!("{s}s")
     }
-}
-
-#[cfg(test)]
-fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> String {
-    let health: serde_json::Value = match serde_json::from_str(health_json) {
-        Ok(v) => v,
-        Err(_) => return health_json.to_owned(),
-    };
-    let telemetry = telemetry_json.and_then(|t| serde_json::from_str(t).ok());
-
-    format_gateway_status_values(&health, telemetry.as_ref())
 }
 
 fn format_gateway_status_values(
@@ -748,7 +718,7 @@ fn append_telemetry_details(telemetry: Option<&serde_json::Value>, out: &mut Str
         if !errors.is_empty() {
             out.push('\n');
             out.push_str(&format!("Recent Errors (last 1h): {}\n", errors.len()));
-            for error in errors.iter().take(5) {
+            for error in errors.iter().rev().take(5) {
                 let kind = error["error_kind"].as_str().unwrap_or("?");
                 let trace = error["trace_id"].as_str().unwrap_or("?");
                 let summary = error["summary"].as_str().unwrap_or("");
@@ -780,16 +750,6 @@ fn append_telemetry_details(telemetry: Option<&serde_json::Value>, out: &mut Str
             }
         }
     }
-}
-
-#[cfg(test)]
-fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
-    let health: serde_json::Value = match serde_json::from_str(health_json) {
-        Ok(health) => health,
-        Err(_) => return health_json.to_owned(),
-    };
-    let telemetry = telemetry_json.and_then(|json| serde_json::from_str(json).ok());
-    merge_health_and_telemetry_values(&health, telemetry.as_ref())
 }
 
 fn merge_health_and_telemetry_values(
@@ -912,7 +872,10 @@ fn uninstall_service() -> Result<(), EgoPulseError> {
 async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<(), EgoPulseError> {
     let systemd = SystemdUserService::connect()?;
     let is_active_output = systemd.command(&["is-active", SERVICE_NAME])?;
-    let is_active = String::from_utf8_lossy(&is_active_output.stdout).trim() == "active";
+    let state = String::from_utf8_lossy(&is_active_output.stdout)
+        .trim()
+        .to_string();
+    let is_active = state == "active";
 
     if is_active {
         match fetch_live_status(cli_config).await {
@@ -927,12 +890,9 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
                     format_gateway_status_values(&status.status, Some(&status.telemetry))
                 );
             }
-            None => show_systemctl_status(systemd.runtime_dir())?,
+            None => systemd.show_systemctl_status()?,
         }
     } else if json {
-        let state = String::from_utf8_lossy(&is_active_output.stdout)
-            .trim()
-            .to_string();
         let status_json = serde_json::json!({
             "ok": false,
             "service": state,
@@ -943,7 +903,7 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
             serde_json::to_string_pretty(&status_json).unwrap_or_default()
         );
     } else {
-        show_systemctl_status(systemd.runtime_dir())?;
+        systemd.show_systemctl_status()?;
         if let Some(logs) = systemd.recent_logs() {
             println!("\nLast error:\n{logs}");
         }
@@ -958,6 +918,10 @@ fn restart_service_action() -> Result<(), EgoPulseError> {
 }
 
 /// Executes the requested gateway action for the EgoPulse systemd service.
+///
+/// # Errors
+///
+/// Returns an error when systemd operations or configuration resolution fail.
 pub async fn run_gateway(
     cli_config: Option<&Path>,
     action: Option<GatewayAction>,
@@ -1403,6 +1367,25 @@ mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> String {
+        let health: serde_json::Value = match serde_json::from_str(health_json) {
+            Ok(v) => v,
+            Err(_) => return health_json.to_owned(),
+        };
+        let telemetry = telemetry_json.and_then(|t| serde_json::from_str(t).ok());
+
+        super::format_gateway_status_values(&health, telemetry.as_ref())
+    }
+
+    fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
+        let health: serde_json::Value = match serde_json::from_str(health_json) {
+            Ok(health) => health,
+            Err(_) => return health_json.to_owned(),
+        };
+        let telemetry = telemetry_json.and_then(|json| serde_json::from_str(json).ok());
+        super::merge_health_and_telemetry_values(&health, telemetry.as_ref())
+    }
 
     #[test]
     fn render_systemd_unit_preserves_service_contract() {

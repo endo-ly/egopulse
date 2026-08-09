@@ -84,7 +84,7 @@ src/
 ├── default_soul.md      # デフォルト SOUL.md テンプレート
 │
 ├── runtime/             # AppState 構築、チャネル起動・監視
-│   ├── mod.rs           # AppState, build_app_state(), start_channels()
+│   ├── mod.rs           # AppState, InstanceGuard, build_app_state(), start_channels()
 │   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
 │   ├── turn_dispatch.rs # durable turn の復旧・dispatch・scheduled turn 実行
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions

@@ -149,6 +149,8 @@ fn acquire_test_instance_guard(state_root: &Path) -> Arc<crate::runtime::Instanc
 fn acquire_test_instance_guard_for_restart(
     state_root: &Path,
 ) -> Arc<crate::runtime::InstanceGuard> {
+    // Use a UUID-suffixed directory so this lock does not conflict with the
+    // lock still held by the previous AppState during restart simulation.
     let lock_root = state_root.join(format!(".runtime-instance-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&lock_root)
         .unwrap_or_else(|e| panic!("create restart test lock root: {e}"));

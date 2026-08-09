@@ -91,14 +91,19 @@ Authorization: Bearer <channels.web.auth_token>
     "discord": { "state": "starting", "last_error": null, "last_activity": null },
     "telegram": { "state": "failed", "last_error": "bot token rejected", "last_activity": null }
   },
-  "mcp": { "healthy": 1, "failed": 0, "servers": [] },
+  "mcp": {
+    "connected": [
+      { "name": "filesystem", "transport": "stdio", "tools": ["read_file"] }
+    ],
+    "failed": []
+  },
   "active_turns": 2,
   "recent_errors_count": 3,
   "instance_lock": { "held": true }
 }
 ```
 
-`version`、`uptime_secs`、`pid`、DB / channel / task / active turn の状態、MCP の sanitized error summary、recent error 件数、critical task failure を返す。`instance_lock` は lock の保有状態だけを返し、lock file の絶対パスは含めない。
+`version`、`uptime_secs`、`pid`、DB / channel / task / active turn の状態、MCP の接続済み・失敗サーバー、recent error 件数、critical task failure を返す。接続済みサーバーには transport と利用可能な tool 名を、失敗サーバーにはエラー概要を含める。`instance_lock` は lock の保有状態だけを返し、lock file の絶対パスは含めない。
 
 ---
 

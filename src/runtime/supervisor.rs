@@ -155,8 +155,8 @@ pub(crate) struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     /// Creates a new supervisor bound to the given [`RuntimeStatus`].
-    /// Builds a supervisor that retains the exclusive instance lock acquired
-    /// before the database was opened.
+    /// The supervisor retains the exclusive instance lock acquired before the
+    /// database was opened for the lifetime of the runtime.
     pub(crate) fn with_instance_guard(
         runtime_status: Arc<RuntimeStatus>,
         instance_guard: Arc<InstanceGuard>,
@@ -652,9 +652,15 @@ mod tests {
 
     #[test]
     fn supervisor_reports_held_instance_lock() {
-        let guard = InstanceGuard::acquire(tempfile::TempDir::new().unwrap().path()).unwrap();
+        // Arrange
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        // Act
+        let guard = InstanceGuard::acquire(temp_dir.path()).unwrap();
         let supervisor =
             RuntimeSupervisor::with_instance_guard(Arc::new(RuntimeStatus::new()), guard);
+
+        // Assert
         assert!(supervisor.instance_lock_held());
 
         let empty = RuntimeSupervisor::with_drain(
