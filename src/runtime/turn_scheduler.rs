@@ -66,8 +66,8 @@ pub(crate) const MAX_QUEUED_TURNS_PER_SESSION: usize = 32;
 /// Maximum turns queued across the whole runtime before new turns are rejected.
 ///
 /// Bounds total scheduler memory across all sessions during sustained
-/// overload. Until a durable queue replaces the in-memory one,
-/// then this is an explicit finite capacity, not unbounded delay.
+/// overload. Until a durable queue replaces the in-memory one, this is an
+/// explicit finite capacity rather than an unbounded delay.
 pub(crate) const MAX_GLOBAL_QUEUED_TURNS: usize = 512;
 
 /// Maximum distinct origin IDs tracked by [`TurnTracker`] before new origins
@@ -397,8 +397,7 @@ impl TurnTracker {
     }
 
     /// Returns the number of turns that have actually begun execution for
-    /// `origin_id`, or `0` if the origin is not tracked. Test-only assertion
-    /// helper; production reads happen inside [`try_begin_execution`].
+    /// `origin_id`, or `0` if the origin is not tracked.
     #[cfg(test)]
     fn executed_count(&self, origin_id: &str) -> usize {
         let origins = self.origins.lock().expect("turn_tracker lock");
@@ -750,8 +749,8 @@ mod tests {
         }
     }
 
-    /// Submits one Started turn plus `queued` additional turns for a session,
-    /// returning the Started turn count behaviour. Used to fill queues.
+    /// Submits one started turn plus `queued` additional turns for a session.
+    /// Used to fill queues in capacity tests.
     fn fill_session(scheduler: &TurnScheduler, agent: &str, queued: usize) {
         scheduler.submit(test_turn(agent, "started"));
         for i in 0..queued {

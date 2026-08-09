@@ -78,12 +78,6 @@ impl InstanceGuard {
         Self::open_and_lock(&lock_path)
     }
 
-    /// Acquires a separate lock file for restart-simulation tests.
-    #[cfg(test)]
-    pub(crate) fn acquire_at(lock_path: &Path) -> Result<Arc<Self>, EgoPulseError> {
-        Self::open_and_lock(lock_path)
-    }
-
     fn open_and_lock(lock_path: &Path) -> Result<Arc<Self>, EgoPulseError> {
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -285,7 +279,7 @@ impl AppState {
         const REPLAY_LIMIT_PER_KEY: usize = 30;
         let mut observations = Vec::new();
         for (scope, db) in self.scoped_databases() {
-            match crate::storage::call_blocking(db, |db| {
+            match call_blocking(db, |db| {
                 db.load_calibration_observations(REPLAY_LIMIT_PER_KEY)
             })
             .await
@@ -447,7 +441,7 @@ pub async fn build_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<Arc<AppState>, EgoPulseError> {
-    crate::runtime::metrics::init_metrics();
+    metrics::init_metrics();
 
     // Acquire the lock before opening storage so concurrent runtimes are
     // rejected before any database side effects occur.
@@ -825,7 +819,6 @@ async fn spawn_runtime_services(state: &Arc<AppState>) {
 
 async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
     state.supervisor.start_accepting();
-    state.runtime_status.set_accepting_inputs(true);
     info!("Runtime active; waiting for Ctrl-C or channel failure");
 
     loop {

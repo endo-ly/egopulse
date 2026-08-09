@@ -162,9 +162,9 @@ impl RuntimeStatus {
         guard.shutdown_started = started;
     }
 
-    /// Records that a critical long-lived task failed, surfacing the failure in
-    /// the status snapshot. The first critical failure is retained; subsequent
-    /// ones are appended to the recent-errors ring buffer via `push_error`.
+    /// Records the first critical long-lived task failure in the status
+    /// snapshot. The first failure is retained; callers record any additional
+    /// failures separately through [`Self::push_error`].
     pub(crate) fn record_critical_task_failure(&self, summary: &str) {
         let mut guard = self.inner.write().expect("runtime_status lock");
         if guard.critical_task_failure.is_none() {

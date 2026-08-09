@@ -25,11 +25,11 @@ use crate::storage::call_blocking;
 /// Real production code uses [`RealClock`]; tests inject [`MockClock`] (via
 /// `Arc<dyn Clock>`) so the next-run calculation can be driven deterministically
 /// while the scheduler still awaits `tokio::time::sleep` in real time.
-pub(crate) trait Clock: Send + Sync {
+trait Clock: Send + Sync {
     fn now(&self) -> DateTime<Utc>;
 }
 
-pub(crate) struct RealClock;
+struct RealClock;
 
 impl Clock for RealClock {
     fn now(&self) -> DateTime<Utc> {
@@ -53,7 +53,7 @@ pub(crate) async fn run_backup_scheduler_loop(
 ///
 /// Returns [`EgoPulseError`] when the underlying storage operations fail
 /// unrecoverably; transient backup failures are logged and the loop continues.
-pub(crate) async fn run_backup_scheduler_loop_with_clock(
+async fn run_backup_scheduler_loop_with_clock(
     state: &AppState,
     clock: Arc<dyn Clock>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -162,12 +162,12 @@ mod tests {
 
     /// `MockClock` returns a fixed instant so tests can drive the next-run
     /// calculation deterministically without freezing the real clock.
-    pub(crate) struct MockClock {
+    struct MockClock {
         now: std::sync::Mutex<DateTime<Utc>>,
     }
 
     impl MockClock {
-        pub(crate) fn new(now: DateTime<Utc>) -> Self {
+        fn new(now: DateTime<Utc>) -> Self {
             Self {
                 now: std::sync::Mutex::new(now),
             }
