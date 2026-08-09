@@ -25,6 +25,29 @@ use crate::tools::{ToolExecutionContext, ToolResult};
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
 pub(crate) const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
 
+/// The iteration at which the model is warned that the hard loop limit is near.
+pub(crate) const FINAL_RESPONSE_WARNING_ITERATION: usize = MAX_TOOL_ITERATIONS - 2;
+pub(crate) const FINAL_RESPONSE_WARNING_GUARD: &str = "[runtime_guard]: The tool loop is near its hard limit. Two model iterations remain after this one. Do not start broad new work; prepare the best concise answer for the user now and state any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
+pub(crate) const FINAL_RESPONSE_GUARD: &str = "[runtime_guard]: The tool loop is at its final response window. Provide the best concise answer to the user now. Do not start broad new work; state what was completed and any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
+
+pub(crate) fn messages_for_iteration(
+    messages: &Arc<Vec<Message>>,
+    iteration: usize,
+) -> Arc<Vec<Message>> {
+    let guard = match iteration {
+        FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_WARNING_GUARD),
+        iteration if iteration > FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_GUARD),
+        _ => None,
+    };
+    let Some(guard) = guard else {
+        return Arc::clone(messages);
+    };
+
+    let mut request_messages = (**messages).clone();
+    request_messages.push(Message::text("user", guard));
+    Arc::new(request_messages)
+}
+
 type ToolStartHook<'a> = Arc<dyn Fn(&ToolCall) + Send + Sync + 'a>;
 type ToolResultHook<'a> = Arc<dyn Fn(&ExecutedToolCall) + Send + Sync + 'a>;
 

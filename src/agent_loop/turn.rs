@@ -12,11 +12,10 @@ use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn_with_limit, persist_phase, persist_phase_messages,
     resolve_chat_id,
 };
-use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::agent_loop::tool_phase::{
-    AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, ToolExecutionHooks,
-    ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase, build_tool_result_phase,
-    send_tool_phase_request_with_empty_retry,
+    AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, MAX_TOOL_RESULT_TEXT_CHARS,
+    ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase,
+    build_tool_result_phase, messages_for_iteration, send_tool_phase_request_with_empty_retry,
 };
 use crate::agent_loop::{
     ConversationScope, SurfaceContext, TurnRuntime, deserialize_scheduled_turn,
@@ -1118,7 +1117,8 @@ fn request_messages_for_iteration(
             request_messages = Arc::new(msgs);
         }
     }
-    request_messages
+
+    messages_for_iteration(&request_messages, iteration)
 }
 
 fn evaluate_end_turn(
@@ -1780,6 +1780,7 @@ pub(crate) struct RecordingProvider {
     >,
     seen_messages: std::sync::Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
     seen_systems: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    seen_tool_counts: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
     delays_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
 }
 
@@ -1855,7 +1856,7 @@ impl crate::llm::LlmProvider for RecordingProvider {
         &self,
         system: &str,
         messages: Arc<Vec<Message>>,
-        _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         self.seen_systems
             .lock()
@@ -1865,6 +1866,10 @@ impl crate::llm::LlmProvider for RecordingProvider {
             .lock()
             .expect("messages")
             .push((*messages).clone());
+        self.seen_tool_counts
+            .lock()
+            .expect("tool counts")
+            .push(tools.as_ref().map_or(0, |definitions| definitions.len()));
         let delay_ms = self.delays_ms.lock().expect("delays").remove(0);
         if delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1907,6 +1912,7 @@ impl RecordingProvider {
             responses: std::sync::Arc::new(std::sync::Mutex::new(responses)),
             seen_messages: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             seen_systems: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            seen_tool_counts: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             delays_ms: std::sync::Arc::new(std::sync::Mutex::new(delays_ms)),
         }
     }
@@ -1917,6 +1923,10 @@ impl RecordingProvider {
 
     pub(crate) fn seen_systems(&self) -> Vec<String> {
         self.seen_systems.lock().expect("systems").clone()
+    }
+
+    pub(crate) fn seen_tool_counts(&self) -> Vec<usize> {
+        self.seen_tool_counts.lock().expect("tool counts").clone()
     }
 }
 
@@ -2085,6 +2095,9 @@ mod tests {
         DeltaEmittingProvider, DeltaThenThinkingProvider, FailingProvider, FakeProvider,
         RecordingProvider, SurfaceContext, build_state_with_provider, cli_context,
     };
+    use crate::agent_loop::tool_phase::{
+        FINAL_RESPONSE_GUARD, FINAL_RESPONSE_WARNING_GUARD, FINAL_RESPONSE_WARNING_ITERATION,
+    };
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
 
@@ -2099,6 +2112,103 @@ mod tests {
     // -----------------------------------------------------------------------
     // Core turn execution
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[serial]
+    async fn late_tool_loop_requests_final_response_with_tools() {
+        // Arrange: keep the model in the Tool phase until the warning boundary,
+        // then return a final response after the shared runtime guards.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut responses = Vec::with_capacity(FINAL_RESPONSE_WARNING_ITERATION + 1);
+        for iteration in 1..=FINAL_RESPONSE_WARNING_ITERATION {
+            responses.push(Ok(MessagesResponse {
+                content: format!("Checking result {iteration}"),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("cap-ls-{iteration}"),
+                    name: "ls".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            }));
+        }
+        responses.push(Ok(MessagesResponse {
+            content: "The available results are complete.".to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        }));
+        let provider =
+            RecordingProvider::new(responses, vec![0; FINAL_RESPONSE_WARNING_ITERATION + 1]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = cli_context("late-tool-loop");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "inspect the workspace")
+            .await
+            .expect("late tool loop should finalize");
+
+        // Assert: the final response is returned before the hard cap becomes an
+        // error, while the final request keeps the Tool definitions available.
+        assert_eq!(reply, "The available results are complete.");
+        let tool_counts = provider.seen_tool_counts();
+        assert_eq!(tool_counts.len(), FINAL_RESPONSE_WARNING_ITERATION + 1);
+        assert!(
+            tool_counts[..FINAL_RESPONSE_WARNING_ITERATION]
+                .iter()
+                .all(|count| *count > 0)
+        );
+        assert!(
+            tool_counts[FINAL_RESPONSE_WARNING_ITERATION] > 0,
+            "final-response request keeps Tool definitions"
+        );
+
+        let seen_messages = provider.seen_messages();
+        let warning_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION - 1]
+            .last()
+            .expect("warning guard message");
+        assert!(
+            warning_message
+                .content
+                .as_text_lossy()
+                .contains(FINAL_RESPONSE_WARNING_GUARD)
+        );
+        let final_guard_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION]
+            .last()
+            .expect("final guard message");
+        assert!(
+            final_guard_message
+                .content
+                .as_text_lossy()
+                .contains(FINAL_RESPONSE_GUARD)
+        );
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:late-tool-loop:agent:default",
+                Some("late-tool-loop"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_runtime(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("session");
+        assert!(loaded.messages.iter().all(|message| {
+            let text = message.content.as_text_lossy();
+            !text.contains(FINAL_RESPONSE_WARNING_GUARD) && !text.contains(FINAL_RESPONSE_GUARD)
+        }));
+    }
 
     #[tokio::test]
     #[serial]

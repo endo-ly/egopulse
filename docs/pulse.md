@@ -505,7 +505,7 @@ Capsule (user message) には prospective memory を含めない。
 
 ### 8.3 Tools
 
-Pulse Activation は通常 turn と同じく built-in tools + MCP tools を使用可能。tool loop を最大 50 イテレーション回し、LLM が完了を出すまで続ける。activation 全体は 30 分のタイムアウトで保護され、タイムアウト・パニック時は run を `failed` として記録する。
+Pulse Activation は通常 turn と同じく built-in tools + MCP tools を使用可能。tool loop を最大 50 イテレーション回し、48回目に終了警告を付け、49〜50回目は最終回答を優先する指示を追加する。activation 全体は 30 分のタイムアウトで保護され、タイムアウト・パニック時は run を `failed` として記録する。
 
 activation 中も `active_turn` を保持するため、その間の通常 turn / 他 Pulse は defer される。
 
