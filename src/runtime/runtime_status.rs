@@ -318,7 +318,6 @@ impl RuntimeStatus {
 mod tests {
     use super::*;
 
-    // 1. new_sets_initial_state
     #[test]
     fn new_sets_initial_state() {
         // Arrange & Act
@@ -366,34 +365,9 @@ mod tests {
         );
     }
 
-    // 6. push_error_appends_to_ring_buffer
-    #[test]
-    fn push_error_appends_to_ring_buffer() {
-        // Arrange
-        let status = RuntimeStatus::new();
-
-        // Act
-        status.push_error("t1", "timeout", "agent-a", "web", "request timed out");
-
-        // Assert
-        let errors = status.recent_errors();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].trace_id, "t1");
-    }
-
-    // 7. push_error_respects_capacity
     #[test]
     fn push_error_respects_capacity() {
-        // Arrange — build a status with capacity 5
         let status = RuntimeStatus::new();
-        // Temporarily set capacity by directly accessing inner via a helper.
-        // Since we cannot change the capacity after construction, we exercise
-        // the default capacity of 100 and push 102 entries.
-        // Instead, we test by creating a dedicated RuntimeStatus with a
-        // constructor that accepts capacity.  We add a small helper for tests.
-        //
-        // Alternative: push 101 items into default (capacity=100) and verify
-        // the oldest is discarded.
         for i in 0..102 {
             status.push_error(
                 &format!("trace-{i}"),
@@ -404,17 +378,13 @@ mod tests {
             );
         }
 
-        // Act
         let errors = status.recent_errors();
 
-        // Assert — only the latest 100 entries survive
         assert_eq!(errors.len(), 100, "should cap at 100 entries");
-        // The first surviving entry should be trace-2 (0 and 1 discarded)
         assert_eq!(errors[0].trace_id, "trace-2");
         assert_eq!(errors[99].trace_id, "trace-101");
     }
 
-    // 8. push_error_records_all_fields
     #[test]
     fn push_error_records_all_fields() {
         // Arrange
@@ -436,7 +406,6 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(&err.at).expect("at should be rfc3339");
     }
 
-    // 11. push_turn_appends_to_ring_buffer
     #[test]
     fn push_turn_appends_to_ring_buffer() {
         // Arrange
@@ -456,7 +425,6 @@ mod tests {
         assert!(turns[0].ok);
     }
 
-    // 12. push_turn_respects_capacity
     #[test]
     fn push_turn_respects_capacity() {
         // Arrange
@@ -481,7 +449,6 @@ mod tests {
         assert_eq!(turns[99].trace_id, "trace-101");
     }
 
-    // 13. push_turn_records_failure
     #[test]
     fn push_turn_records_failure() {
         // Arrange
@@ -496,7 +463,6 @@ mod tests {
         assert!(!turns[0].ok);
     }
 
-    // 14. recent_turns_preserves_order
     #[test]
     fn recent_turns_preserves_order() {
         // Arrange

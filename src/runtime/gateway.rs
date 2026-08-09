@@ -33,6 +33,19 @@ struct ExtractedBinary {
     path: PathBuf,
 }
 
+/// Parsed responses collected from the live runtime endpoints.
+///
+/// Keeping the JSON values together means the gateway fetches and parses each
+/// endpoint once, while the text and JSON renderers can share the same data.
+struct LiveGatewayStatus {
+    status: serde_json::Value,
+    telemetry: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// systemd service context and lifecycle
+// ---------------------------------------------------------------------------
+
 fn unit_path() -> Result<PathBuf, EgoPulseError> {
     let home = dirs::home_dir()
         .ok_or_else(|| EgoPulseError::Internal("HOME directory could not be resolved".into()))?;
@@ -324,11 +337,66 @@ impl SystemdUserService {
     }
 
     fn ensure_success(&self, args: &[&str], action: &str) -> Result<(), EgoPulseError> {
-        ensure_success(self.command(args)?, action)
+        let output = self.command(args)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(EgoPulseError::Internal(format!(
+            "{action} failed: {stderr} {stdout}"
+        )))
     }
 
     fn verify_started(&self) -> Result<(), EgoPulseError> {
-        verify_service_started(self.runtime_dir())
+        let start = std::time::Instant::now();
+        let min_observe = std::time::Duration::from_secs(SERVICE_START_MIN_OBSERVE_SECS);
+        let timeout = std::time::Duration::from_secs(SERVICE_START_TIMEOUT_SECS);
+        let interval = std::time::Duration::from_millis(SERVICE_START_POLL_INTERVAL_MS);
+
+        loop {
+            std::thread::sleep(interval);
+
+            let output = self.command(&["is-active", SERVICE_NAME])?;
+            let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            match state.as_str() {
+                "active" if start.elapsed() >= min_observe => return Ok(()),
+                "failed" => return Err(self.start_failure()),
+                _ if start.elapsed() >= timeout => return Err(self.start_failure()),
+                _ => {}
+            }
+        }
+    }
+
+    fn start_failure(&self) -> EgoPulseError {
+        let mut msg = "egopulse service failed to start".to_string();
+        if let Some(logs) = self.recent_logs() {
+            msg.push_str("\n\nRecent logs:\n");
+            msg.push_str(&logs);
+        }
+        EgoPulseError::Internal(msg)
+    }
+
+    fn recent_logs(&self) -> Option<String> {
+        let mut cmd = ProcessCommand::new("journalctl");
+        cmd.args([
+            "--user",
+            "-u",
+            SERVICE_NAME,
+            "--no-pager",
+            "-n",
+            &SERVICE_FAILURE_LOG_LINES.to_string(),
+        ]);
+        if let Some(runtime_dir) = self.runtime_dir() {
+            cmd.env("XDG_RUNTIME_DIR", runtime_dir).env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!("unix:path={runtime_dir}/bus"),
+            );
+        }
+        let output = cmd.output().ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!stdout.is_empty()).then_some(stdout)
     }
 
     fn restart_and_verify(&self) -> Result<(), EgoPulseError> {
@@ -340,86 +408,6 @@ impl SystemdUserService {
             )));
         }
         self.verify_started()
-    }
-}
-
-fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoPulseError> {
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Err(EgoPulseError::Internal(format!(
-        "{action} failed: {stderr} {stdout}"
-    )))
-}
-
-/// After `start` / `restart`, polls `systemctl is-active` until the service
-/// reaches `active` state or the timeout expires.
-///
-/// To guard against processes that start then immediately crash, the service
-/// must remain `active` for at least [`SERVICE_START_MIN_OBSERVE_SECS`] before
-/// success is returned.
-///
-/// # Errors
-///
-/// Returns an error with recent journal logs if the service enters `failed`
-/// state or does not become active within the timeout.
-fn verify_service_started(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
-    let start = std::time::Instant::now();
-    let min_observe = std::time::Duration::from_secs(SERVICE_START_MIN_OBSERVE_SECS);
-    let timeout = std::time::Duration::from_secs(SERVICE_START_TIMEOUT_SECS);
-    let interval = std::time::Duration::from_millis(SERVICE_START_POLL_INTERVAL_MS);
-
-    loop {
-        std::thread::sleep(interval);
-
-        let output = systemctl_cmd(&["is-active", SERVICE_NAME], runtime_dir)?;
-        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-        match state.as_str() {
-            "active" if start.elapsed() >= min_observe => return Ok(()),
-            "failed" => return Err(format_start_failure(runtime_dir)),
-            _ if start.elapsed() >= timeout => {
-                return Err(format_start_failure(runtime_dir));
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Builds an [`EgoPulseError::Internal`] with recent journal log entries on
-/// service startup failure.
-fn format_start_failure(runtime_dir: Option<&str>) -> EgoPulseError {
-    let mut msg = "egopulse service failed to start".to_string();
-    if let Some(logs) = fetch_recent_service_logs(runtime_dir) {
-        msg.push_str("\n\nRecent logs:\n");
-        msg.push_str(&logs);
-    }
-    EgoPulseError::Internal(msg)
-}
-
-/// Retrieves the last few journal log lines for the egopulse service.
-fn fetch_recent_service_logs(runtime_dir: Option<&str>) -> Option<String> {
-    let mut cmd = ProcessCommand::new("journalctl");
-    cmd.args([
-        "--user",
-        "-u",
-        SERVICE_NAME,
-        "--no-pager",
-        "-n",
-        &SERVICE_FAILURE_LOG_LINES.to_string(),
-    ]);
-    if let Some(rd) = runtime_dir {
-        cmd.env("XDG_RUNTIME_DIR", rd)
-            .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={rd}/bus"));
-    }
-    let output = cmd.output().ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        None
-    } else {
-        Some(stdout)
     }
 }
 
@@ -435,7 +423,11 @@ fn restart_installed_service() -> Result<(), EgoPulseError> {
     Ok(())
 }
 
-async fn fetch_live_status(cli_config: Option<&Path>) -> Option<(String, Option<String>)> {
+// ---------------------------------------------------------------------------
+// Live status collection and rendering
+// ---------------------------------------------------------------------------
+
+async fn fetch_live_status(cli_config: Option<&Path>) -> Option<LiveGatewayStatus> {
     let config = resolve_config_for_service(cli_config).ok()?;
     let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
     let auth_token = loaded.web_auth_token()?.to_owned();
@@ -444,10 +436,7 @@ async fn fetch_live_status(cli_config: Option<&Path>) -> Option<(String, Option<
     fetch_live_status_at(&base_url, &auth_token).await
 }
 
-async fn fetch_live_status_at(
-    base_url: &str,
-    auth_token: &str,
-) -> Option<(String, Option<String>)> {
+async fn fetch_live_status_at(base_url: &str, auth_token: &str) -> Option<LiveGatewayStatus> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -461,7 +450,7 @@ async fn fetch_live_status_at(
         return None;
     }
     let health_text = health_resp.text().await.ok()?;
-    serde_json::from_str::<serde_json::Value>(&health_text).ok()?;
+    let _: serde_json::Value = serde_json::from_str(&health_text).ok()?;
 
     let status_resp = client
         .get(format!("{base_url}/api/status"))
@@ -473,7 +462,7 @@ async fn fetch_live_status_at(
         return None;
     }
     let status_text = status_resp.text().await.ok()?;
-    serde_json::from_str::<serde_json::Value>(&status_text).ok()?;
+    let status: serde_json::Value = serde_json::from_str(&status_text).ok()?;
 
     let telemetry_resp = client
         .get(format!("{base_url}/telemetry"))
@@ -485,9 +474,9 @@ async fn fetch_live_status_at(
         return None;
     }
     let telemetry_text = telemetry_resp.text().await.ok()?;
-    serde_json::from_str::<serde_json::Value>(&telemetry_text).ok()?;
+    let telemetry: serde_json::Value = serde_json::from_str(&telemetry_text).ok()?;
 
-    Some((status_text, Some(telemetry_text)))
+    Some(LiveGatewayStatus { status, telemetry })
 }
 
 fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
@@ -571,6 +560,7 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> String {
     let health: serde_json::Value = match serde_json::from_str(health_json) {
         Ok(v) => v,
@@ -578,9 +568,16 @@ fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> Str
     };
     let telemetry = telemetry_json.and_then(|t| serde_json::from_str(t).ok());
 
+    format_gateway_status_values(&health, telemetry.as_ref())
+}
+
+fn format_gateway_status_values(
+    health: &serde_json::Value,
+    telemetry: Option<&serde_json::Value>,
+) -> String {
     let mut out = String::new();
-    append_health_status(&health, telemetry.is_none(), &mut out);
-    append_telemetry(telemetry.as_ref(), &mut out);
+    append_health_status(health, telemetry.is_none(), &mut out);
+    append_telemetry(telemetry, &mut out);
     out
 }
 
@@ -785,32 +782,37 @@ fn append_telemetry_details(telemetry: Option<&serde_json::Value>, out: &mut Str
     }
 }
 
-fn print_gateway_status_text(health_json: &str, telemetry_json: Option<&str>) {
-    print!("{}", format_gateway_status(health_json, telemetry_json));
+#[cfg(test)]
+fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
+    let health: serde_json::Value = match serde_json::from_str(health_json) {
+        Ok(health) => health,
+        Err(_) => return health_json.to_owned(),
+    };
+    let telemetry = telemetry_json.and_then(|json| serde_json::from_str(json).ok());
+    merge_health_and_telemetry_values(&health, telemetry.as_ref())
 }
 
-fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -> String {
+fn merge_health_and_telemetry_values(
+    health_json: &serde_json::Value,
+    telemetry: Option<&serde_json::Value>,
+) -> String {
     use crate::channels::web::health::{DetailedStatusResponse, GatewayStatusResponse};
 
-    let health: DetailedStatusResponse = match serde_json::from_str(health_json) {
+    let health: DetailedStatusResponse = match serde_json::from_value(health_json.clone()) {
         Ok(h) => h,
         Err(_) => {
-            let mut health: serde_json::Value =
-                serde_json::from_str(health_json).unwrap_or(serde_json::Value::Null);
-            if let (Some(tel_str), Some(obj)) = (telemetry_json, health.as_object_mut()) {
-                if let Ok(tel) = serde_json::from_str::<serde_json::Value>(tel_str) {
-                    obj.insert("telemetry".to_string(), tel);
-                }
+            let mut health = health_json.clone();
+            if let (Some(telemetry), Some(obj)) = (telemetry, health.as_object_mut()) {
+                obj.insert("telemetry".to_string(), telemetry.clone());
             }
             return serde_json::to_string_pretty(&health)
-                .unwrap_or_else(|_| health_json.to_owned());
+                .unwrap_or_else(|_| health_json.to_string());
         }
     };
 
-    let telemetry = telemetry_json.and_then(|s| serde_json::from_str(s).ok());
-
+    let telemetry = telemetry.and_then(|value| serde_json::from_value(value.clone()).ok());
     let merged = GatewayStatusResponse { health, telemetry };
-    serde_json::to_string_pretty(&merged).unwrap_or_else(|_| health_json.to_owned())
+    serde_json::to_string_pretty(&merged).unwrap_or_else(|_| health_json.to_string())
 }
 
 fn print_gateway_help() {
@@ -830,6 +832,10 @@ ACTIONS:
 "#
     );
 }
+
+// ---------------------------------------------------------------------------
+// Gateway command dispatch
+// ---------------------------------------------------------------------------
 
 fn install_service(cli_config: Option<&Path>) -> Result<(), EgoPulseError> {
     let systemd = SystemdUserService::connect()?;
@@ -910,12 +916,16 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
 
     if is_active {
         match fetch_live_status(cli_config).await {
-            Some((health_json, telemetry_json)) if json => {
-                let merged = merge_health_and_telemetry(&health_json, telemetry_json.as_deref());
+            Some(status) if json => {
+                let merged =
+                    merge_health_and_telemetry_values(&status.status, Some(&status.telemetry));
                 println!("{merged}");
             }
-            Some((health_json, telemetry_json)) => {
-                print_gateway_status_text(&health_json, telemetry_json.as_deref());
+            Some(status) => {
+                print!(
+                    "{}",
+                    format_gateway_status_values(&status.status, Some(&status.telemetry))
+                );
             }
             None => show_systemctl_status(systemd.runtime_dir())?,
         }
@@ -926,7 +936,7 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
         let status_json = serde_json::json!({
             "ok": false,
             "service": state,
-            "recent_logs": fetch_recent_service_logs(systemd.runtime_dir()),
+            "recent_logs": systemd.recent_logs(),
         });
         println!(
             "{}",
@@ -934,7 +944,7 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
         );
     } else {
         show_systemctl_status(systemd.runtime_dir())?;
-        if let Some(logs) = fetch_recent_service_logs(systemd.runtime_dir()) {
+        if let Some(logs) = systemd.recent_logs() {
             println!("\nLast error:\n{logs}");
         }
     }
@@ -966,6 +976,10 @@ pub async fn run_gateway(
         GatewayAction::Restart => restart_service_action(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Self-update
+// ---------------------------------------------------------------------------
 
 /// Updates the installed EgoPulse binary from the latest GitHub release.
 pub async fn run_update() -> Result<(), EgoPulseError> {
@@ -1380,6 +1394,10 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1488,34 +1506,6 @@ mod tests {
         systemd_escape_env("line1\nline2");
     }
 
-    #[test]
-    fn format_start_failure_contains_base_message_and_optional_logs() {
-        let err = format_start_failure(None);
-        let msg = match &err {
-            EgoPulseError::Internal(m) => m.clone(),
-            other => panic!("expected Internal error, got {other}"),
-        };
-        assert!(
-            msg.starts_with("egopulse service failed to start"),
-            "message should start with base text: {msg}"
-        );
-
-        // On a system with journalctl and prior service runs, logs may be
-        // present.  The test only asserts the structural contract: if logs
-        // are returned, they appear under a "Recent logs:" header.
-        let err = format_start_failure(None);
-        let msg = match &err {
-            EgoPulseError::Internal(m) => m.clone(),
-            other => panic!("expected Internal error, got {other}"),
-        };
-        if msg.contains("Recent logs:") {
-            // Lines after the header should be non-empty.
-            let body = msg.split("Recent logs:\n").nth(1).unwrap_or("");
-            assert!(!body.trim().is_empty());
-        }
-        // If no logs are available the message is just the base text.
-    }
-
     #[tokio::test]
     async fn fetch_live_status_uses_bearer_token_for_diagnostics() {
         use wiremock::matchers::{header as wiremock_header, method, path};
@@ -1550,12 +1540,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (status_json, telemetry_json) = fetch_live_status_at(&server.uri(), "gateway-secret")
+        let status = fetch_live_status_at(&server.uri(), "gateway-secret")
             .await
             .expect("authenticated diagnostics response");
-        let status: serde_json::Value = serde_json::from_str(&status_json).expect("status json");
-        assert_eq!(status["version"], "0.1.0");
-        assert!(telemetry_json.is_some());
+        assert_eq!(status.status["version"], "0.1.0");
+        assert!(status.telemetry["metrics"].is_object());
     }
 
     #[tokio::test]

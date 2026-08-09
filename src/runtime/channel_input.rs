@@ -120,7 +120,7 @@ pub(crate) async fn store_human_channel_log_message(
     state: &AppState,
     message: HumanChannelLogMessage,
 ) -> Option<i64> {
-    let db = Arc::clone(state.db_for(message.scope));
+    let db = state.db_for(message.scope);
     let key = message.key;
     match call_blocking(Arc::clone(&db), move |db| match key {
         ChannelLogKey::Discord(channel_id) => db.resolve_channel_log_chat_id(channel_id),
@@ -168,7 +168,7 @@ pub(crate) async fn store_human_channel_log_message(
 /// (started or queued) from a queue-capacity rejection. Rejections are logged
 /// centrally here so no turn is silently dropped.
 pub(crate) async fn submit_agent_turn(
-    state: &AppState,
+    state: &Arc<AppState>,
     context: SurfaceContext,
     input: String,
 ) -> SubmitOutcome {
@@ -200,7 +200,7 @@ pub(crate) async fn submit_agent_turn(
 /// rejection: the turn stays `accepted` and the dispatcher retries as capacity
 /// frees.
 pub(crate) async fn submit_scheduled_turn(
-    state: &AppState,
+    state: &Arc<AppState>,
     mut scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
     if scheduled.config_snapshot.is_none() {
@@ -284,8 +284,8 @@ pub(crate) async fn submit_scheduled_turn(
             return SubmitOutcome::Queued;
         }
     };
-    // Stamp the authoritative ids from the DB row (#5: the DB is the source of
-    // truth, not the tentative ScheduledTurn id).
+    // Stamp authoritative ids from the DB row; it is the source of truth for
+    // execution, not the tentative ScheduledTurn id.
     scheduled.turn_id = run.turn_id.clone();
     if let Some(canonical_origin) = run.origin_id.as_deref() {
         scheduled.origin_id = canonical_origin.to_string();
@@ -303,7 +303,10 @@ pub(crate) async fn submit_scheduled_turn(
 /// reservation: live turns reserved at intake, and recovered origins are
 /// rehydrated. The scheduler deduplicates by `turn_id`, so repeat dispatch is
 /// an idempotent no-op; capacity overflow defers to the next scan.
-pub(super) fn enqueue_durable_turn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+pub(super) fn enqueue_durable_turn(
+    state: &Arc<AppState>,
+    scheduled: ScheduledTurn,
+) -> SubmitOutcome {
     schedule_and_spawn(state, scheduled)
 }
 
@@ -312,7 +315,7 @@ pub(super) fn enqueue_durable_turn(state: &AppState, scheduled: ScheduledTurn) -
 /// `Queued` rather than surfaced: the turn is already durably accepted, so it
 /// must never be reported as rejected to the caller. The dispatcher retries as
 /// capacity frees.
-fn schedule_and_spawn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutcome {
+fn schedule_and_spawn(state: &Arc<AppState>, scheduled: ScheduledTurn) -> SubmitOutcome {
     // Shutdown gate: never start a new turn task once shutdown has begun. The
     // durable turn stays in `turn_runs` and is resumed on the next startup, so
     // the supervisor only owns the in-flight turns it is draining (the
@@ -324,7 +327,7 @@ fn schedule_and_spawn(state: &AppState, scheduled: ScheduledTurn) -> SubmitOutco
     match state.turn_scheduler.submit(scheduled) {
         ScheduleResult::Started(turn) => {
             let turn = *turn;
-            let state = state.clone();
+            let state = Arc::clone(state);
             let supervisor = Arc::clone(&state.supervisor);
             supervisor.spawn_turn(async move {
                 crate::runtime::execute_scheduled_turn(&state, turn).await;
@@ -368,7 +371,7 @@ async fn durably_accept_turn(
     };
     let revision = snapshot.revision as i64;
     let fingerprint = snapshot.fingerprint.clone();
-    call_blocking(Arc::clone(state.db_for(scope)), move |db| {
+    call_blocking(state.db_for(scope), move |db| {
         db.accept_or_get_turn(AcceptTurnParams {
             chat_id,
             request_key: &request_key,

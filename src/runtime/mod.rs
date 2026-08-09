@@ -21,12 +21,12 @@ pub(crate) use channel_input::{
 pub(crate) use runtime_status::ChannelState;
 pub(crate) use runtime_status::RuntimeStatus;
 pub(crate) use supervisor::Criticality;
-pub(crate) use supervisor::InstanceGuard;
 pub(crate) use supervisor::RuntimeSupervisor;
 pub(crate) use supervisor::TaskKind;
 pub(crate) use supervisor::TaskSpec;
 pub(crate) use turn_scheduler::ActiveTurnTracker;
 
+use fs2::FileExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,8 +57,63 @@ use crate::storage::TurnRunState;
 use crate::storage::call_blocking;
 use crate::tools::ToolRegistry;
 
+// ---------------------------------------------------------------------------
+// Shared state and dependency construction
+// ---------------------------------------------------------------------------
+
+const INSTANCE_LOCK_FILE_NAME: &str = "runtime-instance.lock";
+
+/// Holds an exclusive advisory lock for a single state root.
+///
+/// The lock is bound to the underlying file descriptor, which stays open for
+/// as long as this guard is alive. Dropping the guard — or the process
+/// exiting, normally or abnormally — closes the descriptor and releases the
+/// lock.
+#[derive(Debug)]
+pub(crate) struct InstanceGuard {
+    _file: std::fs::File,
+}
+
+impl InstanceGuard {
+    /// Acquires the exclusive instance lock for `state_root`.
+    pub(crate) fn acquire(state_root: &Path) -> Result<Arc<Self>, EgoPulseError> {
+        let lock_path = state_root.join(INSTANCE_LOCK_FILE_NAME);
+        Self::open_and_lock(&lock_path)
+    }
+
+    /// Acquires a separate lock file for restart-simulation tests.
+    #[cfg(test)]
+    pub(crate) fn acquire_at(lock_path: &Path) -> Result<Arc<Self>, EgoPulseError> {
+        Self::open_and_lock(lock_path)
+    }
+
+    fn open_and_lock(lock_path: &Path) -> Result<Arc<Self>, EgoPulseError> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|e| {
+                EgoPulseError::Internal(format!(
+                    "failed to open runtime instance lock {}: {e}",
+                    lock_path.display()
+                ))
+            })?;
+        file.try_lock_exclusive().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                EgoPulseError::RuntimeAlreadyRunning(lock_path.display().to_string())
+            } else {
+                EgoPulseError::Internal(format!(
+                    "failed to acquire runtime instance lock {}: {e}",
+                    lock_path.display()
+                ))
+            }
+        })?;
+        Ok(Arc::new(Self { _file: file }))
+    }
+}
+
 /// Holds the shared runtime dependencies used across all channels.
-#[derive(Clone)]
 pub struct AppState {
     pub(crate) db: Arc<Database>,
     /// Secret DB for isolated secret-mode storage. `None` when no secret channels are configured.
@@ -189,20 +244,36 @@ impl AppState {
         }
     }
 
-    /// Returns the appropriate `Database` reference based on `scope`.
+    /// Returns an owned handle to the appropriate database for `scope`.
     ///
     /// # Panics
     ///
     /// Panics if `scope` is `Secret` but `secret_db` was not initialized
     /// (i.e., no secret channels in config).
-    pub(crate) fn db_for(&self, scope: ConversationScope) -> &Arc<Database> {
+    pub(crate) fn db_for(&self, scope: ConversationScope) -> Arc<Database> {
         match scope {
-            ConversationScope::Normal => &self.db,
-            ConversationScope::Secret => self
-                .secret_db
-                .as_ref()
-                .expect("secret db required but not initialized"),
+            ConversationScope::Normal => Arc::clone(&self.db),
+            ConversationScope::Secret => Arc::clone(
+                self.secret_db
+                    .as_ref()
+                    .expect("secret db required but not initialized"),
+            ),
         }
+    }
+
+    /// Returns every initialized conversation scope with its database handle.
+    ///
+    /// Keeping scope enumeration here prevents startup and dispatcher code
+    /// from growing separate normal/secret branches whenever a new database
+    /// operation is added.
+    pub(crate) fn scoped_databases(
+        &self,
+    ) -> impl Iterator<Item = (ConversationScope, Arc<Database>)> + '_ {
+        std::iter::once((ConversationScope::Normal, Arc::clone(&self.db))).chain(
+            self.secret_db
+                .iter()
+                .map(|db| (ConversationScope::Secret, Arc::clone(db))),
+        )
     }
 
     /// Rebuilds calibration factors from persisted usage observations.
@@ -215,25 +286,17 @@ impl AppState {
     /// empty), leaving unmeasured keys at `DEFAULT_FACTOR`.
     pub(crate) async fn warm_up_calibrator(&self) {
         const REPLAY_LIMIT_PER_KEY: usize = 30;
-        let mut observations = match crate::storage::call_blocking(Arc::clone(&self.db), |db| {
-            db.load_calibration_observations(REPLAY_LIMIT_PER_KEY)
-        })
-        .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(error = %e, "calibration load failed (normal db); using defaults");
-                Vec::new()
-            }
-        };
-        if let Some(secret_db) = &self.secret_db {
-            match crate::storage::call_blocking(Arc::clone(secret_db), |db| {
+        let mut observations = Vec::new();
+        for (scope, db) in self.scoped_databases() {
+            match crate::storage::call_blocking(db, |db| {
                 db.load_calibration_observations(REPLAY_LIMIT_PER_KEY)
             })
             .await
             {
                 Ok(o) => observations.extend(o),
-                Err(e) => warn!(error = %e, "calibration load failed (secret db); using defaults"),
+                Err(e) => {
+                    warn!(scope = %scope, error = %e, "calibration load failed; using defaults")
+                }
             }
         }
         // Each database already applied the per-key cap; re-cap after merging
@@ -274,14 +337,6 @@ impl AppState {
     /// 現在の設定スナップショットを返す。
     pub fn current_config(&self) -> Arc<Config> {
         Arc::new(self.config_manager.current_blocking().config.clone())
-    }
-
-    /// 設定ファイルパスがある場合はディスクから再読込した最新設定を返す。
-    pub fn try_current_config(&self) -> Result<Arc<Config>, EgoPulseError> {
-        match self.config_path.as_deref() {
-            Some(path) => Ok(Arc::new(Config::load_allow_missing_api_key(Some(path))?)),
-            None => Ok(self.current_config()),
-        }
     }
 }
 
@@ -335,8 +390,7 @@ async fn build_runtime_tooling(
         crate::tools::mcp::McpManager::new(&workspace_dir).await?,
     ));
 
-    let mut tools = ToolRegistry::new(config, Arc::clone(&deps.skills));
-    tools.set_config_manager(Arc::clone(config_manager));
+    let mut tools = build_tool_registry(config, &deps.skills, config_manager);
     tools.set_mcp_manager(Arc::clone(&mcp_manager));
     tools.register_tool(Box::new(crate::tools::SendAttachmentTool::new(
         workspace_dir.clone(),
@@ -360,6 +414,16 @@ async fn build_runtime_tooling(
         agent_send_intake,
         workspace_dir,
     })
+}
+
+fn build_tool_registry(
+    config: &Config,
+    skills: &Arc<SkillManager>,
+    config_manager: &Arc<ConfigManager>,
+) -> ToolRegistry {
+    let mut tools = ToolRegistry::new(config, Arc::clone(skills));
+    tools.set_config_manager(Arc::clone(config_manager));
+    tools
 }
 
 /// Builds the application state without recording a config file path.
@@ -424,6 +488,10 @@ pub async fn build_app_state_with_path(
     Ok(state)
 }
 
+// ---------------------------------------------------------------------------
+// Startup recovery and background services
+// ---------------------------------------------------------------------------
+
 async fn recover_runtime_state(state: &AppState) -> Result<(), EgoPulseError> {
     state.warm_up_calibrator().await;
     recover_durable_state(state).await?;
@@ -474,9 +542,8 @@ fn spawn_runtime_background_tasks(state: &Arc<AppState>, workspace_dir: PathBuf)
 /// Returns the first [`EgoPulseError`] encountered while recovering the normal
 /// or secret database.
 async fn recover_durable_state(state: &AppState) -> Result<(), EgoPulseError> {
-    recover_durable_state_for_db(&state.db, ConversationScope::Normal)?;
-    if let Some(secret_db) = &state.secret_db {
-        recover_durable_state_for_db(secret_db, ConversationScope::Secret)?;
+    for (scope, db) in state.scoped_databases() {
+        recover_durable_state_for_db(&db, scope)?;
     }
     Ok(())
 }
@@ -530,9 +597,8 @@ fn recover_durable_state_for_db(
 /// Runs against both the primary and (when present) secret databases.
 fn rehydrate_origin_tracker(state: &AppState) -> Result<(), EgoPulseError> {
     let ttl_secs = turn_scheduler::ORIGIN_TTL.as_secs() as i64;
-    rehydrate_origin_tracker_for_db(state, &state.db, ConversationScope::Normal, ttl_secs)?;
-    if let Some(secret_db) = &state.secret_db {
-        rehydrate_origin_tracker_for_db(state, secret_db, ConversationScope::Secret, ttl_secs)?;
+    for (scope, db) in state.scoped_databases() {
+        rehydrate_origin_tracker_for_db(state, &db, scope, ttl_secs)?;
     }
     Ok(())
 }
@@ -568,9 +634,7 @@ pub fn build_sleep_app_state_with_path(
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
     let channels = Arc::new(ChannelRegistry::new());
     let config_manager = Arc::new(ConfigManager::new(config.clone(), config_path.as_deref()));
-    let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
-    tools.set_config_manager(Arc::clone(&config_manager));
-    let tools = Arc::new(tools);
+    let tools = Arc::new(build_tool_registry(&config, &deps.skills, &config_manager));
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
@@ -658,6 +722,10 @@ fn build_app_state_dependencies(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Durable turn dispatcher
+// ---------------------------------------------------------------------------
+
 /// Spawns the turn dispatcher: a long-lived supervisor task that periodically
 /// scans both databases for durably accepted turns (request persisted but never
 /// started) and re-submits them so a crash before execution is fully recovered
@@ -704,16 +772,11 @@ fn spawn_turn_dispatcher(state: Arc<AppState>, shutdown: CancellationToken) {
 /// on the next tick from the head, so no turn is ever permanently skipped.
 /// Bounded by `MAX_PAGES_PER_TICK` so a huge backlog cannot monopolise a single
 /// tick; remaining turns are reached on subsequent ticks.
-async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
-    let scopes: &[ConversationScope] = if state.secret_db.is_some() {
-        &[ConversationScope::Normal, ConversationScope::Secret]
-    } else {
-        &[ConversationScope::Normal]
-    };
+async fn dispatch_durable_turns(state: &Arc<AppState>) -> Result<(), EgoPulseError> {
     let mut backlog_total: u64 = 0;
     let mut backlog_ok = true;
-    for &scope in scopes {
-        match dispatch_durable_turns_for_scope(state, scope).await? {
+    for (scope, db) in state.scoped_databases() {
+        match dispatch_durable_turns_for_scope(state, scope, db).await? {
             Some(count) => backlog_total += count,
             None => backlog_ok = false,
         }
@@ -725,10 +788,10 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
 }
 
 async fn dispatch_durable_turns_for_scope(
-    state: &AppState,
+    state: &Arc<AppState>,
     scope: ConversationScope,
+    db: Arc<Database>,
 ) -> Result<Option<u64>, EgoPulseError> {
-    let db = Arc::clone(state.db_for(scope));
     let backlog = match call_blocking(Arc::clone(&db), |db| db.count_durable_pending()).await {
         Ok(count) => Some(count as u64),
         Err(error) => {
@@ -903,7 +966,7 @@ async fn persist_turn_cancellation(
     reason: &str,
     note: &str,
 ) -> Result<(), EgoPulseError> {
-    let db = Arc::clone(state.db_for(scope));
+    let db = state.db_for(scope);
     let turn_id = turn_id.to_owned();
     let identifier = turn_id.clone();
     let reason = reason.to_owned();
@@ -948,7 +1011,7 @@ async fn persist_origin_terminal_reason(
     origin_id: &str,
     reason: turn_scheduler::StopReason,
 ) -> Result<(), EgoPulseError> {
-    let db = Arc::clone(state.db_for(scope));
+    let db = state.db_for(scope);
     let origin_id = origin_id.to_owned();
     let identifier = origin_id.clone();
     let reason = reason.to_string();
@@ -1003,6 +1066,10 @@ pub(crate) fn execute_scheduled_turn(
         .await;
     })
 }
+
+// ---------------------------------------------------------------------------
+// Scheduled turn lifecycle
+// ---------------------------------------------------------------------------
 
 async fn prepare_scheduled_turn(
     state: &AppState,
@@ -1078,7 +1145,7 @@ async fn load_durable_turn_state(
     const MAX_TURN_DB_BACKOFF: Duration = Duration::from_secs(5);
 
     loop {
-        match call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
+        match call_blocking(state.db_for(turn.context.scope), {
             let turn_id = turn.turn_id.clone();
             move |db| db.get_turn_run(&turn_id).map(|run| run.state)
         })
@@ -1362,7 +1429,7 @@ async fn store_scheduled_turn_response(
         return;
     };
 
-    let db = Arc::clone(state.db_for(turn.context.scope));
+    let db = state.db_for(turn.context.scope);
     let agent_id = turn.context.agent_id.clone();
     let response = response.to_owned();
     if let Err(error) = crate::storage::call_blocking(db, move |db| {
@@ -1581,6 +1648,10 @@ async fn spawn_mcp_reconnect_loop(
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Public entry points and channel lifecycle
+// ---------------------------------------------------------------------------
 
 /// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
@@ -1849,17 +1920,61 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     supervise_runtime(&state).await
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::agent_loop::ConversationScope;
+    use crate::agent_loop::turn::RecordingProvider;
     use crate::config::ResolvedLlmConfig;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
+    }
+
+    fn final_provider() -> RecordingProvider {
+        RecordingProvider::new(
+            vec![Ok(crate::llm::MessagesResponse {
+                content: "ok".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        )
+    }
+
+    #[test]
+    fn second_acquisition_on_same_state_root_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let _g1 = InstanceGuard::acquire(dir.path()).unwrap();
+        let err = InstanceGuard::acquire(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, EgoPulseError::RuntimeAlreadyRunning(_)),
+            "second runtime must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn lock_is_released_after_drop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let g1 = InstanceGuard::acquire(dir.path()).unwrap();
+        drop(g1);
+        let _g2 = InstanceGuard::acquire(dir.path())
+            .expect("lock should be reacquirable after the first guard is dropped");
+    }
+
+    #[test]
+    fn distinct_state_roots_do_not_conflict() {
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let _g1 = InstanceGuard::acquire(a.path()).unwrap();
+        let _g2 = InstanceGuard::acquire(b.path()).unwrap();
     }
 
     #[test]
@@ -1930,115 +2045,6 @@ mod tests {
         );
     }
 
-    struct StubFinalProvider;
-
-    #[async_trait::async_trait]
-    impl crate::llm::LlmProvider for StubFinalProvider {
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-        fn model_name(&self) -> &str {
-            "stub-model"
-        }
-        async fn send_message(
-            &self,
-            _: &str,
-            _: std::sync::Arc<Vec<crate::llm::Message>>,
-            _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
-        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-            Ok(crate::llm::MessagesResponse {
-                content: "ok".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })
-        }
-
-        async fn send_message_streaming(
-            &self,
-            system: &str,
-            messages: std::sync::Arc<Vec<crate::llm::Message>>,
-            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
-            on_delta: &(dyn Fn(String) + Send + Sync),
-        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-            let _ = on_delta;
-            self.send_message(system, messages, tools).await
-        }
-    }
-
-    struct StubFailingProvider;
-
-    #[async_trait::async_trait]
-    impl crate::llm::LlmProvider for StubFailingProvider {
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-        fn model_name(&self) -> &str {
-            "stub-model"
-        }
-        async fn send_message(
-            &self,
-            _: &str,
-            _: std::sync::Arc<Vec<crate::llm::Message>>,
-            _: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
-        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-            Err(crate::error::LlmError::InvalidResponse(
-                "stub failure".to_string(),
-            ))
-        }
-
-        async fn send_message_streaming(
-            &self,
-            system: &str,
-            messages: std::sync::Arc<Vec<crate::llm::Message>>,
-            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
-            on_delta: &(dyn Fn(String) + Send + Sync),
-        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-            let _ = on_delta;
-            self.send_message(system, messages, tools).await
-        }
-    }
-
-    struct RetryableFailingProvider {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::llm::LlmProvider for RetryableFailingProvider {
-        fn provider_name(&self) -> &str {
-            "stub"
-        }
-
-        fn model_name(&self) -> &str {
-            "stub-model"
-        }
-
-        async fn send_message(
-            &self,
-            _: &str,
-            _: Arc<Vec<crate::llm::Message>>,
-            _: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
-        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(crate::error::LlmError::ApiError {
-                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-                body_preview: "test failure".to_string(),
-                retry_after_secs: None,
-            })
-        }
-
-        async fn send_message_streaming(
-            &self,
-            system: &str,
-            messages: Arc<Vec<crate::llm::Message>>,
-            tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
-            on_delta: &(dyn Fn(String) + Send + Sync),
-        ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-            let _ = on_delta;
-            self.send_message(system, messages, tools).await
-        }
-    }
-
     #[tokio::test]
     async fn execute_turn_with_progress_terminates_on_success_and_failure() {
         // A coordinator without a sink must terminate for both result paths;
@@ -2047,7 +2053,7 @@ mod tests {
         let success_dir = tempfile::tempdir().expect("tempdir");
         let success_state = crate::test_util::build_state_with_provider(
             success_dir.path().to_str().expect("utf8"),
-            Box::new(StubFinalProvider),
+            Box::new(final_provider()),
         );
         let success_context = crate::test_util::cli_context("progress-success");
         let success_result = tokio::time::timeout(
@@ -2064,9 +2070,15 @@ mod tests {
         assert_eq!(success_result.unwrap().expect("turn ok"), "ok");
 
         let failure_dir = tempfile::tempdir().expect("tempdir");
+        let failure_provider = RecordingProvider::new(
+            vec![Err(crate::error::LlmError::InvalidResponse(
+                "stub failure".to_string(),
+            ))],
+            vec![0],
+        );
         let failure_state = crate::test_util::build_state_with_provider(
             failure_dir.path().to_str().expect("utf8"),
-            Box::new(StubFailingProvider),
+            Box::new(failure_provider),
         );
         let failure_context = crate::test_util::cli_context("progress-failure");
         let failure_result = tokio::time::timeout(
@@ -2087,12 +2099,23 @@ mod tests {
     async fn retryable_llm_failure_executes_one_turn_and_persists_one_input() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let calls = Arc::new(AtomicUsize::new(0));
+        let retry_count = crate::agent_loop::turn::MAX_LLM_RETRIES;
+        let retry_provider = RecordingProvider::new(
+            (0..retry_count)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        body_preview: "test failure".to_string(),
+                        retry_after_secs: None,
+                    })
+                })
+                .collect(),
+            vec![0; retry_count],
+        );
+        let retry_observer = retry_provider.clone();
         let state = crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(RetryableFailingProvider {
-                calls: Arc::clone(&calls),
-            }),
+            Box::new(retry_provider),
         );
         let context = crate::test_util::cli_context("retryable-failure");
 
@@ -2110,8 +2133,8 @@ mod tests {
         // single Turn with a single persisted input.
         assert!(result.is_err(), "retryable failure must reach the caller");
         assert_eq!(
-            calls.load(Ordering::SeqCst),
-            crate::agent_loop::turn::MAX_LLM_RETRIES,
+            retry_observer.seen_systems().len(),
+            retry_count,
             "LLM must be retried up to MAX_LLM_RETRIES within the same iteration"
         );
         let conn = state.db.get_conn().expect("connection");
@@ -2221,27 +2244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cloned_app_state_shares_llm_cache() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
-        let state = build_app_state(config).await.expect("build state");
-        let cloned = state.clone();
-        let context = crate::test_util::cli_context("cache-clone-test");
-
-        let snapshot = state.config_manager.current_blocking();
-        let a = state
-            .turn_runtime()
-            .llm_for_context_with_snapshot(&context, &snapshot)
-            .expect("llm");
-        let b = cloned
-            .turn_runtime()
-            .llm_for_context_with_snapshot(&context, &snapshot)
-            .expect("llm");
-
-        assert!(Arc::ptr_eq(&a, &b));
-    }
-
-    #[tokio::test]
     async fn llm_override_bypasses_cache() {
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -2280,15 +2282,6 @@ mod tests {
         assert!(!snap.version.is_empty());
         assert!(snap.pid > 0);
         assert!(!snap.started_at.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cloned_app_state_shares_runtime_status() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
-        let state = build_app_state(config).await.expect("build state");
-        let cloned = state.clone();
-        assert!(Arc::ptr_eq(&state.runtime_status, &cloned.runtime_status));
     }
 
     #[test]
@@ -2339,15 +2332,15 @@ mod tests {
         let secret_result = state.db_for(ConversationScope::Secret);
 
         assert!(
-            Arc::ptr_eq(normal_db, &state.db),
+            Arc::ptr_eq(&normal_db, &state.db),
             "Normal scope must return the primary database"
         );
         assert!(
-            Arc::ptr_eq(secret_result, &secret_db),
+            Arc::ptr_eq(&secret_result, &secret_db),
             "Secret scope must return the isolated secret database"
         );
         assert!(
-            !Arc::ptr_eq(normal_db, secret_result),
+            !Arc::ptr_eq(&normal_db, &secret_result),
             "Normal and Secret scopes must return different databases"
         );
     }
@@ -2364,7 +2357,6 @@ mod tests {
     #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
         use crate::agent_loop::ScheduledTurn;
-        use crate::agent_loop::turn::RecordingProvider;
         use crate::llm::MessagesResponse;
         use crate::storage::call_blocking;
 
@@ -2439,10 +2431,10 @@ mod tests {
         use crate::agent_loop::ConversationScope;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_provider(
+        let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(StubFinalProvider),
-        );
+            Box::new(final_provider()),
+        ));
         // Inject a permanent storage fault so every recovery read fails.
         state
             .db_for(ConversationScope::Normal)
@@ -2461,7 +2453,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state = crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(StubFinalProvider),
+            Box::new(final_provider()),
         );
         // Two transient failures, then recovery. The unbounded backoff retry
         // must keep trying until the DB heals, then succeed.
@@ -2485,7 +2477,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn db_failure_during_dispatch_retries_and_preserves_turn_order() {
-        use crate::agent_loop::turn::RecordingProvider;
         use crate::agent_loop::{ConversationScope, ScheduledTurn};
         use crate::llm::MessagesResponse;
         use crate::runtime::turn_scheduler::ScheduleResult;
@@ -2508,10 +2499,10 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let state = crate::test_util::build_state_with_provider(
+        let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
             Box::new(provider.clone()),
-        );
+        ));
 
         // Two turns for the same session: A first, B queued behind it.
         let mut ctx = crate::test_util::cli_context("fix1-session");
@@ -2576,10 +2567,10 @@ mod tests {
         use crate::storage::call_blocking;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_provider(
+        let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(StubFinalProvider),
-        );
+            Box::new(final_provider()),
+        ));
         state.supervisor.start_accepting();
 
         let session_key = "cli:session-blk1:agent:default";
@@ -2624,7 +2615,7 @@ mod tests {
         dispatch_durable_turns(&state)
             .await
             .expect("dispatch tick 1");
-        let count = call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), |db| {
+        let count = call_blocking(state.db_for(ConversationScope::Normal), |db| {
             db.count_durable_pending()
         })
         .await
@@ -2651,7 +2642,7 @@ mod tests {
             .expect("dispatch tick 2");
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let count = call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), |db| {
+        let count = call_blocking(state.db_for(ConversationScope::Normal), |db| {
             db.count_durable_pending()
         })
         .await
@@ -2668,10 +2659,10 @@ mod tests {
         use crate::runtime::turn_scheduler::StopReason;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_provider(
+        let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(StubFinalProvider),
-        );
+            Box::new(final_provider()),
+        ));
         state
             .db_for(ConversationScope::Normal)
             .fault_inject_next_get_conn(2);
@@ -2764,7 +2755,6 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn dispatch_invalid_durable_payloads_terminalizes_without_execution() {
-        use crate::agent_loop::turn::RecordingProvider;
         use crate::llm::MessagesResponse;
         use crate::storage::{AcceptOutcome, AcceptTurnParams};
 
@@ -2779,10 +2769,10 @@ mod tests {
             })],
             vec![0],
         );
-        let state = crate::test_util::build_state_with_provider(
+        let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
             Box::new(provider.clone()),
-        );
+        ));
         let chat_id = call_blocking(Arc::clone(&state.db), |db| {
             db.resolve_or_create_chat_id("cli", "invalid-payloads", None, "cli", "default")
         })
@@ -2857,10 +2847,10 @@ mod tests {
 
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_provider(
+        let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(StubFinalProvider),
-        );
+            Box::new(final_provider()),
+        ));
         let turn_id = call_blocking(Arc::clone(&state.db), |db| {
             let chat_id = db.resolve_or_create_chat_id(
                 "cli",
@@ -2920,7 +2910,6 @@ mod tests {
         use crate::agent_loop::ScheduledTurn;
         use crate::agent_loop::resume_input_committed_turn;
         use crate::agent_loop::serialize_scheduled_turn;
-        use crate::agent_loop::turn::RecordingProvider;
         use crate::llm::MessagesResponse;
         use crate::storage::{AcceptOutcome, StoredMessage, TurnRunState};
 
@@ -2956,7 +2945,7 @@ mod tests {
         };
         let scheduled_json = serialize_scheduled_turn(&scheduled).expect("serialize");
 
-        let accepted = call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+        let accepted = call_blocking(state.db_for(ConversationScope::Normal), {
             let scheduled_json = scheduled_json.clone();
             move |db| {
                 db.accept_or_get_turn(crate::storage::AcceptTurnParams {
@@ -2982,7 +2971,7 @@ mod tests {
         let mut msg = StoredMessage::user(chat_id, "sender".to_string(), input.clone());
         msg.id = format!("turn:{turn_id}:input");
         msg.turn_id = Some(turn_id.clone());
-        call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+        call_blocking(state.db_for(ConversationScope::Normal), {
             let msg = msg.clone();
             let turn_id = turn_id.clone();
             move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id, 0, None)
@@ -2991,7 +2980,7 @@ mod tests {
         .expect("commit input");
 
         assert_eq!(
-            call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+            call_blocking(state.db_for(ConversationScope::Normal), {
                 let turn_id = turn_id.clone();
                 move |db| db.get_turn_run(&turn_id).map(|r| r.state)
             })
@@ -3012,7 +3001,7 @@ mod tests {
 
         // Assert: the model loop ran to completion and the turn is terminal.
         assert_eq!(
-            call_blocking(Arc::clone(state.db_for(ConversationScope::Normal)), {
+            call_blocking(state.db_for(ConversationScope::Normal), {
                 let turn_id = turn_id.clone();
                 move |db| db.get_turn_run(&turn_id).map(|r| r.state)
             })

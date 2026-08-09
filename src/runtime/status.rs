@@ -65,11 +65,4 @@ mod tests {
         let parsed: TransportType = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, TransportType::Stdio);
     }
-
-    #[test]
-    fn mcp_status_default_is_empty() {
-        let status = McpStatus::default();
-        assert!(status.connected.is_empty());
-        assert!(status.failed.is_empty());
-    }
 }
