@@ -117,6 +117,13 @@ struct AppStateDependencies {
     memory_loader: Arc<MemoryLoader>,
 }
 
+struct RuntimeTooling {
+    tools: Arc<ToolRegistry>,
+    mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
+    agent_send_intake: Arc<channel_input::TurnIntake>,
+    workspace_dir: PathBuf,
+}
+
 /// Resolved storage endpoints for a conversation scope.
 ///
 /// Groups the database handle and archive root path so callers do not
@@ -292,6 +299,83 @@ impl AppState {
     }
 }
 
+fn acquire_instance_guard(state_root: &str) -> Result<Arc<InstanceGuard>, EgoPulseError> {
+    std::fs::create_dir_all(Path::new(state_root))
+        .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
+    let instance_guard = InstanceGuard::acquire(Path::new(state_root))?;
+    metrics::set_instance_lock_held(true);
+    Ok(instance_guard)
+}
+
+fn build_channel_registry(
+    config: &Config,
+    config_manager: &Arc<ConfigManager>,
+) -> Arc<ChannelRegistry> {
+    let mut channels = ChannelRegistry::new();
+    channels.register(Arc::new(WebAdapter));
+    if config.voice_enabled() {
+        channels.register(Arc::new(VoiceAdapter));
+    }
+
+    #[cfg(feature = "channel-discord")]
+    if !config.discord_bots().is_empty() {
+        channels.register(Arc::new(
+            crate::channels::discord::DiscordAdapter::new_for_bots_with_manager(Arc::clone(
+                config_manager,
+            )),
+        ));
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    if !config.telegram_bots().is_empty() {
+        channels.register(Arc::new(
+            crate::channels::telegram::TelegramAdapter::new_multi_with_manager(Arc::clone(
+                config_manager,
+            )),
+        ));
+    }
+
+    Arc::new(channels)
+}
+
+async fn build_runtime_tooling(
+    config: &Config,
+    deps: &AppStateDependencies,
+    config_manager: &Arc<ConfigManager>,
+    channels: &Arc<ChannelRegistry>,
+) -> Result<RuntimeTooling, EgoPulseError> {
+    let workspace_dir = config.workspace_dir()?;
+    let mcp_manager = Arc::new(tokio::sync::RwLock::new(
+        crate::tools::mcp::McpManager::new(&workspace_dir).await?,
+    ));
+
+    let mut tools = ToolRegistry::new(config, Arc::clone(&deps.skills));
+    tools.set_config_manager(Arc::clone(config_manager));
+    tools.set_mcp_manager(Arc::clone(&mcp_manager));
+    tools.register_tool(Box::new(crate::tools::SendAttachmentTool::new(
+        workspace_dir.clone(),
+        Arc::clone(channels),
+        Arc::clone(&deps.db),
+        deps.secret_db.clone(),
+    )));
+
+    let agent_send_intake = Arc::new(channel_input::TurnIntake::new());
+    tools.register_tool(Box::new(crate::tools::AgentSendTool::new_with_manager(
+        Arc::clone(&deps.db),
+        deps.secret_db.clone(),
+        Arc::clone(channels),
+        Arc::clone(&agent_send_intake),
+        Arc::clone(config_manager),
+    )));
+
+    Ok(RuntimeTooling {
+        tools: Arc::new(tools),
+        mcp_manager,
+        agent_send_intake,
+        workspace_dir,
+    })
+}
+
 /// Builds the application state without recording a config file path.
 ///
 /// # Errors
@@ -318,73 +402,14 @@ pub async fn build_app_state_with_path(
 ) -> Result<Arc<AppState>, EgoPulseError> {
     crate::runtime::metrics::init_metrics();
 
-    // Acquire the exclusive instance lock before the database is opened, so a
-    // concurrent runtime or manual `sleep` command against this state root is
-    // rejected up front. Create the state root first so a nested, not-yet-
-    // existing path (first run) does not fail the lock file open.
-    std::fs::create_dir_all(Path::new(&config.state_root))
-        .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
-    let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
-    metrics::set_instance_lock_held(true);
+    // Acquire the lock before opening storage so concurrent runtimes are
+    // rejected before any database side effects occur.
+    let instance_guard = acquire_instance_guard(&config.state_root)?;
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::Yes)?;
     let config_manager = Arc::new(ConfigManager::new(config.clone(), config_path.as_deref()));
-
-    let mut channels = ChannelRegistry::new();
-    channels.register(Arc::new(WebAdapter));
-    if config.voice_enabled() {
-        channels.register(Arc::new(VoiceAdapter));
-    }
-
-    #[cfg(feature = "channel-discord")]
-    if !config.discord_bots().is_empty() {
-        channels.register(Arc::new(
-            crate::channels::discord::DiscordAdapter::new_for_bots_with_manager(Arc::clone(
-                &config_manager,
-            )),
-        ));
-    }
-
-    #[cfg(feature = "channel-telegram")]
-    if !config.telegram_bots().is_empty() {
-        channels.register(Arc::new(
-            crate::channels::telegram::TelegramAdapter::new_multi_with_manager(Arc::clone(
-                &config_manager,
-            )),
-        ));
-    }
-
-    let channels = Arc::new(channels);
-    let mut tools = ToolRegistry::new(&config, Arc::clone(&deps.skills));
-    tools.set_config_manager(Arc::clone(&config_manager));
-
-    let workspace_dir = config.workspace_dir()?;
-    let mcp_manager = crate::tools::mcp::McpManager::new(&workspace_dir).await?;
-    let mcp_arc = Arc::new(tokio::sync::RwLock::new(mcp_manager));
-    tools.set_mcp_manager(Arc::clone(&mcp_arc));
-
-    tools.register_tool(Box::new(crate::tools::SendAttachmentTool::new(
-        workspace_dir.clone(),
-        Arc::clone(&channels),
-        Arc::clone(&deps.db),
-        deps.secret_db.clone(),
-    )));
-
-    // `AgentSendTool` durably accepts its target turn through the shared intake.
-    // Register it before the registry is wrapped in `Arc` (linear construction,
-    // no `Arc::get_mut` two-stage init); the intake is bound to the live runtime
-    // once `AppState` exists (below), so the tool never holds a reference back
-    // to the whole `AppState`.
-    let agent_send_intake = Arc::new(channel_input::TurnIntake::new());
-    tools.register_tool(Box::new(crate::tools::AgentSendTool::new_with_manager(
-        Arc::clone(&deps.db),
-        deps.secret_db.clone(),
-        Arc::clone(&channels),
-        Arc::clone(&agent_send_intake),
-        Arc::clone(&config_manager),
-    )));
-
-    let tools = Arc::new(tools);
+    let channels = build_channel_registry(&config, &config_manager);
+    let tooling = build_runtime_tooling(&config, &deps, &config_manager, &channels).await?;
 
     let runtime_status = Arc::new(RuntimeStatus::new());
 
@@ -397,8 +422,8 @@ pub async fn build_app_state_with_path(
         llm_override: None,
         channels,
         skills: deps.skills,
-        tools,
-        mcp_manager: Some(mcp_arc),
+        tools: tooling.tools,
+        mcp_manager: Some(Arc::clone(&tooling.mcp_manager)),
         assets: deps.assets,
         soul_agents: deps.soul_agents,
         memory_loader: deps.memory_loader,
@@ -406,37 +431,27 @@ pub async fn build_app_state_with_path(
         instance_guard: Arc::clone(&instance_guard),
     }));
 
-    // Bind the agent_send intake to the now-fully-built runtime. No
-    // `Arc::get_mut` is needed: the tool was registered during linear
-    // construction above, avoiding the fragile two-stage initialization.
-    agent_send_intake.bind(&state);
+    tooling.agent_send_intake.bind(&state);
+    recover_runtime_state(&state).await?;
+    spawn_runtime_background_tasks(&state, tooling.workspace_dir);
 
+    Ok(state)
+}
+
+async fn recover_runtime_state(state: &AppState) -> Result<(), EgoPulseError> {
     state.warm_up_calibrator().await;
+    recover_durable_state(state).await?;
+    rehydrate_origin_tracker(state)?;
+    crate::sleep::recover_memory_publication(state)?;
+    Ok(())
+}
 
-    // Recover durable Turn / Tool state left non-terminal by a prior crash.
-    // Running Tools become uncertain, and interrupted turn_runs stop safely.
-    // Fail-closed: a recovery failure aborts startup (see `recover_durable_state`).
-    recover_durable_state(&state).await?;
+fn spawn_runtime_background_tasks(state: &Arc<AppState>, workspace_dir: PathBuf) {
+    // Spawn order is part of the startup contract: recovered turns must be
+    // dispatched before MCP reconnect work begins.
+    spawn_turn_dispatcher(Arc::clone(state), state.supervisor.shutdown_token());
 
-    // Rehydrate the per-origin turn tracker from `turn_runs` so a chain that had
-    // already consumed turns before the crash keeps its per-chain limit.
-    // Must run before the turn dispatcher starts. Failure is fail-closed: if
-    // the counts cannot be rebuilt, startup aborts rather than silently
-    // resetting every chain's turn budget to zero.
-    rehydrate_origin_tracker(&state)?;
-
-    // Re-drive memory publication for sleep runs interrupted mid-publication.
-    // Must complete before the TurnDispatcher and Channels start so Turns never
-    // read a half-published memory bundle.
-    crate::sleep::recover_memory_publication(&state)?;
-
-    // Own long-lived background tasks through the supervisor so their lifetime
-    // and shutdown are centrally managed. Spawn order follows the startup
-    // contract: dispatcher first so recovered turns are picked up, then the
-    // MCP reconnect loop.
-    spawn_turn_dispatcher(Arc::clone(&state), state.supervisor.shutdown_token());
-
-    let mcp_arc = state
+    let mcp_manager = state
         .mcp_manager
         .as_ref()
         .expect("mcp manager initialized")
@@ -448,13 +463,11 @@ pub async fn build_app_state_with_path(
             Criticality::NonCritical,
         ),
         spawn_mcp_reconnect_loop(
-            mcp_arc,
-            workspace_dir.clone(),
+            mcp_manager,
+            workspace_dir,
             state.supervisor.shutdown_token(),
         ),
     );
-
-    Ok(state)
 }
 
 /// Recovers durable Turn / Tool state on startup.
@@ -564,12 +577,7 @@ pub fn build_sleep_app_state_with_path(
     config: Config,
     config_path: Option<PathBuf>,
 ) -> Result<AppState, EgoPulseError> {
-    // Acquire the exclusive instance lock before the database is opened, so a
-    // concurrent runtime against this state root is rejected.
-    std::fs::create_dir_all(Path::new(&config.state_root))
-        .map_err(|e| EgoPulseError::Internal(format!("failed to create state root: {e}")))?;
-    let instance_guard = InstanceGuard::acquire(Path::new(&config.state_root))?;
-    metrics::set_instance_lock_held(true);
+    let instance_guard = acquire_instance_guard(&config.state_root)?;
 
     let deps = build_app_state_dependencies(&config, ProvisionDefaultSoul::No)?;
     let channels = Arc::new(ChannelRegistry::new());
@@ -719,105 +727,165 @@ async fn dispatch_durable_turns(state: &AppState) -> Result<(), EgoPulseError> {
     let mut backlog_total: u64 = 0;
     let mut backlog_ok = true;
     for &scope in scopes {
-        let db = Arc::clone(state.db_for(scope));
-
-        // Observe the true backlog (not batch-capped) once per scope, outside
-        // the pagination loop, so the availability risk (unbounded durable
-        // growth under a runaway sender) stays visible without being multiplied
-        // by the page count.
-        match call_blocking(Arc::clone(&db), |db| db.count_durable_pending()).await {
-            Ok(count) => backlog_total += count as u64,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "durable backlog count failed; retaining previous gauge"
-                );
-                backlog_ok = false;
-            }
-        }
-
-        const MAX_PAGES_PER_TICK: u32 = 8;
-        let mut pages = 0u32;
-        let mut after_at = String::new();
-        let mut after_id = String::new();
-        loop {
-            let batch = call_blocking(Arc::clone(&db), {
-                let after_at = after_at.clone();
-                let after_id = after_id.clone();
-                move |db| {
-                    db.scan_durable_pending_turns_after(
-                        &after_at,
-                        &after_id,
-                        DISPATCHER_BATCH_LIMIT,
-                    )
-                }
-            })
-            .await
-            .map_err(EgoPulseError::from)?;
-
-            let batch_len = batch.len();
-            for crate::storage::DurablePendingTurn {
-                turn_id,
-                accepted_at,
-                scheduled_request_json: json,
-            } in batch
-            {
-                // Advance the in-tick cursor before dispatching so the next
-                // page resumes after this turn regardless of the dispatch
-                // outcome. Capacity-rejected turns are retried from the head on
-                // the next tick — the in-tick cursor only bounds work within a
-                // single tick and is never persisted.
-                after_at = accepted_at;
-                after_id = turn_id.clone();
-
-                let mut turn = match deserialize_scheduled_turn(&json) {
-                    Ok(turn) => turn,
-                    Err(_) => {
-                        let failed_turn_id = turn_id.clone();
-                        let result = call_blocking(Arc::clone(&db), move |db| {
-                            db.fail_invalid_durable_turn(&failed_turn_id)
-                        })
-                        .await;
-                        match result {
-                            Ok(()) => {}
-                            Err(crate::error::StorageError::Conflict(_)) => {
-                                tracing::debug!(
-                                    scope = %scope,
-                                    turn_id = %turn_id,
-                                    "durable turn state changed before invalid payload terminalization"
-                                );
-                                continue;
-                            }
-                            Err(error) => return Err(EgoPulseError::from(error)),
-                        }
-                        metrics::inc_durable_payload_invalid();
-                        tracing::warn!(
-                            scope = %scope,
-                            turn_id = %turn_id,
-                            error_kind = DURABLE_PAYLOAD_INVALID_ERROR_KIND,
-                            "terminalized durable turn with invalid payload"
-                        );
-                        continue;
-                    }
-                };
-                turn.turn_id = turn_id;
-                // Re-enqueue. The scheduler deduplicates by `turn_id`, so a
-                // turn already running or queued is an idempotent no-op; a turn
-                // the scheduler cannot accept yet (capacity) is left in the DB
-                // and retried on the next tick from the head.
-                let _ = channel_input::enqueue_durable_turn(state, turn);
-            }
-
-            pages += 1;
-            if (batch_len as i64) < DISPATCHER_BATCH_LIMIT || pages >= MAX_PAGES_PER_TICK {
-                break;
-            }
+        match dispatch_durable_turns_for_scope(state, scope).await? {
+            Some(count) => backlog_total += count,
+            None => backlog_ok = false,
         }
     }
     if backlog_ok {
         metrics::set_durable_pending_turns(backlog_total as usize);
     }
     Ok(())
+}
+
+async fn dispatch_durable_turns_for_scope(
+    state: &AppState,
+    scope: ConversationScope,
+) -> Result<Option<u64>, EgoPulseError> {
+    let db = Arc::clone(state.db_for(scope));
+    let backlog = match call_blocking(Arc::clone(&db), |db| db.count_durable_pending()).await {
+        Ok(count) => Some(count as u64),
+        Err(error) => {
+            tracing::warn!(
+                scope = %scope,
+                error = %error,
+                "durable backlog count failed; retaining previous gauge"
+            );
+            None
+        }
+    };
+
+    const MAX_PAGES_PER_TICK: u32 = 8;
+    let mut pages = 0u32;
+    let mut after_at = String::new();
+    let mut after_id = String::new();
+    loop {
+        let batch = call_blocking(Arc::clone(&db), {
+            let after_at = after_at.clone();
+            let after_id = after_id.clone();
+            move |db| {
+                db.scan_durable_pending_turns_after(&after_at, &after_id, DISPATCHER_BATCH_LIMIT)
+            }
+        })
+        .await
+        .map_err(EgoPulseError::from)?;
+
+        let batch_len = batch.len();
+        for crate::storage::DurablePendingTurn {
+            turn_id,
+            accepted_at,
+            scheduled_request_json: json,
+        } in batch
+        {
+            // Advance the in-tick cursor before dispatching so the next page
+            // resumes after this turn regardless of the dispatch outcome.
+            after_at = accepted_at;
+            after_id = turn_id.clone();
+
+            let mut turn = match deserialize_scheduled_turn(&json) {
+                Ok(turn) => turn,
+                Err(_) => {
+                    terminalize_invalid_durable_turn(&db, scope, &turn_id).await?;
+                    continue;
+                }
+            };
+            turn.turn_id = turn_id;
+            // Re-enqueue. The scheduler deduplicates by `turn_id`, so a turn
+            // already running or queued is an idempotent no-op; a turn rejected
+            // by capacity stays in the DB for the next tick.
+            let _ = channel_input::enqueue_durable_turn(state, turn);
+        }
+
+        pages += 1;
+        if (batch_len as i64) < DISPATCHER_BATCH_LIMIT || pages >= MAX_PAGES_PER_TICK {
+            break;
+        }
+    }
+
+    Ok(backlog)
+}
+
+async fn terminalize_invalid_durable_turn(
+    db: &Arc<Database>,
+    scope: ConversationScope,
+    turn_id: &str,
+) -> Result<(), EgoPulseError> {
+    let failed_turn_id = turn_id.to_owned();
+    match call_blocking(Arc::clone(db), move |db| {
+        db.fail_invalid_durable_turn(&failed_turn_id)
+    })
+    .await
+    {
+        Ok(()) => {
+            metrics::inc_durable_payload_invalid();
+            tracing::warn!(
+                scope = %scope,
+                turn_id,
+                error_kind = DURABLE_PAYLOAD_INVALID_ERROR_KIND,
+                "terminalized durable turn with invalid payload"
+            );
+        }
+        Err(crate::error::StorageError::Conflict(_)) => {
+            tracing::debug!(
+                scope = %scope,
+                turn_id,
+                "durable turn state changed before invalid payload terminalization"
+            );
+        }
+        Err(error) => return Err(EgoPulseError::from(error)),
+    }
+    Ok(())
+}
+
+async fn retry_durable_storage_write<Attempt, WriteFuture, IsAlreadyDone>(
+    state: &AppState,
+    identifier: &str,
+    operation: &str,
+    mut attempt: Attempt,
+    is_already_done: IsAlreadyDone,
+) -> Result<(), EgoPulseError>
+where
+    Attempt: FnMut() -> WriteFuture,
+    WriteFuture: std::future::Future<Output = Result<(), crate::error::StorageError>>,
+    IsAlreadyDone: Fn(&crate::error::StorageError) -> bool,
+{
+    let mut backoff = Duration::from_millis(50);
+    const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error) if is_already_done(&error) => {
+                tracing::debug!(
+                    operation,
+                    identifier,
+                    error = %error,
+                    "durable write already completed; treating as success"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                if state.supervisor.is_shutting_down() {
+                    tracing::info!(
+                        operation,
+                        identifier,
+                        error = %error,
+                        "shutdown during durable write retry; leaving state blocked"
+                    );
+                    return Err(EgoPulseError::from(error));
+                }
+                tracing::warn!(
+                    operation,
+                    identifier,
+                    backoff_ms = backoff.as_millis(),
+                    error = %error,
+                    "durable write transient failure; retrying with backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+    }
 }
 
 /// Persists the durable cancellation of a turn, retrying across transient
@@ -849,49 +917,31 @@ async fn persist_turn_cancellation(
     reason: &str,
     note: &str,
 ) -> Result<(), EgoPulseError> {
-    let mut backoff = Duration::from_millis(50);
-    const MAX_BACKOFF: Duration = Duration::from_secs(5);
-    loop {
-        let result = call_blocking(Arc::clone(state.db_for(scope)), {
-            let turn_id = turn_id.to_string();
-            let reason = reason.to_string();
-            let note = note.to_string();
-            move |db| db.cancel_turn(&turn_id, &reason, &note)
-        })
-        .await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(crate::error::StorageError::NotFound(_)) => {
-                tracing::debug!(turn_id, "cancel_turn: turn not found; treating as success");
-                return Ok(());
-            }
-            Err(crate::error::StorageError::Conflict(_)) => {
-                tracing::debug!(
-                    turn_id,
-                    "cancel_turn: turn past cancellable state; treating as success"
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                if state.supervisor.is_shutting_down() {
-                    tracing::info!(
-                        error = %error,
-                        turn_id,
-                        "shutdown during cancel_turn retry; leaving turn blocked"
-                    );
-                    return Err(EgoPulseError::from(error));
-                }
-                tracing::warn!(
-                    backoff_ms = backoff.as_millis(),
-                    error = %error,
-                    turn_id,
-                    "cancel_turn transient failure; retrying with backoff"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        }
-    }
+    let db = Arc::clone(state.db_for(scope));
+    let turn_id = turn_id.to_owned();
+    let identifier = turn_id.clone();
+    let reason = reason.to_owned();
+    let note = note.to_owned();
+
+    retry_durable_storage_write(
+        state,
+        &identifier,
+        "cancel_turn",
+        move || {
+            let db = Arc::clone(&db);
+            let turn_id = turn_id.clone();
+            let reason = reason.clone();
+            let note = note.clone();
+            call_blocking(db, move |db| db.cancel_turn(&turn_id, &reason, &note))
+        },
+        |error| {
+            matches!(
+                error,
+                crate::error::StorageError::NotFound(_) | crate::error::StorageError::Conflict(_)
+            )
+        },
+    )
+    .await
 }
 
 /// Durably records an origin's terminal stop reason in `turn_origins` so a
@@ -912,37 +962,26 @@ async fn persist_origin_terminal_reason(
     origin_id: &str,
     reason: turn_scheduler::StopReason,
 ) -> Result<(), EgoPulseError> {
-    let mut backoff = Duration::from_millis(50);
-    const MAX_BACKOFF: Duration = Duration::from_secs(5);
-    loop {
-        let result = call_blocking(Arc::clone(state.db_for(scope)), {
-            let origin_id = origin_id.to_string();
-            let reason = reason.to_string();
-            move |db| db.upsert_turn_origin(&origin_id, Some(&reason))
-        })
-        .await;
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                if state.supervisor.is_shutting_down() {
-                    tracing::info!(
-                        error = %error,
-                        origin_id,
-                        "shutdown during origin terminal reason persist; leaving turn blocked"
-                    );
-                    return Err(EgoPulseError::from(error));
-                }
-                tracing::warn!(
-                    backoff_ms = backoff.as_millis(),
-                    error = %error,
-                    origin_id,
-                    "upsert_turn_origin transient failure; retrying with backoff"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-        }
-    }
+    let db = Arc::clone(state.db_for(scope));
+    let origin_id = origin_id.to_owned();
+    let identifier = origin_id.clone();
+    let reason = reason.to_string();
+
+    retry_durable_storage_write(
+        state,
+        &identifier,
+        "upsert_turn_origin",
+        move || {
+            let db = Arc::clone(&db);
+            let origin_id = origin_id.clone();
+            let reason = reason.clone();
+            call_blocking(db, move |db| {
+                db.upsert_turn_origin(&origin_id, Some(&reason))
+            })
+        },
+        |_| false,
+    )
+    .await
 }
 
 pub(crate) fn execute_scheduled_turn(
@@ -950,390 +989,385 @@ pub(crate) fn execute_scheduled_turn(
     turn: crate::agent_loop::ScheduledTurn,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
-        let trace_id = uuid::Uuid::new_v4().to_string();
-        let mut turn = turn;
-        turn.context.trace_id = trace_id;
-
-        let session_key = turn.session_key();
-        let origin_id = if turn.origin_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            turn.origin_id.clone()
+        let Some((turn, session_key, origin_id)) = prepare_scheduled_turn(state, turn).await else {
+            return;
         };
 
-        state
-            .runtime_status
-            .touch_channel_activity(&turn.context.channel);
-
-        // Shutdown may have begun between acceptance and execution start. Once
-        // shutdown is in progress, no new turn is started: release the
-        // reservation and let the in-flight task complete so the supervisor can
-        // drain it. This closes the race between the intake gate and execution.
-        if state.supervisor.is_shutting_down() {
-            tracing::info!(
-                agent_id = %turn.context.agent_id,
-                origin_id = %origin_id,
-                "shutdown in progress: not starting submitted turn"
-            );
-            state.turn_tracker.release(&origin_id);
-            return;
-        }
-
-        // The origin was already reserved at acceptance (submit_scheduled_turn).
-        // Re-check here for queued turns whose chain terminated while waiting in
-        // the scheduler; release the reservation so capacity is not leaked.
-        if let Some(reason) = state.turn_tracker.terminal_reason(&origin_id) {
-            tracing::warn!(
-                agent_id = %turn.context.agent_id,
-                origin_id = %origin_id,
-                reason = ?reason,
-                "dropping turn: origin already has terminal stop reason"
-            );
-            // Fail-closed: persist the termination so the dispatcher never
-            // re-dispatches this accepted turn on its next 5s scan (otherwise it
-            // loops forever). On a cancellation-persist failure we must NOT
-            // release the reservation or start the next queued turn: leaving the
-            // session blocked (the current turn stays the scheduler's current
-            // turn) is the safe state, and startup rehydration will cancel it
-            // once the DB recovers.
-            match persist_turn_cancellation(
-                state,
-                turn.context.scope,
-                &turn.turn_id,
-                &reason.to_string(),
-                "origin chain already terminated",
-            )
-            .await
-            {
-                Ok(()) => {
-                    state.turn_tracker.release(&origin_id);
-                    drain_next_queued_turn(state, &session_key).await;
-                }
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        turn_id = %turn.turn_id,
-                        "durable cancellation failed; leaving turn blocked until DB recovers"
-                    );
-                }
-            }
-            return;
-        }
-
-        // A turn the dispatcher recovered in `input_committed` state must resume
-        // the already-committed model loop, not re-accept/re-persist the input
-        //. A turn still in `accepted` (or any other state) runs the
-        // normal intake+execute path, which finds the existing row and proceeds.
-        // Looked up *before* `try_begin_execution`: a transient DB failure here
-        // must NOT start the next queued turn (B) before this one (A) — the
-        // session's causal order would be destroyed. We retry the lookup with
-        // exponential backoff (capped at 5 s) so a transient DB outage does not
-        // wedge the session permanently: once the DB recovers the lookup
-        // succeeds and the turn proceeds in order. The loop aborts only on
-        // shutdown. We never drain the next queued turn from this branch.
-        let current_state = {
-            let mut backoff = Duration::from_millis(20);
-            const MAX_TURN_DB_BACKOFF: Duration = Duration::from_secs(5);
-            loop {
-                match call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
-                    let turn_id = turn.turn_id.clone();
-                    move |db| db.get_turn_run(&turn_id).map(|run| run.state)
-                })
-                .await
-                {
-                    Ok(state) => break Some(state),
-                    // Genuinely missing record: run the normal intake path, which will
-                    // re-accept the turn idempotently.
-                    Err(crate::error::StorageError::NotFound(_)) => break None,
-                    Err(error) => {
-                        if state.supervisor.is_shutting_down() {
-                            tracing::info!(
-                                error = %error,
-                                turn_id = %turn.turn_id,
-                                "shutdown during turn state lookup; leaving turn blocked"
-                            );
-                            return;
-                        }
-                        tracing::warn!(
-                            backoff_ms = backoff.as_millis(),
-                            error = %error,
-                            turn_id = %turn.turn_id,
-                            "dispatcher: turn state lookup failed; retrying with backoff"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_TURN_DB_BACKOFF);
-                    }
-                }
-            }
+        let current_state = match load_durable_turn_state(state, &turn).await {
+            DurableTurnStateLookup::Found(state) => state,
+            DurableTurnStateLookup::Shutdown => return,
         };
-
         let config_snapshot = turn
             .config_snapshot
             .clone()
             .unwrap_or_else(|| state.config_manager.current_blocking());
-        let valid_ids: Vec<&str> = config_snapshot
-            .config
-            .agents
-            .keys()
-            .map(|id| id.as_str())
-            .collect();
-        let chain_depth = turn.context.chain_depth;
-        let agent_id = &turn.context.agent_id;
 
-        // Atomically gate the turn and commit it to execution in a single
-        // tracker lock: the per-chain turn-count check and the executed-count
-        // increment happen together, so two concurrent turns for the same origin
-        // (different agent sessions share an origin) cannot both pass the limit.
-        // try_begin_execution consumes the reservation on both paths, so it must
-        // not be paired with a release() here. A turn whose chain already
-        // terminated while queued is dropped quietly by the re-check above; a
-        // new rejection records the terminal reason inside the call.
-        match state
-            .turn_tracker
-            .try_begin_execution(&origin_id, chain_depth, agent_id, &valid_ids)
-        {
-            Ok(_executed_turn_count) => {}
-            Err(reason) => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    chain_depth,
-                    reason = ?reason,
-                    "scheduled turn rejected by stop condition evaluator"
-                );
-                // Fail-closed: persist the stop so the dispatcher does not
-                // re-dispatch this accepted turn forever. The tracker already
-                // recorded the terminal reason for this process; the DB write
-                // makes the stop durable across restarts. On a cancellation
-                // failure we must NOT start the next queued turn: this turn
-                // stays blocked (its slot remains busy) until the DB recovers
-                // and startup rehydration re-drives cancellation.
-                // Fail-closed: persist the terminal reason before cancelling
-                // the turn or starting the next queued one. Without the durable
-                // write a restart would lose the stop and the dispatcher would
-                // re-dispatch this origin's accepted child turns. On failure we
-                // must NOT proceed — the session stays blocked until the DB
-                // recovers.
-                if let Err(error) = persist_origin_terminal_reason(
-                    state,
-                    turn.context.scope,
-                    &origin_id,
-                    reason.clone(),
-                )
-                .await
-                {
-                    tracing::error!(
-                        error = %error,
-                        origin_id = %origin_id,
-                        turn_id = %turn.turn_id,
-                        "durable terminal reason persist failed; leaving turn blocked"
-                    );
-                    return;
-                }
-                if let Err(error) = persist_turn_cancellation(
-                    state,
-                    turn.context.scope,
-                    &turn.turn_id,
-                    &reason.to_string(),
-                    &format!("turn rejected by stop condition: {reason:?}"),
-                )
-                .await
-                {
-                    tracing::error!(
-                        error = %error,
-                        turn_id = %turn.turn_id,
-                        "durable stop cancellation failed; leaving turn blocked"
-                    );
-                    return;
-                }
-                state.runtime_status.push_error(
-                    &turn.context.trace_id,
-                    "stop_condition",
-                    agent_id,
-                    &turn.context.channel,
-                    &format!("{reason:?}"),
-                );
-                crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
-                if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                    if let Err(error) = state
-                        .db_for(turn.context.scope)
-                        .store_system_event(log_chat_id, &reason)
-                    {
-                        tracing::warn!(error = %error, "failed to store system event for stop condition");
-                    }
-                }
-                drain_next_queued_turn(state, &session_key).await;
-                return;
-            }
+        if !begin_scheduled_turn(state, &turn, &origin_id, &session_key, &config_snapshot).await {
+            return;
         }
 
-        let adapter = state.channels.get(&turn.context.channel);
-        let external_chat_id = turn.context.session_key();
-        let _activity = match adapter {
-            Some(adapter) => match adapter.begin_turn_activity(&external_chat_id).await {
-                Ok(activity) => Some(activity),
-                Err(error) => {
-                    tracing::warn!(
-                        agent_id = %turn.context.agent_id,
-                        error = %error,
-                        "scheduled turn: failed to begin channel activity"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        execute_and_publish_scheduled_turn(
+            state,
+            &turn,
+            &origin_id,
+            &session_key,
+            current_state,
+            config_snapshot,
+        )
+        .await;
+    })
+}
 
-        let started_at = chrono::Utc::now().to_rfc3339();
-        let started = std::time::Instant::now();
+async fn prepare_scheduled_turn(
+    state: &AppState,
+    mut turn: crate::agent_loop::ScheduledTurn,
+) -> Option<(crate::agent_loop::ScheduledTurn, String, String)> {
+    turn.context.trace_id = uuid::Uuid::new_v4().to_string();
+    let session_key = turn.session_key();
+    let origin_id = if turn.origin_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        turn.origin_id.clone()
+    };
+    state
+        .runtime_status
+        .touch_channel_activity(&turn.context.channel);
 
-        let runtime = state.turn_runtime();
-        let turn_result = match current_state {
-            Some(TurnRunState::InputCommitted) => {
-                resume_input_committed_turn(
-                    &runtime,
-                    turn.context.scope,
-                    &turn.turn_id,
-                    Arc::clone(&config_snapshot),
-                )
-                .await
-            }
-            _ => {
-                execute_turn_with_progress_and_snapshot(
-                    state,
-                    &turn.context,
-                    &turn.input,
-                    Arc::clone(&config_snapshot),
-                )
-                .await
-            }
-        };
-        let duration = started.elapsed().as_secs_f64();
+    if state.supervisor.is_shutting_down() {
+        tracing::info!(
+            agent_id = %turn.context.agent_id,
+            origin_id = %origin_id,
+            "shutdown in progress: not starting submitted turn"
+        );
+        state.turn_tracker.release(&origin_id);
+        return None;
+    }
 
-        match turn_result {
-            Ok(response) => {
-                state.runtime_status.push_turn(
-                    &turn.context.trace_id,
-                    &turn.context.agent_id,
-                    &turn.context.channel,
-                    &started_at,
-                    duration,
-                    true,
-                );
-                if let Some(adapter) = adapter {
-                    if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
-                        tracing::warn!(
-                            agent_id = %turn.context.agent_id,
-                            error = %error,
-                            "scheduled turn: failed to send response to channel"
-                        );
-                        state.runtime_status.push_error(
-                            &origin_id,
-                            "channel_send",
-                            &turn.context.agent_id,
-                            &turn.context.channel,
-                            &error.to_string(),
-                        );
-                        crate::runtime::metrics::inc_turn_errors_total(
-                            "channel_send",
-                            &turn.context.agent_id,
-                        );
-                    }
-                }
-                if !response.is_empty() {
-                    if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                        let db = std::sync::Arc::clone(state.db_for(turn.context.scope));
-                        let agent_id = turn.context.agent_id.clone();
-                        let response_owned = response.clone();
-                        if let Err(error) = crate::storage::call_blocking(db, move |db| {
-                            db.store_channel_log_bot_response(
-                                log_chat_id,
-                                &agent_id,
-                                &response_owned,
-                            )
-                        })
-                        .await
-                        {
-                            tracing::warn!(error = %error, "failed to store bot response in Channel Log");
-                        }
-                    }
-                }
+    if let Some(reason) = state.turn_tracker.terminal_reason(&origin_id) {
+        tracing::warn!(
+            agent_id = %turn.context.agent_id,
+            origin_id = %origin_id,
+            reason = ?reason,
+            "dropping turn: origin already has terminal stop reason"
+        );
+
+        let reason_text = reason.to_string();
+        match persist_turn_cancellation(
+            state,
+            turn.context.scope,
+            &turn.turn_id,
+            &reason_text,
+            "origin chain already terminated",
+        )
+        .await
+        {
+            Ok(()) => {
+                state.turn_tracker.release(&origin_id);
+                drain_next_queued_turn(state, &session_key).await;
             }
             Err(error) => {
-                // A duplicate executor (recovered `input_committed` turn
-                // re-dispatched by the dispatcher, or a duplicate delivery) lost
-                // the `input_committed -> model_pending` CAS. Another executor
-                // owns the turn; exit cleanly without a failure message, without
-                // terminating the origin chain, and without marking the turn
-                // terminal. Just release the session slot.
-                if matches!(error, EgoPulseError::TurnConcurrencyConflict) {
-                    drain_next_queued_turn(state, &session_key).await;
-                    return;
-                }
-                state.runtime_status.push_turn(
-                    &turn.context.trace_id,
-                    &turn.context.agent_id,
-                    &turn.context.channel,
-                    &started_at,
-                    duration,
-                    false,
+                tracing::error!(
+                    error = %error,
+                    turn_id = %turn.turn_id,
+                    "durable cancellation failed; leaving turn blocked until DB recovers"
                 );
+            }
+        }
+        return None;
+    }
+
+    Some((turn, session_key, origin_id))
+}
+
+enum DurableTurnStateLookup {
+    Found(Option<TurnRunState>),
+    Shutdown,
+}
+
+async fn load_durable_turn_state(
+    state: &AppState,
+    turn: &crate::agent_loop::ScheduledTurn,
+) -> DurableTurnStateLookup {
+    let mut backoff = Duration::from_millis(20);
+    const MAX_TURN_DB_BACKOFF: Duration = Duration::from_secs(5);
+
+    loop {
+        match call_blocking(Arc::clone(state.db_for(turn.context.scope)), {
+            let turn_id = turn.turn_id.clone();
+            move |db| db.get_turn_run(&turn_id).map(|run| run.state)
+        })
+        .await
+        {
+            Ok(state) => return DurableTurnStateLookup::Found(Some(state)),
+            Err(crate::error::StorageError::NotFound(_)) => {
+                return DurableTurnStateLookup::Found(None);
+            }
+            Err(error) => {
+                if state.supervisor.is_shutting_down() {
+                    tracing::info!(
+                        error = %error,
+                        turn_id = %turn.turn_id,
+                        "shutdown during turn state lookup; leaving turn blocked"
+                    );
+                    return DurableTurnStateLookup::Shutdown;
+                }
+                tracing::warn!(
+                    backoff_ms = backoff.as_millis(),
+                    error = %error,
+                    turn_id = %turn.turn_id,
+                    "dispatcher: turn state lookup failed; retrying with backoff"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_TURN_DB_BACKOFF);
+            }
+        }
+    }
+}
+
+async fn begin_scheduled_turn(
+    state: &AppState,
+    turn: &crate::agent_loop::ScheduledTurn,
+    origin_id: &str,
+    session_key: &str,
+    config_snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
+) -> bool {
+    let valid_ids: Vec<&str> = config_snapshot
+        .config
+        .agents
+        .keys()
+        .map(|id| id.as_str())
+        .collect();
+    let chain_depth = turn.context.chain_depth;
+    let agent_id = &turn.context.agent_id;
+
+    match state
+        .turn_tracker
+        .try_begin_execution(origin_id, chain_depth, agent_id, &valid_ids)
+    {
+        Ok(_) => true,
+        Err(reason) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                chain_depth,
+                reason = ?reason,
+                "scheduled turn rejected by stop condition evaluator"
+            );
+            if let Err(error) =
+                persist_origin_terminal_reason(state, turn.context.scope, origin_id, reason.clone())
+                    .await
+            {
+                tracing::error!(
+                    error = %error,
+                    origin_id,
+                    turn_id = %turn.turn_id,
+                    "durable terminal reason persist failed; leaving turn blocked"
+                );
+                return false;
+            }
+            if let Err(error) = persist_turn_cancellation(
+                state,
+                turn.context.scope,
+                &turn.turn_id,
+                &reason.to_string(),
+                &format!("turn rejected by stop condition: {reason:?}"),
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %error,
+                    turn_id = %turn.turn_id,
+                    "durable stop cancellation failed; leaving turn blocked"
+                );
+                return false;
+            }
+
+            let reason_text = format!("{reason:?}");
+            state.runtime_status.push_error(
+                &turn.context.trace_id,
+                "stop_condition",
+                agent_id,
+                &turn.context.channel,
+                &reason_text,
+            );
+            crate::runtime::metrics::inc_turn_errors_total("stop_condition", agent_id);
+            if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                if let Err(error) = state
+                    .db_for(turn.context.scope)
+                    .store_system_event(log_chat_id, &reason)
+                {
+                    tracing::warn!(error = %error, "failed to store system event for stop condition");
+                }
+            }
+            drain_next_queued_turn(state, session_key).await;
+            false
+        }
+    }
+}
+
+async fn execute_and_publish_scheduled_turn(
+    state: &AppState,
+    turn: &crate::agent_loop::ScheduledTurn,
+    origin_id: &str,
+    session_key: &str,
+    current_state: Option<TurnRunState>,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+) {
+    let adapter = state.channels.get(&turn.context.channel).cloned();
+    let external_chat_id = turn.context.session_key();
+    let _activity = match adapter.as_ref() {
+        Some(adapter) => match adapter.begin_turn_activity(&external_chat_id).await {
+            Ok(activity) => Some(activity),
+            Err(error) => {
                 tracing::warn!(
                     agent_id = %turn.context.agent_id,
                     error = %error,
-                    "scheduled turn: process_turn failed"
+                    "scheduled turn: failed to begin channel activity"
                 );
-                state.runtime_status.push_error(
-                    &origin_id,
-                    "turn_failure",
-                    &turn.context.agent_id,
-                    &turn.context.channel,
-                    &error.to_string(),
-                );
-                crate::runtime::metrics::inc_turn_errors_total(
-                    "turn_failure",
-                    &turn.context.agent_id,
-                );
-                state
-                    .turn_tracker
-                    .set_terminal_reason(&origin_id, turn_scheduler::StopReason::LlmFailure);
-                // Fail-closed: durably remember the terminal stop reason so a
-                // restart does not silently resume this chain (and so its
-                // still-accepted child turns are rejected by the dispatcher
-                // after rehydration). On failure we must NOT send the failure
-                // notice, drain the next queued turn, or otherwise advance the
-                // session — the turn stays blocked until the DB recovers.
-                if let Err(persist_err) = persist_origin_terminal_reason(
-                    state,
-                    turn.context.scope,
-                    &origin_id,
-                    turn_scheduler::StopReason::LlmFailure,
-                )
-                .await
-                {
-                    tracing::error!(
-                        error = %persist_err,
-                        origin_id = %origin_id,
-                        turn_id = %turn.turn_id,
-                        "durable terminal reason persist failed; leaving turn blocked"
+                None
+            }
+        },
+        None => None,
+    };
+
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let started = std::time::Instant::now();
+    let runtime = state.turn_runtime();
+    let turn_result = match current_state {
+        Some(TurnRunState::InputCommitted) => {
+            resume_input_committed_turn(
+                &runtime,
+                turn.context.scope,
+                &turn.turn_id,
+                Arc::clone(&config_snapshot),
+            )
+            .await
+        }
+        _ => {
+            execute_turn_with_progress_and_snapshot(
+                state,
+                &turn.context,
+                &turn.input,
+                config_snapshot,
+            )
+            .await
+        }
+    };
+    let duration = started.elapsed().as_secs_f64();
+
+    match turn_result {
+        Ok(response) => {
+            state.runtime_status.push_turn(
+                &turn.context.trace_id,
+                &turn.context.agent_id,
+                &turn.context.channel,
+                &started_at,
+                duration,
+                true,
+            );
+            if let Some(adapter) = adapter.as_ref() {
+                if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
+                    tracing::warn!(
+                        agent_id = %turn.context.agent_id,
+                        error = %error,
+                        "scheduled turn: failed to send response to channel"
                     );
-                    return;
+                    state.runtime_status.push_error(
+                        origin_id,
+                        "channel_send",
+                        &turn.context.agent_id,
+                        &turn.context.channel,
+                        &error.to_string(),
+                    );
+                    crate::runtime::metrics::inc_turn_errors_total(
+                        "channel_send",
+                        &turn.context.agent_id,
+                    );
                 }
-                if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                    if let Err(db_err) = state
-                        .db_for(turn.context.scope)
-                        .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
-                    {
-                        tracing::warn!(error = %db_err, "failed to store LLM failure system event");
-                    }
-                }
-                send_turn_failure_to_channel(adapter, &external_chat_id, &error).await;
-                drain_next_queued_turn(state, &session_key).await;
+            }
+            store_scheduled_turn_response(state, turn, &response).await;
+        }
+        Err(error) => {
+            if matches!(error, EgoPulseError::TurnConcurrencyConflict) {
+                drain_next_queued_turn(state, session_key).await;
                 return;
             }
+            state.runtime_status.push_turn(
+                &turn.context.trace_id,
+                &turn.context.agent_id,
+                &turn.context.channel,
+                &started_at,
+                duration,
+                false,
+            );
+            tracing::warn!(
+                agent_id = %turn.context.agent_id,
+                error = %error,
+                "scheduled turn: process_turn failed"
+            );
+            state.runtime_status.push_error(
+                origin_id,
+                "turn_failure",
+                &turn.context.agent_id,
+                &turn.context.channel,
+                &error.to_string(),
+            );
+            crate::runtime::metrics::inc_turn_errors_total("turn_failure", &turn.context.agent_id);
+            state
+                .turn_tracker
+                .set_terminal_reason(origin_id, turn_scheduler::StopReason::LlmFailure);
+            if let Err(persist_err) = persist_origin_terminal_reason(
+                state,
+                turn.context.scope,
+                origin_id,
+                turn_scheduler::StopReason::LlmFailure,
+            )
+            .await
+            {
+                tracing::error!(
+                    error = %persist_err,
+                    origin_id,
+                    turn_id = %turn.turn_id,
+                    "durable terminal reason persist failed; leaving turn blocked"
+                );
+                return;
+            }
+            if let Some(log_chat_id) = turn.context.channel_log_chat_id {
+                if let Err(db_err) = state
+                    .db_for(turn.context.scope)
+                    .store_system_event(log_chat_id, &turn_scheduler::StopReason::LlmFailure)
+                {
+                    tracing::warn!(error = %db_err, "failed to store LLM failure system event");
+                }
+            }
+            send_turn_failure_to_channel(adapter.as_ref(), &external_chat_id, &error).await;
         }
+    }
 
-        drain_next_queued_turn(state, &session_key).await;
+    drain_next_queued_turn(state, session_key).await;
+}
+
+async fn store_scheduled_turn_response(
+    state: &AppState,
+    turn: &crate::agent_loop::ScheduledTurn,
+    response: &str,
+) {
+    if response.is_empty() {
+        return;
+    }
+    let Some(log_chat_id) = turn.context.channel_log_chat_id else {
+        return;
+    };
+
+    let db = Arc::clone(state.db_for(turn.context.scope));
+    let agent_id = turn.context.agent_id.clone();
+    let response = response.to_owned();
+    if let Err(error) = crate::storage::call_blocking(db, move |db| {
+        db.store_channel_log_bot_response(log_chat_id, &agent_id, &response)
     })
+    .await
+    {
+        tracing::warn!(error = %error, "failed to store bot response in Channel Log");
+    }
 }
 
 /// Drains the next queued turn for a session after the current turn completes.
@@ -1573,134 +1607,127 @@ pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(),
     channels::tui::run(state).await
 }
 
-/// Starts all enabled channels and supervises them until shutdown or failure.
-///
-/// Every long-lived task (channel listeners, schedulers) is owned by the
-/// runtime supervisor. The run loop watches for critical task failures and
-/// Ctrl-C; on either trigger it runs `RuntimeSupervisor::shutdown`, which
-/// stops accepting input, drains in-flight turns, then drains long-lived tasks
-/// within bounded deadlines.
-pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
-    let mut has_active_channels = false;
+fn spawn_web_channel(state: &Arc<AppState>) -> bool {
+    if !state.config.web_enabled() {
+        return false;
+    }
 
-    // Web サーバー起動
-    if state.config.web_enabled() {
-        has_active_channels = true;
-        let rs = Arc::clone(&state.runtime_status);
-        rs.update_channel("web", ChannelState::Starting);
-        let web_state = state.clone();
-        let host = state.config.web_host().to_owned();
-        let port = state.config.web_port();
-        let token = state.supervisor.shutdown_token();
-        info!("Starting Web UI server on {host}:{port}");
+    state
+        .runtime_status
+        .update_channel("web", ChannelState::Starting);
+    let web_state = Arc::clone(state);
+    let host = state.config.web_host().to_owned();
+    let port = state.config.web_port();
+    let token = state.supervisor.shutdown_token();
+    info!("Starting Web UI server on {host}:{port}");
+    state.supervisor.spawn_long_lived(
+        TaskSpec::new(TaskKind::Channel, "web", Criticality::Critical),
+        async move { crate::channels::web::run_server(web_state, &host, port, token).await },
+    );
+    true
+}
+
+#[cfg(feature = "channel-discord")]
+fn spawn_discord_channels(state: &Arc<AppState>) -> bool {
+    let bot_configs: Vec<_> = state
+        .config
+        .discord_bots()
+        .into_iter()
+        .map(|bot| (bot.bot_id.clone(), bot.token.to_string()))
+        .collect();
+
+    if bot_configs.is_empty() {
+        tracing::warn!(
+            "Discord channel is enabled but no bots have a token configured. \
+             Set channels.discord.bots.<id>.token in egopulse.config.yaml."
+        );
+        return false;
+    }
+
+    state
+        .runtime_status
+        .update_channel("discord", ChannelState::Starting);
+    let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
+    for (bot_id, token) in bot_configs {
+        let discord_state = Arc::clone(state);
+        info!("Starting Discord bot '{bot_id}'...");
+        let bot_id_for_task = bot_id.clone();
+        let chain_state = Arc::clone(&shared_chain_state);
+        let handle_name = format!("discord[{bot_id}]");
         state.supervisor.spawn_long_lived(
-            TaskSpec::new(TaskKind::Channel, "web", Criticality::Critical),
-            async move { crate::channels::web::run_server(web_state, &host, port, token).await },
+            TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
+            async move {
+                crate::channels::discord::start_discord_bot_for_bot(
+                    discord_state,
+                    &token,
+                    &bot_id_for_task,
+                    chain_state,
+                )
+                .await
+                .map_err(|error| {
+                    EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                        "discord bot ({bot_id_for_task}) failed: {error}",
+                    )))
+                })
+            },
         );
     }
+    true
+}
 
-    // Discord bot 起動 — Bot ごとに 1 つ以上の Discord client を起動する。
-    #[cfg(feature = "channel-discord")]
-    {
-        let bot_configs: Vec<_> = state
-            .config
-            .discord_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.clone(), b.token.to_string()))
-            .collect();
+#[cfg(feature = "channel-telegram")]
+fn spawn_telegram_channels(state: &Arc<AppState>) -> bool {
+    let bot_configs: Vec<_> = state
+        .config
+        .telegram_bots()
+        .into_iter()
+        .map(|bot| (bot.bot_id.clone(), bot.token.to_string()))
+        .collect();
 
-        if !bot_configs.is_empty() {
-            has_active_channels = true;
-            let rs = Arc::clone(&state.runtime_status);
-            rs.update_channel("discord", ChannelState::Starting);
-            let shared_chain_state = Arc::new(crate::channels::discord::BotChainState::new());
-            for (bot_id, token) in bot_configs {
-                let discord_state = Arc::clone(&state);
-                info!("Starting Discord bot '{bot_id}'...");
-                let bid = bot_id.clone();
-                let chain_state = Arc::clone(&shared_chain_state);
-                let handle_name = format!("discord[{bot_id}]");
-                state.supervisor.spawn_long_lived(
-                    TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
-                    async move {
-                        crate::channels::discord::start_discord_bot_for_bot(
-                            discord_state,
-                            &token,
-                            &bid,
-                            chain_state,
-                        )
-                        .await
-                        .map_err(|error| {
-                            EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                                "discord bot ({bid}) failed: {error}",
-                            )))
-                        })
-                    },
-                );
-            }
-        } else {
-            tracing::warn!(
-                "Discord channel is enabled but no bots have a token configured. \
-                 Set channels.discord.bots.<id>.token in egopulse.config.yaml."
-            );
-        }
-    }
-
-    // Telegram bot 起動
-    #[cfg(feature = "channel-telegram")]
-    {
-        let bot_configs: Vec<_> = state
-            .config
-            .telegram_bots()
-            .into_iter()
-            .map(|b| (b.bot_id.clone(), b.token.to_string()))
-            .collect();
-
-        if !bot_configs.is_empty() {
-            has_active_channels = true;
-            let rs = Arc::clone(&state.runtime_status);
-            rs.update_channel("telegram", ChannelState::Starting);
-            let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
-            for (bot_id, token) in bot_configs {
-                let telegram_state = Arc::clone(&state);
-                info!("Starting Telegram bot '{bot_id}'...");
-                let bid = bot_id.clone();
-                let chain_state = Arc::clone(&shared_chain_state);
-                let handle_name = format!("telegram[{bot_id}]");
-                state.supervisor.spawn_long_lived(
-                    TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
-                    async move {
-                        crate::channels::telegram::start_telegram_bot_for_bot(
-                            telegram_state,
-                            &token,
-                            &bid,
-                            chain_state,
-                        )
-                        .await
-                        .map_err(|error| {
-                            EgoPulseError::Channel(ChannelError::SendFailed(format!(
-                                "telegram bot ({bid}) failed: {error}",
-                            )))
-                        })
-                    },
-                );
-            }
-        } else if state.config.channel_enabled("telegram") {
+    if bot_configs.is_empty() {
+        if state.config.channel_enabled("telegram") {
             tracing::warn!(
                 "Telegram channel is enabled but no bots have a token configured. \
                  Set channels.telegram.bots.<id>.token in egopulse.config.yaml."
             );
         }
+        return false;
     }
 
-    if !has_active_channels {
-        return Err(EgoPulseError::Config(
-            crate::error::ConfigError::NoActiveChannels,
-        ));
+    state
+        .runtime_status
+        .update_channel("telegram", ChannelState::Starting);
+    let shared_chain_state = Arc::new(crate::channels::telegram::BotChainState::new());
+    for (bot_id, token) in bot_configs {
+        let telegram_state = Arc::clone(state);
+        info!("Starting Telegram bot '{bot_id}'...");
+        let bot_id_for_task = bot_id.clone();
+        let chain_state = Arc::clone(&shared_chain_state);
+        let handle_name = format!("telegram[{bot_id}]");
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(TaskKind::Channel, handle_name, Criticality::Critical),
+            async move {
+                crate::channels::telegram::start_telegram_bot_for_bot(
+                    telegram_state,
+                    &token,
+                    &bot_id_for_task,
+                    chain_state,
+                )
+                .await
+                .map_err(|error| {
+                    EgoPulseError::Channel(ChannelError::SendFailed(format!(
+                        "telegram bot ({bot_id_for_task}) failed: {error}",
+                    )))
+                })
+            },
+        );
     }
+    true
+}
 
+async fn spawn_runtime_services(state: &Arc<AppState>) {
     if state.config_path.is_some() {
-        let reload_state = Arc::clone(&state);
+        let reload_state = Arc::clone(state);
         let token = state.supervisor.shutdown_token();
         state.supervisor.spawn_long_lived(
             TaskSpec::new(
@@ -1712,7 +1739,7 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
         );
     }
 
-    let scheduler_state = state.clone();
+    let scheduler_state = Arc::clone(state);
     let token = state.supervisor.shutdown_token();
     info!("Starting sleep batch scheduler");
     state.supervisor.spawn_long_lived(
@@ -1724,17 +1751,13 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
         async move { crate::sleep::scheduler::run_scheduler_loop(scheduler_state, token).await },
     );
 
-    match crate::storage::call_blocking(std::sync::Arc::clone(&state.db), |db| {
-        db.reap_orphaned_pulse_runs()
-    })
-    .await
-    {
+    match call_blocking(Arc::clone(&state.db), |db| db.reap_orphaned_pulse_runs()).await {
         Ok(n) if n > 0 => info!("reaped {n} orphaned pulse_runs on startup"),
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "failed to reap orphaned pulse_runs on startup"),
     }
 
-    let pulse_state = (*state).clone();
+    let pulse_state = (**state).clone();
     let token = state.supervisor.shutdown_token();
     info!("Starting pulse scheduler");
     state.supervisor.spawn_long_lived(
@@ -1750,7 +1773,7 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     );
 
     if state.config.db.backup.scheduler_enabled() {
-        let backup_state = (*state).clone();
+        let backup_state = (**state).clone();
         let token = state.supervisor.shutdown_token();
         info!("Starting backup scheduler");
         state.supervisor.spawn_long_lived(
@@ -1762,23 +1785,21 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
             async move { backup_scheduler::run_backup_scheduler_loop(backup_state, token).await },
         );
     }
+}
 
-    // Recovery is complete and channels are starting; the runtime may now serve
-    // external input. Flipped back to false by `shutdown`.
+async fn supervise_runtime(state: &Arc<AppState>) -> Result<(), EgoPulseError> {
     state.supervisor.start_accepting();
     state.runtime_status.set_accepting_inputs(true);
-
     info!("Runtime active; waiting for Ctrl-C or channel failure");
 
     loop {
-        // Detect critical long-lived task failures (channel exit, worker panic).
         if let Some(outcome) = state.supervisor.poll_long_lived() {
             let summary = match outcome.result() {
                 supervisor::TaskResult::Ok => {
                     format!("critical task '{}' exited unexpectedly", outcome.name())
                 }
                 supervisor::TaskResult::Err(msg) => {
-                    format!("critical task '{}' failed: {}", outcome.name(), msg)
+                    format!("critical task '{}' failed: {msg}", outcome.name())
                 }
                 supervisor::TaskResult::Panic => {
                     format!("critical task '{}' panicked", outcome.name())
@@ -1807,6 +1828,35 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
     }
 }
 
+/// Starts all enabled channels and supervises them until shutdown or failure.
+///
+/// Every long-lived task (channel listeners, schedulers) is owned by the
+/// runtime supervisor. The run loop watches for critical task failures and
+/// Ctrl-C; on either trigger it runs `RuntimeSupervisor::shutdown`, which
+/// stops accepting input, drains in-flight turns, then drains long-lived tasks
+/// within bounded deadlines.
+pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
+    let mut has_active_channels = spawn_web_channel(&state);
+
+    #[cfg(feature = "channel-discord")]
+    {
+        has_active_channels |= spawn_discord_channels(&state);
+    }
+    #[cfg(feature = "channel-telegram")]
+    {
+        has_active_channels |= spawn_telegram_channels(&state);
+    }
+
+    if !has_active_channels {
+        return Err(EgoPulseError::Config(
+            crate::error::ConfigError::NoActiveChannels,
+        ));
+    }
+
+    spawn_runtime_services(&state).await;
+    supervise_runtime(&state).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1814,7 +1864,6 @@ mod tests {
 
     use super::*;
     use crate::agent_loop::ConversationScope;
-    use crate::agent_loop::soul_agents::SoulAgentsLoader;
     use crate::config::ResolvedLlmConfig;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
@@ -1888,8 +1937,6 @@ mod tests {
             "web never enabled"
         );
     }
-
-    // --- tool progress wiring (T16/T17/T19): coordinator must never hang the turn ---
 
     struct StubFinalProvider;
 
@@ -2001,60 +2048,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_turn_with_progress_terminates_on_success() {
-        // Arrange: a turn whose coordinator has no sink (web/cli channel).
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_provider(
-            dir.path().to_str().expect("utf8"),
+    async fn execute_turn_with_progress_terminates_on_success_and_failure() {
+        // A coordinator without a sink must terminate for both result paths;
+        // the failure path is important because it must also close the event
+        // stream.
+        let success_dir = tempfile::tempdir().expect("tempdir");
+        let success_state = crate::test_util::build_state_with_provider(
+            success_dir.path().to_str().expect("utf8"),
             Box::new(StubFinalProvider),
         );
-        let context = crate::test_util::cli_context("progress-success");
-
-        // Act: a bounded timeout proves the coordinator never hangs the turn.
-        let result = tokio::time::timeout(
+        let success_context = crate::test_util::cli_context("progress-success");
+        let success_result = tokio::time::timeout(
             Duration::from_secs(10),
             execute_turn_with_progress_and_snapshot(
-                &state,
-                &context,
+                &success_state,
+                &success_context,
                 "hello",
-                state.config_manager.current_blocking(),
+                success_state.config_manager.current_blocking(),
             ),
         )
         .await;
+        assert!(success_result.is_ok(), "success path must not hang");
+        assert_eq!(success_result.unwrap().expect("turn ok"), "ok");
 
-        // Assert
-        assert!(result.is_ok(), "execute_turn_with_progress must not hang");
-        assert_eq!(result.unwrap().expect("turn ok"), "ok");
-    }
-
-    #[tokio::test]
-    async fn execute_turn_with_progress_terminates_on_failure() {
-        // Arrange: the LLM always fails.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_provider(
-            dir.path().to_str().expect("utf8"),
+        let failure_dir = tempfile::tempdir().expect("tempdir");
+        let failure_state = crate::test_util::build_state_with_provider(
+            failure_dir.path().to_str().expect("utf8"),
             Box::new(StubFailingProvider),
         );
-        let context = crate::test_util::cli_context("progress-failure");
-
-        // Act: the failure path must also drop evt_tx and return bounded.
-        let result = tokio::time::timeout(
+        let failure_context = crate::test_util::cli_context("progress-failure");
+        let failure_result = tokio::time::timeout(
             Duration::from_secs(10),
             execute_turn_with_progress_and_snapshot(
-                &state,
-                &context,
+                &failure_state,
+                &failure_context,
                 "hello",
-                state.config_manager.current_blocking(),
+                failure_state.config_manager.current_blocking(),
             ),
         )
         .await;
-
-        // Assert
-        assert!(
-            result.is_ok(),
-            "execute_turn_with_progress must not hang on failure"
-        );
-        assert!(result.unwrap().is_err(), "turn should fail");
+        assert!(failure_result.is_ok(), "failure path must not hang");
+        assert!(failure_result.unwrap().is_err(), "turn should fail");
     }
 
     #[tokio::test]
@@ -2099,14 +2133,6 @@ mod tests {
         assert_eq!(user_messages, 1, "input must be persisted once");
     }
 
-    #[tokio::test]
-    async fn build_app_state_contains_soul_agents_loader() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
-        let state = build_app_state(config).await.expect("build state");
-        let _ = &*state.soul_agents;
-    }
-
     #[test]
     fn build_sleep_app_state_skips_mcp_initialization() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2121,23 +2147,8 @@ mod tests {
             "sleep state must not connect MCP servers"
         );
         assert_eq!(state.config_path.as_deref(), Some(config_path.as_path()));
-        let _ = &*state.memory_loader;
-    }
-
-    #[tokio::test]
-    async fn soul_agents_loader_loads_agents_from_config_paths() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state_root = dir.path().to_str().expect("utf8").to_string();
-        let config = test_config_for_runtime(state_root);
-        let loader = SoulAgentsLoader::new(&config);
-
-        assert!(loader.load_global_agents().is_none());
-
-        std::fs::write(dir.path().join("AGENTS.md"), "test agents content").expect("write");
-        assert_eq!(
-            loader.load_global_agents(),
-            Some("test agents content".to_string())
-        );
+        let snapshot = state.runtime_status.snapshot();
+        assert!(!snapshot.version.is_empty());
     }
 
     fn resolved_config(provider: &str, model: &str, base_url: &str) -> ResolvedLlmConfig {
@@ -2153,41 +2164,30 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_differs_when_provider_differs() {
-        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        let b = resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1");
-        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
-    }
-
-    #[test]
-    fn cache_key_differs_when_model_differs() {
-        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        let b = resolved_config("openai", "gpt-4o-mini", "https://api.openai.com/v1");
-        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
-    }
-
-    #[test]
-    fn cache_key_differs_when_base_url_differs() {
-        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        let b = resolved_config("openai", "gpt-4o", "https://proxy.example.com/v1");
-        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
-    }
-
-    #[test]
-    fn cache_key_differs_when_api_key_differs() {
-        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        let mut b = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        b.api_key = Some(secrecy::SecretString::new(
+    fn cache_key_separates_provider_model_url_and_api_key() {
+        let base = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let mut different_api_key = base.clone();
+        different_api_key.api_key = Some(secrecy::SecretString::new(
             "sk-other".to_string().into_boxed_str(),
         ));
-        assert_ne!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
-    }
 
-    #[test]
-    fn cache_key_same_for_identical_configs() {
-        let a = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        let b = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        assert_eq!(a.cache_key_with_revision(0), b.cache_key_with_revision(0));
+        for different in [
+            resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1"),
+            resolved_config("openai", "gpt-4o-mini", "https://api.openai.com/v1"),
+            resolved_config("openai", "gpt-4o", "https://proxy.example.com/v1"),
+            different_api_key,
+        ] {
+            assert_ne!(
+                base.cache_key_with_revision(0),
+                different.cache_key_with_revision(0)
+            );
+        }
+
+        let identical = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        assert_eq!(
+            base.cache_key_with_revision(0),
+            identical.cache_key_with_revision(0)
+        );
     }
 
     #[tokio::test]
@@ -2300,15 +2300,6 @@ mod tests {
     }
 
     #[test]
-    fn build_sleep_app_state_includes_runtime_status() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
-        let state = build_sleep_app_state_with_path(config, None).expect("build sleep state");
-        let snap = state.runtime_status.snapshot();
-        assert!(!snap.version.is_empty());
-    }
-
-    #[test]
     fn cap_observations_per_key_keeps_newest_n_for_shared_keys() {
         let mk = |created_at: &str, input: i64| CalibrationObservation {
             provider: "p".into(),
@@ -2345,26 +2336,7 @@ mod tests {
     }
 
     #[test]
-    fn db_for_returns_normal_db_for_normal_scope() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_sleep_state(&dir);
-        let result = state.db_for(ConversationScope::Normal);
-        assert!(Arc::ptr_eq(result, &state.db));
-    }
-
-    #[test]
-    fn db_for_returns_secret_db_for_secret_scope() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = build_sleep_state(&dir);
-        let secret_path = dir.path().join("runtime").join("secret.db");
-        let secret_db = Arc::new(Database::new_secret(&secret_path).expect("secret db"));
-        state.secret_db = Some(Arc::clone(&secret_db));
-        let result = state.db_for(ConversationScope::Secret);
-        assert!(Arc::ptr_eq(result, &secret_db));
-    }
-
-    #[test]
-    fn db_for_returns_database_for_conversation_scope() {
+    fn db_for_routes_normal_and_secret_scopes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut state = build_sleep_state(&dir);
         let secret_path = dir.path().join("runtime").join("secret.db");
@@ -2470,8 +2442,6 @@ mod tests {
         );
     }
 
-    // --- Fix 6: startup recovery must be fail-closed (abort on storage error) ---
-
     #[tokio::test]
     async fn recover_durable_state_fails_closed_on_storage_error() {
         use crate::agent_loop::ConversationScope;
@@ -2491,8 +2461,6 @@ mod tests {
             "startup recovery must abort (fail-closed) on storage failure"
         );
     }
-
-    // --- Fix 3: durable cancellation retries until DB recovers ---
 
     #[tokio::test]
     async fn persist_turn_cancellation_retries_until_db_recovers() {
@@ -2521,8 +2489,6 @@ mod tests {
             "cancellation must succeed after DB recovers (retry with backoff)"
         );
     }
-
-    // --- Fix 1 + Major: transient DB failure retries, then preserves turn order ---
 
     #[tokio::test]
     #[serial_test::serial]
@@ -2607,8 +2573,6 @@ mod tests {
             "turn B must have been drained after A completed"
         );
     }
-
-    // --- Blocker 1: dispatcher must re-scan capacity-rejected turns ---
 
     #[tokio::test]
     #[serial_test::serial]
@@ -2706,8 +2670,6 @@ mod tests {
         );
     }
 
-    // --- Blocker 2: terminal reason persist retries until DB recovers ---
-
     #[tokio::test]
     async fn persist_origin_terminal_reason_retries_until_db_recovers() {
         use crate::agent_loop::ConversationScope;
@@ -2733,8 +2695,6 @@ mod tests {
             "terminal reason persist must succeed after DB recovers"
         );
     }
-
-    // --- Major: permanent DB failure keeps the session blocked ---
 
     #[tokio::test]
     #[serial_test::serial]

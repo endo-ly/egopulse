@@ -292,6 +292,57 @@ fn systemctl_cmd(
         .map_err(|e| EgoPulseError::Internal(format!("failed to run systemctl --user: {e}")))
 }
 
+struct SystemdUserService {
+    runtime_dir: Option<String>,
+}
+
+impl SystemdUserService {
+    fn connect() -> Result<Self, EgoPulseError> {
+        Ok(Self {
+            runtime_dir: ensure_user_session()?,
+        })
+    }
+
+    fn from_current_environment() -> Self {
+        Self {
+            runtime_dir: std::env::var("XDG_RUNTIME_DIR").ok(),
+        }
+    }
+
+    fn with_runtime_dir(runtime_dir: Option<&str>) -> Self {
+        Self {
+            runtime_dir: runtime_dir.map(str::to_owned),
+        }
+    }
+
+    fn runtime_dir(&self) -> Option<&str> {
+        self.runtime_dir.as_deref()
+    }
+
+    fn command(&self, args: &[&str]) -> Result<std::process::Output, EgoPulseError> {
+        systemctl_cmd(args, self.runtime_dir())
+    }
+
+    fn ensure_success(&self, args: &[&str], action: &str) -> Result<(), EgoPulseError> {
+        ensure_success(self.command(args)?, action)
+    }
+
+    fn verify_started(&self) -> Result<(), EgoPulseError> {
+        verify_service_started(self.runtime_dir())
+    }
+
+    fn restart_and_verify(&self) -> Result<(), EgoPulseError> {
+        let output = self.command(&["restart", SERVICE_NAME])?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(EgoPulseError::Internal(format!(
+                "failed to restart egopulse service: {stderr}"
+            )));
+        }
+        self.verify_started()
+    }
+}
+
 fn ensure_success(output: std::process::Output, action: &str) -> Result<(), EgoPulseError> {
     if output.status.success() {
         return Ok(());
@@ -372,22 +423,14 @@ fn fetch_recent_service_logs(runtime_dir: Option<&str>) -> Option<String> {
     }
 }
 
-fn restart_service() -> Result<(), EgoPulseError> {
+fn restart_installed_service() -> Result<(), EgoPulseError> {
     let unit = unit_path()?;
     if !unit.exists() {
         println!("Service not installed, skipping restart");
         return Ok(());
     }
 
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-    let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(EgoPulseError::Internal(format!(
-            "failed to restart egopulse service: {stderr}"
-        )));
-    }
-    verify_service_started(runtime_dir.as_deref())?;
+    SystemdUserService::from_current_environment().restart_and_verify()?;
     println!("egopulse service restarted");
     Ok(())
 }
@@ -448,7 +491,11 @@ async fn fetch_live_status_at(
 }
 
 fn show_systemctl_status(runtime_dir: Option<&str>) -> Result<(), EgoPulseError> {
-    let output = systemctl_cmd(&["status", SERVICE_NAME, "--no-pager"], runtime_dir)?;
+    let output = SystemdUserService::with_runtime_dir(runtime_dir).command(&[
+        "status",
+        SERVICE_NAME,
+        "--no-pager",
+    ])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     print!("{stdout}{stderr}");
@@ -529,26 +576,34 @@ fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> Str
         Ok(v) => v,
         Err(_) => return health_json.to_owned(),
     };
-
-    let telemetry: Option<serde_json::Value> =
-        telemetry_json.and_then(|t| serde_json::from_str(t).ok());
+    let telemetry = telemetry_json.and_then(|t| serde_json::from_str(t).ok());
 
     let mut out = String::new();
+    append_health_status(&health, telemetry.is_none(), &mut out);
+    append_telemetry(telemetry.as_ref(), &mut out);
+    out
+}
 
-    let ok = health["ok"].as_bool().unwrap_or(false);
-    let status_label = if ok { "healthy" } else { "unhealthy" };
+fn append_health_status(
+    health: &serde_json::Value,
+    include_recent_error_count: bool,
+    out: &mut String,
+) {
+    let status_label = if health["ok"].as_bool().unwrap_or(false) {
+        "healthy"
+    } else {
+        "unhealthy"
+    };
     out.push_str(&format!("Service: active (systemd)  [{status_label}]\n\n"));
 
     if let Some(version) = health["version"].as_str() {
         let pid = health["pid"].as_u64().unwrap_or(0);
-        let uptime_secs = health["uptime_secs"].as_u64().unwrap_or(0);
-        let uptime = format_uptime(uptime_secs);
+        let uptime = format_uptime(health["uptime_secs"].as_u64().unwrap_or(0));
         out.push_str(&format!(
             "EgoPulse v{version}  PID {pid}  uptime {uptime}\n"
         ));
     }
 
-    // DB section
     if let Some(db) = health.get("db") {
         let db_ok = db["ok"].as_bool().unwrap_or(false);
         let marker = if db_ok { "●" } else { "✗" };
@@ -560,179 +615,174 @@ fn format_gateway_status(health_json: &str, telemetry_json: Option<&str>) -> Str
         out.push('\n');
         out.push_str("Channels\n");
         for name in ["web", "discord", "telegram"] {
-            if let Some(ch) = channels.get(name) {
-                let state = ch["state"].as_str().unwrap_or("unknown");
+            if let Some(channel) = channels.get(name) {
+                let state = channel["state"].as_str().unwrap_or("unknown");
                 let marker = if state == "running" { "●" } else { "✗" };
                 out.push_str(&format!("{name:>10} {marker} {state}\n"));
             }
         }
     }
 
-    // MCP section
-    if let Some(mcp) = health.get("mcp") {
-        if !mcp.is_null() {
-            let healthy = mcp["healthy"].as_u64().unwrap_or(0);
-            let failed = mcp["failed"].as_u64().unwrap_or(0);
-
-            let connected_names: Vec<String> = mcp
-                .get("servers")
-                .and_then(|s| s.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|s| s["connected"].as_bool().unwrap_or(false))
-                        .filter_map(|s| s["name"].as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let failed_names: Vec<String> = mcp
-                .get("servers")
-                .and_then(|s| s.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter(|s| !s["connected"].as_bool().unwrap_or(false))
-                        .filter_map(|s| s["name"].as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if !connected_names.is_empty() {
-                out.push_str(&format!(
-                    "MCP       {healthy} connected ({})\n",
-                    connected_names.join(", ")
-                ));
-            } else if healthy > 0 {
-                out.push_str(&format!("MCP       {healthy} connected\n"));
-            }
-
-            if !failed_names.is_empty() {
-                out.push_str(&format!(
-                    "          {failed} failed ({})\n",
-                    failed_names.join(", ")
-                ));
-            } else if failed > 0 {
-                out.push_str(&format!("          {failed} failed\n"));
-            }
-        }
-    }
+    append_mcp_status(health, out);
 
     if let Some(active_turns) = health.get("active_turns").and_then(|v| v.as_u64()) {
         out.push_str(&format!("Active Turns: {active_turns}\n"));
     }
 
-    // recent errors count (when no telemetry)
-    if telemetry.is_none() {
-        if let Some(count) = health.get("recent_errors_count").and_then(|v| v.as_u64()) {
-            if count > 0 {
-                out.push('\n');
-                out.push_str(&format!("Recent Errors (last 1h): {count}\n"));
-            }
-        }
+    if include_recent_error_count
+        && let Some(count) = health.get("recent_errors_count").and_then(|v| v.as_u64())
+        && count > 0
+    {
+        out.push('\n');
+        out.push_str(&format!("Recent Errors (last 1h): {count}\n"));
+    }
+}
+
+fn append_mcp_status(health: &serde_json::Value, out: &mut String) {
+    let Some(mcp) = health.get("mcp").filter(|mcp| !mcp.is_null()) else {
+        return;
+    };
+
+    let healthy = mcp["healthy"].as_u64().unwrap_or(0);
+    let failed = mcp["failed"].as_u64().unwrap_or(0);
+    let connected_names = mcp_server_names(mcp, true);
+    let failed_names = mcp_server_names(mcp, false);
+
+    if !connected_names.is_empty() {
+        out.push_str(&format!(
+            "MCP       {healthy} connected ({})\n",
+            connected_names.join(", ")
+        ));
+    } else if healthy > 0 {
+        out.push_str(&format!("MCP       {healthy} connected\n"));
     }
 
-    // Metrics section
-    if let Some(ref tel) = telemetry {
-        if let Some(metrics) = tel.get("metrics") {
-            if let Some(obj) = metrics.as_object() {
-                if !obj.is_empty() {
-                    let turns = sum_metric_values(obj, "egopulse_turns_total");
-                    let errors = sum_metric_values(obj, "egopulse_turn_errors_total");
-                    let tokens_in =
-                        sum_metric_by_label(obj, "egopulse_llm_tokens_total", "direction", "input");
-                    let tokens_out = sum_metric_by_label(
-                        obj,
-                        "egopulse_llm_tokens_total",
-                        "direction",
-                        "output",
-                    );
-                    let tool_calls = sum_metric_values(obj, "egopulse_tool_calls_total");
+    if !failed_names.is_empty() {
+        out.push_str(&format!(
+            "          {failed} failed ({})\n",
+            failed_names.join(", ")
+        ));
+    } else if failed > 0 {
+        out.push_str(&format!("          {failed} failed\n"));
+    }
+}
 
-                    let has_any = turns.is_some()
-                        || errors.is_some()
-                        || tokens_in.is_some()
-                        || tokens_out.is_some()
-                        || tool_calls.is_some();
+fn mcp_server_names(mcp: &serde_json::Value, connected: bool) -> Vec<String> {
+    mcp.get("servers")
+        .and_then(serde_json::Value::as_array)
+        .map(|servers| {
+            servers
+                .iter()
+                .filter(|server| server["connected"].as_bool().unwrap_or(false) == connected)
+                .filter_map(|server| server["name"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
-                    if has_any {
-                        out.push('\n');
-                        out.push_str("Metrics\n");
+fn append_telemetry(telemetry: Option<&serde_json::Value>, out: &mut String) {
+    append_metrics(telemetry, out);
+    append_telemetry_details(telemetry, out);
+}
 
-                        if turns.is_some() || errors.is_some() {
-                            let mut line = String::from("  ");
-                            if let Some(t) = turns {
-                                line.push_str(&format!("Turns: {t}  "));
-                            }
-                            if let Some(e) = errors {
-                                line.push_str(&format!("Errors: {e}  "));
-                            }
-                            out.push_str(line.trim_end());
-                            out.push('\n');
-                        }
+fn append_metrics(telemetry: Option<&serde_json::Value>, out: &mut String) {
+    let Some(metrics) = telemetry
+        .and_then(|telemetry| telemetry.get("metrics"))
+        .and_then(serde_json::Value::as_object)
+        .filter(|metrics| !metrics.is_empty())
+    else {
+        return;
+    };
 
-                        if tokens_in.is_some() || tokens_out.is_some() {
-                            let mut line = String::from("  Tokens:");
-                            if let Some(ti) = tokens_in {
-                                line.push_str(&format!(" {ti} in"));
-                            }
-                            if let Some(to) = tokens_out {
-                                line.push_str(&format!(" / {to} out"));
-                            }
-                            out.push_str(&line);
-                            out.push('\n');
-                        }
+    let turns = sum_metric_values(metrics, "egopulse_turns_total");
+    let errors = sum_metric_values(metrics, "egopulse_turn_errors_total");
+    let tokens_in = sum_metric_by_label(metrics, "egopulse_llm_tokens_total", "direction", "input");
+    let tokens_out =
+        sum_metric_by_label(metrics, "egopulse_llm_tokens_total", "direction", "output");
+    let tool_calls = sum_metric_values(metrics, "egopulse_tool_calls_total");
 
-                        if let Some(tc) = tool_calls {
-                            out.push_str(&format!("  Tool Calls: {tc}\n"));
-                        }
-                    }
-                }
-            }
-        }
+    if turns.is_none()
+        && errors.is_none()
+        && tokens_in.is_none()
+        && tokens_out.is_none()
+        && tool_calls.is_none()
+    {
+        return;
     }
 
-    if let Some(ref tel) = telemetry {
-        if let Some(errors) = tel.get("recent_errors").and_then(|v| v.as_array()) {
-            if !errors.is_empty() {
-                out.push('\n');
-                out.push_str(&format!("Recent Errors (last 1h): {}\n", errors.len()));
-                for err in errors.iter().take(5) {
-                    let kind = err["error_kind"].as_str().unwrap_or("?");
-                    let trace = err["trace_id"].as_str().unwrap_or("?");
-                    let summary = err["summary"].as_str().unwrap_or("");
-                    out.push_str(&format!("  [{kind}] trace={trace} {summary}\n"));
-                }
-            }
-        }
+    out.push('\n');
+    out.push_str("Metrics\n");
 
-        if let Some(turns) = tel.get("recent_turns").and_then(|v| v.as_array()) {
-            if !turns.is_empty() {
-                out.push('\n');
-                let last_turns: Vec<&serde_json::Value> = turns.iter().rev().take(5).collect();
-                out.push_str(&format!(
-                    "Recent Turns (last {} shown):\n",
-                    last_turns.len()
-                ));
-                for turn in last_turns {
-                    let agent = turn["agent_id"].as_str().unwrap_or("?");
-                    let channel = turn["channel"].as_str().unwrap_or("?");
-                    let ok_marker = if turn["ok"].as_bool().unwrap_or(false) {
-                        "ok"
-                    } else {
-                        "FAIL"
-                    };
-                    let dur = turn["duration_secs"].as_f64().unwrap_or(0.0);
-                    out.push_str(&format!("  {agent}/{channel} [{ok_marker}] {dur:.1}s\n"));
-                }
-            }
+    if turns.is_some() || errors.is_some() {
+        let mut line = String::from("  ");
+        if let Some(turns) = turns {
+            line.push_str(&format!("Turns: {turns}  "));
         }
-    } else if let Some(count) = health.get("recent_errors_count").and_then(|v| v.as_u64()) {
-        if count > 0 {
+        if let Some(errors) = errors {
+            line.push_str(&format!("Errors: {errors}  "));
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+
+    if tokens_in.is_some() || tokens_out.is_some() {
+        let mut line = String::from("  Tokens:");
+        if let Some(tokens_in) = tokens_in {
+            line.push_str(&format!(" {tokens_in} in"));
+        }
+        if let Some(tokens_out) = tokens_out {
+            line.push_str(&format!(" / {tokens_out} out"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    if let Some(tool_calls) = tool_calls {
+        out.push_str(&format!("  Tool Calls: {tool_calls}\n"));
+    }
+}
+
+fn append_telemetry_details(telemetry: Option<&serde_json::Value>, out: &mut String) {
+    let Some(telemetry) = telemetry else {
+        return;
+    };
+
+    if let Some(errors) = telemetry.get("recent_errors").and_then(|v| v.as_array()) {
+        if !errors.is_empty() {
             out.push('\n');
-            out.push_str(&format!("Recent Errors (last 1h): {count}\n"));
+            out.push_str(&format!("Recent Errors (last 1h): {}\n", errors.len()));
+            for error in errors.iter().take(5) {
+                let kind = error["error_kind"].as_str().unwrap_or("?");
+                let trace = error["trace_id"].as_str().unwrap_or("?");
+                let summary = error["summary"].as_str().unwrap_or("");
+                out.push_str(&format!("  [{kind}] trace={trace} {summary}\n"));
+            }
         }
     }
 
-    out
+    if let Some(turns) = telemetry.get("recent_turns").and_then(|v| v.as_array()) {
+        if !turns.is_empty() {
+            out.push('\n');
+            let last_turns: Vec<&serde_json::Value> = turns.iter().rev().take(5).collect();
+            out.push_str(&format!(
+                "Recent Turns (last {} shown):\n",
+                last_turns.len()
+            ));
+            for turn in last_turns {
+                let agent = turn["agent_id"].as_str().unwrap_or("?");
+                let channel = turn["channel"].as_str().unwrap_or("?");
+                let ok_marker = if turn["ok"].as_bool().unwrap_or(false) {
+                    "ok"
+                } else {
+                    "FAIL"
+                };
+                let duration = turn["duration_secs"].as_f64().unwrap_or(0.0);
+                out.push_str(&format!(
+                    "  {agent}/{channel} [{ok_marker}] {duration:.1}s\n"
+                ));
+            }
+        }
+    }
 }
 
 fn print_gateway_status_text(health_json: &str, telemetry_json: Option<&str>) {
@@ -763,14 +813,9 @@ fn merge_health_and_telemetry(health_json: &str, telemetry_json: Option<&str>) -
     serde_json::to_string_pretty(&merged).unwrap_or_else(|_| health_json.to_owned())
 }
 
-/// Executes the requested gateway action for the EgoPulse systemd service.
-pub async fn run_gateway(
-    cli_config: Option<&PathBuf>,
-    action: Option<GatewayAction>,
-) -> Result<(), EgoPulseError> {
-    let Some(action) = action else {
-        println!(
-            r#"Gateway service management
+fn print_gateway_help() {
+    println!(
+        r#"Gateway service management
 
 USAGE:
     egopulse gateway <ACTION>
@@ -783,158 +828,145 @@ ACTIONS:
     status       Show systemd service status
     restart      Restart the systemd service
 "#
+    );
+}
+
+fn install_service(cli_config: Option<&PathBuf>) -> Result<(), EgoPulseError> {
+    let systemd = SystemdUserService::connect()?;
+    let exe_path = std::env::current_exe()
+        .map_err(|e| EgoPulseError::Internal(format!("failed to resolve binary path: {e}")))?;
+    let config_path = resolve_config_for_service(cli_config)?;
+    if !config_path.exists() {
+        return Err(EgoPulseError::Internal(format!(
+            "Config not found at: {}. Run 'egopulse setup' first, then retry.",
+            config_path.display()
+        )));
+    }
+
+    let unit = unit_path()?;
+    let unit_dir = unit
+        .parent()
+        .ok_or_else(|| EgoPulseError::Internal("invalid unit file path".into()))?;
+    std::fs::create_dir_all(unit_dir)
+        .map_err(|e| EgoPulseError::Internal(format!("failed to create unit directory: {e}")))?;
+
+    let already_installed = unit.exists();
+    let unit_content = render_systemd_unit(
+        &exe_path.to_string_lossy(),
+        &config_path,
+        &build_service_env(),
+    );
+    std::fs::write(&unit, unit_content)
+        .map_err(|e| EgoPulseError::Internal(format!("failed to write unit file: {e}")))?;
+
+    systemd.ensure_success(&["daemon-reload"], "daemon-reload")?;
+
+    if already_installed {
+        systemd.ensure_success(&["restart", SERVICE_NAME], "restart service")?;
+        systemd.verify_started()?;
+        println!("Updated and restarted egopulse service: {}", unit.display());
+    } else {
+        systemd.ensure_success(&["enable", "--now", SERVICE_NAME], "enable service")?;
+        systemd.verify_started()?;
+        println!("Installed and started egopulse service: {}", unit.display());
+    }
+    Ok(())
+}
+
+fn start_service() -> Result<(), EgoPulseError> {
+    let systemd = SystemdUserService::connect()?;
+    systemd.ensure_success(&["start", SERVICE_NAME], "start service")?;
+    systemd.verify_started()?;
+    println!("egopulse service started");
+    Ok(())
+}
+
+fn stop_service() -> Result<(), EgoPulseError> {
+    let systemd = SystemdUserService::connect()?;
+    systemd.ensure_success(&["stop", SERVICE_NAME], "stop service")?;
+    println!("egopulse service stopped");
+    Ok(())
+}
+
+fn uninstall_service() -> Result<(), EgoPulseError> {
+    let systemd = SystemdUserService::connect()?;
+    let _ = systemd.command(&["disable", "--now", SERVICE_NAME]);
+
+    let unit = unit_path()?;
+    if unit.exists() {
+        std::fs::remove_file(&unit)
+            .map_err(|e| EgoPulseError::Internal(format!("failed to remove unit file: {e}")))?;
+    }
+    systemd.ensure_success(&["daemon-reload"], "daemon-reload")?;
+
+    println!("Uninstalled egopulse service");
+    Ok(())
+}
+
+async fn show_gateway_status(
+    cli_config: Option<&PathBuf>,
+    json: bool,
+) -> Result<(), EgoPulseError> {
+    let systemd = SystemdUserService::connect()?;
+    let is_active_output = systemd.command(&["is-active", SERVICE_NAME])?;
+    let is_active = String::from_utf8_lossy(&is_active_output.stdout).trim() == "active";
+
+    if is_active {
+        match fetch_live_status(cli_config).await {
+            Some((health_json, telemetry_json)) if json => {
+                let merged = merge_health_and_telemetry(&health_json, telemetry_json.as_deref());
+                println!("{merged}");
+            }
+            Some((health_json, telemetry_json)) => {
+                print_gateway_status_text(&health_json, telemetry_json.as_deref());
+            }
+            None => show_systemctl_status(systemd.runtime_dir())?,
+        }
+    } else if json {
+        let state = String::from_utf8_lossy(&is_active_output.stdout)
+            .trim()
+            .to_string();
+        let status_json = serde_json::json!({
+            "ok": false,
+            "service": state,
+            "recent_logs": fetch_recent_service_logs(systemd.runtime_dir()),
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status_json).unwrap_or_default()
         );
+    } else {
+        show_systemctl_status(systemd.runtime_dir())?;
+        if let Some(logs) = fetch_recent_service_logs(systemd.runtime_dir()) {
+            println!("\nLast error:\n{logs}");
+        }
+    }
+    Ok(())
+}
+
+fn restart_service_action() -> Result<(), EgoPulseError> {
+    SystemdUserService::connect()?.restart_and_verify()?;
+    println!("egopulse service restarted");
+    Ok(())
+}
+
+/// Executes the requested gateway action for the EgoPulse systemd service.
+pub async fn run_gateway(
+    cli_config: Option<&PathBuf>,
+    action: Option<GatewayAction>,
+) -> Result<(), EgoPulseError> {
+    let Some(action) = action else {
+        print_gateway_help();
         return Ok(());
     };
 
     match action {
-        GatewayAction::Install => {
-            let runtime_dir = ensure_user_session()?;
-
-            let exe_path = std::env::current_exe().map_err(|e| {
-                EgoPulseError::Internal(format!("failed to resolve binary path: {e}"))
-            })?;
-            let config_path = resolve_config_for_service(cli_config)?;
-            if !config_path.exists() {
-                return Err(EgoPulseError::Internal(format!(
-                    "Config not found at: {}. Run 'egopulse setup' first, then retry.",
-                    config_path.display()
-                )));
-            }
-
-            let service_env = build_service_env();
-
-            let unit = unit_path()?;
-            let unit_dir = unit
-                .parent()
-                .ok_or_else(|| EgoPulseError::Internal("invalid unit file path".into()))?;
-            std::fs::create_dir_all(unit_dir).map_err(|e| {
-                EgoPulseError::Internal(format!("failed to create unit directory: {e}"))
-            })?;
-
-            let already_installed = unit.exists();
-            let unit_content =
-                render_systemd_unit(&exe_path.to_string_lossy(), &config_path, &service_env);
-            std::fs::write(&unit, &unit_content)
-                .map_err(|e| EgoPulseError::Internal(format!("failed to write unit file: {e}")))?;
-
-            ensure_success(
-                systemctl_cmd(&["daemon-reload"], runtime_dir.as_deref())?,
-                "daemon-reload",
-            )?;
-
-            if already_installed {
-                ensure_success(
-                    systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?,
-                    "restart service",
-                )?;
-                verify_service_started(runtime_dir.as_deref())?;
-                println!("Updated and restarted egopulse service: {}", unit.display());
-            } else {
-                ensure_success(
-                    systemctl_cmd(&["enable", "--now", SERVICE_NAME], runtime_dir.as_deref())?,
-                    "enable service",
-                )?;
-                verify_service_started(runtime_dir.as_deref())?;
-                println!("Installed and started egopulse service: {}", unit.display());
-            }
-            Ok(())
-        }
-        GatewayAction::Start => {
-            let runtime_dir = ensure_user_session()?;
-            ensure_success(
-                systemctl_cmd(&["start", SERVICE_NAME], runtime_dir.as_deref())?,
-                "start service",
-            )?;
-            verify_service_started(runtime_dir.as_deref())?;
-            println!("egopulse service started");
-            Ok(())
-        }
-        GatewayAction::Stop => {
-            let runtime_dir = ensure_user_session()?;
-            ensure_success(
-                systemctl_cmd(&["stop", SERVICE_NAME], runtime_dir.as_deref())?,
-                "stop service",
-            )?;
-            println!("egopulse service stopped");
-            Ok(())
-        }
-        GatewayAction::Uninstall => {
-            let runtime_dir = ensure_user_session()?;
-            let _ = systemctl_cmd(&["disable", "--now", SERVICE_NAME], runtime_dir.as_deref());
-            let _ = systemctl_cmd(&["daemon-reload"], runtime_dir.as_deref());
-
-            let unit = unit_path()?;
-            if unit.exists() {
-                std::fs::remove_file(&unit).map_err(|e| {
-                    EgoPulseError::Internal(format!("failed to remove unit file: {e}"))
-                })?;
-            }
-            ensure_success(
-                systemctl_cmd(&["daemon-reload"], runtime_dir.as_deref())?,
-                "daemon-reload",
-            )?;
-
-            println!("Uninstalled egopulse service");
-            Ok(())
-        }
-        GatewayAction::Status { json } => {
-            let runtime_dir = ensure_user_session()?;
-
-            let is_active_output =
-                systemctl_cmd(&["is-active", SERVICE_NAME], runtime_dir.as_deref())?;
-            let is_active = String::from_utf8_lossy(&is_active_output.stdout).trim() == "active";
-
-            if is_active {
-                let live_status = fetch_live_status(cli_config).await;
-
-                match live_status {
-                    Some((health_json, telemetry_json)) => {
-                        if json {
-                            let merged =
-                                merge_health_and_telemetry(&health_json, telemetry_json.as_deref());
-                            println!("{merged}");
-                        } else {
-                            print_gateway_status_text(&health_json, telemetry_json.as_deref());
-                        }
-                    }
-                    None => show_systemctl_status(runtime_dir.as_deref())?,
-                }
-            } else if json {
-                let state = String::from_utf8_lossy(&is_active_output.stdout)
-                    .trim()
-                    .to_string();
-                let logs = fetch_recent_service_logs(runtime_dir.as_deref());
-                let status_json = serde_json::json!({
-                    "ok": false,
-                    "service": state,
-                    "recent_logs": logs,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&status_json).unwrap_or_default()
-                );
-            } else {
-                show_systemctl_status(runtime_dir.as_deref())?;
-                if let Some(logs) = fetch_recent_service_logs(runtime_dir.as_deref()) {
-                    println!("\nLast error:\n{logs}");
-                }
-            }
-            Ok(())
-        }
-        GatewayAction::Restart => {
-            let runtime_dir = ensure_user_session()?;
-            let output = systemctl_cmd(&["restart", SERVICE_NAME], runtime_dir.as_deref())?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                return Err(EgoPulseError::Internal(format!(
-                    "failed to restart egopulse service: {stderr}"
-                )));
-            }
-            verify_service_started(runtime_dir.as_deref())?;
-            println!("egopulse service restarted");
-            Ok(())
-        }
+        GatewayAction::Install => install_service(cli_config),
+        GatewayAction::Start => start_service(),
+        GatewayAction::Stop => stop_service(),
+        GatewayAction::Uninstall => uninstall_service(),
+        GatewayAction::Status { json } => show_gateway_status(cli_config, json).await,
+        GatewayAction::Restart => restart_service_action(),
     }
 }
 
@@ -977,7 +1009,7 @@ pub async fn run_update() -> Result<(), EgoPulseError> {
     replace_binary(&new_binary.path)?;
 
     println!("Restarting service...");
-    restart_service()?;
+    restart_installed_service()?;
     println!("Update completed: {VERSION} -> {tag_name}");
     Ok(())
 }
@@ -1112,12 +1144,22 @@ fn resolve_checksum_url(assets: &[serde_json::Value]) -> Option<String> {
     })
 }
 
-/// Downloads a tar.gz archive, extracts the `egopulse` binary, and returns its path.
+/// Downloads, verifies, and extracts the `egopulse` binary from a tar.gz archive.
 async fn download_and_extract(
     client: &reqwest::Client,
     url: &str,
     checksum_url: &str,
 ) -> Result<ExtractedBinary, EgoPulseError> {
+    let bytes = download_archive(client, url).await?;
+
+    eprint!("  Verifying checksum... ");
+    verify_archive_checksum(client, url, checksum_url, &bytes).await?;
+    eprintln!("ok");
+
+    extract_binary(&bytes)
+}
+
+async fn download_archive(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, EgoPulseError> {
     let mut resp = client
         .get(url)
         .send()
@@ -1158,12 +1200,12 @@ async fn download_and_extract(
     }
     eprintln!();
 
-    eprint!("  Verifying checksum... ");
-    verify_archive_checksum(client, url, checksum_url, bytes.as_ref()).await?;
-    eprintln!("ok");
+    Ok(bytes)
+}
 
+fn extract_binary(bytes: &[u8]) -> Result<ExtractedBinary, EgoPulseError> {
     eprint!("  Extracting binary... ");
-    let gz = flate2::read::GzDecoder::new(bytes.as_slice());
+    let gz = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(gz);
 
     let tmp_dir = tempfile::tempdir()
@@ -1348,7 +1390,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn render_systemd_unit_contains_expected_directives() {
+    fn render_systemd_unit_preserves_service_contract() {
         let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
         let mut service_env = BTreeMap::new();
         service_env.insert("HOME".to_string(), "/home/user".to_string());
@@ -1369,29 +1411,26 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
         assert!(unit.contains("Environment=HOME=/home/user"));
         assert!(unit.contains("Environment=PATH="));
+
+        let without_env = render_systemd_unit(
+            "/home/user/.local/bin/egopulse",
+            &config_path,
+            &BTreeMap::new(),
+        );
+        assert!(!without_env.contains("Environment="));
     }
 
     #[test]
     fn render_systemd_unit_escapes_config_path_with_special_chars() {
         let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
-        let service_env = BTreeMap::new();
-
-        let unit =
-            render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
+        let unit = render_systemd_unit(
+            "/home/user/.local/bin/egopulse",
+            &config_path,
+            &BTreeMap::new(),
+        );
 
         assert!(unit.contains("/tmp/ego pulse/config dir/egopulse.config.yaml"));
         assert!(unit.contains("WantedBy=default.target"));
-    }
-
-    #[test]
-    fn render_systemd_unit_without_service_env() {
-        let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
-        let service_env = BTreeMap::new();
-
-        let unit =
-            render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
-
-        assert!(!unit.contains("Environment="));
     }
 
     #[test]
@@ -1409,21 +1448,14 @@ mod tests {
     }
 
     #[test]
-    fn systemd_escape_env_plain_value() {
-        assert_eq!(systemd_escape_env("/usr/bin"), "/usr/bin");
-    }
-
-    #[test]
-    fn systemd_escape_env_value_with_spaces() {
-        assert_eq!(
-            systemd_escape_env("/path with spaces"),
-            "\"/path with spaces\""
-        );
-    }
-
-    #[test]
-    fn systemd_escape_env_value_with_quotes() {
-        assert_eq!(systemd_escape_env("a\"b"), "\"a\\\"b\"");
+    fn systemd_escape_env_preserves_systemd_values() {
+        for (input, expected) in [
+            ("/usr/bin", "/usr/bin"),
+            ("/path with spaces", "\"/path with spaces\""),
+            ("a\"b", "\"a\\\"b\""),
+        ] {
+            assert_eq!(systemd_escape_env(input), expected);
+        }
     }
 
     #[test]
@@ -1437,22 +1469,17 @@ mod tests {
     }
 
     #[test]
-    fn build_systemctl_command_sets_runtime_dir_only_when_present() {
-        let command = build_systemctl_command(&["status"], Some("/run/user/1000"));
-        let envs: Vec<_> = command.get_envs().collect();
-
-        assert!(envs.iter().any(|(key, value)| {
+    fn build_systemctl_command_handles_optional_runtime_dir() {
+        let with_runtime_dir = build_systemctl_command(&["status"], Some("/run/user/1000"));
+        let with_envs: Vec<_> = with_runtime_dir.get_envs().collect();
+        assert!(with_envs.iter().any(|(key, value)| {
             *key == OsStr::new("XDG_RUNTIME_DIR") && *value == Some(OsStr::new("/run/user/1000"))
         }));
-    }
 
-    #[test]
-    fn build_systemctl_command_omits_runtime_dir_when_absent() {
-        let command = build_systemctl_command(&["status"], None);
-        let envs: Vec<_> = command.get_envs().collect();
-
+        let without_runtime_dir = build_systemctl_command(&["status"], None);
+        let without_envs: Vec<_> = without_runtime_dir.get_envs().collect();
         assert!(
-            !envs
+            !without_envs
                 .iter()
                 .any(|(key, _)| *key == OsStr::new("XDG_RUNTIME_DIR"))
         );
@@ -1465,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn format_start_failure_contains_base_message() {
+    fn format_start_failure_contains_base_message_and_optional_logs() {
         let err = format_start_failure(None);
         let msg = match &err {
             EgoPulseError::Internal(m) => m.clone(),
@@ -1475,10 +1502,7 @@ mod tests {
             msg.starts_with("egopulse service failed to start"),
             "message should start with base text: {msg}"
         );
-    }
 
-    #[test]
-    fn format_start_failure_includes_logs_when_available() {
         // On a system with journalctl and prior service runs, logs may be
         // present.  The test only asserts the structural contract: if logs
         // are returned, they appear under a "Recent logs:" header.
@@ -1493,16 +1517,6 @@ mod tests {
             assert!(!body.trim().is_empty());
         }
         // If no logs are available the message is just the base text.
-    }
-
-    #[test]
-    fn fetch_recent_service_logs_does_not_panic_without_journalctl() {
-        // On any environment (including CI without journalctl) this must
-        // return None rather than panicking.
-        let result = fetch_recent_service_logs(None);
-        // We only assert it returns without panicking; the value depends on
-        // the environment.
-        assert!(result.is_none() || result.as_ref().is_some_and(|s| !s.is_empty()));
     }
 
     #[tokio::test]
@@ -1572,25 +1586,7 @@ mod tests {
     }
 
     #[test]
-    fn service_start_constants_are_consistent() {
-        const {
-            assert!(
-                SERVICE_START_MIN_OBSERVE_SECS < SERVICE_START_TIMEOUT_SECS,
-                "min observe must be shorter than timeout"
-            );
-            assert!(
-                SERVICE_START_POLL_INTERVAL_MS > 0,
-                "poll interval must be positive"
-            );
-            assert!(
-                SERVICE_FAILURE_LOG_LINES > 0,
-                "failure log lines must be positive"
-            );
-        }
-    }
-
-    #[test]
-    fn gateway_status_json_flag_parses() {
+    fn gateway_status_json_flag_parses_with_and_without_json() {
         use clap::Parser;
 
         #[derive(Debug, Parser)]
@@ -1599,27 +1595,15 @@ mod tests {
             action: GatewayAction,
         }
 
-        let cli: Cli = Parser::try_parse_from(["egopulse", "status", "--json"]).expect("parse");
-        match cli.action {
-            GatewayAction::Status { json } => assert!(json),
-            other => panic!("expected Status, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gateway_status_without_json_parses() {
-        use clap::Parser;
-
-        #[derive(Debug, Parser)]
-        struct Cli {
-            #[command(subcommand)]
-            action: GatewayAction,
-        }
-
-        let cli: Cli = Parser::try_parse_from(["egopulse", "status"]).expect("parse");
-        match cli.action {
-            GatewayAction::Status { json } => assert!(!json),
-            other => panic!("expected Status, got {other:?}"),
+        for (args, expected_json) in [
+            (vec!["egopulse", "status", "--json"], true),
+            (vec!["egopulse", "status"], false),
+        ] {
+            let cli: Cli = Parser::try_parse_from(args).expect("parse");
+            match cli.action {
+                GatewayAction::Status { json } => assert_eq!(json, expected_json),
+                other => panic!("expected Status, got {other:?}"),
+            }
         }
     }
 
@@ -1669,20 +1653,13 @@ mod tests {
             output.contains("Recent Errors (last 1h): 3"),
             "expected errors count, got: {output}"
         );
-    }
+        assert_eq!(
+            output.matches("Recent Errors (last 1h): 3").count(),
+            1,
+            "error count should be shown once, got: {output}"
+        );
 
-    #[test]
-    fn format_uptime_various() {
-        assert_eq!(format_uptime(0), "0s");
-        assert_eq!(format_uptime(45), "45s");
-        assert_eq!(format_uptime(90), "1m 30s");
-        assert_eq!(format_uptime(5400), "1h 30m 0s");
-        assert_eq!(format_uptime(90061), "1d 1h 1m");
-    }
-
-    #[test]
-    fn format_gateway_status_without_errors() {
-        let health = serde_json::json!({
+        let without_errors = serde_json::json!({
             "ok": true,
             "version": "0.1.0",
             "uptime_secs": 3600,
@@ -1693,7 +1670,7 @@ mod tests {
         })
         .to_string();
 
-        let output = format_gateway_status(&health, None);
+        let output = format_gateway_status(&without_errors, None);
         assert!(
             !output.contains("Recent Errors"),
             "should not show errors section when count is 0 or absent, got: {output}"
@@ -1702,6 +1679,15 @@ mod tests {
             output.contains("1h 0m 0s"),
             "expected 1h uptime, got: {output}"
         );
+    }
+
+    #[test]
+    fn format_uptime_various() {
+        assert_eq!(format_uptime(0), "0s");
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(90), "1m 30s");
+        assert_eq!(format_uptime(5400), "1h 30m 0s");
+        assert_eq!(format_uptime(90061), "1d 1h 1m");
     }
 
     #[test]
@@ -1841,68 +1827,40 @@ mod tests {
     }
 
     #[test]
-    fn format_gateway_status_db_section_shows_ok() {
-        // Arrange
-        let health = serde_json::json!({
-            "ok": true,
-            "version": "0.1.0",
-            "uptime_secs": 100,
-            "pid": 1,
-            "db": { "ok": true }
-        })
-        .to_string();
+    fn format_gateway_status_db_section_handles_health_and_absence() {
+        for (db, expected) in [
+            (
+                Some(serde_json::json!({ "ok": true })),
+                Some("DB       ● ok"),
+            ),
+            (
+                Some(serde_json::json!({ "ok": false })),
+                Some("DB       ✗ unhealthy"),
+            ),
+            (None, None),
+        ] {
+            let mut health = serde_json::json!({
+                "ok": true,
+                "version": "0.1.0",
+                "uptime_secs": 100,
+                "pid": 1
+            });
+            if let Some(db) = db {
+                health["db"] = db;
+            }
 
-        // Act
-        let output = format_gateway_status(&health, None);
-
-        // Assert
-        assert!(
-            output.contains("DB       ● ok"),
-            "expected DB ok section, got: {output}"
-        );
-    }
-
-    #[test]
-    fn format_gateway_status_db_section_shows_unhealthy() {
-        // Arrange
-        let health = serde_json::json!({
-            "ok": false,
-            "version": "0.1.0",
-            "uptime_secs": 100,
-            "pid": 1,
-            "db": { "ok": false }
-        })
-        .to_string();
-
-        // Act
-        let output = format_gateway_status(&health, None);
-
-        // Assert
-        assert!(
-            output.contains("DB       ✗ unhealthy"),
-            "expected DB unhealthy section, got: {output}"
-        );
-    }
-
-    #[test]
-    fn format_gateway_status_db_section_absent_when_missing() {
-        // Arrange
-        let health = serde_json::json!({
-            "ok": true,
-            "version": "0.1.0",
-            "uptime_secs": 100,
-            "pid": 1
-        })
-        .to_string();
-
-        // Act
-        let output = format_gateway_status(&health, None);
-
-        // Assert
-        assert!(
-            !output.contains("DB"),
-            "should not show DB section when absent, got: {output}"
-        );
+            let output = format_gateway_status(&health.to_string(), None);
+            match expected {
+                Some(expected) => assert!(
+                    output.contains(expected),
+                    "expected DB section {expected:?}, got: {output}"
+                ),
+                None => assert!(
+                    !output.contains("DB"),
+                    "should not show DB section when absent, got: {output}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -1940,46 +1898,24 @@ mod tests {
     }
 
     #[test]
-    fn format_gateway_status_mcp_section_skipped_when_null() {
-        // Arrange
-        let health = serde_json::json!({
-            "ok": true,
-            "version": "0.1.0",
-            "uptime_secs": 100,
-            "pid": 1,
-            "mcp": null
-        })
-        .to_string();
+    fn format_gateway_status_mcp_section_skips_missing_or_null_data() {
+        for mcp in [Some(serde_json::Value::Null), None] {
+            let mut health = serde_json::json!({
+                "ok": true,
+                "version": "0.1.0",
+                "uptime_secs": 100,
+                "pid": 1
+            });
+            if let Some(mcp) = mcp {
+                health["mcp"] = mcp;
+            }
 
-        // Act
-        let output = format_gateway_status(&health, None);
-
-        // Assert
-        assert!(
-            !output.contains("MCP"),
-            "should not show MCP section when null, got: {output}"
-        );
-    }
-
-    #[test]
-    fn format_gateway_status_mcp_section_skipped_when_absent() {
-        // Arrange
-        let health = serde_json::json!({
-            "ok": true,
-            "version": "0.1.0",
-            "uptime_secs": 100,
-            "pid": 1
-        })
-        .to_string();
-
-        // Act
-        let output = format_gateway_status(&health, None);
-
-        // Assert
-        assert!(
-            !output.contains("MCP"),
-            "should not show MCP section when absent, got: {output}"
-        );
+            let output = format_gateway_status(&health.to_string(), None);
+            assert!(
+                !output.contains("MCP"),
+                "should not show MCP section when data is missing, got: {output}"
+            );
+        }
     }
 
     #[test]
@@ -2070,8 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn format_gateway_status_metrics_section_skipped_when_empty() {
-        // Arrange
+    fn format_gateway_status_metrics_section_skips_without_values() {
         let health = serde_json::json!({
             "ok": true,
             "version": "0.1.0",
@@ -2079,43 +2014,20 @@ mod tests {
             "pid": 1
         })
         .to_string();
-
-        let telemetry = serde_json::json!({
+        let empty_telemetry = serde_json::json!({
             "metrics": {},
             "recent_errors": [],
             "recent_turns": []
         })
         .to_string();
 
-        // Act
-        let output = format_gateway_status(&health, Some(&telemetry));
-
-        // Assert
-        assert!(
-            !output.contains("Metrics"),
-            "should not show Metrics section when empty, got: {output}"
-        );
-    }
-
-    #[test]
-    fn format_gateway_status_metrics_section_skipped_when_no_telemetry() {
-        // Arrange
-        let health = serde_json::json!({
-            "ok": true,
-            "version": "0.1.0",
-            "uptime_secs": 100,
-            "pid": 1
-        })
-        .to_string();
-
-        // Act
-        let output = format_gateway_status(&health, None);
-
-        // Assert
-        assert!(
-            !output.contains("Metrics"),
-            "should not show Metrics section without telemetry, got: {output}"
-        );
+        for telemetry in [Some(empty_telemetry.as_str()), None] {
+            let output = format_gateway_status(&health, telemetry);
+            assert!(
+                !output.contains("Metrics"),
+                "should not show Metrics section without values, got: {output}"
+            );
+        }
     }
 
     #[test]
