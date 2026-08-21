@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tracing::warn;
 
@@ -16,6 +17,12 @@ use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
 use crate::storage::call_blocking;
+
+/// Maximum number of attempts for a single LLM model iteration.
+pub(crate) const MAX_LLM_RETRIES: usize = 3;
+
+/// Base backoff (milliseconds) for exponential LLM retry.
+const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
 
 pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
@@ -77,6 +84,115 @@ impl<'a> ModelRunner<'a> {
         )
         .await
     }
+
+    /// Executes one durable model iteration with bounded transport retries.
+    pub(crate) async fn run_with_retry(
+        &self,
+        turn_id: &str,
+        messages: Arc<Vec<Message>>,
+    ) -> Result<ModelStep, ModelRequestError> {
+        let hash = model_request_hash(
+            self.request.system_prompt,
+            &messages,
+            self.request
+                .tools
+                .as_deref()
+                .filter(|tools| !tools.is_empty())
+                .and_then(|tools| serde_json::to_string(tools).ok())
+                .as_deref(),
+        );
+        let turn_id_for_init = turn_id.to_string();
+        let hash_for_init = hash;
+        let scope = self.request.scope;
+        let iteration = self.request.iteration as i64;
+        let db = self.request.state.db_for(scope);
+        let advanced = call_blocking(db, move |db| {
+            db.begin_turn_model_iteration(&turn_id_for_init, iteration, &hash_for_init)
+        })
+        .await
+        .map_err(|error| ModelRequestError {
+            error: EgoPulseError::from(error),
+            output_published: false,
+        })?;
+        if !advanced {
+            return Err(ModelRequestError {
+                error: EgoPulseError::TurnConcurrencyConflict,
+                output_published: false,
+            });
+        }
+
+        let output_published = Arc::new(AtomicBool::new(false));
+        let mut empty_reply_retry_attempted = false;
+        let mut retry_messages = messages;
+        for attempt in 1..=MAX_LLM_RETRIES {
+            let published_flag = Arc::clone(&output_published);
+            let caller_on_delta = self.request.on_delta;
+            let on_delta = move |text: String| {
+                published_flag.store(true, Ordering::SeqCst);
+                caller_on_delta(text);
+            };
+            let response = self
+                .run_once(
+                    Arc::clone(&retry_messages),
+                    &mut empty_reply_retry_attempted,
+                    Some(output_published.as_ref()),
+                    &on_delta,
+                )
+                .await;
+            match response {
+                Ok(step) => return Ok(step),
+                Err(step_error) => {
+                    let (error, next_retry_messages) = step_error.into_parts();
+                    retry_messages = next_retry_messages;
+                    let published = output_published.load(Ordering::SeqCst);
+                    let retryable =
+                        matches!(&error, EgoPulseError::Llm(error) if error.is_retryable());
+                    if retryable && !published && attempt < MAX_LLM_RETRIES {
+                        let turn_id_for_attempt = turn_id.to_string();
+                        let _ = call_blocking(
+                            self.request.state.db_for(self.request.scope),
+                            move |db| db.increment_turn_model_attempt(&turn_id_for_attempt),
+                        )
+                        .await;
+                        let backoff = llm_retry_backoff(attempt, &error);
+                        warn!(
+                            attempt,
+                            max = MAX_LLM_RETRIES,
+                            backoff_ms = backoff.as_millis() as u64,
+                            error = %error,
+                            "retryable llm error; retrying same iteration"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        continue;
+                    }
+                    return Err(ModelRequestError {
+                        error,
+                        output_published: published,
+                    });
+                }
+            }
+        }
+        unreachable!("retry loop exits via return")
+    }
+
+    async fn run_once(
+        &self,
+        messages: Arc<Vec<Message>>,
+        empty_retry_attempted: &mut bool,
+        output_published: Option<&AtomicBool>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<ModelStep, ModelStepError> {
+        send_model_step_with_empty_retry(
+            ModelStepRequest {
+                messages,
+                on_delta,
+                ..self.request.clone()
+            },
+            empty_retry_attempted,
+            output_published,
+        )
+        .await
+    }
 }
 
 /// A tool-phase error together with the request payload that can be retried.
@@ -84,6 +200,18 @@ impl<'a> ModelRunner<'a> {
 pub(crate) struct ModelStepError {
     error: EgoPulseError,
     retry_messages: Arc<Vec<Message>>,
+}
+
+/// An iteration-level model failure and whether it already published output.
+pub(crate) struct ModelRequestError {
+    error: EgoPulseError,
+    output_published: bool,
+}
+
+impl ModelRequestError {
+    pub(crate) fn into_parts(self) -> (EgoPulseError, bool) {
+        (self.error, self.output_published)
+    }
 }
 
 impl ModelStepError {
@@ -300,6 +428,39 @@ fn empty_response_after_published_output() -> EgoPulseError {
     EgoPulseError::Llm(LlmError::InvalidResponse(
         "assistant content was empty after output was published".to_string(),
     ))
+}
+
+/// SHA-256 over the fixed model-iteration inputs stored with a durable Turn.
+fn model_request_hash(
+    system_prompt: &str,
+    messages: &[Message],
+    tools_json: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(system_prompt.as_bytes());
+    hasher.update(b"\x00");
+    if let Ok(json) = serde_json::to_string(messages) {
+        hasher.update(json.as_bytes());
+    }
+    hasher.update(b"\x00");
+    if let Some(tools) = tools_json {
+        hasher.update(tools.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Calculates the delay before the next LLM transport retry.
+fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
+    if let EgoPulseError::Llm(LlmError::ApiError {
+        retry_after_secs: Some(secs),
+        ..
+    }) = error
+    {
+        return Duration::from_secs(*secs);
+    }
+    Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
 }
 
 pub(crate) fn build_assistant_tool_phase(

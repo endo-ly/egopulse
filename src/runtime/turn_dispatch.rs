@@ -1139,7 +1139,7 @@ mod tests {
     async fn retryable_llm_failure_executes_one_turn_and_persists_one_input() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let retry_count = crate::agent_loop::turn::MAX_LLM_RETRIES;
+        let retry_count = crate::agent_loop::model_step::MAX_LLM_RETRIES;
         let retry_provider = RecordingProvider::new(
             (0..retry_count)
                 .map(|_| {

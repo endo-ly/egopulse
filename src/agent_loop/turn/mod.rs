@@ -6,45 +6,29 @@
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
+use crate::agent_loop::compaction::PromptContext;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
-use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
-use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
+use crate::agent_loop::formatting::format_channel_log_message;
 use crate::agent_loop::turn::lifecycle::{TurnAcceptance, TurnLifecycle, fail_resume_permanently};
 use crate::agent_loop::turn::persistence::TurnPersistence;
 
 use crate::agent_loop::TurnRuntime;
-use crate::agent_loop::r#loop::{MAX_TOOL_ITERATIONS, messages_for_iteration};
-use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
+use crate::agent_loop::r#loop::AgentLoop;
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
-use crate::agent_loop::tool_execution::{
-    ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
-    build_tool_result_phase,
-};
-use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::{ConversationScope, SurfaceContext};
-use crate::error::{EgoPulseError, LlmError};
-use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
+use crate::error::EgoPulseError;
+use crate::llm::{LlmProvider, Message, ToolDefinition};
 use crate::runtime::scheduled_turn::deserialize_scheduled_turn;
 use crate::storage::{TurnRun, TurnRunState, call_blocking};
 use crate::tools::ToolExecutionContext;
 use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use tracing::Instrument;
 use tracing::warn;
 
 /// Maximum number of Channel Log events to inject as Shared Room Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
-
-/// Maximum number of attempts for a single LLM model iteration before the
-/// error surfaces. Retries are confined to the same iteration and only fire
-/// while no output has been published.
-pub(crate) const MAX_LLM_RETRIES: usize = 3;
-/// Base backoff (milliseconds) for exponential LLM retry. Doubled per attempt.
-const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
 
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
@@ -58,70 +42,20 @@ impl Drop for ActiveTurnGuard<'_> {
     }
 }
 
-enum TurnAction {
-    Retry(Option<Arc<Vec<Message>>>),
-    Done {
-        final_content: String,
-        reasoning_content: Option<String>,
-    },
-}
-
-/// An LLM model-iteration failure paired with whether any external output
-/// (delta) was already published. The caller uses `output_published` to choose
-/// `uncertain` (published) over `failed` (clean) when recording the Turn state.
-struct ModelRequestError {
-    error: EgoPulseError,
-    output_published: bool,
-}
-
-enum PhaseOutcome {
-    Continue,
-    ToolsExecuted,
-    Finished(String),
-}
-
-struct PreparedTurn {
-    turn_id: String,
-    chat_id: i64,
-    tool_context: ToolExecutionContext,
-    system_prompt: String,
-    channel_llm: Arc<dyn LlmProvider>,
-    tool_defs: Arc<Vec<ToolDefinition>>,
-    tools_json: Option<String>,
-    user_message: Message,
-    input_message_id: String,
+pub(crate) struct PreparedTurn {
+    pub(crate) turn_id: String,
+    pub(crate) chat_id: i64,
+    pub(crate) tool_context: ToolExecutionContext,
+    pub(crate) system_prompt: String,
+    pub(crate) channel_llm: Arc<dyn LlmProvider>,
+    pub(crate) tool_defs: Arc<Vec<ToolDefinition>>,
+    pub(crate) tools_json: Option<String>,
+    pub(crate) user_message: Message,
+    pub(crate) input_message_id: String,
     /// Immutable Config snapshot acquired at Turn start. All downstream
     /// processing must use this snapshot rather than re-reading ConfigManager,
     /// preventing generation-mixing when config changes mid-flight.
-    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
-}
-
-struct TurnLoopState {
-    messages: Arc<Vec<Message>>,
-    session_revision: Option<i64>,
-    retry_messages: Option<Arc<Vec<Message>>>,
-    declarative_retry_attempted: bool,
-}
-
-impl TurnLoopState {
-    fn new(messages: Arc<Vec<Message>>, session_revision: Option<i64>) -> Self {
-        Self {
-            messages,
-            session_revision,
-            retry_messages: None,
-            declarative_retry_attempted: false,
-        }
-    }
-
-    fn request_messages(&mut self) -> Arc<Vec<Message>> {
-        self.retry_messages
-            .take()
-            .unwrap_or_else(|| Arc::clone(&self.messages))
-    }
-
-    fn reset_retry_guards_after_tool_phase(&mut self) {
-        self.declarative_retry_attempted = false;
-    }
+    pub(crate) config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 }
 
 struct TurnExecutor<'a> {
@@ -476,10 +410,10 @@ impl TurnExecutor<'_> {
                 let channel_context_msg = load_channel_context(self.state, self.context).await;
 
                 // 段階4: 最終応答が得られるまで、LLM 呼び出しとツール実行を反復する。
-                self.run_model_loop(
+                self.run_agent_loop(
                     &turn,
                     &prepared,
-                    &prompt_ctx,
+                    prompt_ctx,
                     channel_context_msg,
                     messages,
                     session_revision,
@@ -545,10 +479,10 @@ impl TurnExecutor<'_> {
             )
             .await?;
             let channel_context_msg = load_channel_context(self.state, self.context).await;
-            self.run_model_loop(
+            self.run_agent_loop(
                 turn_run,
                 &prepared,
-                &prompt_ctx,
+                prompt_ctx,
                 channel_context_msg,
                 loaded.messages,
                 loaded.session_revision,
@@ -719,319 +653,57 @@ impl TurnExecutor<'_> {
         .await
     }
 
-    async fn run_model_loop(
+    async fn run_agent_loop(
         &self,
         turn: &TurnRun,
         prepared: &PreparedTurn,
-        prompt_ctx: &PromptContext<'_>,
+        prompt_ctx: PromptContext<'_>,
         channel_context_msg: Option<Message>,
         messages: Arc<Vec<Message>>,
         session_revision: Option<i64>,
     ) -> Result<String, EgoPulseError> {
-        let mut loop_state = TurnLoopState::new(messages, session_revision);
-        for iteration in 1..=MAX_TOOL_ITERATIONS {
-            self.on_event.emit(AgentEvent::Iteration { iteration });
-            let request_messages =
-                request_messages_for_iteration(&mut loop_state, iteration, &channel_context_msg);
+        let result = AgentLoop::new(
+            self.state,
+            self.context,
+            turn,
+            prepared,
+            prompt_ctx,
+            channel_context_msg,
+            self.on_event.clone(),
+        )
+        .run(messages, session_revision)
+        .await?;
 
-            let phase_response = match send_model_request_with_retry(
-                self.state,
-                self.context,
-                turn,
-                prepared,
-                request_messages,
-                iteration,
-                &self.on_event,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(ModelRequestError {
-                    error,
-                    output_published,
-                }) => {
-                    if output_published {
-                        self.lifecycle(&prepared.turn_id)
-                            .mark_output_published()
-                            .await;
-                    }
-                    return Err(error);
-                }
-            };
-
-            match self
-                .handle_phase_response(prepared, &mut loop_state, phase_response)
-                .await?
-            {
-                PhaseOutcome::Continue => continue,
-                PhaseOutcome::Finished(response) => return Ok(response),
-                PhaseOutcome::ToolsExecuted => {}
-            }
-
-            loop_state.reset_retry_guards_after_tool_phase();
-            if let Ok(compacted) = maybe_compact_messages(
-                self.state,
-                self.context,
-                prepared.chat_id,
-                &loop_state.messages,
-                &prepared.channel_llm,
-                prompt_ctx,
-                &prepared.config_snapshot.config,
-            )
-            .await
-            {
-                loop_state.messages = Arc::new(compacted);
-            }
-        }
-
-        Err(EgoPulseError::Internal(format!(
-            "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
-        )))
+        self.persist_agent_loop_result(prepared, result).await
     }
 
-    async fn handle_phase_response(
+    async fn persist_agent_loop_result(
         &self,
         prepared: &PreparedTurn,
-        loop_state: &mut TurnLoopState,
-        phase_response: ModelStep,
-    ) -> Result<PhaseOutcome, EgoPulseError> {
-        match phase_response {
-            ModelStep::Final(response) => {
-                self.lifecycle(&prepared.turn_id).complete_model().await?;
-                match evaluate_end_turn(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut loop_state.declarative_retry_attempted,
-                    &loop_state.messages,
-                )? {
-                    TurnAction::Retry(msgs) => loop_state.retry_messages = msgs,
-                    TurnAction::Done {
-                        final_content,
-                        reasoning_content,
-                    } => {
-                        return self
-                            .finish_turn(prepared, loop_state, final_content, reasoning_content)
-                            .await;
-                    }
-                }
-                Ok(PhaseOutcome::Continue)
-            }
-            ModelStep::MalformedToolCalls(response) => {
-                self.lifecycle(&prepared.turn_id).complete_model().await?;
-                match evaluate_malformed_response(
-                    &response.content,
-                    response.reasoning_content.as_deref(),
-                    &mut loop_state.declarative_retry_attempted,
-                    &loop_state.messages,
-                )? {
-                    TurnAction::Retry(msgs) => loop_state.retry_messages = msgs,
-                    TurnAction::Done {
-                        final_content,
-                        reasoning_content,
-                    } => {
-                        return self
-                            .finish_turn(prepared, loop_state, final_content, reasoning_content)
-                            .await;
-                    }
-                }
-                Ok(PhaseOutcome::Continue)
-            }
-            ModelStep::ToolCalls(assistant_phase) => {
-                let lifecycle = self.lifecycle(&prepared.turn_id);
-                lifecycle.complete_model().await?;
-                lifecycle.begin_tools().await?;
-                lifecycle.mark_output_published().await;
-                let assistant_message_id = uuid::Uuid::new_v4().to_string();
-                let persistence = TurnPersistence::new(
-                    self.state,
-                    self.context,
-                    prepared.chat_id,
-                    &prepared.turn_id,
-                    &prepared.tool_context.agent_id,
-                );
-                let persisted = persistence
-                    .persist_tool_call(
-                        &assistant_message_id,
-                        &assistant_phase,
-                        Arc::try_unwrap(Arc::clone(&loop_state.messages))
-                            .unwrap_or_else(|messages| (*messages).clone()),
-                        loop_state.session_revision,
-                    )
-                    .await?;
-                let tool_outcomes = execute_tool_calls(
-                    self.state,
-                    &self.on_event,
-                    &prepared.tool_context,
-                    &assistant_message_id,
-                    assistant_phase.tool_calls,
-                )
-                .await?;
-                let persisted = persistence
-                    .persist_tool_results(
-                        &assistant_message_id,
-                        persisted.messages,
-                        build_tool_result_phase(tool_outcomes),
-                        Some(persisted.revision),
-                    )
-                    .await?;
-                loop_state.messages = Arc::new(persisted.messages);
-                loop_state.session_revision = Some(persisted.revision);
-                lifecycle.complete_tools().await?;
-                Ok(PhaseOutcome::ToolsExecuted)
-            }
-        }
-    }
-
-    async fn finish_turn(
-        &self,
-        prepared: &PreparedTurn,
-        loop_state: &mut TurnLoopState,
-        final_content: String,
-        reasoning_content: Option<String>,
-    ) -> Result<PhaseOutcome, EgoPulseError> {
+        result: crate::agent_loop::r#loop::AgentLoopResult,
+    ) -> Result<String, EgoPulseError> {
         let final_message_id = format!("turn:{}:final", prepared.turn_id);
+        let mut messages = result.messages;
         let response = TurnPersistence::new(
             self.state,
             self.context,
             prepared.chat_id,
             &prepared.turn_id,
-            &self.context.agent_id,
+            &prepared.tool_context.agent_id,
         )
         .persist_final(
             &final_message_id,
-            &mut loop_state.messages,
-            loop_state.session_revision,
+            &mut messages,
+            result.session_revision,
             &self.on_event,
-            (final_content, reasoning_content),
+            (result.final_content, result.reasoning_content),
         )
         .await?;
         let lifecycle = self.lifecycle(&prepared.turn_id);
         lifecycle.mark_output_published().await;
         lifecycle.complete(&final_message_id).await?;
-        Ok(PhaseOutcome::Finished(response))
+        Ok(response)
     }
-}
-
-fn request_messages_for_iteration(
-    loop_state: &mut TurnLoopState,
-    iteration: usize,
-    channel_context_msg: &Option<Message>,
-) -> Arc<Vec<Message>> {
-    let mut request_messages = loop_state.request_messages();
-    if iteration == 1 {
-        if let Some(ctx_msg) = channel_context_msg {
-            let mut msgs = Arc::try_unwrap(request_messages).unwrap_or_else(|arc| (*arc).clone());
-            msgs.insert(0, ctx_msg.clone());
-            request_messages = Arc::new(msgs);
-        }
-    }
-
-    messages_for_iteration(&request_messages, iteration)
-}
-
-fn evaluate_end_turn(
-    raw_content: &str,
-    reasoning_content: Option<&str>,
-    declarative_retry_attempted: &mut bool,
-    messages: &[Message],
-) -> Result<TurnAction, EgoPulseError> {
-    let visible_text = strip_thinking(raw_content.trim());
-    let has_displayable_output = !visible_text.trim().is_empty();
-
-    if has_displayable_output
-        && !*declarative_retry_attempted
-        && is_declarative_only_reply(&visible_text)
-    {
-        *declarative_retry_attempted = true;
-        warn!("declarative-only reply detected; injecting corrective prompt and retrying once");
-        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
-            messages,
-            raw_content,
-            reasoning_content,
-            "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
-        )))));
-    }
-
-    if !has_displayable_output {
-        return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
-            "assistant content was empty after retry".to_string(),
-        )));
-    }
-
-    Ok(TurnAction::Done {
-        final_content: visible_text.trim().to_string(),
-        reasoning_content: reasoning_content.map(ToString::to_string),
-    })
-}
-
-fn evaluate_malformed_response(
-    raw_content: &str,
-    reasoning_content: Option<&str>,
-    declarative_retry_attempted: &mut bool,
-    messages: &[Message],
-) -> Result<TurnAction, EgoPulseError> {
-    let visible_text = strip_thinking(raw_content.trim());
-
-    if visible_text.trim().is_empty() {
-        return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
-            "all tool calls were malformed (empty names)".to_string(),
-        )));
-    }
-
-    if !*declarative_retry_attempted && is_declarative_only_reply(&visible_text) {
-        *declarative_retry_attempted = true;
-        warn!("all tool calls were malformed and reply was declarative-only; retrying once");
-        return Ok(TurnAction::Retry(Some(Arc::new(runtime_guard_messages(
-            messages,
-            raw_content,
-            reasoning_content,
-            "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
-        )))));
-    }
-
-    Ok(TurnAction::Done {
-        final_content: visible_text.trim().to_string(),
-        reasoning_content: reasoning_content.map(ToString::to_string),
-    })
-}
-
-async fn execute_tool_calls(
-    state: &TurnRuntime,
-    on_event: &EventEmitter,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    valid_tool_calls: Vec<ToolCall>,
-) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
-    if valid_tool_calls.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let start_emitter = on_event.clone();
-    let result_emitter = on_event.clone();
-    let hooks = ToolExecutionHooks {
-        on_start: Some(Arc::new(move |tool_call: &ToolCall| {
-            start_emitter.emit(AgentEvent::ToolStart {
-                call_id: tool_call.id.clone(),
-                name: tool_call.name.clone(),
-                input: tool_call.arguments.clone(),
-            });
-        })),
-        on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {
-            result_emitter.emit(AgentEvent::ToolResult {
-                call_id: outcome.tool_call.id.clone(),
-                name: outcome.tool_call.name.clone(),
-                is_error: outcome.result.is_error,
-                preview: truncate_by_chars(&outcome.payload, MAX_TOOL_RESULT_TEXT_CHARS),
-                duration_ms: outcome.duration_ms,
-            });
-        })),
-    };
-
-    let outcomes = ToolExecutor::new(state, tool_context, hooks)
-        .execute(assistant_message_id, valid_tool_calls)
-        .await?;
-
-    Ok(outcomes)
 }
 
 async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> Option<Message> {
@@ -1064,167 +736,6 @@ async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> 
              <shared-context>\n{formatted}\n</shared-context>"
         ),
     ))
-}
-
-/// Sends one model iteration with bounded in-place retry.
-///
-/// Before the call, the Turn is advanced to `model_pending` and the fixed
-/// `model_request_hash` is stamped so a later retry or recovery can prove the
-/// same payload is being re-sent. Retry is permitted only when **all** of the
-/// following hold:
-///
-/// * the error is transient ([`LlmError::is_retryable`]): 429 / 5xx / network,
-/// * no delta has been published for this iteration (the `on_delta` callback
-///   tracks publication),
-/// * the attempt budget is not exhausted.
-///
-/// A provider response with no displayable assistant content is handled by the
-/// shared tool-phase runtime guard before this transient-error retry policy is
-/// applied when no delta has been published. That recovery is limited to one
-/// guarded request per iteration. If a delta was already published, the guard
-/// is skipped and the Turn becomes `uncertain` instead of making another LLM
-/// request.
-///
-/// If a delta escaped before the error, retry is refused and the caller routes
-/// the Turn to `uncertain`. The `output_published` flag on [`ModelRequestError`]
-/// communicates that decision.
-async fn send_model_request_with_retry(
-    state: &TurnRuntime,
-    context: &SurfaceContext,
-    turn: &TurnRun,
-    prepared: &PreparedTurn,
-    request_messages: Arc<Vec<Message>>,
-    iteration: usize,
-    on_event: &EventEmitter,
-) -> Result<ModelStep, ModelRequestError> {
-    let hash = model_request_hash(
-        &prepared.system_prompt,
-        &request_messages,
-        prepared.tools_json.as_deref(),
-    );
-    let turn_id = turn.turn_id.clone();
-    let hash_for_init = hash.clone();
-    let advanced = call_blocking(state.db_for(context.scope), move |db| {
-        db.begin_turn_model_iteration(&turn_id, iteration as i64, &hash_for_init)
-    })
-    .await
-    .map_err(|e| ModelRequestError {
-        error: EgoPulseError::from(e),
-        output_published: false,
-    })?;
-    if !advanced {
-        // Another executor already began this iteration (the `input_committed ->
-        // model_pending` CAS lost the race). This duplicate execution must exit
-        // without producing output or marking the turn failed.
-        return Err(ModelRequestError {
-            error: EgoPulseError::TurnConcurrencyConflict,
-            output_published: false,
-        });
-    }
-
-    let output_published = Arc::new(AtomicBool::new(false));
-    let mut empty_reply_retry_attempted = false;
-    let mut retry_messages = Arc::clone(&request_messages);
-    for attempt in 1..=MAX_LLM_RETRIES {
-        let delta_emitter = on_event.clone();
-        let flag = Arc::clone(&output_published);
-        let on_delta = move |text: String| {
-            flag.store(true, Ordering::SeqCst);
-            delta_emitter.emit(AgentEvent::Delta { text });
-        };
-
-        let model_runner = ModelRunner::new(ModelStepRequest {
-            state,
-            llm: prepared.channel_llm.as_ref(),
-            system_prompt: &prepared.system_prompt,
-            messages: Arc::clone(&retry_messages),
-            tools: Some(Arc::clone(&prepared.tool_defs)),
-            chat_id: prepared.chat_id,
-            caller_channel: &context.channel,
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration,
-            scope: context.scope,
-            on_delta: &on_delta,
-        });
-        match model_runner
-            .run(
-                Arc::clone(&retry_messages),
-                &mut empty_reply_retry_attempted,
-                Some(output_published.as_ref()),
-            )
-            .await
-        {
-            Ok(response) => return Ok(response),
-            Err(request_error) => {
-                let (error, next_retry_messages) = request_error.into_parts();
-                retry_messages = next_retry_messages;
-                let published = output_published.load(Ordering::SeqCst);
-                let retryable = matches!(&error, EgoPulseError::Llm(e) if e.is_retryable());
-                if retryable && !published && attempt < MAX_LLM_RETRIES {
-                    let turn_id = turn.turn_id.clone();
-                    let _ = call_blocking(state.db_for(context.scope), move |db| {
-                        db.increment_turn_model_attempt(&turn_id)
-                    })
-                    .await;
-                    let backoff = llm_retry_backoff(attempt, &error);
-                    warn!(
-                        attempt,
-                        max = MAX_LLM_RETRIES,
-                        backoff_ms = backoff.as_millis() as u64,
-                        error = %error,
-                        "retryable llm error; retrying same iteration"
-                    );
-                    tokio::time::sleep(backoff).await;
-                    continue;
-                }
-                return Err(ModelRequestError {
-                    error,
-                    output_published: published,
-                });
-            }
-        }
-    }
-    unreachable!("retry loop exits via return")
-}
-
-/// SHA-256 over the fixed model-iteration inputs: system prompt, serialized
-/// conversation messages, and tool definitions. Stored as
-/// `turn_runs.model_request_hash` so a retry or recovery can verify the same
-/// request is being re-sent.
-fn model_request_hash(
-    system_prompt: &str,
-    messages: &[Message],
-    tools_json: Option<&str>,
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(system_prompt.as_bytes());
-    hasher.update(b"\x00");
-    if let Ok(json) = serde_json::to_string(messages) {
-        hasher.update(json.as_bytes());
-    }
-    hasher.update(b"\x00");
-    if let Some(tools) = tools_json {
-        hasher.update(tools.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
-/// Backoff before an LLM retry. Honors `Retry-After` (seconds) for 429 when
-/// the provider supplied it; otherwise exponential backoff from
-/// [`LLM_RETRY_BASE_BACKOFF_MS`].
-fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
-    if let EgoPulseError::Llm(LlmError::ApiError {
-        retry_after_secs: Some(secs),
-        ..
-    }) = error
-    {
-        return Duration::from_secs(*secs);
-    }
-    Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
 }
 
 #[cfg(test)]

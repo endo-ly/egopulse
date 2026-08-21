@@ -2,7 +2,26 @@
 
 use std::sync::Arc;
 
-use crate::llm::Message;
+use tracing::warn;
+
+use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
+use crate::agent_loop::event::{AgentEvent, EventEmitter};
+use crate::agent_loop::formatting::strip_thinking;
+use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
+use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
+use crate::agent_loop::tool_execution::{
+    ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
+    build_tool_result_phase,
+};
+use crate::agent_loop::turn::PreparedTurn;
+use crate::agent_loop::turn::lifecycle::TurnLifecycle;
+use crate::agent_loop::turn::persistence::TurnPersistence;
+use crate::channels::utils::text::truncate_by_chars;
+use crate::conversation::SurfaceContext;
+use crate::error::EgoPulseError;
+use crate::llm::{Message, ToolCall};
+use crate::storage::TurnRun;
 
 /// Maximum number of model/tool iterations allowed for one activation.
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
@@ -18,23 +37,411 @@ pub(crate) const FINAL_RESPONSE_WARNING_GUARD: &str = "[runtime_guard]: The tool
 /// prioritize a concise final response over starting new broad tool work.
 pub(crate) const FINAL_RESPONSE_GUARD: &str = "[runtime_guard]: The tool loop is at its final response window. Provide the best concise answer to the user now. Do not start broad new work; state what was completed and any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
 
+/// Mutable conversation state owned by one Agent Loop.
+pub(crate) struct LoopState {
+    pub(crate) messages: Arc<Vec<Message>>,
+    pub(crate) session_revision: Option<i64>,
+    retry_messages: Option<Arc<Vec<Message>>>,
+    declarative_retry_attempted: bool,
+}
+
+impl LoopState {
+    pub(crate) fn new(messages: Arc<Vec<Message>>, session_revision: Option<i64>) -> Self {
+        Self {
+            messages,
+            session_revision,
+            retry_messages: None,
+            declarative_retry_attempted: false,
+        }
+    }
+
+    fn request_messages(&mut self) -> Arc<Vec<Message>> {
+        self.retry_messages
+            .take()
+            .unwrap_or_else(|| Arc::clone(&self.messages))
+    }
+
+    fn reset_retry_guards_after_tool_phase(&mut self) {
+        self.declarative_retry_attempted = false;
+    }
+}
+
+/// Result returned when the Agent Loop has produced a final response.
+pub(crate) struct AgentLoopResult {
+    pub(crate) final_content: String,
+    pub(crate) reasoning_content: Option<String>,
+    pub(crate) messages: Arc<Vec<Message>>,
+    pub(crate) session_revision: Option<i64>,
+}
+
+/// Executes the LLM/tool loop for one durable Turn.
+pub(crate) struct AgentLoop<'a> {
+    state: &'a TurnRuntime,
+    context: &'a SurfaceContext,
+    turn: &'a TurnRun,
+    prepared: &'a PreparedTurn,
+    prompt_ctx: PromptContext<'a>,
+    channel_context_msg: Option<Message>,
+    on_event: EventEmitter,
+}
+
+impl<'a> AgentLoop<'a> {
+    /// Creates an Agent Loop with dependencies fixed for one Turn.
+    pub(crate) fn new(
+        state: &'a TurnRuntime,
+        context: &'a SurfaceContext,
+        turn: &'a TurnRun,
+        prepared: &'a PreparedTurn,
+        prompt_ctx: PromptContext<'a>,
+        channel_context_msg: Option<Message>,
+        on_event: EventEmitter,
+    ) -> Self {
+        Self {
+            state,
+            context,
+            turn,
+            prepared,
+            prompt_ctx,
+            channel_context_msg,
+            on_event,
+        }
+    }
+
+    /// Runs model steps, tool execution, and loop-level compaction.
+    pub(crate) async fn run(
+        &self,
+        messages: Arc<Vec<Message>>,
+        session_revision: Option<i64>,
+    ) -> Result<AgentLoopResult, EgoPulseError> {
+        let mut loop_state = LoopState::new(messages, session_revision);
+
+        for iteration in 1..=MAX_TOOL_ITERATIONS {
+            self.on_event.emit(AgentEvent::Iteration { iteration });
+            let request_messages = request_messages_for_iteration(
+                &mut loop_state,
+                iteration,
+                &self.channel_context_msg,
+            );
+            let event_emitter = self.on_event.clone();
+            let on_delta = move |text: String| {
+                event_emitter.emit(AgentEvent::Delta { text });
+            };
+            let model_runner = ModelRunner::new(ModelStepRequest {
+                state: self.state,
+                llm: self.prepared.channel_llm.as_ref(),
+                system_prompt: &self.prepared.system_prompt,
+                messages: Arc::clone(&request_messages),
+                tools: Some(Arc::clone(&self.prepared.tool_defs)),
+                chat_id: self.prepared.chat_id,
+                caller_channel: &self.context.channel,
+                request_kind: "agent_loop",
+                usage_log_failure: "llm usage logging failed",
+                log_scope: "agent_loop",
+                send_failure_log: "LLM send_message failed",
+                iteration,
+                scope: self.context.scope,
+                on_delta: &on_delta,
+            });
+            let phase_response = match model_runner
+                .run_with_retry(&self.turn.turn_id, Arc::clone(&request_messages))
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let (error, output_published) = error.into_parts();
+                    if output_published {
+                        TurnLifecycle::new(
+                            self.state,
+                            self.context.scope,
+                            &self.prepared.turn_id,
+                            &self.context.origin_id,
+                        )
+                        .mark_output_published()
+                        .await;
+                    }
+                    return Err(error);
+                }
+            };
+            drop(request_messages);
+
+            match phase_response {
+                ModelStep::Final(response) => {
+                    TurnLifecycle::new(
+                        self.state,
+                        self.context.scope,
+                        &self.prepared.turn_id,
+                        &self.context.origin_id,
+                    )
+                    .complete_model()
+                    .await?;
+                    match evaluate_end_turn(
+                        &response.content,
+                        response.reasoning_content.as_deref(),
+                        &mut loop_state.declarative_retry_attempted,
+                        &loop_state.messages,
+                    )? {
+                        LoopAction::Retry(messages) => loop_state.retry_messages = messages,
+                        LoopAction::Done {
+                            final_content,
+                            reasoning_content,
+                        } => {
+                            return Ok(AgentLoopResult {
+                                final_content,
+                                reasoning_content,
+                                messages: loop_state.messages,
+                                session_revision: loop_state.session_revision,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                ModelStep::MalformedToolCalls(response) => {
+                    TurnLifecycle::new(
+                        self.state,
+                        self.context.scope,
+                        &self.prepared.turn_id,
+                        &self.context.origin_id,
+                    )
+                    .complete_model()
+                    .await?;
+                    match evaluate_malformed_response(
+                        &response.content,
+                        response.reasoning_content.as_deref(),
+                        &mut loop_state.declarative_retry_attempted,
+                        &loop_state.messages,
+                    )? {
+                        LoopAction::Retry(messages) => loop_state.retry_messages = messages,
+                        LoopAction::Done {
+                            final_content,
+                            reasoning_content,
+                        } => {
+                            return Ok(AgentLoopResult {
+                                final_content,
+                                reasoning_content,
+                                messages: loop_state.messages,
+                                session_revision: loop_state.session_revision,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                ModelStep::ToolCalls(assistant_phase) => {
+                    self.execute_tool_phase(&mut loop_state, assistant_phase)
+                        .await?;
+                }
+            }
+
+            loop_state.reset_retry_guards_after_tool_phase();
+            if let Ok(compacted) = maybe_compact_messages(
+                self.state,
+                self.context,
+                self.prepared.chat_id,
+                &loop_state.messages,
+                &self.prepared.channel_llm,
+                &self.prompt_ctx,
+                &self.prepared.config_snapshot.config,
+            )
+            .await
+            {
+                loop_state.messages = Arc::new(compacted);
+            }
+        }
+
+        Err(EgoPulseError::Internal(format!(
+            "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
+        )))
+    }
+
+    async fn execute_tool_phase(
+        &self,
+        loop_state: &mut LoopState,
+        assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
+    ) -> Result<(), EgoPulseError> {
+        let lifecycle = TurnLifecycle::new(
+            self.state,
+            self.context.scope,
+            &self.prepared.turn_id,
+            &self.context.origin_id,
+        );
+        lifecycle.complete_model().await?;
+        lifecycle.begin_tools().await?;
+        lifecycle.mark_output_published().await;
+
+        let assistant_message_id = uuid::Uuid::new_v4().to_string();
+        let persistence = TurnPersistence::new(
+            self.state,
+            self.context,
+            self.prepared.chat_id,
+            &self.prepared.turn_id,
+            &self.prepared.tool_context.agent_id,
+        );
+        let messages = std::mem::replace(&mut loop_state.messages, Arc::new(Vec::new()));
+        let messages = Arc::try_unwrap(messages).unwrap_or_else(|messages| (*messages).clone());
+        let persisted = persistence
+            .persist_tool_call(
+                &assistant_message_id,
+                &assistant_phase,
+                messages,
+                loop_state.session_revision,
+            )
+            .await?;
+        let tool_outcomes = self
+            .execute_tools(&assistant_message_id, assistant_phase.tool_calls)
+            .await?;
+        let persisted = persistence
+            .persist_tool_results(
+                &assistant_message_id,
+                persisted.messages,
+                build_tool_result_phase(tool_outcomes),
+                Some(persisted.revision),
+            )
+            .await?;
+        loop_state.messages = Arc::new(persisted.messages);
+        loop_state.session_revision = Some(persisted.revision);
+        lifecycle.complete_tools().await?;
+        Ok(())
+    }
+
+    async fn execute_tools(
+        &self,
+        assistant_message_id: &str,
+        tool_calls: Vec<ToolCall>,
+    ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
+        let start_emitter = self.on_event.clone();
+        let result_emitter = self.on_event.clone();
+        let hooks = ToolExecutionHooks {
+            on_start: Some(Arc::new(move |tool_call: &ToolCall| {
+                start_emitter.emit(AgentEvent::ToolStart {
+                    call_id: tool_call.id.clone(),
+                    name: tool_call.name.clone(),
+                    input: tool_call.arguments.clone(),
+                });
+            })),
+            on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {
+                result_emitter.emit(AgentEvent::ToolResult {
+                    call_id: outcome.tool_call.id.clone(),
+                    name: outcome.tool_call.name.clone(),
+                    is_error: outcome.result.is_error,
+                    preview: truncate_by_chars(&outcome.payload, MAX_TOOL_RESULT_TEXT_CHARS),
+                    duration_ms: outcome.duration_ms,
+                });
+            })),
+        };
+
+        ToolExecutor::new(self.state, &self.prepared.tool_context, hooks)
+            .execute(assistant_message_id, tool_calls)
+            .await
+    }
+}
+
+/// Adds channel context and the iteration-specific guard to a request-only copy.
+fn request_messages_for_iteration(
+    loop_state: &mut LoopState,
+    iteration: usize,
+    channel_context_msg: &Option<Message>,
+) -> Arc<Vec<Message>> {
+    let mut request_messages = loop_state.request_messages();
+    if iteration == 1 {
+        if let Some(ctx_msg) = channel_context_msg {
+            let mut messages =
+                Arc::try_unwrap(request_messages).unwrap_or_else(|messages| (*messages).clone());
+            messages.insert(0, ctx_msg.clone());
+            request_messages = Arc::new(messages);
+        }
+    }
+
+    messages_for_iteration(&request_messages, iteration)
+}
+
 /// Adds the iteration-specific runtime guard to a request-only copy of `messages`.
-///
-/// The original messages are not modified.
 pub(crate) fn messages_for_iteration(
     messages: &Arc<Vec<Message>>,
     iteration: usize,
 ) -> Arc<Vec<Message>> {
-    let guard = match iteration {
+    let guard_messages = match iteration {
         FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_WARNING_GUARD),
         iteration if iteration > FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_GUARD),
         _ => None,
     };
-    let Some(guard) = guard else {
+    let Some(guard) = guard_messages else {
         return Arc::clone(messages);
     };
 
     let mut request_messages = (**messages).clone();
     request_messages.push(Message::text("user", guard));
     Arc::new(request_messages)
+}
+
+enum LoopAction {
+    Retry(Option<Arc<Vec<Message>>>),
+    Done {
+        final_content: String,
+        reasoning_content: Option<String>,
+    },
+}
+
+fn evaluate_end_turn(
+    raw_content: &str,
+    reasoning_content: Option<&str>,
+    declarative_retry_attempted: &mut bool,
+    messages: &[Message],
+) -> Result<LoopAction, EgoPulseError> {
+    let visible_text = strip_thinking(raw_content.trim());
+    let has_displayable_output = !visible_text.trim().is_empty();
+
+    if has_displayable_output
+        && !*declarative_retry_attempted
+        && is_declarative_only_reply(&visible_text)
+    {
+        *declarative_retry_attempted = true;
+        warn!("declarative-only reply detected; injecting corrective prompt and retrying once");
+        return Ok(LoopAction::Retry(Some(Arc::new(runtime_guard_messages(
+            messages,
+            raw_content,
+            reasoning_content,
+            "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
+        )))));
+    }
+
+    if !has_displayable_output {
+        return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
+            "assistant content was empty after retry".to_string(),
+        )));
+    }
+
+    Ok(LoopAction::Done {
+        final_content: visible_text.trim().to_string(),
+        reasoning_content: reasoning_content.map(ToString::to_string),
+    })
+}
+
+fn evaluate_malformed_response(
+    raw_content: &str,
+    reasoning_content: Option<&str>,
+    declarative_retry_attempted: &mut bool,
+    messages: &[Message],
+) -> Result<LoopAction, EgoPulseError> {
+    let visible_text = strip_thinking(raw_content.trim());
+
+    if visible_text.trim().is_empty() {
+        return Err(EgoPulseError::Llm(crate::error::LlmError::InvalidResponse(
+            "all tool calls were malformed (empty names)".to_string(),
+        )));
+    }
+
+    if !*declarative_retry_attempted && is_declarative_only_reply(&visible_text) {
+        *declarative_retry_attempted = true;
+        warn!("all tool calls were malformed and reply was declarative-only; retrying once");
+        return Ok(LoopAction::Retry(Some(Arc::new(runtime_guard_messages(
+            messages,
+            raw_content,
+            reasoning_content,
+            "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
+        )))));
+    }
+
+    Ok(LoopAction::Done {
+        final_content: visible_text.trim().to_string(),
+        reasoning_content: reasoning_content.map(ToString::to_string),
+    })
 }

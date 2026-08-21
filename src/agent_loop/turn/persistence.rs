@@ -14,7 +14,7 @@ use crate::llm::{LlmProvider, Message};
 use crate::storage::StoredMessage;
 
 /// Owns Message and Session persistence for one Turn.
-pub(super) struct TurnPersistence<'a> {
+pub(crate) struct TurnPersistence<'a> {
     runtime: &'a TurnRuntime,
     context: &'a SurfaceContext,
     chat_id: i64,
@@ -24,7 +24,7 @@ pub(super) struct TurnPersistence<'a> {
 
 impl<'a> TurnPersistence<'a> {
     /// Creates a persistence boundary for one Turn.
-    pub(super) fn new(
+    pub(crate) fn new(
         runtime: &'a TurnRuntime,
         context: &'a SurfaceContext,
         chat_id: i64,
@@ -41,7 +41,7 @@ impl<'a> TurnPersistence<'a> {
     }
 
     /// Persists the user input and the resulting session snapshot.
-    pub(super) async fn persist_user_input(
+    pub(crate) async fn persist_user_input(
         &self,
         input_message_id: &str,
         user_message: &Message,
@@ -66,7 +66,7 @@ impl<'a> TurnPersistence<'a> {
     }
 
     /// Persists the final assistant message and emits its final-response event.
-    pub(super) async fn persist_final(
+    pub(crate) async fn persist_final(
         &self,
         final_message_id: &str,
         messages: &mut Arc<Vec<Message>>,
@@ -90,7 +90,7 @@ impl<'a> TurnPersistence<'a> {
     }
 
     /// Persists an assistant Tool Call message before execution begins.
-    pub(super) async fn persist_tool_call(
+    pub(crate) async fn persist_tool_call(
         &self,
         assistant_message_id: &str,
         assistant_phase: &AssistantToolPhase,
@@ -112,7 +112,7 @@ impl<'a> TurnPersistence<'a> {
     }
 
     /// Persists Tool Result messages after execution completes.
-    pub(super) async fn persist_tool_results(
+    pub(crate) async fn persist_tool_results(
         &self,
         assistant_message_id: &str,
         messages: Vec<Message>,
