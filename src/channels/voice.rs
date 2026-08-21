@@ -157,6 +157,7 @@ pub(crate) async fn turn(
 /// thread identity. The configured surface allowlist is enforced before a
 /// traced [`SurfaceContext`] is passed to
 /// [`crate::runtime::execute_observed_turn`].
+#[allow(clippy::result_large_err)]
 async fn process_request(
     state: &AppState,
     request: VoiceTurnRequest,
