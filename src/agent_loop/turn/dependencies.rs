@@ -1,4 +1,4 @@
-//! Turn execution runtime: narrows [`AppState`] to the fields a [`TurnExecutor`]
+//! Dependency boundary for Turn execution: narrows [`AppState`] to the fields a [`TurnExecutor`]
 //! actually needs.
 //!
 //! All Turn execution paths (Agent loop, Prompt builder, Compaction, Tool

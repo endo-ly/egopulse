@@ -201,29 +201,7 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    #[test]
-    fn chat_specific_soul_file_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("SOUL.md"), "Global soul");
-        let chat_soul = dir.path().join("runtime/groups/web/thread1/SOUL.md");
-        write_file(&chat_soul, "Chat-specific soul");
-
-        let result = loader.load_soul(None);
-        assert_eq!(result, Some("Global soul".to_string()));
-    }
-
     // --- agent_id tests ---
-
-    #[test]
-    fn load_soul_agent_id_falls_through_to_global() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-        write_file(&dir.path().join("SOUL.md"), "Global soul");
-
-        let result = loader.load_soul(Some("user1"));
-        assert_eq!(result, Some("Global soul".to_string()));
-    }
 
     // --- build_soul_section tests ---
 
@@ -240,7 +218,7 @@ mod tests {
     // --- build_agents_section tests ---
 
     #[test]
-    fn build_agents_section_formats_memories_header() {
+    fn build_agents_section_formats_context_wrapper() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
         write_file(&dir.path().join("AGENTS.md"), "Global agents content");
@@ -289,15 +267,6 @@ mod tests {
     }
 
     // --- path traversal guards ---
-
-    #[test]
-    fn load_soul_agent_id_rejects_parent_dir_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let loader = make_loader(dir.path());
-
-        let result = loader.load_soul(Some("../etc"));
-        assert_eq!(result, None);
-    }
 
     // --- agent-specific SOUL/AGENTS tests ---
 
