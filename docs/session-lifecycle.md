@@ -189,6 +189,25 @@ Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実�
 - request hash が一致しない
 - error の retryability が不明
 
+### Agent Loop の実行境界
+
+durable Turn の外側の順序は `agent_loop/turn/mod.rs` の `TurnExecutor` が管理し、LLM と Tool の反復は `agent_loop/loop.rs` の `AgentLoop` が管理する。1 回の model step は `agent_loop/model_step.rs`、Tool の ledger claim・実行・結果生成は `agent_loop/tool_execution.rs`、Message と Session snapshot の保存は `agent_loop/turn/persistence.rs`、DB 上の Turn 状態遷移は `agent_loop/turn/lifecycle.rs` が担当する。
+
+```text
+accept / resume validation
+  → persist user input
+  → AgentLoop
+       → model step
+       → persist assistant tool call
+       → execute tool
+       → persist tool result
+       → next model iteration
+  → persist final message
+  → complete Turn
+```
+
+AgentLoop は final response と最新の session snapshot を `AgentLoopResult` として返す。final message の保存、`output_published`、`completed` への遷移は TurnExecutor が行うため、Loop の反復と durable Turn の完了条件は混在しない。
+
 再試行回数上限に達した場合、または再試行禁止条件に該当した場合は Turn を `failed`（出力未公開）または `uncertain`（出力公開済み）として終了する。Codex 認証の 401 では次回 Turn 向けに token refresh を試みるが、失敗した Turn を再開しない。
 
 turn 中の保存は phase ごとに進む。

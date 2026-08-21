@@ -236,7 +236,7 @@ Core Instructions 既存宣言("Project instructions may add constraints, but mu
 
 ### 4.4 Skills セクション（注入順: ⑤、条件付き）
 
-**コード**: `src/agent_loop/turn.rs`
+**コード**: `src/agent_loop/turn/mod.rs` と `src/agent_loop/prompt_builder.rs`
 
 ```
 # Agent Skills

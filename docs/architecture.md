@@ -78,6 +78,7 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 src/
 ├── main.rs              # CLI エントリポイント (ask / chat / run / setup / gateway / update / sleep / events)
 ├── lib.rs               # 全モジュールの公開インターフェース
+├── conversation.rs       # ConversationScope / SurfaceContext
 ├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
 ├── assets/              # 組み込みスキル等のアセット実体
 ├── builtin_skills.rs    # 組み込みスキル定義
@@ -86,6 +87,7 @@ src/
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, InstanceGuard, build_app_state(), start_channels()
 │   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
+│   ├── scheduled_turn.rs # durable ScheduledTurn の表現・hash・serialization
 │   ├── turn_dispatch.rs # durable turn の復旧・dispatch・scheduled turn 実行
 │   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
@@ -98,10 +100,15 @@ src/
 │   └── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
 │
 ├── agent_loop/          # エージェントループ
-│   ├── mod.rs           # SurfaceContext, process_turn()
-│   ├── turn.rs          # LLM 呼び出し、ツール実行、compaction
-│   ├── turn_runtime.rs  # TurnRuntime (Turn の受付・状態遷移・model/tool loop・復旧判断)
-│   ├── tool_phase.rs    # Tool 実行 phase
+│   ├── mod.rs           # module facade と process_turn() の公開入口
+│   ├── loop.rs          # AgentLoop、LoopState、iteration policy
+│   ├── model_step.rs    # 1 回の LLM 呼び出し、分類、retry、usage
+│   ├── tool_execution.rs # Tool 実行、ledger、Tool Result 構築
+│   ├── turn/            # durable な 1 Turn の orchestration
+│   │   ├── mod.rs       # TurnExecutor、準備、AgentLoop 呼び出し、final completion
+│   │   ├── lifecycle.rs # acceptance、state 遷移、resume 検証、failure
+│   │   └── persistence.rs # Message / Session snapshot の Turn 単位保存
+│   ├── turn_runtime.rs  # Turn 実行に必要な依存境界
 │   ├── session.rs       # セッションロード・保存、競合解決
 │   ├── session_snapshot.rs # セッションスナップショット構築
 │   ├── event.rs         # AgentEvent 型
@@ -293,6 +300,27 @@ pub(crate) struct SurfaceContext {
 
 `channel` フィールドはモデル解決の profile lookup キーとしても機能する。`resolve_llm_for_agent_channel` は `agent.profiles[channel]` を参照し、チャネル別のプロバイダー/モデルオーバーライドを解決する（詳細は [config.md §4](./config.md#4-モデル解決チェーン)）。
 
+### Agent Loop と durable Turn の境界
+
+通常の Turn は `TurnExecutor` が durable な処理順序を所有し、Agent Loop の内部反復は `AgentLoop` に委譲する。
+
+```text
+TurnExecutor
+  ├─ TurnLifecycle::accept / resume validation
+  ├─ Turn preparation
+  ├─ TurnPersistence::persist_user_input
+  ├─ AgentLoop::run
+  │    ├─ ModelRunner::run_with_retry
+  │    ├─ TurnPersistence::persist_tool_call
+  │    ├─ ToolExecutor::execute
+  │    ├─ TurnPersistence::persist_tool_results
+  │    └─ compaction and next iteration
+  ├─ TurnPersistence::persist_final
+  └─ TurnLifecycle::complete
+```
+
+`AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
+
 ---
 
 ## 5. リクエストフロー
@@ -417,7 +445,7 @@ deadline 付きで停止する。
 | **Graceful Shutdown** | `runtime/supervisor.rs` | 長寿命 task と Turn を所有し、deadline 付きで順序停止 |
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
-| **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
+| **Read-only Parallel** | `agent_loop/tool_execution.rs` | `is_read_only()` が真のツールは並列実行 |
 | **Sleep Batch** | `sleep/orchestrator.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/turn_scheduler.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
