@@ -191,7 +191,7 @@ use crate::runtime::AppState;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::turn::FakeProvider;
+    use crate::agent_loop::test_support::FakeProvider;
     use crate::test_util;
     use std::fs;
 

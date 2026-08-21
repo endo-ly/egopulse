@@ -921,7 +921,7 @@ mod integration_tests {
         crate::config::persist::save_config_with_secrets(&config, &config_path)
             .expect("save initial config");
 
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![Ok(crate::llm::MessagesResponse {
                 content: "queued response".to_string(),
                 reasoning_content: None,

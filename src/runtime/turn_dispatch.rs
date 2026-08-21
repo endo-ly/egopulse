@@ -986,7 +986,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::agent_loop::turn::RecordingProvider;
+    use crate::agent_loop::test_support::RecordingProvider;
 
     fn final_provider() -> RecordingProvider {
         RecordingProvider::new(
@@ -1523,7 +1523,7 @@ mod tests {
         use crate::runtime::turn_scheduler::ScheduleResult;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![Ok(crate::llm::MessagesResponse {
                 content: "never".to_string(),
                 reasoning_content: None,

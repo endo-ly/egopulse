@@ -1203,9 +1203,9 @@ mod tests {
             .entry(crate::config::ChannelName::new("telegram"))
             .or_default()
             .telegram_channels = Some(channels);
-        Arc::new(crate::agent_loop::turn::build_state(
+        Arc::new(crate::agent_loop::test_support::build_state(
             config,
-            Box::new(crate::agent_loop::turn::FakeProvider {
+            Box::new(crate::agent_loop::test_support::FakeProvider {
                 responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
                     content: "ok".to_string(),
                     reasoning_content: None,

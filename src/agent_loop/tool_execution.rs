@@ -402,7 +402,9 @@ mod integration_tests {
     use tokio::sync::Barrier;
 
     use crate::agent_loop::process_turn;
-    use crate::agent_loop::turn::{RecordingProvider, build_state_with_provider, cli_context};
+    use crate::agent_loop::test_support::{
+        RecordingProvider, build_state_with_provider, cli_context,
+    };
     use crate::llm::{MessagesResponse, ToolCall, ToolDefinition};
     use crate::storage::call_blocking;
     use crate::tools::{Tool, ToolExecutionContext, ToolResult};

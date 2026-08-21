@@ -274,7 +274,7 @@ pub(crate) fn format_channel_log_message(msg: &StoredMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::turn::tool_result_message;
+    use crate::agent_loop::test_support::tool_result_message;
     use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 
     #[test]

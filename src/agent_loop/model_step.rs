@@ -533,7 +533,9 @@ mod tests {
     use super::*;
     use crate::agent_loop::formatting::message_to_text;
     use crate::agent_loop::process_turn;
-    use crate::agent_loop::turn::{RecordingProvider, build_state_with_provider, cli_context};
+    use crate::agent_loop::test_support::{
+        RecordingProvider, build_state_with_provider, cli_context,
+    };
     use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
     use crate::llm::{Message, MessagesResponse, ToolCall, ToolDefinition};
     use crate::storage::call_blocking;

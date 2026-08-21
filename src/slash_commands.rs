@@ -760,7 +760,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::agent_loop::turn::{build_state, build_state_for_config_file, test_config};
+    use crate::agent_loop::test_support::{build_state, build_state_for_config_file, test_config};
     use crate::config::{AgentId, Config};
     use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::LlmError;

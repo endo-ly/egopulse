@@ -836,7 +836,7 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 mod tests {
     use super::*;
     use crate::agent_loop::process_turn;
-    use crate::agent_loop::turn::{
+    use crate::agent_loop::test_support::{
         RecordingProvider, build_state, cli_context, test_config_with_compaction,
     };
     use crate::conversation::ConversationScope;

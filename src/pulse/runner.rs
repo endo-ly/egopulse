@@ -377,7 +377,7 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
         }));
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             responses,
             vec![0; crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_ITERATION + 2],
         );
@@ -447,7 +447,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().to_str().expect("utf8").to_string();
 
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![Ok(crate::llm::MessagesResponse {
                 content: "PULSE_OK".to_string(),
                 reasoning_content: None,
@@ -525,7 +525,7 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().to_str().expect("utf8").to_string();
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![
                 Err(crate::error::LlmError::InvalidResponse(
                     "assistant content was empty (output_items=1)".to_string(),

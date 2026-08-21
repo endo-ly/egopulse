@@ -399,7 +399,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::agent_loop::turn::FakeProvider;
+    use crate::agent_loop::test_support::FakeProvider;
     use crate::channels::adapter::ChannelRegistry;
     use crate::config::secret_ref::ResolvedValue;
     use crate::config::{

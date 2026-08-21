@@ -13,6 +13,8 @@ pub(crate) mod prompt_builder;
 pub(crate) mod session;
 pub(crate) mod session_snapshot;
 pub(crate) mod soul_agents;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod tool_execution;
 pub(crate) mod turn;
 pub(crate) mod turn_runtime;
