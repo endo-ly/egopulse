@@ -73,14 +73,218 @@ impl<'a> ToolExecutor<'a> {
         assistant_message_id: &str,
         tool_calls: Vec<ToolCall>,
     ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
-        execute_tool_calls(
-            self.runtime,
-            self.context,
-            assistant_message_id,
-            tool_calls,
-            self.hooks.clone(),
+        if tool_calls.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let read_only_flags = self.read_only_flags(&tool_calls).await;
+        let mut outcomes = Vec::with_capacity(tool_calls.len());
+        let mut cursor = 0;
+
+        while cursor < tool_calls.len() {
+            if read_only_flags[cursor] {
+                let block_start = cursor;
+                while cursor < tool_calls.len() && read_only_flags[cursor] {
+                    cursor += 1;
+                }
+                let block_futures = tool_calls[block_start..cursor]
+                    .iter()
+                    .cloned()
+                    .zip(read_only_flags[block_start..cursor].iter().copied())
+                    .map(|(tool_call, is_read_only)| {
+                        self.execute_single_tool(assistant_message_id, tool_call, is_read_only)
+                    })
+                    .collect::<Vec<_>>();
+                let block_results = join_all(block_futures).await;
+                for result in block_results {
+                    outcomes.push(result?);
+                }
+            } else {
+                outcomes.push(
+                    self.execute_single_tool(
+                        assistant_message_id,
+                        tool_calls[cursor].clone(),
+                        read_only_flags[cursor],
+                    )
+                    .await?,
+                );
+                cursor += 1;
+            }
+        }
+
+        Ok(outcomes)
+    }
+
+    async fn read_only_flags(&self, tool_calls: &[ToolCall]) -> Vec<bool> {
+        let mut flags = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            flags.push(self.runtime.tools.is_read_only(&tool_call.name).await);
+        }
+        flags
+    }
+
+    async fn execute_single_tool(
+        &self,
+        assistant_message_id: &str,
+        tool_call: ToolCall,
+        is_read_only: bool,
+    ) -> Result<ExecutedToolCall, EgoPulseError> {
+        if let Some(on_start) = &self.hooks.on_start {
+            on_start(&tool_call);
+        }
+
+        let tool_start = std::time::Instant::now();
+
+        // Claim the ledger slot before executing so a Tool call is never run
+        // before its durable row exists. Read-only Tools skip the ledger because
+        // they have no side effects and may be safely retried after a crash;
+        // this avoids SQLite write contention during parallel execution.
+        let claim = if is_read_only {
+            ClaimOutcome::Acquired
+        } else {
+            self.claim_tool_slot(assistant_message_id, &tool_call)
+                .await?
+        };
+
+        let (result, payload, executed) = match claim {
+            ClaimOutcome::Acquired => {
+                // Bind this execution's Tool Call ID into the context so tools
+                // (e.g. `agent_send`) can build per-call idempotency keys.
+                let mut exec_context = self.context.clone();
+                exec_context.tool_call_id = tool_call.id.clone();
+                let result = self
+                    .runtime
+                    .tools
+                    .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
+                    .await;
+                let payload = format_tool_result(&tool_call, &result);
+                if !is_read_only {
+                    self.record_tool_outcome(&tool_call, &result, &payload)
+                        .await?;
+                }
+                (result, payload, true)
+            }
+            ClaimOutcome::Reused { tool_output } => {
+                // A prior execution already succeeded; return the stored output
+                // without re-running the Tool.
+                let result = ToolResult::success(tool_output.clone());
+                (result, tool_output, false)
+            }
+            ClaimOutcome::Blocked { state: tool_state } => {
+                // The ledger forbids execution (failed / uncertain / in flight).
+                let result =
+                    ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
+                let payload = format_tool_result(&tool_call, &result);
+                (result, payload, false)
+            }
+        };
+
+        let duration_ms = tool_start.elapsed().as_millis();
+
+        if executed {
+            crate::runtime::metrics::inc_tool_calls_total(
+                &tool_call.name,
+                if result.is_error { "error" } else { "ok" },
+            );
+        }
+
+        let message = Message {
+            role: "tool".to_string(),
+            content: tool_message_content(&payload, &result),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call.id.clone()),
+        };
+
+        let outcome = ExecutedToolCall {
+            tool_call,
+            result,
+            payload,
+            message,
+            duration_ms,
+        };
+
+        if let Some(on_result) = &self.hooks.on_result {
+            on_result(&outcome);
+        }
+
+        Ok(outcome)
+    }
+
+    /// Claims a Tool execution slot in the `tool_calls` ledger.
+    ///
+    /// The canonical input and its hash are computed before any DB write so the
+    /// retry identity is fixed at claim time. Idempotency classification comes
+    /// from the [`ToolRegistry`] (derived from each tool's read-only declaration).
+    async fn claim_tool_slot(
+        &self,
+        assistant_message_id: &str,
+        tool_call: &ToolCall,
+    ) -> Result<ClaimOutcome, EgoPulseError> {
+        let canonical = canonical_tool_input(&tool_call.name, &tool_call.arguments);
+        let hash = input_hash(&canonical);
+        let tool_input = tool_call.arguments.to_string();
+        let class = self.runtime.tools.idempotency_class(&tool_call.name).await;
+        let key = self
+            .runtime
+            .tools
+            .idempotency_key(&tool_call.name, &tool_call.arguments)
+            .await;
+        let turn_id = self.context.turn_id.clone();
+        let chat_id = self.context.chat_id;
+        let message_id = assistant_message_id.to_string();
+        let tool_call_id = tool_call.id.clone();
+        let tool_name = tool_call.name.clone();
+        let hash_for_closure = hash;
+        let tool_input_for_closure = tool_input;
+        let key_for_closure = key;
+        Ok(
+            call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                db.claim_tool_execution(ClaimParams {
+                    turn_id: &turn_id,
+                    chat_id,
+                    message_id: &message_id,
+                    tool_call_id: &tool_call_id,
+                    tool_name: &tool_name,
+                    tool_input: &tool_input_for_closure,
+                    input_hash: &hash_for_closure,
+                    idempotency_class: class,
+                    idempotency_key: key_for_closure.as_deref(),
+                })
+            })
+            .await?,
         )
-        .await
+    }
+
+    /// Records the Tool execution outcome (success or failure) in the ledger.
+    ///
+    /// `payload` and `result.content` are already sanitized by [`ToolRegistry::execute`],
+    /// so no secret reaches the persisted `tool_output` / `error_message`.
+    async fn record_tool_outcome(
+        &self,
+        tool_call: &ToolCall,
+        result: &ToolResult,
+        payload: &str,
+    ) -> Result<(), EgoPulseError> {
+        let turn_id = self.context.turn_id.clone();
+        let tool_call_id = tool_call.id.clone();
+        if result.is_error {
+            let error_message = result.content.clone();
+            Ok(
+                call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                    db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
+                })
+                .await?,
+            )
+        } else {
+            let payload = payload.to_string();
+            Ok(
+                call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                    db.record_tool_success(&turn_id, &tool_call_id, &payload)
+                })
+                .await?,
+            )
+        }
     }
 }
 
@@ -103,229 +307,6 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     truncate_by_chars(&joined, MAX_TOOL_RESULT_TEXT_CHARS)
-}
-async fn execute_tool_calls<'a>(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    valid_tool_calls: Vec<ToolCall>,
-    hooks: ToolExecutionHooks<'a>,
-) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
-    if valid_tool_calls.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let read_only_flags = read_only_flags(state, &valid_tool_calls).await;
-    let mut outcomes = Vec::with_capacity(valid_tool_calls.len());
-    let mut cursor = 0;
-
-    while cursor < valid_tool_calls.len() {
-        if read_only_flags[cursor] {
-            let block_start = cursor;
-            while cursor < valid_tool_calls.len() && read_only_flags[cursor] {
-                cursor += 1;
-            }
-            let block_futures = valid_tool_calls[block_start..cursor]
-                .iter()
-                .cloned()
-                .zip(read_only_flags[block_start..cursor].iter().copied())
-                .map(|(tool_call, is_read_only)| {
-                    execute_single_tool(
-                        state,
-                        tool_context,
-                        assistant_message_id,
-                        tool_call,
-                        is_read_only,
-                        hooks.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let block_results = join_all(block_futures).await;
-            for result in block_results {
-                outcomes.push(result?);
-            }
-        } else {
-            outcomes.push(
-                execute_single_tool(
-                    state,
-                    tool_context,
-                    assistant_message_id,
-                    valid_tool_calls[cursor].clone(),
-                    read_only_flags[cursor],
-                    hooks.clone(),
-                )
-                .await?,
-            );
-            cursor += 1;
-        }
-    }
-
-    Ok(outcomes)
-}
-
-async fn read_only_flags(state: &TurnRuntime, valid_tool_calls: &[ToolCall]) -> Vec<bool> {
-    let mut flags = Vec::with_capacity(valid_tool_calls.len());
-    for tool_call in valid_tool_calls {
-        flags.push(state.tools.is_read_only(&tool_call.name).await);
-    }
-    flags
-}
-
-async fn execute_single_tool(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    tool_call: ToolCall,
-    is_read_only: bool,
-    hooks: ToolExecutionHooks<'_>,
-) -> Result<ExecutedToolCall, EgoPulseError> {
-    if let Some(on_start) = &hooks.on_start {
-        on_start(&tool_call);
-    }
-
-    let tool_start = std::time::Instant::now();
-
-    // Claim the ledger slot before executing so a Tool call is never run
-    // before its durable row exists. Read-only Tools skip the ledger because
-    // they have no side effects and may be safely retried after a crash;
-    // this avoids SQLite write contention during parallel execution.
-    let claim = if is_read_only {
-        ClaimOutcome::Acquired
-    } else {
-        claim_tool_slot(state, tool_context, assistant_message_id, &tool_call).await?
-    };
-
-    let (result, payload, executed) = match claim {
-        ClaimOutcome::Acquired => {
-            // Bind this execution's Tool Call ID into the context so tools
-            // (e.g. `agent_send`) can build per-call idempotency keys.
-            let mut exec_context = tool_context.clone();
-            exec_context.tool_call_id = tool_call.id.clone();
-            let result = state
-                .tools
-                .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
-                .await;
-            let payload = format_tool_result(&tool_call, &result);
-            if !is_read_only {
-                record_tool_outcome(state, tool_context, &tool_call, &result, &payload).await?;
-            }
-            (result, payload, true)
-        }
-        ClaimOutcome::Reused { tool_output } => {
-            // A prior execution already succeeded; return the stored output
-            // without re-running the Tool.
-            let result = ToolResult::success(tool_output.clone());
-            (result, tool_output, false)
-        }
-        ClaimOutcome::Blocked { state: tool_state } => {
-            // The ledger forbids execution (failed / uncertain / in flight).
-            let result = ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
-            let payload = format_tool_result(&tool_call, &result);
-            (result, payload, false)
-        }
-    };
-
-    let duration_ms = tool_start.elapsed().as_millis();
-
-    if executed {
-        crate::runtime::metrics::inc_tool_calls_total(
-            &tool_call.name,
-            if result.is_error { "error" } else { "ok" },
-        );
-    }
-
-    let message = Message {
-        role: "tool".to_string(),
-        content: tool_message_content(&payload, &result),
-        reasoning_content: None,
-        tool_calls: Vec::new(),
-        tool_call_id: Some(tool_call.id.clone()),
-    };
-
-    let outcome = ExecutedToolCall {
-        tool_call,
-        result,
-        payload,
-        message,
-        duration_ms,
-    };
-
-    if let Some(on_result) = &hooks.on_result {
-        on_result(&outcome);
-    }
-
-    Ok(outcome)
-}
-
-/// Claims a Tool execution slot in the `tool_calls` ledger.
-///
-/// The canonical input and its hash are computed before any DB write so the
-/// retry identity is fixed at claim time. Idempotency classification comes
-/// from the [`ToolRegistry`] (derived from each tool's read-only declaration).
-async fn claim_tool_slot(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    tool_call: &ToolCall,
-) -> Result<ClaimOutcome, EgoPulseError> {
-    let canonical = canonical_tool_input(&tool_call.name, &tool_call.arguments);
-    let hash = input_hash(&canonical);
-    let tool_input = tool_call.arguments.to_string();
-    let class = state.tools.idempotency_class(&tool_call.name).await;
-    let key = state
-        .tools
-        .idempotency_key(&tool_call.name, &tool_call.arguments)
-        .await;
-    let turn_id = tool_context.turn_id.clone();
-    let chat_id = tool_context.chat_id;
-    let message_id = assistant_message_id.to_string();
-    let tool_call_id = tool_call.id.clone();
-    let tool_name = tool_call.name.clone();
-    let hash_for_closure = hash;
-    let tool_input_for_closure = tool_input;
-    let key_for_closure = key;
-    Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
-        db.claim_tool_execution(ClaimParams {
-            turn_id: &turn_id,
-            chat_id,
-            message_id: &message_id,
-            tool_call_id: &tool_call_id,
-            tool_name: &tool_name,
-            tool_input: &tool_input_for_closure,
-            input_hash: &hash_for_closure,
-            idempotency_class: class,
-            idempotency_key: key_for_closure.as_deref(),
-        })
-    })
-    .await?)
-}
-
-/// Records the Tool execution outcome (success or failure) in the ledger.
-///
-/// `payload` and `result.content` are already sanitized by [`ToolRegistry::execute`],
-/// so no secret reaches the persisted `tool_output` / `error_message`.
-async fn record_tool_outcome(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    tool_call: &ToolCall,
-    result: &ToolResult,
-    payload: &str,
-) -> Result<(), EgoPulseError> {
-    let turn_id = tool_context.turn_id.clone();
-    let tool_call_id = tool_call.id.clone();
-    if result.is_error {
-        let error_message = result.content.clone();
-        Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
-            db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
-        })
-        .await?)
-    } else {
-        let payload = payload.to_string();
-        Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
-            db.record_tool_success(&turn_id, &tool_call_id, &payload)
-        })
-        .await?)
-    }
 }
 
 #[cfg(test)]
