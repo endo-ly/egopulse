@@ -8,27 +8,23 @@ pub(crate) mod config_reload;
 pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
-pub(crate) mod runtime_status;
-pub(crate) mod scheduled_turn;
+pub(crate) mod status;
 pub(crate) mod supervisor;
-pub(crate) mod tool_progress;
-pub(crate) mod turn_dispatch;
-pub(crate) mod turn_scheduler;
+pub(crate) mod turn;
 
 pub(crate) use channel_input::{
     ChannelLogKey, HumanChannelLogMessage, TurnIntake, build_channel_context,
     channel_scope_from_secret, store_human_channel_log_message, submit_agent_turn,
 };
-pub(crate) use runtime_status::ChannelState;
-pub(crate) use runtime_status::RuntimeStatus;
+pub(crate) use status::ChannelState;
+pub(crate) use status::RuntimeStatus;
 pub(crate) use supervisor::Criticality;
 pub(crate) use supervisor::RuntimeSupervisor;
 pub(crate) use supervisor::TaskKind;
 pub(crate) use supervisor::TaskSpec;
-pub(crate) use turn_dispatch::{execute_observed_turn, execute_scheduled_turn};
-pub(crate) use turn_scheduler::ActiveTurnTracker;
+pub(crate) use turn::{ActiveTurnTracker, execute_observed_turn, execute_scheduled_turn};
 
-use turn_dispatch::{recover_durable_state, rehydrate_origin_tracker, spawn_turn_dispatcher};
+use turn::{recover_durable_state, rehydrate_origin_tracker, spawn_turn_dispatcher};
 
 use fs2::FileExt;
 use std::collections::HashMap;
@@ -38,7 +34,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::agent_loop::soul_agents::SoulAgentsLoader;
+use crate::agent_loop::prompt::sources::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
@@ -125,9 +121,9 @@ pub struct AppState {
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     /// Per-session turn scheduler for concurrency control and ordered execution.
-    pub(crate) turn_scheduler: Arc<turn_scheduler::TurnScheduler>,
+    pub(crate) turn_scheduler: Arc<turn::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
-    pub(crate) turn_tracker: Arc<turn_scheduler::TurnTracker>,
+    pub(crate) turn_tracker: Arc<turn::TurnTracker>,
     /// In-memory runtime health summary for observability.
     pub(crate) runtime_status: Arc<RuntimeStatus>,
     /// Owns long-lived tasks and in-flight turns; orchestrates shutdown.
@@ -200,8 +196,8 @@ impl AppState {
             memory_loader: parts.memory_loader,
             llm_cache: Arc::new(Mutex::new(HashMap::new())),
             active_turns: Arc::new(ActiveTurnTracker::new()),
-            turn_scheduler: Arc::new(turn_scheduler::TurnScheduler::new()),
-            turn_tracker: Arc::new(turn_scheduler::TurnTracker::new()),
+            turn_scheduler: Arc::new(turn::TurnScheduler::new()),
+            turn_tracker: Arc::new(turn::TurnTracker::new()),
             runtime_status: parts.runtime_status.clone(),
             supervisor: Arc::new(RuntimeSupervisor::with_instance_guard(
                 parts.runtime_status,
@@ -212,14 +208,14 @@ impl AppState {
         }
     }
 
-    /// Builds a [`crate::agent_loop::TurnRuntime`] from the subset of this
+    /// Builds a [`crate::agent_loop::TurnDependencies`] from the subset of this
     /// `AppState` that Turn execution actually needs.
     ///
     /// Scheduling, channel dispatch, and runtime observability fields are
     /// intentionally omitted so that Turn logic cannot accidentally depend on
     /// them.
-    pub(crate) fn turn_runtime(&self) -> crate::agent_loop::TurnRuntime {
-        crate::agent_loop::TurnRuntime {
+    pub(crate) fn turn_dependencies(&self) -> crate::agent_loop::TurnDependencies {
+        crate::agent_loop::TurnDependencies {
             db: Arc::clone(&self.db),
             secret_db: self.secret_db.clone(),
             config_manager: Arc::clone(&self.config_manager),
@@ -995,7 +991,7 @@ mod tests {
         let state = build_app_state(config).await.expect("build state");
         let context = crate::test_util::cli_context("cache-test");
 
-        let runtime = state.turn_runtime();
+        let runtime = state.turn_dependencies();
         let snapshot = state.config_manager.current_blocking();
         let a = runtime
             .llm_for_context_with_snapshot(&context, &snapshot)
@@ -1013,7 +1009,7 @@ mod tests {
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");
         let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        let runtime = state.turn_runtime();
+        let runtime = state.turn_dependencies();
 
         let newer = runtime
             .cached_provider(&resolved, 2)
@@ -1046,7 +1042,7 @@ mod tests {
 
         let snapshot = state.config_manager.current_blocking();
         let result = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         assert_eq!(result.provider_name(), expected_provider);

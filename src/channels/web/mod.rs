@@ -535,7 +535,7 @@ mod tests {
         let (app, state) = authenticated_web_test_router(&dir);
         state
             .runtime_status
-            .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
+            .update_channel("web", crate::runtime::status::ChannelState::Running);
 
         // Act
         let response = app
@@ -604,7 +604,7 @@ mod tests {
         let (app, state) = authenticated_web_test_router(&dir);
         state
             .runtime_status
-            .update_channel("web", crate::runtime::runtime_status::ChannelState::Running);
+            .update_channel("web", crate::runtime::status::ChannelState::Running);
 
         // Act
         let response = app
@@ -1563,7 +1563,7 @@ mod tests {
         // are executed; this only occupies tracker capacity so the next fresh
         // origin must be refused at acceptance rather than accepted and later
         // dropped.
-        for i in 0..crate::runtime::turn_scheduler::MAX_TRACKED_ORIGINS {
+        for i in 0..crate::runtime::turn::scheduler::MAX_TRACKED_ORIGINS {
             app_state
                 .turn_tracker
                 .reserve(&format!("fill-{i}"))

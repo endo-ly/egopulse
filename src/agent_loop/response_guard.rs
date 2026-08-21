@@ -126,9 +126,13 @@ mod tests {
             }),
         );
 
-        let error = process_turn(&state.turn_runtime(), &cli_context("empty-guard"), "hello")
-            .await
-            .expect_err("should fail after retry");
+        let error = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("empty-guard"),
+            "hello",
+        )
+        .await
+        .expect_err("should fail after retry");
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
@@ -157,7 +161,7 @@ mod tests {
         );
 
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("declarative-guard"),
             "help me",
         )
@@ -177,7 +181,7 @@ mod tests {
         .await
         .expect("chat id");
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -220,7 +224,7 @@ mod tests {
         );
 
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("malformed-declarative"),
             "test",
         )

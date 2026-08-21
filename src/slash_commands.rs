@@ -84,7 +84,7 @@ pub(crate) async fn process_slash_command(
         return SlashCommandOutcome::Respond(response);
     }
 
-    match resolve_chat_id(&state.turn_runtime(), context).await {
+    match resolve_chat_id(&state.turn_dependencies(), context).await {
         Ok(chat_id) => {
             let response = handle_slash_command(state, chat_id, context, text, sender_id)
                 .await
@@ -219,7 +219,7 @@ async fn handle_compact(
     context: &SurfaceContext,
 ) -> Option<String> {
     let config_snapshot = state.config_manager.current_blocking();
-    let runtime = state.turn_runtime();
+    let runtime = state.turn_dependencies();
     let loaded = match load_messages_for_turn_with_limit(
         &runtime,
         context.scope,

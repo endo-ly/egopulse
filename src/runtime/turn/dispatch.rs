@@ -9,11 +9,10 @@ use crate::agent_loop::resume_input_committed_turn;
 use crate::config::manager::ConfigSnapshot;
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
-use crate::runtime::scheduled_turn::{ScheduledTurn, deserialize_scheduled_turn};
-use crate::runtime::{
-    AppState, Criticality, TaskKind, TaskSpec, channel_input, metrics,
-    runtime_status::RuntimeStatus, tool_progress, turn_scheduler,
-};
+use crate::runtime::status::RuntimeStatus;
+use crate::runtime::turn::{ScheduledTurn, deserialize_scheduled_turn};
+use crate::runtime::turn::{ToolProgressCoordinator, scheduler};
+use crate::runtime::{AppState, Criticality, TaskKind, TaskSpec, channel_input, metrics};
 use crate::storage::{
     DISPATCHER_BATCH_LIMIT, DURABLE_PAYLOAD_INVALID_ERROR_KIND, Database, TurnRunState,
     call_blocking,
@@ -32,7 +31,7 @@ struct PreparedScheduledTurn {
 /// Spawns the turn dispatcher: a long-lived supervisor task that periodically
 /// scans both databases for durably accepted turns (request persisted but never
 /// started) and re-submits them so a crash before execution is fully recovered
-pub(super) fn spawn_turn_dispatcher(state: Arc<AppState>, shutdown: CancellationToken) {
+pub(in crate::runtime) fn spawn_turn_dispatcher(state: Arc<AppState>, shutdown: CancellationToken) {
     let supervisor = Arc::clone(&state.supervisor);
     supervisor.spawn_long_lived(
         TaskSpec::new(
@@ -312,7 +311,7 @@ async fn persist_origin_terminal_reason(
     state: &AppState,
     scope: crate::conversation::ConversationScope,
     origin_id: &str,
-    reason: turn_scheduler::StopReason,
+    reason: scheduler::StopReason,
 ) -> Result<(), EgoPulseError> {
     let db = state.db_for(scope);
     let origin_id = origin_id.to_owned();
@@ -340,7 +339,9 @@ async fn persist_origin_terminal_reason(
 ///
 /// Recovery is fail-closed: a failure in any database is returned so startup
 /// cannot accept new turns while durable state is only partially recovered.
-pub(super) async fn recover_durable_state(state: &AppState) -> Result<(), EgoPulseError> {
+pub(in crate::runtime) async fn recover_durable_state(
+    state: &AppState,
+) -> Result<(), EgoPulseError> {
     for (scope, db) in state.scoped_databases() {
         recover_durable_state_for_db(&db, scope)?;
     }
@@ -389,8 +390,8 @@ fn recover_durable_state_for_db(
 
 /// Rehydrates the in-memory origin tracker from durable turn state after a
 /// restart so chain limits and terminal guards survive process loss.
-pub(super) fn rehydrate_origin_tracker(state: &AppState) -> Result<(), EgoPulseError> {
-    let ttl_secs = turn_scheduler::ORIGIN_TTL.as_secs() as i64;
+pub(in crate::runtime) fn rehydrate_origin_tracker(state: &AppState) -> Result<(), EgoPulseError> {
+    let ttl_secs = scheduler::ORIGIN_TTL.as_secs() as i64;
     for (scope, db) in state.scoped_databases() {
         rehydrate_origin_tracker_for_db(state, &db, scope, ttl_secs)?;
     }
@@ -670,7 +671,7 @@ async fn execute_and_publish_scheduled_turn(
 
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
-    let runtime = state.turn_runtime();
+    let runtime = state.turn_dependencies();
     let turn_result = match current_state {
         Some(TurnRunState::InputCommitted) => {
             resume_input_committed_turn(
@@ -739,12 +740,12 @@ async fn execute_and_publish_scheduled_turn(
             );
             state
                 .turn_tracker
-                .set_terminal_reason(origin_id, turn_scheduler::StopReason::LlmFailure);
+                .set_terminal_reason(origin_id, scheduler::StopReason::LlmFailure);
             if let Err(persist_err) = persist_origin_terminal_reason(
                 state,
                 turn.context.scope,
                 origin_id,
-                turn_scheduler::StopReason::LlmFailure,
+                scheduler::StopReason::LlmFailure,
             )
             .await
             {
@@ -757,7 +758,7 @@ async fn execute_and_publish_scheduled_turn(
                 return;
             }
             if let Some(log_chat_id) = turn.context.channel_log_chat_id {
-                let reason = turn_scheduler::StopReason::LlmFailure;
+                let reason = scheduler::StopReason::LlmFailure;
                 if let Err(db_err) = call_blocking(state.db_for(turn.context.scope), move |db| {
                     db.store_system_event(log_chat_id, &reason)
                 })
@@ -863,7 +864,7 @@ pub(crate) async fn execute_observed_turn(
         .touch_channel_activity(&context.channel);
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
-    let runtime = state.turn_runtime();
+    let runtime = state.turn_dependencies();
     let result =
         crate::agent_loop::process_turn_with_events(&runtime, context, input, |_| {}).await;
     let duration = started.elapsed().as_secs_f64();
@@ -891,13 +892,13 @@ async fn execute_turn_with_progress_and_snapshot(
 
     let (evt_tx, evt_rx) =
         tokio::sync::mpsc::unbounded_channel::<crate::agent_loop::event::AgentEvent>();
-    let coordinator = tool_progress::ToolProgressCoordinator::new(sink, external_chat_id.clone());
+    let coordinator = ToolProgressCoordinator::new(sink, external_chat_id.clone());
     let coordinator_handle = tokio::spawn(coordinator.run(evt_rx));
     // timeout 枝でタスクを確実に停止できるよう abort handle を保持する。
     let coordinator_abort = coordinator_handle.abort_handle();
 
     let event_sender = evt_tx.clone();
-    let runtime = state.turn_runtime();
+    let runtime = state.turn_dependencies();
     let result = crate::agent_loop::process_turn_with_events_and_snapshot(
         &runtime,
         context,
@@ -1082,7 +1083,7 @@ mod tests {
         let capture = TraceCapture::new();
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
-        let turn = crate::runtime::scheduled_turn::ScheduledTurn {
+        let turn = crate::runtime::turn::ScheduledTurn {
             turn_id: "turn-1".to_string(),
             context,
             input: "scheduled turn".to_string(),
@@ -1274,7 +1275,7 @@ mod tests {
     #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
         use crate::llm::MessagesResponse;
-        use crate::runtime::scheduled_turn::ScheduledTurn;
+        use crate::runtime::turn::ScheduledTurn;
         use crate::storage::call_blocking;
 
         // Arrange: state with secret DB + recording provider
@@ -1396,8 +1397,8 @@ mod tests {
     async fn db_failure_during_dispatch_retries_and_preserves_turn_order() {
         use crate::conversation::ConversationScope;
         use crate::llm::MessagesResponse;
-        use crate::runtime::scheduled_turn::ScheduledTurn;
-        use crate::runtime::turn_scheduler::ScheduleResult;
+        use crate::runtime::turn::ScheduleResult;
+        use crate::runtime::turn::ScheduledTurn;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
@@ -1480,8 +1481,8 @@ mod tests {
     async fn dispatch_re_scans_capacity_rejected_turn_after_capacity_frees() {
         use crate::conversation::ConversationScope;
         use crate::runtime::channel_input;
-        use crate::runtime::scheduled_turn::ScheduledTurn;
-        use crate::runtime::turn_scheduler::SubmitOutcome;
+        use crate::runtime::turn::ScheduledTurn;
+        use crate::runtime::turn::SubmitOutcome;
         use crate::storage::call_blocking;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1492,7 +1493,7 @@ mod tests {
         state.supervisor.start_accepting();
 
         let session_key = "cli:session-blk1:agent:default";
-        let max_queued = crate::runtime::turn_scheduler::MAX_QUEUED_TURNS_PER_SESSION;
+        let max_queued = crate::runtime::turn::scheduler::MAX_QUEUED_TURNS_PER_SESSION;
         // Fill the per-session queue: 1 started + max_queued queued.
         for i in 0..=max_queued {
             let mut ctx = crate::test_util::cli_context("session-blk1");
@@ -1574,7 +1575,7 @@ mod tests {
     #[tokio::test]
     async fn persist_origin_terminal_reason_retries_until_db_recovers() {
         use crate::conversation::ConversationScope;
-        use crate::runtime::turn_scheduler::StopReason;
+        use crate::runtime::turn::StopReason;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let state = Arc::new(crate::test_util::build_state_with_provider(
@@ -1601,8 +1602,8 @@ mod tests {
     #[serial_test::serial]
     async fn permanent_db_failure_keeps_session_blocked() {
         use crate::conversation::ConversationScope;
-        use crate::runtime::scheduled_turn::ScheduledTurn;
-        use crate::runtime::turn_scheduler::ScheduleResult;
+        use crate::runtime::turn::ScheduleResult;
+        use crate::runtime::turn::ScheduledTurn;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = crate::agent_loop::test_support::RecordingProvider::new(
@@ -1827,8 +1828,8 @@ mod tests {
     async fn resume_input_committed_turn_restarts_model_loop() {
         use crate::agent_loop::resume_input_committed_turn;
         use crate::llm::MessagesResponse;
-        use crate::runtime::scheduled_turn::ScheduledTurn;
-        use crate::runtime::scheduled_turn::serialize_scheduled_turn;
+        use crate::runtime::turn::ScheduledTurn;
+        use crate::runtime::turn::serialize_scheduled_turn;
         use crate::storage::{AcceptOutcome, StoredMessage, TurnRunState};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1845,7 +1846,7 @@ mod tests {
             dir.path().to_str().expect("utf8"),
             Box::new(provider),
         );
-        let runtime = state.turn_runtime();
+        let runtime = state.turn_dependencies();
 
         let mut context = crate::test_util::cli_context("resume-input-committed");
         context.scope = ConversationScope::Normal;

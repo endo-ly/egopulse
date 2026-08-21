@@ -50,7 +50,7 @@ pub(crate) struct TurnRun {
     pub updated_at: String,
     pub finished_at: Option<String>,
     pub request_payload_hash: Option<String>,
-    /// Serialized accepted request ([`crate::runtime::scheduled_turn::PersistedScheduledTurnV1`]),
+    /// Serialized accepted request ([`crate::runtime::turn::scheduled::PersistedScheduledTurnV1`]),
     /// present once the turn has been durably accepted. Lets a restarted runtime
     /// rebuild the `SurfaceContext` without re-delivering the platform event.
     pub scheduled_request_json: Option<String>,
@@ -95,7 +95,7 @@ pub(crate) struct RecoveredTurnRun {
 }
 
 /// Per-origin execution count rehydrated from `turn_runs` after a restart.
-/// The in-memory [`crate::runtime::turn_scheduler::TurnTracker`] is
+/// The in-memory [`crate::runtime::turn::TurnTracker`] is
 /// rebuilt from these so a chain that already consumed turns before a crash
 /// keeps its per-chain turn limit instead of resetting to zero. `terminal_reason`
 /// (when present) is the durable terminal stop reason restored from
@@ -906,7 +906,7 @@ impl Database {
     }
     ///
     /// Used when the turn dispatcher drops a turn because its origin already has a
-    /// terminal stop reason, or [`crate::runtime::turn_scheduler::TurnTracker::try_begin_execution`]
+    /// terminal stop reason, or [`crate::runtime::turn::TurnTracker::try_begin_execution`]
     /// refuses it (chain depth, turn count, missing agent). Moving the turn to
     /// `cancelled` (with `error_kind` / `error_message`) prevents the dispatcher
     /// from re-scanning and re-dispatching it on every 5s loop — otherwise a
@@ -1114,7 +1114,7 @@ impl Database {
     /// counts toward its origin, because those are exactly the states the turn
     /// dispatcher re-executes live after startup; counting them here would
     /// double-count. Once a turn has begun execution it has consumed a slot via
-    /// [`crate::runtime::turn_scheduler::TurnTracker::try_begin_execution`],
+    /// [`crate::runtime::turn::TurnTracker::try_begin_execution`],
     /// regardless of how it later terminated.
     ///
     /// # Errors
@@ -1149,7 +1149,7 @@ impl Database {
     /// origin. The `executed_turn_count` column is left unchanged (it is derived
     /// from `turn_runs` at startup); only `terminal_reason` is written. A `None`
     /// reason clears it. Called whenever the in-memory
-    /// [`crate::runtime::turn_scheduler::TurnTracker`] records a terminal reason,
+    /// [`crate::runtime::turn::TurnTracker`] records a terminal reason,
     /// so a terminated chain is durably remembered across restarts.
     ///
     /// # Errors

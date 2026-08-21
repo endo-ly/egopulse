@@ -1,16 +1,16 @@
 //! System prompt construction for agent turns.
 
-use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::TurnDependencies;
 use crate::conversation::{ConversationScope, SurfaceContext};
 
-const CORE_INSTRUCTIONS: &str = include_str!("prompts/core_instructions.md");
+const CORE_INSTRUCTIONS: &str = include_str!("templates/core_instructions.md");
 
 /// Builds the system prompt using the provided immutable Config snapshot.
 ///
 /// Callers inside a Turn should use this so the entire Turn runs against a
 /// single fixed Config generation.
 pub(crate) fn build_system_prompt_with_config(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     config: &crate::config::Config,
 ) -> String {
@@ -55,7 +55,7 @@ pub(crate) fn build_system_prompt_with_config(
     prompt
 }
 
-fn build_soul_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
+fn build_soul_prompt_section(state: &TurnDependencies, context: &SurfaceContext) -> Option<String> {
     let soul_content = state.soul_agents.load_soul(
         &context.channel,
         &context.surface_thread,
@@ -70,7 +70,7 @@ fn build_soul_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> O
 }
 
 fn build_model_instructions_section(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     config: &crate::config::Config,
 ) -> Option<String> {
@@ -103,7 +103,10 @@ fn build_model_instructions_section(
     ))
 }
 
-fn build_agents_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
+fn build_agents_prompt_section(
+    state: &TurnDependencies,
+    context: &SurfaceContext,
+) -> Option<String> {
     state.soul_agents.build_agents_section(
         &context.channel,
         &context.surface_thread,
@@ -111,7 +114,10 @@ fn build_agents_prompt_section(state: &TurnRuntime, context: &SurfaceContext) ->
     )
 }
 
-fn build_secret_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
+fn build_secret_prompt_section(
+    state: &TurnDependencies,
+    context: &SurfaceContext,
+) -> Option<String> {
     if context.scope != ConversationScope::Secret {
         return None;
     }
@@ -119,7 +125,7 @@ fn build_secret_prompt_section(state: &TurnRuntime, context: &SurfaceContext) ->
     Some(format!("<secret>\n{content}\n</secret>"))
 }
 
-fn build_skills_prompt_section(state: &TurnRuntime) -> Option<String> {
+fn build_skills_prompt_section(state: &TurnDependencies) -> Option<String> {
     let skills_catalog = state.skills.build_skills_catalog();
     if skills_catalog.is_empty() {
         return None;
@@ -133,7 +139,10 @@ fn build_skills_prompt_section(state: &TurnRuntime) -> Option<String> {
     Some(section)
 }
 
-fn build_memory_prompt_section(state: &TurnRuntime, context: &SurfaceContext) -> Option<String> {
+fn build_memory_prompt_section(
+    state: &TurnDependencies,
+    context: &SurfaceContext,
+) -> Option<String> {
     let memory = match state.memory_loader.load_bundle(&context.agent_id) {
         Ok(memory) => memory,
         Err(error) => {
@@ -229,7 +238,7 @@ mod tests {
 
     fn build_test_system_prompt(state: &AppState, context: &SurfaceContext) -> String {
         let snapshot = state.config_manager.current_blocking();
-        build_system_prompt_with_config(&state.turn_runtime(), context, &snapshot.config)
+        build_system_prompt_with_config(&state.turn_dependencies(), context, &snapshot.config)
     }
 
     fn test_context(agent_id: &str) -> SurfaceContext {
@@ -270,7 +279,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
+        let result = build_memory_prompt_section(&state.turn_dependencies(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -299,7 +308,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
+        let result = build_memory_prompt_section(&state.turn_dependencies(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -328,7 +337,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
+        let result = build_memory_prompt_section(&state.turn_dependencies(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -352,7 +361,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
+        let result = build_memory_prompt_section(&state.turn_dependencies(), &ctx);
 
         // Assert
         let section = result.expect("should return Some");
@@ -378,7 +387,7 @@ mod tests {
         let ctx = test_context("testagent");
 
         // Act
-        let result = build_memory_prompt_section(&state.turn_runtime(), &ctx);
+        let result = build_memory_prompt_section(&state.turn_dependencies(), &ctx);
 
         // Assert
         assert!(result.is_none(), "should return None when no memory files");

@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::TurnRuntime;
-use crate::agent_loop::formatting::{format_tool_result, message_to_text, tool_message_content};
+use crate::agent_loop::TurnDependencies;
+use crate::agent_loop::message_format::{
+    format_tool_result, message_to_text, tool_message_content,
+};
 use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, ToolCall};
@@ -48,7 +50,7 @@ pub(crate) struct ToolResultPhase {
 
 /// Executes validated tool calls while preserving ordering and idempotency.
 pub(crate) struct ToolExecutor<'a> {
-    runtime: &'a TurnRuntime,
+    runtime: &'a TurnDependencies,
     context: &'a ToolExecutionContext,
     hooks: ToolExecutionHooks<'a>,
 }
@@ -56,7 +58,7 @@ pub(crate) struct ToolExecutor<'a> {
 impl<'a> ToolExecutor<'a> {
     /// Creates an executor for one assistant tool-call phase.
     pub(crate) fn new(
-        runtime: &'a TurnRuntime,
+        runtime: &'a TurnDependencies,
         context: &'a ToolExecutionContext,
         hooks: ToolExecutionHooks<'a>,
     ) -> Self {
@@ -483,7 +485,7 @@ mod integration_tests {
         let reply = tokio::time::timeout(
             Duration::from_secs(2),
             process_turn(
-                &state.turn_runtime(),
+                &state.turn_dependencies(),
                 &cli_context("parallel-read"),
                 "read both",
             ),
@@ -553,7 +555,7 @@ mod integration_tests {
         context.scope = ConversationScope::Secret;
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "run a command")
+        let reply = process_turn(&state.turn_dependencies(), &context, "run a command")
             .await
             .expect("process turn");
 
@@ -630,9 +632,13 @@ mod integration_tests {
         .expect("dir");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &cli_context("seq-write"), "write it")
-            .await
-            .expect("turn");
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("seq-write"),
+            "write it",
+        )
+        .await
+        .expect("turn");
 
         // Assert
         assert_eq!(reply, "Done.");
@@ -712,7 +718,7 @@ mod integration_tests {
 
         // Act
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("transcript-order"),
             "ordered",
         )

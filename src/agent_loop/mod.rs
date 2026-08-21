@@ -5,24 +5,22 @@
 
 pub(crate) mod compaction;
 pub(crate) mod event;
-pub(crate) mod execution;
-pub(crate) mod formatting;
-pub(crate) mod guards;
+pub(crate) mod loop_runner;
+pub(crate) mod message_format;
 pub(crate) mod model_step;
-pub(crate) mod prompt_builder;
+pub(crate) mod prompt;
+pub(crate) mod response_guard;
 pub(crate) mod session;
 pub(crate) mod session_snapshot;
-pub(crate) mod soul_agents;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod tool_execution;
 pub(crate) mod turn;
-pub(crate) mod turn_runtime;
 
 pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
 pub use turn::ask_in_session;
+pub(crate) use turn::dependencies::TurnDependencies;
 pub(crate) use turn::{
     process_turn, process_turn_with_events, process_turn_with_events_and_snapshot,
     resume_input_committed_turn, send_turn,
 };
-pub(crate) use turn_runtime::TurnRuntime;

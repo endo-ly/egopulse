@@ -1103,7 +1103,7 @@ mod tests {
 
         // Act: run a full turn through the real provider and forward each event.
         let reply = process_turn_with_events(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &crate::agent_loop::test_support::cli_context("narration-e2e"),
             "please read note.txt",
             move |event| {

@@ -1,11 +1,11 @@
 //! Durable Turn acceptance, state transitions, resume validation, and failure.
 
-use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::TurnDependencies;
 use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
-use crate::runtime::scheduled_turn::{ScheduledTurn, deserialize_scheduled_turn};
-use crate::runtime::turn_scheduler::StopReason;
+use crate::runtime::turn::StopReason;
+use crate::runtime::turn::{ScheduledTurn, deserialize_scheduled_turn};
 use crate::storage::{AcceptOutcome, TurnRun, TurnRunState, call_blocking};
 use tracing::warn;
 
@@ -32,7 +32,7 @@ pub(crate) fn resolve_request_key(context: &SurfaceContext) -> String {
 
 /// Owns durable state transitions for one Turn.
 pub(crate) struct TurnLifecycle<'a> {
-    runtime: &'a TurnRuntime,
+    runtime: &'a TurnDependencies,
     scope: ConversationScope,
     turn_id: String,
     origin_id: String,
@@ -41,7 +41,7 @@ pub(crate) struct TurnLifecycle<'a> {
 impl<'a> TurnLifecycle<'a> {
     /// Creates a lifecycle boundary for one durable Turn.
     pub(crate) fn new(
-        runtime: &'a TurnRuntime,
+        runtime: &'a TurnDependencies,
         scope: ConversationScope,
         turn_id: &str,
         origin_id: &str,
@@ -56,7 +56,7 @@ impl<'a> TurnLifecycle<'a> {
 
     /// Accepts a request idempotently or returns the existing Turn outcome.
     pub(crate) async fn accept(
-        runtime: &TurnRuntime,
+        runtime: &TurnDependencies,
         scope: ConversationScope,
         chat_id: i64,
         request_key: &str,
@@ -230,7 +230,7 @@ impl<'a> TurnLifecycle<'a> {
 
 /// Marks an unrecoverable resume target as failed.
 pub(crate) async fn fail_resume_permanently(
-    runtime: &TurnRuntime,
+    runtime: &TurnDependencies,
     scope: ConversationScope,
     turn_id: &str,
     reason: &str,
@@ -255,7 +255,7 @@ pub(crate) async fn fail_resume_permanently(
 
 /// Validates and decodes a durable `input_committed` resume target.
 pub(crate) async fn validate_resume(
-    runtime: &TurnRuntime,
+    runtime: &TurnDependencies,
     scope: ConversationScope,
     turn_id: &str,
     run: &TurnRun,
@@ -363,7 +363,7 @@ mod tests {
     use crate::conversation::SurfaceContext;
     use crate::llm::MessagesResponse;
     use crate::runtime::AppState;
-    use crate::runtime::scheduled_turn::{ScheduledTurn, serialize_scheduled_turn};
+    use crate::runtime::turn::{ScheduledTurn, serialize_scheduled_turn};
     use crate::storage::{AcceptOutcome, StoredMessage, TurnRun, TurnRunState, call_blocking};
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
@@ -413,7 +413,7 @@ mod tests {
         output_published: bool,
         keep_input: bool,
     ) -> TurnRun {
-        let runtime = state.turn_runtime();
+        let runtime = state.turn_dependencies();
         let chat_id = resolve_chat_id(&runtime, context).await.expect("chat id");
         let snapshot = state.config_manager.current_blocking();
         let config_revision = snapshot.revision as i64;
@@ -515,10 +515,10 @@ mod tests {
         let context = context_with_request_key("dup-accept", "cli:duplicate:1");
 
         // Act: accept the same request_key twice.
-        let first = process_turn(&state.turn_runtime(), &context, "hi")
+        let first = process_turn(&state.turn_dependencies(), &context, "hi")
             .await
             .expect("first turn");
-        let second = process_turn(&state.turn_runtime(), &context, "hi")
+        let second = process_turn(&state.turn_dependencies(), &context, "hi")
             .await
             .expect("second turn");
 
@@ -578,8 +578,7 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let payload_hash =
-            crate::runtime::scheduled_turn::canonical_request_hash(&context, "hello");
+        let payload_hash = crate::runtime::turn::canonical_request_hash(&context, "hello");
         {
             let conn = state.db.get_conn().expect("conn");
             conn.execute(
@@ -600,11 +599,12 @@ mod tests {
         // Act: a duplicate request for the in-progress Turn must terminate.
         let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let collector = Arc::clone(&collected);
-        let reply = process_turn_with_events(&state.turn_runtime(), &context, "hello", move |ev| {
-            collector.lock().expect("collector").push(ev);
-        })
-        .await
-        .expect("turn");
+        let reply =
+            process_turn_with_events(&state.turn_dependencies(), &context, "hello", move |ev| {
+                collector.lock().expect("collector").push(ev);
+            })
+            .await
+            .expect("turn");
 
         // Assert: a non-empty terminal message is returned and a FinalResponse
         // event is emitted, and the owning executor's LLM is never invoked.
@@ -654,8 +654,7 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let payload_hash =
-            crate::runtime::scheduled_turn::canonical_request_hash(&context, "hello");
+        let payload_hash = crate::runtime::turn::canonical_request_hash(&context, "hello");
         {
             let conn = state.db.get_conn().expect("conn");
             conn.execute(
@@ -676,11 +675,12 @@ mod tests {
         // Act
         let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let collector = Arc::clone(&collected);
-        let reply = process_turn_with_events(&state.turn_runtime(), &context, "hello", move |ev| {
-            collector.lock().expect("collector").push(ev);
-        })
-        .await
-        .expect("turn");
+        let reply =
+            process_turn_with_events(&state.turn_dependencies(), &context, "hello", move |ev| {
+                collector.lock().expect("collector").push(ev);
+            })
+            .await
+            .expect("turn");
 
         // Assert: a non-empty terminal message is returned and a FinalResponse
         // event is emitted, with no LLM call.
@@ -721,7 +721,7 @@ mod tests {
 
         // Act
         let error = validate_resume(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             context.scope,
             &run.turn_id,
             &run,
@@ -764,7 +764,7 @@ mod tests {
 
         // Act
         let error = validate_resume(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             context.scope,
             &run.turn_id,
             &run,
@@ -806,7 +806,7 @@ mod tests {
 
         // Act
         let error = validate_resume(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             context.scope,
             &run.turn_id,
             &run,
@@ -853,7 +853,7 @@ mod tests {
 
         // Act
         let error = validate_resume(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             context.scope,
             &run.turn_id,
             &run,
@@ -896,7 +896,7 @@ mod tests {
 
         // Act
         let error = validate_resume(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             context.scope,
             &run.turn_id,
             &run,
@@ -939,7 +939,7 @@ mod tests {
 
         // Act
         let persisted = validate_resume(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             context.scope,
             &run.turn_id,
             &run,

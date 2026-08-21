@@ -1365,7 +1365,7 @@ mod tests {
         let chat_id = db.resolve_channel_log_chat_id(300).expect("create");
         db.store_system_event(
             chat_id,
-            &crate::runtime::turn_scheduler::StopReason::ChainDepthExceeded,
+            &crate::runtime::turn::StopReason::ChainDepthExceeded,
         )
         .expect("store");
 
@@ -1381,7 +1381,7 @@ mod tests {
         let chat_id = db.resolve_channel_log_chat_id(301).expect("create");
         db.store_system_event(
             chat_id,
-            &crate::runtime::turn_scheduler::StopReason::TurnCountExceeded,
+            &crate::runtime::turn::StopReason::TurnCountExceeded,
         )
         .expect("store");
 
@@ -1395,11 +1395,8 @@ mod tests {
         let (db, _dir) = test_db();
 
         let chat_id = db.resolve_channel_log_chat_id(302).expect("create");
-        db.store_system_event(
-            chat_id,
-            &crate::runtime::turn_scheduler::StopReason::LlmFailure,
-        )
-        .expect("store");
+        db.store_system_event(chat_id, &crate::runtime::turn::StopReason::LlmFailure)
+            .expect("store");
 
         let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs[0].sender_id, "system");
@@ -1524,11 +1521,8 @@ mod tests {
         let (db, _dir) = test_db();
 
         let chat_id = db.resolve_channel_log_chat_id(500).expect("create");
-        db.store_system_event(
-            chat_id,
-            &crate::runtime::turn_scheduler::StopReason::LlmFailure,
-        )
-        .expect("store");
+        db.store_system_event(chat_id, &crate::runtime::turn::StopReason::LlmFailure)
+            .expect("store");
 
         let msgs = db.get_all_messages(chat_id).expect("messages");
         let found = msgs.iter().find(|m| m.content.contains("llm_failure"));
@@ -1543,7 +1537,7 @@ mod tests {
         let chat_id = db.resolve_channel_log_chat_id(600).expect("create");
         db.store_system_event(
             chat_id,
-            &crate::runtime::turn_scheduler::StopReason::ChainDepthExceeded,
+            &crate::runtime::turn::StopReason::ChainDepthExceeded,
         )
         .expect("store");
 

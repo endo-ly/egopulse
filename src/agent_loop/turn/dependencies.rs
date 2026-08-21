@@ -2,7 +2,7 @@
 //! actually needs.
 //!
 //! All Turn execution paths (Agent loop, Prompt builder, Compaction, Tool
-//! phase, Session persistence) receive `&TurnRuntime` instead of `&AppState`,
+//! phase, Session persistence) receive `&TurnDependencies` instead of `&AppState`,
 //! eliminating accidental dependency on scheduling / channel / observability
 //! state.
 
@@ -16,19 +16,19 @@ use crate::error::EgoPulseError;
 use crate::llm::LlmProvider;
 use crate::memory::MemoryLoader;
 use crate::runtime::ScopedStorage;
-use crate::runtime::turn_scheduler::ActiveTurnTracker;
+use crate::runtime::turn::ActiveTurnTracker;
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
 
 /// Narrow dependency bundle for Turn execution.
 ///
-/// Constructed once per Turn via [`crate::runtime::AppState::turn_runtime`].
+/// Constructed once per Turn via [`crate::runtime::AppState::turn_dependencies`].
 /// Holds only the services that participate in model/tool loop execution,
 /// leaving scheduling (`TurnScheduler`, `TurnTracker`, `ActiveTurns`),
 /// channel dispatch (`ChannelRegistry`), and runtime observability
 /// (`RuntimeStatus`) on the caller side.
-pub(crate) struct TurnRuntime {
+pub(crate) struct TurnDependencies {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config_manager: Arc<ConfigManager>,
@@ -37,14 +37,14 @@ pub(crate) struct TurnRuntime {
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn LlmProvider>>>>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) skills: Arc<SkillManager>,
-    pub(crate) soul_agents: Arc<crate::agent_loop::soul_agents::SoulAgentsLoader>,
+    pub(crate) soul_agents: Arc<crate::agent_loop::prompt::sources::SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) assets: Arc<crate::assets::AssetStore>,
     pub(crate) usage_calibrator: Arc<crate::llm::calibration::UsageCalibrator>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
 }
 
-impl TurnRuntime {
+impl TurnDependencies {
     /// Returns an owned handle to the appropriate database for `scope`.
     ///
     /// # Panics

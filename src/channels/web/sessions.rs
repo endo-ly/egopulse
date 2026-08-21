@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agent_loop::formatting::is_tool_preview_message;
+use crate::agent_loop::message_format::is_tool_preview_message;
 use crate::storage::{SenderKind, StoredMessage, ToolCall, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};

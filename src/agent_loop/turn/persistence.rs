@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::model_step::AssistantToolPhase;
@@ -15,7 +15,7 @@ use crate::storage::StoredMessage;
 
 /// Owns Message and Session persistence for one Turn.
 pub(crate) struct TurnPersistence<'a> {
-    runtime: &'a TurnRuntime,
+    runtime: &'a TurnDependencies,
     context: &'a SurfaceContext,
     chat_id: i64,
     turn_id: String,
@@ -24,7 +24,7 @@ pub(crate) struct TurnPersistence<'a> {
 impl<'a> TurnPersistence<'a> {
     /// Creates a persistence boundary for one Turn.
     pub(crate) fn new(
-        runtime: &'a TurnRuntime,
+        runtime: &'a TurnDependencies,
         context: &'a SurfaceContext,
         chat_id: i64,
         turn_id: &str,
@@ -310,7 +310,7 @@ mod tests {
         let context = context_with_request_key("turn-id-links", "cli:turnid:1");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "read the note")
+        let reply = process_turn(&state.turn_dependencies(), &context, "read the note")
             .await
             .expect("turn");
         assert_eq!(reply, "done");

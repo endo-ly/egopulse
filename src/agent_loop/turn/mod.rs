@@ -3,19 +3,20 @@
 //! Model、Tool、Persistence、Lifecycleの責務は各モジュールへ委譲し、
 //! このモジュールはTurn全体の境界と実行順序を管理する。
 
+pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
 use crate::agent_loop::compaction::PromptContext;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
-use crate::agent_loop::formatting::format_channel_log_message;
+use crate::agent_loop::message_format::format_channel_log_message;
 use crate::agent_loop::turn::lifecycle::{
     TurnAcceptance, TurnLifecycle, resolve_request_key, validate_resume,
 };
 use crate::agent_loop::turn::persistence::TurnPersistence;
 
-use crate::agent_loop::TurnRuntime;
-use crate::agent_loop::execution::AgentLoop;
+use crate::agent_loop::TurnDependencies;
+use crate::agent_loop::loop_runner::AgentLoop;
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
@@ -33,7 +34,7 @@ const CHANNEL_CONTEXT_LIMIT: usize = 30;
 
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
-    state: &'a TurnRuntime,
+    state: &'a TurnDependencies,
     agent_id: &'a str,
 }
 
@@ -60,7 +61,7 @@ pub(super) struct PreparedTurn {
 }
 
 struct TurnExecutor<'a> {
-    state: &'a TurnRuntime,
+    state: &'a TurnDependencies,
     context: &'a SurfaceContext,
     on_event: EventEmitter,
     config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
@@ -88,7 +89,7 @@ pub async fn ask_in_session(
         request_key: String::new(),
     };
 
-    let runtime = state.turn_runtime();
+    let runtime = state.turn_dependencies();
     tokio::select! {
         response = process_turn(&runtime, &context, prompt) => response,
         _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
@@ -97,7 +98,7 @@ pub async fn ask_in_session(
 
 /// Processes a turn and aborts cleanly when Ctrl-C is received.
 pub(crate) async fn send_turn(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     prompt: &str,
 ) -> Result<String, EgoPulseError> {
@@ -134,7 +135,7 @@ fn format_current_time(tz: &str) -> String {
 
 /// Processes one user turn against the persisted session state.
 pub(crate) async fn process_turn(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
@@ -143,7 +144,7 @@ pub(crate) async fn process_turn(
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
 pub(crate) async fn process_turn_with_events<F>(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
     on_event: F,
@@ -164,7 +165,7 @@ where
 /// Processes a user turn with a caller-supplied Config snapshot and emits
 /// lifecycle events for streaming consumers.
 pub(crate) async fn process_turn_with_events_and_snapshot<F>(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
     on_event: F,
@@ -200,7 +201,7 @@ where
 /// fingerprint drift, missing input message) marks the turn `failed` so the
 /// dispatcher stops retrying it.
 pub(crate) async fn resume_input_committed_turn(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     scope: ConversationScope,
     turn_id: &str,
     config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
@@ -226,7 +227,7 @@ pub(crate) async fn resume_input_committed_turn(
 }
 
 async fn process_turn_inner(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
     on_event: EventEmitter,
@@ -270,7 +271,7 @@ impl TurnExecutor<'_> {
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = resolve_request_key(self.context);
             let payload_hash =
-                crate::runtime::scheduled_turn::canonical_request_hash(self.context, user_input);
+                crate::runtime::turn::canonical_request_hash(self.context, user_input);
             let acceptance = TurnLifecycle::accept(
                 self.state,
                 self.context.scope,
@@ -487,7 +488,7 @@ impl TurnExecutor<'_> {
             tool_call_id: String::new(),
         };
         let config_snapshot = Arc::clone(snapshot);
-        let system_prompt = crate::agent_loop::prompt_builder::build_system_prompt_with_config(
+        let system_prompt = crate::agent_loop::prompt::builder::build_system_prompt_with_config(
             self.state,
             self.context,
             &config_snapshot.config,
@@ -578,7 +579,7 @@ impl TurnExecutor<'_> {
     async fn persist_agent_loop_result(
         &self,
         prepared: &PreparedTurn,
-        result: crate::agent_loop::execution::AgentLoopResult,
+        result: crate::agent_loop::loop_runner::AgentLoopResult,
     ) -> Result<String, EgoPulseError> {
         let final_message_id = format!("turn:{}:final", prepared.turn_id);
         let messages = result.messages;
@@ -599,7 +600,10 @@ impl TurnExecutor<'_> {
     }
 }
 
-async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> Option<Message> {
+async fn load_channel_context(
+    state: &TurnDependencies,
+    context: &SurfaceContext,
+) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
     let agent_id = context.agent_id.clone();
     let messages = call_blocking(state.db_for(context.scope), move |db| {
@@ -687,7 +691,7 @@ mod tests {
         std::fs::write(&note_path, "hello from tool").expect("notes");
 
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("tool-flow"),
             "please read the note",
         )
@@ -728,7 +732,7 @@ mod tests {
         let context = cli_context("failure");
 
         // Act
-        let error = process_turn(&state.turn_runtime(), &context, "hello")
+        let error = process_turn(&state.turn_dependencies(), &context, "hello")
             .await
             .expect_err("should fail");
 
@@ -774,7 +778,7 @@ mod tests {
         let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let collector = Arc::clone(&collected);
         let reply = process_turn_with_events(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("delta-stream"),
             "hello",
             move |event| {
@@ -930,7 +934,7 @@ mod tests {
         let context = multi_agent_context("ctx-loaded", log_chat_id);
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "test input")
+        let reply = process_turn(&state.turn_dependencies(), &context, "test input")
             .await
             .expect("turn");
         assert_eq!(reply, "ok");
@@ -1023,7 +1027,7 @@ mod tests {
         );
 
         let context = multi_agent_context_for_agent("ctx-projection", log_chat_id, "default");
-        process_turn(&state.turn_runtime(), &context, "current input")
+        process_turn(&state.turn_dependencies(), &context, "current input")
             .await
             .expect("turn");
 
@@ -1076,7 +1080,7 @@ mod tests {
         let context = multi_agent_context("ctx-limit-30", log_chat_id);
 
         // Act
-        let _reply = process_turn(&state.turn_runtime(), &context, "test input")
+        let _reply = process_turn(&state.turn_dependencies(), &context, "test input")
             .await
             .expect("turn");
 
@@ -1135,7 +1139,7 @@ mod tests {
         let context = multi_agent_context("ctx-direct-input", log_chat_id);
 
         // Act
-        let _reply = process_turn(&state.turn_runtime(), &context, "my direct question")
+        let _reply = process_turn(&state.turn_dependencies(), &context, "my direct question")
             .await
             .expect("turn");
 
@@ -1207,7 +1211,7 @@ mod tests {
                 Box::new(provider.clone()),
             );
 
-            let reply = process_turn(&state.turn_runtime(), &context, "hello")
+            let reply = process_turn(&state.turn_dependencies(), &context, "hello")
                 .await
                 .expect("turn");
             assert_eq!(reply, "ok");
@@ -1265,7 +1269,7 @@ mod tests {
         let context = multi_agent_context("ctx-no-persist", log_chat_id);
 
         // Act
-        let _reply = process_turn(&state.turn_runtime(), &context, "hello")
+        let _reply = process_turn(&state.turn_dependencies(), &context, "hello")
             .await
             .expect("turn");
 
@@ -1349,7 +1353,7 @@ mod tests {
 
         // First turn with channel context
         let context = multi_agent_context("int-full-flow", log_chat_id);
-        let reply1 = process_turn(&state.turn_runtime(), &context, "first question")
+        let reply1 = process_turn(&state.turn_dependencies(), &context, "first question")
             .await
             .expect("turn 1");
         assert_eq!(reply1, "First answer.");
@@ -1366,7 +1370,7 @@ mod tests {
         );
 
         // Second turn — verify session continuity
-        let reply2 = process_turn(&state.turn_runtime(), &context, "follow up")
+        let reply2 = process_turn(&state.turn_dependencies(), &context, "follow up")
             .await
             .expect("turn 2");
         assert_eq!(reply2, "Following up.");
@@ -1519,7 +1523,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state.turn_runtime(), &context, "trace me")
+        let reply = process_turn(&state.turn_dependencies(), &context, "trace me")
             .await
             .expect("turn");
 
@@ -1560,7 +1564,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state.turn_runtime(), &context, "auto trace me")
+        let reply = process_turn(&state.turn_dependencies(), &context, "auto trace me")
             .await
             .expect("turn");
 
@@ -1606,7 +1610,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state.turn_runtime(), &context, "top secret input")
+        let reply = process_turn(&state.turn_dependencies(), &context, "top secret input")
             .await
             .expect("turn");
 
@@ -1643,7 +1647,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let reply = process_turn(&state.turn_runtime(), &context, "normal input")
+        let reply = process_turn(&state.turn_dependencies(), &context, "normal input")
             .await
             .expect("turn");
 
@@ -1692,7 +1696,7 @@ mod tests {
         let mut context = cli_context("secret-db-isolation");
         context.scope = ConversationScope::Secret;
 
-        let reply = process_turn(&state.turn_runtime(), &context, "top secret")
+        let reply = process_turn(&state.turn_dependencies(), &context, "top secret")
             .await
             .expect("process turn");
         assert_eq!(reply, "secret reply");

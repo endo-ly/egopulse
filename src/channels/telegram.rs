@@ -1071,7 +1071,7 @@ async fn handle_message(
 
     let outcome =
         crate::runtime::submit_agent_turn(&handler.app_state, context, combined_text).await;
-    if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
+    if let crate::runtime::turn::SubmitOutcome::Rejected(reason) = outcome {
         warn!(reason = %reason, "telegram turn rejected: origin or scheduler at capacity");
         let _ = bot
             .send_message(

@@ -9,9 +9,7 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::metrics;
-use crate::runtime::runtime_status::{
-    AuditError, ChannelHealth, ChannelState, StatusSnapshot, TurnRecord,
-};
+use crate::runtime::status::{AuditError, ChannelHealth, ChannelState, StatusSnapshot, TurnRecord};
 use crate::tools::mcp::McpStatus;
 
 use super::WebState;
@@ -271,7 +269,7 @@ mod tests {
     use axum::body::to_bytes;
 
     use super::*;
-    use crate::runtime::runtime_status::ChannelState;
+    use crate::runtime::status::ChannelState;
 
     fn test_state() -> WebState {
         let dir = tempfile::TempDir::new().unwrap();

@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::TurnRuntime;
-use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
+use crate::agent_loop::TurnDependencies;
+use crate::agent_loop::message_format::{message_to_archive_text, message_to_text, strip_thinking};
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
@@ -46,7 +46,7 @@ pub(crate) struct PromptContext<'a> {
 }
 
 pub(crate) async fn maybe_compact_messages(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
@@ -93,7 +93,7 @@ pub(crate) async fn maybe_compact_messages(
 }
 
 pub(crate) async fn force_compact(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
@@ -228,7 +228,7 @@ enum SummarizeOutcome {
 }
 
 async fn safety_compact(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     input: SafetyCompactInput<'_>,
 ) -> Result<Vec<Message>, EgoPulseError> {
     archive_current_conversation(
@@ -278,7 +278,7 @@ async fn safety_compact(
 }
 
 async fn archive_current_conversation(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
@@ -325,7 +325,7 @@ fn select_compaction_slices(
 
 #[allow(clippy::too_many_arguments)]
 async fn summarize_old_messages(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     old_messages: &[Message],
@@ -398,7 +398,7 @@ async fn send_summary_request(
 }
 
 async fn log_summarizer_usage(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     llm: &std::sync::Arc<dyn LlmProvider>,
@@ -1146,7 +1146,7 @@ mod tests {
         .await
         .expect("save session");
 
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
         assert_eq!(reply, "final answer");
@@ -1175,7 +1175,7 @@ mod tests {
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -1254,7 +1254,7 @@ mod tests {
         .await
         .expect("save session");
 
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
         assert_eq!(reply, "final answer");
@@ -1283,7 +1283,7 @@ mod tests {
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -1325,7 +1325,7 @@ mod tests {
         let context = cli_context("force-compact-threshold");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let messages = vec![
@@ -1335,7 +1335,7 @@ mod tests {
         ];
 
         let result = force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             1,
             &messages,
@@ -1372,7 +1372,7 @@ mod tests {
         let context = cli_context("force-compact-recent");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let messages = vec![
@@ -1386,7 +1386,7 @@ mod tests {
         ];
 
         let result = force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             1,
             &messages,
@@ -1420,7 +1420,7 @@ mod tests {
         let context = cli_context("force-compact-archive");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let chat_id: i64 = 42;
@@ -1430,7 +1430,7 @@ mod tests {
         ];
 
         force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             chat_id,
             &messages,
@@ -1480,7 +1480,7 @@ mod tests {
         context.scope = ConversationScope::Secret;
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let chat_id: i64 = 77;
@@ -1490,7 +1490,7 @@ mod tests {
         ];
 
         force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             chat_id,
             &messages,
@@ -1551,7 +1551,7 @@ mod tests {
         let context = cli_context("archive-normal-routing");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let chat_id: i64 = 88;
@@ -1561,7 +1561,7 @@ mod tests {
         ];
 
         force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             chat_id,
             &messages,
@@ -1654,7 +1654,7 @@ mod tests {
         .await
         .expect("save session");
 
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
         assert_eq!(reply, "final answer");
@@ -1700,7 +1700,7 @@ mod tests {
         let context = cli_context("calibrated-trigger");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let key = CalibrationKey::new("test", "test-model", "agent_loop", false);
@@ -1716,7 +1716,7 @@ mod tests {
 
         // Act
         let result = maybe_compact_messages(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             1,
             &messages,
@@ -1794,7 +1794,7 @@ mod tests {
         .expect("save session");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
 

@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
-use crate::agent_loop::formatting::strip_thinking;
-use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
+use crate::agent_loop::message_format::strip_thinking;
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
+use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_messages};
 use crate::agent_loop::tool_execution::{
     ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
     build_tool_result_phase,
@@ -75,7 +75,7 @@ pub(crate) struct AgentLoopResult {
 
 /// Executes the LLM/tool loop for one durable Turn.
 pub(crate) struct AgentLoop<'a> {
-    state: &'a TurnRuntime,
+    state: &'a TurnDependencies,
     context: &'a SurfaceContext,
     prepared: &'a PreparedTurn,
     prompt_ctx: PromptContext<'a>,
@@ -88,7 +88,7 @@ pub(crate) struct AgentLoop<'a> {
 impl<'a> AgentLoop<'a> {
     /// Creates an Agent Loop with dependencies fixed for one Turn.
     pub(super) fn new(
-        state: &'a TurnRuntime,
+        state: &'a TurnDependencies,
         context: &'a SurfaceContext,
         prepared: &'a PreparedTurn,
         prompt_ctx: PromptContext<'a>,
@@ -466,9 +466,13 @@ mod tests {
         let context = cli_context("late-tool-loop");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "inspect the workspace")
-            .await
-            .expect("late tool loop should finalize");
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &context,
+            "inspect the workspace",
+        )
+        .await
+        .expect("late tool loop should finalize");
 
         // Assert: the final response is returned at the hard-cap boundary.
         assert_eq!(reply, "The available results are complete.");
@@ -505,7 +509,7 @@ mod tests {
         .await
         .expect("chat id");
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )

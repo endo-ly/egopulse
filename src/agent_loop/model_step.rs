@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use tracing::warn;
 
-use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::compaction::estimate_prompt_tokens;
-use crate::agent_loop::formatting::{
+use crate::agent_loop::message_format::{
     sanitize_assistant_response_text, strip_thinking, summarize_tool_calls_with_content,
 };
-use crate::agent_loop::guards::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
+use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
 use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
@@ -40,7 +40,7 @@ pub(crate) enum ModelStep {
 
 #[derive(Clone)]
 pub(crate) struct ModelStepRequest<'a> {
-    pub(crate) state: &'a TurnRuntime,
+    pub(crate) state: &'a TurnDependencies,
     pub(crate) llm: &'a dyn LlmProvider,
     pub(crate) system_prompt: &'a str,
     pub(crate) messages: Arc<Vec<Message>>,
@@ -511,7 +511,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::agent_loop::formatting::message_to_text;
+    use crate::agent_loop::message_format::message_to_text;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::test_support::{
         DeltaThenFailProvider, DeltaThenThinkingProvider, RecordingProvider,
@@ -650,7 +650,7 @@ mod tests {
 
         // Act
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("usage-log-single"),
             "hi",
         )
@@ -720,7 +720,7 @@ mod tests {
         let context = cli_context("usage-calibration");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let tools = Arc::new(vec![ToolDefinition {
@@ -731,7 +731,7 @@ mod tests {
 
         // Act
         let response = send_model_step(ModelStepRequest {
-            state: &state.turn_runtime(),
+            state: &state.turn_dependencies(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -790,7 +790,7 @@ mod tests {
         let context = cli_context("empty-response-retry");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let mut retry_attempted = false;
@@ -798,7 +798,7 @@ mod tests {
         // Act
         let response = send_model_step_with_empty_retry(
             ModelStepRequest {
-                state: &state.turn_runtime(),
+                state: &state.turn_dependencies(),
                 llm: llm.as_ref(),
                 system_prompt: "system prompt",
                 messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -851,7 +851,7 @@ mod tests {
         let context = cli_context("non-empty-invalid-response");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let mut retry_attempted = false;
@@ -859,7 +859,7 @@ mod tests {
         // Act
         let result = send_model_step_with_empty_retry(
             ModelStepRequest {
-                state: &state.turn_runtime(),
+                state: &state.turn_dependencies(),
                 llm: llm.as_ref(),
                 system_prompt: "system prompt",
                 messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -914,13 +914,13 @@ mod tests {
         let context = cli_context("usage-calibration-none");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
 
         // Act
         let response = send_model_step(ModelStepRequest {
-            state: &state.turn_runtime(),
+            state: &state.turn_dependencies(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -976,13 +976,13 @@ mod tests {
         let context = cli_context("usage-calibration-empty-tools");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
 
         // Act
         let response = send_model_step(ModelStepRequest {
-            state: &state.turn_runtime(),
+            state: &state.turn_dependencies(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
@@ -1068,7 +1068,7 @@ mod tests {
 
         // Act
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("usage-log-multi"),
             "read the file",
         )
@@ -1146,7 +1146,7 @@ mod tests {
         let context = context_with_request_key("retry", "cli:retry:1");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+        let reply = process_turn(&state.turn_dependencies(), &context, "hello")
             .await
             .expect("turn");
 
@@ -1193,7 +1193,7 @@ mod tests {
         let context = context_with_request_key("empty-guard-transient", "cli:empty-guard:1");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+        let reply = process_turn(&state.turn_dependencies(), &context, "hello")
             .await
             .expect("turn should recover with the guarded request");
 
@@ -1224,7 +1224,7 @@ mod tests {
         let context = context_with_request_key("partial-delta", "cli:partial:1");
 
         // Act
-        let error = process_turn(&state.turn_runtime(), &context, "hello")
+        let error = process_turn(&state.turn_dependencies(), &context, "hello")
             .await
             .expect_err("should fail after partial delta");
 
@@ -1278,7 +1278,7 @@ mod tests {
         let context = context_with_request_key("thinking-only-after-delta", "cli:thinking-only:1");
 
         // Act
-        let error = process_turn(&state.turn_runtime(), &context, "hello")
+        let error = process_turn(&state.turn_dependencies(), &context, "hello")
             .await
             .expect_err("should fail after published output");
 
@@ -1350,7 +1350,7 @@ mod tests {
         let context = context_with_request_key("tc-fail", "cli:tc-fail:1");
 
         // Act
-        let error = process_turn(&state.turn_runtime(), &context, "read the note")
+        let error = process_turn(&state.turn_dependencies(), &context, "read the note")
             .await
             .expect_err("should fail on the second LLM call");
 
