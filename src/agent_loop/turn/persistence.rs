@@ -19,7 +19,6 @@ pub(crate) struct TurnPersistence<'a> {
     context: &'a SurfaceContext,
     chat_id: i64,
     turn_id: String,
-    agent_id: String,
 }
 
 impl<'a> TurnPersistence<'a> {
@@ -29,14 +28,12 @@ impl<'a> TurnPersistence<'a> {
         context: &'a SurfaceContext,
         chat_id: i64,
         turn_id: &str,
-        agent_id: &str,
     ) -> Self {
         Self {
             runtime,
             context,
             chat_id,
             turn_id: turn_id.to_string(),
-            agent_id: agent_id.to_string(),
         }
     }
 
@@ -136,8 +133,11 @@ impl<'a> TurnPersistence<'a> {
         let mut updated = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
         updated.push(assistant_message.clone());
 
-        let mut stored =
-            StoredMessage::assistant(self.chat_id, self.agent_id.clone(), final_content.clone());
+        let mut stored = StoredMessage::assistant(
+            self.chat_id,
+            self.context.agent_id.clone(),
+            final_content.clone(),
+        );
         stored.id = final_message_id.to_string();
         stored.turn_id = Some(self.turn_id.clone());
         let _persisted = persist_phase(
@@ -175,7 +175,7 @@ impl<'a> TurnPersistence<'a> {
                 turn_id: Some(self.turn_id.clone()),
                 ..StoredMessage::assistant(
                     self.chat_id,
-                    self.agent_id.clone(),
+                    self.context.agent_id.clone(),
                     assistant_phase.assistant_preview.clone(),
                 )
             },
@@ -207,8 +207,11 @@ impl<'a> TurnPersistence<'a> {
 
         let mut messages_with_tools = messages;
         messages_with_tools.extend(tool_messages.iter().cloned());
-        let mut tool_summary =
-            StoredMessage::assistant(self.chat_id, self.agent_id.clone(), tool_result_preview);
+        let mut tool_summary = StoredMessage::assistant(
+            self.chat_id,
+            self.context.agent_id.clone(),
+            tool_result_preview,
+        );
         tool_summary.turn_id = Some(self.turn_id.clone());
         tool_summary.parent_message_id = Some(assistant_message_id.to_string());
         persist_phase_messages(

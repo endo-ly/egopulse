@@ -418,13 +418,13 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 | `model_pending` / `model_completed` / `tools_pending` / `tools_completed` | `uncertain`（外部出力や Tool 副作用が及んでいる可能性があり、再開の安全性を証明できない） |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
-起動時の fail-stop は `config_fingerprint` に関わらず適用する。fingerprint は Turn 受付時の Config 同一性記録として保持されるが、再開の可否判定には用いない。
+起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため `failed` とする。
 
 同時に `Database::recover_running_tools()` が `running` の Tool をすべて `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
 
 #### TurnDispatcher による再実行
 
-`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査し、`accepted` / `input_committed` で残された Turn を検出して再投入する。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed → model_pending`）が重複実行を安全に排除する。`input_committed` で resume 検証（input message や session snapshot の整合性）に失敗した Turn は `failed` へ移行する。
+`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査し、`accepted` / `input_committed` で残された Turn を検出して再投入する。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed → model_pending`）が重複実行を安全に排除する。`input_committed` で resume 検証（input message、session snapshot、保存済み Config fingerprint の整合性）に失敗した Turn は `failed` へ移行する。
 
 Dispatcher が保存済み `scheduled_request_json` の JSON 構文、必須フィールド、型、または version を解釈できない場合は、決定的な復旧不能として Turn を `failed` に移行する。このとき `error_kind` は `durable_payload_invalid`、`error_message` は固定の sanitized 文言とし、payload の内容や deserializer の詳細をログ・DBへ保存しない。`origin_id` がある場合は Turn の失敗と origin の terminal reason を同一 transaction で記録する。DB 読み取り失敗と scheduler の容量不足は一時障害として扱い、Turn を `accepted` / `input_committed` のまま次の tick で再試行する。
 

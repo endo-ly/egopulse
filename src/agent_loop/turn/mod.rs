@@ -451,7 +451,6 @@ impl TurnExecutor<'_> {
             self.context,
             prepared.chat_id,
             &prepared.turn_id,
-            &prepared.tool_context.agent_id,
         )
     }
 

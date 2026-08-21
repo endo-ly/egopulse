@@ -97,13 +97,7 @@ impl<'a> AgentLoop<'a> {
     ) -> Self {
         let lifecycle =
             TurnLifecycle::new(state, context.scope, &prepared.turn_id, &context.origin_id);
-        let persistence = TurnPersistence::new(
-            state,
-            context,
-            prepared.chat_id,
-            &prepared.turn_id,
-            &prepared.tool_context.agent_id,
-        );
+        let persistence = TurnPersistence::new(state, context, prepared.chat_id, &prepared.turn_id);
         Self {
             state,
             context,
