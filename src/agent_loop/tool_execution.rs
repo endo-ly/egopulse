@@ -324,3 +324,68 @@ async fn record_tool_outcome(
         .await?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn build_tool_result_phase_preserves_order_and_previews_results() {
+        // Arrange
+        let first = ExecutedToolCall {
+            tool_call: tool_call("call-1", "read", json!({"path": "a.txt"})),
+            result: ToolResult::success("alpha".to_string()),
+            payload: json!({"tool": "read", "status": "success", "result": "alpha"}).to_string(),
+            message: Message {
+                role: "tool".to_string(),
+                content: crate::llm::MessageContent::text(
+                    json!({"tool": "read", "status": "success", "result": "alpha"}).to_string(),
+                ),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-1".to_string()),
+            },
+            duration_ms: 1,
+        };
+        let second = ExecutedToolCall {
+            tool_call: tool_call("call-2", "grep", json!({"pattern": "beta"})),
+            result: ToolResult::success("beta".to_string()),
+            payload: json!({"tool": "grep", "status": "success", "result": "beta"}).to_string(),
+            message: Message {
+                role: "tool".to_string(),
+                content: crate::llm::MessageContent::text(
+                    json!({"tool": "grep", "status": "success", "result": "beta"}).to_string(),
+                ),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-2".to_string()),
+            },
+            duration_ms: 2,
+        };
+
+        // Act
+        let phase = build_tool_result_phase(vec![first, second]);
+
+        // Assert
+        assert_eq!(phase.tool_messages.len(), 2);
+        assert_eq!(
+            phase.tool_messages[0].tool_call_id.as_deref(),
+            Some("call-1")
+        );
+        assert_eq!(
+            phase.tool_messages[1].tool_call_id.as_deref(),
+            Some("call-2")
+        );
+        assert!(phase.tool_result_preview.contains("alpha"));
+        assert!(phase.tool_result_preview.contains("beta"));
+    }
+}

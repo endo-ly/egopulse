@@ -445,3 +445,71 @@ fn evaluate_malformed_response(
         reasoning_content: reasoning_content.map(ToString::to_string),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_for_iteration_adds_warning_guards_only_in_final_window() {
+        // Arrange
+        let messages = Arc::new(vec![Message::text("user", "inspect")]);
+
+        // Act
+        let before_warning =
+            messages_for_iteration(&messages, FINAL_RESPONSE_WARNING_ITERATION - 1);
+        let warning = messages_for_iteration(&messages, FINAL_RESPONSE_WARNING_ITERATION);
+        let final_window = messages_for_iteration(&messages, MAX_TOOL_ITERATIONS);
+
+        // Assert
+        assert_eq!(before_warning.len(), 1);
+        assert!(
+            warning
+                .last()
+                .expect("warning message")
+                .content
+                .as_text_lossy()
+                .contains(FINAL_RESPONSE_WARNING_GUARD)
+        );
+        assert!(
+            final_window
+                .last()
+                .expect("final guard message")
+                .content
+                .as_text_lossy()
+                .contains(FINAL_RESPONSE_GUARD)
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "request guards must not mutate loop state"
+        );
+    }
+
+    #[test]
+    fn evaluate_end_turn_retries_declarative_output_once() {
+        // Arrange
+        let messages = vec![Message::text("user", "do the work")];
+        let mut retry_attempted = false;
+
+        // Act
+        let action = evaluate_end_turn(
+            "I will inspect the files.",
+            None,
+            &mut retry_attempted,
+            &messages,
+        )
+        .expect("declarative response should be recoverable");
+
+        // Assert
+        assert!(retry_attempted);
+        match action {
+            LoopAction::Retry(Some(retry_messages)) => {
+                assert!(retry_messages.len() > messages.len());
+            }
+            LoopAction::Retry(None) | LoopAction::Done { .. } => {
+                panic!("declarative response should inject a corrective retry")
+            }
+        }
+    }
+}
