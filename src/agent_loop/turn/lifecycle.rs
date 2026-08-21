@@ -354,15 +354,17 @@ fn sanitize_error_message(error: &EgoPulseError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::validate_resume;
     use crate::agent_loop::event::AgentEvent;
     use crate::agent_loop::test_support::{
         RecordingProvider, build_state_with_provider, cli_context,
     };
-    use crate::agent_loop::{process_turn, process_turn_with_events};
+    use crate::agent_loop::{process_turn, process_turn_with_events, resolve_chat_id};
     use crate::conversation::SurfaceContext;
     use crate::llm::MessagesResponse;
     use crate::runtime::AppState;
-    use crate::storage::call_blocking;
+    use crate::runtime::scheduled_turn::{ScheduledTurn, serialize_scheduled_turn};
+    use crate::storage::{AcceptOutcome, StoredMessage, TurnRun, TurnRunState, call_blocking};
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
 
@@ -392,6 +394,106 @@ mod tests {
         .expect("count user messages")
     }
 
+    fn resume_payload(context: &SurfaceContext, input: &str) -> String {
+        serialize_scheduled_turn(&ScheduledTurn {
+            turn_id: String::new(),
+            context: context.clone(),
+            input: input.to_string(),
+            origin_id: context.origin_id.clone(),
+            config_snapshot: None,
+        })
+        .expect("serialize scheduled turn")
+    }
+
+    async fn seed_input_committed_turn(
+        state: &AppState,
+        context: &SurfaceContext,
+        scheduled_request_json: Option<&str>,
+        config_fingerprint: Option<&str>,
+        output_published: bool,
+        keep_input: bool,
+    ) -> TurnRun {
+        let runtime = state.turn_runtime();
+        let chat_id = resolve_chat_id(&runtime, context).await.expect("chat id");
+        let snapshot = state.config_manager.current_blocking();
+        let config_revision = snapshot.revision as i64;
+        let config_fingerprint = config_fingerprint.map(str::to_string);
+        let accept_fingerprint = config_fingerprint.clone();
+        let request_key = context.request_key.clone();
+        let scheduled_request_json = scheduled_request_json.map(str::to_string);
+        let accepted = call_blocking(state.db_for(context.scope), move |db| {
+            db.accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: &request_key,
+                config_revision,
+                config_fingerprint: accept_fingerprint.as_deref(),
+                request_payload_hash: "resume-test-hash",
+                origin_id: None,
+                scheduled_request_json: scheduled_request_json.as_deref(),
+            })
+        })
+        .await
+        .expect("accept turn");
+        let turn_id = match accepted {
+            AcceptOutcome::Created(run) => run.turn_id,
+            AcceptOutcome::Existing(_) => panic!("resume test must create a new turn"),
+        };
+
+        let mut message =
+            StoredMessage::user(chat_id, "sender".to_string(), "resume input".to_string());
+        message.id = format!("turn:{turn_id}:input");
+        message.turn_id = Some(turn_id.clone());
+        let fingerprint = config_fingerprint.clone();
+        call_blocking(state.db_for(context.scope), {
+            let message = message.clone();
+            let turn_id = turn_id.clone();
+            move |db| {
+                db.commit_turn_input_with_conversation(
+                    &message,
+                    "[]",
+                    None,
+                    &turn_id,
+                    config_revision,
+                    fingerprint.as_deref(),
+                )
+            }
+        })
+        .await
+        .expect("commit turn input");
+
+        if !keep_input {
+            let input_id = message.id.clone();
+            call_blocking(state.db_for(context.scope), move |db| {
+                db.get_conn()?.execute(
+                    "DELETE FROM messages WHERE id = ?1",
+                    rusqlite::params![input_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("delete input message");
+        }
+        if output_published {
+            let turn_id = turn_id.clone();
+            call_blocking(state.db_for(context.scope), move |db| {
+                db.mark_turn_output_published(&turn_id)
+            })
+            .await
+            .expect("mark output published");
+        }
+
+        call_blocking(state.db_for(context.scope), move |db| {
+            db.get_turn_run(&turn_id)
+        })
+        .await
+        .expect("load seeded turn")
+    }
+
+    fn assert_failed(run: &TurnRun) {
+        assert_eq!(run.state, TurnRunState::Failed);
+        assert_eq!(run.error_kind.as_deref(), Some("validation"));
+    }
+
     #[tokio::test]
     #[serial]
     async fn same_request_key_accepts_one_turn_and_one_user_message() {
@@ -408,7 +510,7 @@ mod tests {
         );
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
+            Box::new(provider.clone()),
         );
         let context = context_with_request_key("dup-accept", "cli:duplicate:1");
 
@@ -441,40 +543,6 @@ mod tests {
             1,
             "exactly one user message"
         );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn completed_turn_re_acceptance_does_not_invoke_llm() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "final answer".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-        let context = context_with_request_key("reuse", "cli:reuse:1");
-
-        // Act: run once (consumes the response), then re-accept.
-        let first = process_turn(&state.turn_runtime(), &context, "hello")
-            .await
-            .expect("first");
-        let second = process_turn(&state.turn_runtime(), &context, "hello")
-            .await
-            .expect("second");
-
-        // Assert: the LLM was called exactly once; the second call reused the
-        // saved final message.
-        assert_eq!(first, "final answer");
-        assert_eq!(second, "final answer");
         assert_eq!(
             provider.seen_messages().len(),
             1,
@@ -629,5 +697,263 @@ mod tests {
             "terminated re-acceptance must emit a matching FinalResponse event"
         );
         assert!(provider.seen_messages().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_resume_rejects_missing_payload_and_marks_turn_failed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-missing-payload", "resume:missing-payload");
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            None,
+            Some(&state.config_manager.current_blocking().fingerprint),
+            false,
+            true,
+        )
+        .await;
+
+        // Act
+        let error = validate_resume(
+            &state.turn_runtime(),
+            context.scope,
+            &run.turn_id,
+            &run,
+            &state.config_manager.current_blocking(),
+        )
+        .await
+        .expect_err("missing payload must be rejected");
+
+        // Assert
+        assert!(error.to_string().contains("no scheduled request"));
+        assert_failed(
+            &state
+                .db
+                .get_turn_run(&run.turn_id)
+                .expect("failed resume turn"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_resume_rejects_published_output_and_marks_turn_failed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-published", "resume:published");
+        let snapshot = state.config_manager.current_blocking();
+        let payload = resume_payload(&context, "resume input");
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            Some(&payload),
+            Some(&snapshot.fingerprint),
+            true,
+            true,
+        )
+        .await;
+
+        // Act
+        let error = validate_resume(
+            &state.turn_runtime(),
+            context.scope,
+            &run.turn_id,
+            &run,
+            &snapshot,
+        )
+        .await
+        .expect_err("published output must be rejected");
+
+        // Assert
+        assert!(error.to_string().contains("already published output"));
+        assert_failed(
+            &state
+                .db
+                .get_turn_run(&run.turn_id)
+                .expect("failed resume turn"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_resume_rejects_invalid_payload_and_marks_turn_failed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-invalid-payload", "resume:invalid-payload");
+        let snapshot = state.config_manager.current_blocking();
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            Some("not-json"),
+            Some(&snapshot.fingerprint),
+            false,
+            true,
+        )
+        .await;
+
+        // Act
+        let error = validate_resume(
+            &state.turn_runtime(),
+            context.scope,
+            &run.turn_id,
+            &run,
+            &snapshot,
+        )
+        .await
+        .expect_err("invalid payload must be rejected");
+
+        // Assert
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode scheduled request")
+        );
+        assert_failed(
+            &state
+                .db
+                .get_turn_run(&run.turn_id)
+                .expect("failed resume turn"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_resume_rejects_fingerprint_mismatch_and_marks_turn_failed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-fingerprint", "resume:fingerprint");
+        let snapshot = state.config_manager.current_blocking();
+        let payload = resume_payload(&context, "resume input");
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            Some(&payload),
+            Some("stale-fingerprint"),
+            false,
+            true,
+        )
+        .await;
+
+        // Act
+        let error = validate_resume(
+            &state.turn_runtime(),
+            context.scope,
+            &run.turn_id,
+            &run,
+            &snapshot,
+        )
+        .await
+        .expect_err("fingerprint mismatch must be rejected");
+
+        // Assert
+        assert!(error.to_string().contains("config fingerprint mismatch"));
+        assert_failed(
+            &state
+                .db
+                .get_turn_run(&run.turn_id)
+                .expect("failed resume turn"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_resume_rejects_missing_input_and_marks_turn_failed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-missing-input", "resume:missing-input");
+        let snapshot = state.config_manager.current_blocking();
+        let payload = resume_payload(&context, "resume input");
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            Some(&payload),
+            Some(&snapshot.fingerprint),
+            false,
+            false,
+        )
+        .await;
+
+        // Act
+        let error = validate_resume(
+            &state.turn_runtime(),
+            context.scope,
+            &run.turn_id,
+            &run,
+            &snapshot,
+        )
+        .await
+        .expect_err("missing input must be rejected");
+
+        // Assert
+        assert!(error.to_string().contains("input message is missing"));
+        assert_failed(
+            &state
+                .db
+                .get_turn_run(&run.turn_id)
+                .expect("failed resume turn"),
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_resume_accepts_valid_input_committed_turn() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-valid", "resume:valid");
+        let snapshot = state.config_manager.current_blocking();
+        let payload = resume_payload(&context, "resume input");
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            Some(&payload),
+            Some(&snapshot.fingerprint),
+            false,
+            true,
+        )
+        .await;
+
+        // Act
+        let persisted = validate_resume(
+            &state.turn_runtime(),
+            context.scope,
+            &run.turn_id,
+            &run,
+            &snapshot,
+        )
+        .await
+        .expect("valid resume target");
+
+        // Assert
+        assert_eq!(persisted.input, "resume input");
+        assert_eq!(persisted.context.session_key(), context.session_key());
+        assert_eq!(
+            state.db.get_turn_run(&run.turn_id).expect("turn run").state,
+            TurnRunState::InputCommitted
+        );
     }
 }
