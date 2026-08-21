@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::agent_loop::SurfaceContext;
 use crate::channels::adapter::{ChannelAdapter, ConversationKind};
+use crate::conversation::SurfaceContext;
 use crate::runtime::AppState;
 
 use super::web::WebState;

@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::ConversationScope;
-use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::tool_phase::{
     MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
     build_tool_result_phase, ignore_delta, messages_for_iteration,
     send_tool_phase_request_with_empty_retry,
 };
+use crate::conversation::ConversationScope;
+use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;

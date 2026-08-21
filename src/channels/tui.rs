@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_loop;
-use crate::agent_loop::SurfaceContext;
+use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
 use crate::runtime::AppState;
 use crate::storage::{SessionSummary, call_blocking};

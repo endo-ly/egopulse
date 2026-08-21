@@ -4,7 +4,8 @@
 
 use std::io::{self, BufRead, Write};
 
-use crate::agent_loop::{SurfaceContext, process_turn};
+use crate::agent_loop::process_turn;
+use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::slash_commands::{SlashCommandOutcome, process_slash_command};

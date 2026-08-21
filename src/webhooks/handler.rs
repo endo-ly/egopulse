@@ -4,10 +4,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::web::WebState;
 use crate::channels::web::auth::constant_time_eq;
 use crate::config::{Config, WebhookReceiverId};
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::runtime::channel_scope_from_secret;
 
 pub(crate) const MAX_WEBHOOK_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -236,11 +236,11 @@ fn webhook_request_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::ConversationScope;
     use crate::config::{
         AgentId, ChannelConfig, ChannelName, Config, DiscordChannelConfig, ProviderConfig,
         ProviderId, WebhookReceiverConfig, WebhookReceiverId, WebhookTargetConfig,
     };
+    use crate::conversation::ConversationScope;
 
     fn test_config_with_discord_secret(thread: &str, secret: bool) -> Config {
         let channel_id: u64 = thread.parse().unwrap_or(0);

@@ -22,7 +22,6 @@ use serenity::model::id::{ChannelId, UserId};
 use serenity::prelude::*;
 use tracing::{error, info, warn};
 
-use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{
     ChannelAdapter, PreparedAttachment, ToolProgressHandle, ToolProgressSink, TurnActivity,
@@ -30,6 +29,7 @@ use crate::channels::adapter::{
 use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::DiscordChannelConfig;
 use crate::config::manager::ConfigSnapshot;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 
 /// Discord API リクエストのタイムアウト (秒)。

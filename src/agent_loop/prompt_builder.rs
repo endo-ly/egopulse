@@ -1,6 +1,7 @@
 //! System prompt construction for agent turns.
 
-use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
+use crate::agent_loop::TurnRuntime;
+use crate::conversation::{ConversationScope, SurfaceContext};
 
 const CORE_INSTRUCTIONS: &str = include_str!("prompts/core_instructions.md");
 

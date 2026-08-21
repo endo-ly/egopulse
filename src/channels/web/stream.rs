@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::agent_loop::{SurfaceContext, process_turn_with_events, resolve_chat_id};
+use crate::agent_loop::{process_turn_with_events, resolve_chat_id};
+use crate::conversation::SurfaceContext;
 use tracing::error;
 
 use super::sessions::parse_chat_id_from_session_key;

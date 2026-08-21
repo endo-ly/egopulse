@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
 
-use crate::agent_loop::ConversationScope;
 use crate::channels::adapter::{ChannelRegistry, PreparedAttachment};
+use crate::conversation::ConversationScope;
 use crate::llm::ToolDefinition;
 use crate::storage::{Database, call_blocking};
 

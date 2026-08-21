@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::ConversationScope;
 use crate::config::{Config, ConfigManager, ResolvedLlmConfig};
+use crate::conversation::ConversationScope;
 use crate::error::EgoPulseError;
 use crate::llm::LlmProvider;
 use crate::memory::MemoryLoader;
@@ -99,7 +99,7 @@ impl TurnRuntime {
     /// resolved configuration fails.
     pub(crate) fn llm_for_context_with_snapshot(
         &self,
-        context: &crate::agent_loop::SurfaceContext,
+        context: &crate::conversation::SurfaceContext,
         snapshot: &crate::config::manager::ConfigSnapshot,
     ) -> Result<Arc<dyn LlmProvider>, EgoPulseError> {
         if let Some(provider) = self.llm_override.clone() {

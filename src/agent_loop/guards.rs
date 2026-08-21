@@ -73,9 +73,9 @@ pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::turn::{FakeProvider, build_state_with_provider, cli_context};
+    use crate::conversation::ConversationScope;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use serial_test::serial;

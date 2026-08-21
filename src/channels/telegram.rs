@@ -23,7 +23,6 @@ use teloxide::prelude::*;
 use teloxide::types::{FileId, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
-use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{
     ChannelAdapter, PreparedAttachment, ToolProgressHandle, ToolProgressSink,
@@ -31,6 +30,7 @@ use crate::channels::adapter::{
 use crate::channels::utils::text::{floor_char_boundary, keep_tail, split_text};
 use crate::config::TelegramChatConfig;
 use crate::config::manager::ConfigSnapshot;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 

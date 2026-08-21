@@ -9,6 +9,7 @@ pub mod gateway;
 pub mod logging;
 pub(crate) mod metrics;
 pub(crate) mod runtime_status;
+pub(crate) mod scheduled_turn;
 pub(crate) mod supervisor;
 pub(crate) mod tool_progress;
 pub(crate) mod turn_dispatch;
@@ -37,7 +38,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::agent_loop::ConversationScope;
 use crate::agent_loop::soul_agents::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
@@ -45,6 +45,7 @@ use crate::channels::adapter::ChannelRegistry;
 use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
 use crate::config::{Config, ConfigManager};
+use crate::conversation::ConversationScope;
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::calibration::{CalibrationKey, CalibrationObservation, UsageCalibrator};
 use crate::llm::{Message, create_provider};
@@ -895,8 +896,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::agent_loop::ConversationScope;
     use crate::config::ResolvedLlmConfig;
+    use crate::conversation::ConversationScope;
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)

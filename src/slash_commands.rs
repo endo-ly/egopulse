@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use crate::agent_loop::compaction::force_compact;
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
-use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::config::{AgentId, ChannelName, Config, ProviderId};
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::storage::call_blocking;
@@ -761,8 +761,8 @@ mod tests {
     use async_trait::async_trait;
 
     use crate::agent_loop::turn::{build_state, build_state_for_config_file, test_config};
-    use crate::agent_loop::{ConversationScope, SurfaceContext};
     use crate::config::{AgentId, Config};
+    use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
     use crate::runtime::AppState;

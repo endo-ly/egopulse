@@ -5,12 +5,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::agent_loop::{
-    ConversationScope, ScheduledTurn, SurfaceContext, deserialize_scheduled_turn,
-    resume_input_committed_turn,
-};
+use crate::agent_loop::resume_input_committed_turn;
 use crate::config::manager::ConfigSnapshot;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
+use crate::runtime::scheduled_turn::{ScheduledTurn, deserialize_scheduled_turn};
 use crate::runtime::{
     AppState, Criticality, TaskKind, TaskSpec, channel_input, metrics,
     runtime_status::RuntimeStatus, tool_progress, turn_scheduler,
@@ -265,7 +264,7 @@ where
 /// Returns [`EgoPulseError`] only when shutdown begins mid-retry.
 async fn persist_turn_cancellation(
     state: &AppState,
-    scope: crate::agent_loop::ConversationScope,
+    scope: crate::conversation::ConversationScope,
     turn_id: &str,
     reason: &str,
     note: &str,
@@ -311,7 +310,7 @@ async fn persist_turn_cancellation(
 /// Returns [`EgoPulseError`] only when shutdown begins mid-retry.
 async fn persist_origin_terminal_reason(
     state: &AppState,
-    scope: crate::agent_loop::ConversationScope,
+    scope: crate::conversation::ConversationScope,
     origin_id: &str,
     reason: turn_scheduler::StopReason,
 ) -> Result<(), EgoPulseError> {
@@ -845,7 +844,7 @@ async fn drain_next_queued_turn(state: &AppState, session_key: &str) {
 /// Executes one agent turn while recording runtime activity and telemetry.
 ///
 /// The crate-visible helper accepts the shared [`AppState`], a
-/// [`crate::agent_loop::SurfaceContext`], and the user `input`, returning the
+/// [`crate::conversation::SurfaceContext`], and the user `input`, returning the
 /// generated response as `Result<String, EgoPulseError>`. It touches channel
 /// activity, records the completed turn, and records an error plus the
 /// `turn_failure` metric when execution fails.
@@ -1020,8 +1019,8 @@ mod tests {
 
     #[test]
     fn tool_progress_enabled_reads_channel_config_flag() {
-        use crate::agent_loop::SurfaceContext;
         use crate::config::{ChannelConfig, ChannelName, DiscordChannelConfig};
+        use crate::conversation::SurfaceContext;
         use std::collections::HashMap;
 
         // Arrange: discord channel 123 has tool_progress on, 456 off
@@ -1192,8 +1191,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
-        use crate::agent_loop::ScheduledTurn;
         use crate::llm::MessagesResponse;
+        use crate::runtime::scheduled_turn::ScheduledTurn;
         use crate::storage::call_blocking;
 
         // Arrange: state with secret DB + recording provider
@@ -1264,7 +1263,7 @@ mod tests {
 
     #[tokio::test]
     async fn recover_durable_state_fails_closed_on_storage_error() {
-        use crate::agent_loop::ConversationScope;
+        use crate::conversation::ConversationScope;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let state = Arc::new(crate::test_util::build_state_with_provider(
@@ -1284,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_turn_cancellation_retries_until_db_recovers() {
-        use crate::agent_loop::ConversationScope;
+        use crate::conversation::ConversationScope;
 
         let dir = tempfile::tempdir().expect("tempdir");
         let state = crate::test_util::build_state_with_provider(
@@ -1313,8 +1312,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn db_failure_during_dispatch_retries_and_preserves_turn_order() {
-        use crate::agent_loop::{ConversationScope, ScheduledTurn};
+        use crate::conversation::ConversationScope;
         use crate::llm::MessagesResponse;
+        use crate::runtime::scheduled_turn::ScheduledTurn;
         use crate::runtime::turn_scheduler::ScheduleResult;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1396,9 +1396,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn dispatch_re_scans_capacity_rejected_turn_after_capacity_frees() {
-        use crate::agent_loop::ConversationScope;
-        use crate::agent_loop::ScheduledTurn;
+        use crate::conversation::ConversationScope;
         use crate::runtime::channel_input;
+        use crate::runtime::scheduled_turn::ScheduledTurn;
         use crate::runtime::turn_scheduler::SubmitOutcome;
         use crate::storage::call_blocking;
 
@@ -1491,7 +1491,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_origin_terminal_reason_retries_until_db_recovers() {
-        use crate::agent_loop::ConversationScope;
+        use crate::conversation::ConversationScope;
         use crate::runtime::turn_scheduler::StopReason;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1518,8 +1518,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn permanent_db_failure_keeps_session_blocked() {
-        use crate::agent_loop::ConversationScope;
-        use crate::agent_loop::ScheduledTurn;
+        use crate::conversation::ConversationScope;
+        use crate::runtime::scheduled_turn::ScheduledTurn;
         use crate::runtime::turn_scheduler::ScheduleResult;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1743,10 +1743,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn resume_input_committed_turn_restarts_model_loop() {
-        use crate::agent_loop::ScheduledTurn;
         use crate::agent_loop::resume_input_committed_turn;
-        use crate::agent_loop::serialize_scheduled_turn;
         use crate::llm::MessagesResponse;
+        use crate::runtime::scheduled_turn::ScheduledTurn;
+        use crate::runtime::scheduled_turn::serialize_scheduled_turn;
         use crate::storage::{AcceptOutcome, StoredMessage, TurnRunState};
 
         let dir = tempfile::tempdir().expect("tempdir");

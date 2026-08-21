@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 
+use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::session_snapshot::{
     SnapshotMessage, messages_from_snapshot, messages_to_snapshot,
 };
-use crate::agent_loop::{ConversationScope, SurfaceContext, TurnRuntime};
 use crate::assets::AssetStore;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent};
 use crate::storage::{SenderKind, SessionSnapshot, SessionSummary, StoredMessage, call_blocking};
@@ -422,8 +423,8 @@ mod tests {
     use async_trait::async_trait;
 
     use super::{load_messages_for_turn, persist_phase};
-    use crate::agent_loop::{ConversationScope, SurfaceContext};
     use crate::config::Config;
+    use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::LlmError;
     use crate::llm::{
         LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse, ToolCall,

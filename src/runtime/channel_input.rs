@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::{OnceLock, Weak};
 
 use crate::agent_loop::session::resolve_chat_id;
-use crate::agent_loop::{
-    ConversationScope, ScheduledTurn, SurfaceContext, canonical_request_hash,
-    serialize_scheduled_turn,
-};
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::runtime::metrics;
+use crate::runtime::scheduled_turn::{
+    ScheduledTurn, canonical_request_hash, serialize_scheduled_turn,
+};
 use crate::runtime::turn_scheduler::{RejectReason, ScheduleResult, SubmitOutcome};
 use crate::storage::{AcceptOutcome, AcceptTurnParams};
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};

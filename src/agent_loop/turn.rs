@@ -8,6 +8,7 @@ use crate::agent_loop::event::AgentEvent;
 use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 
+use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn_with_limit, persist_phase, persist_phase_messages,
     resolve_chat_id,
@@ -17,12 +18,11 @@ use crate::agent_loop::tool_phase::{
     ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase,
     build_tool_result_phase, messages_for_iteration, send_tool_phase_request_with_empty_retry,
 };
-use crate::agent_loop::{
-    ConversationScope, SurfaceContext, TurnRuntime, deserialize_scheduled_turn,
-};
 use crate::channels::utils::text::truncate_by_chars;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::{EgoPulseError, LlmError, StorageError};
 use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
+use crate::runtime::scheduled_turn::deserialize_scheduled_turn;
 use crate::storage::{AcceptOutcome, StoredMessage, TurnRun, TurnRunState, call_blocking};
 use crate::tools::ToolExecutionContext;
 use chrono::{Datelike, Utc};
@@ -491,7 +491,8 @@ impl TurnExecutor<'_> {
                 .unwrap_or_else(|| self.state.config_manager.current_blocking());
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = self.resolve_request_key();
-            let payload_hash = crate::agent_loop::canonical_request_hash(self.context, user_input);
+            let payload_hash =
+                crate::runtime::scheduled_turn::canonical_request_hash(self.context, user_input);
             let acceptance = self
                 .accept_turn(chat_id, &request_key, &payload_hash, &snapshot)
                 .await?;
@@ -2086,9 +2087,9 @@ mod tests {
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
 
-    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::event::AgentEvent;
     use crate::agent_loop::{process_turn, process_turn_with_events};
+    use crate::conversation::ConversationScope;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use crate::runtime::AppState;
@@ -3374,7 +3375,7 @@ mod tests {
         let capture = SpanCapture::new();
         let _guard = install_capture_subscriber(&capture);
 
-        let turn = crate::agent_loop::ScheduledTurn {
+        let turn = crate::runtime::scheduled_turn::ScheduledTurn {
             turn_id: "turn-1".to_string(),
             context: ctx,
             input: "scheduled turn".to_string(),
@@ -4114,7 +4115,8 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let payload_hash = crate::agent_loop::canonical_request_hash(&context, "hello");
+        let payload_hash =
+            crate::runtime::scheduled_turn::canonical_request_hash(&context, "hello");
         {
             let conn = state.db.get_conn().expect("conn");
             conn.execute(
@@ -4190,7 +4192,8 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let payload_hash = crate::agent_loop::canonical_request_hash(&context, "hello");
+        let payload_hash =
+            crate::runtime::scheduled_turn::canonical_request_hash(&context, "hello");
         {
             let conn = state.db.get_conn().expect("conn");
             conn.execute(

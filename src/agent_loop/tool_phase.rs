@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures_util::future::join_all;
 use tracing::warn;
 
-use crate::agent_loop::ConversationScope;
 use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::formatting::{
@@ -15,6 +14,7 @@ use crate::agent_loop::formatting::{
 };
 use crate::agent_loop::guards::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
 use crate::channels::utils::text::truncate_by_chars;
+use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};

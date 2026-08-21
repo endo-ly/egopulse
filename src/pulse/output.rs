@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use tracing::{error, warn};
 
-use crate::agent_loop::ConversationScope;
 use crate::agent_loop::session::{
     PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once,
 };
 use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::channels::utils::text::truncate_by_chars;
+use crate::conversation::ConversationScope;
 use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;

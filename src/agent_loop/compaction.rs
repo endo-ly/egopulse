@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::SurfaceContext;
 use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
+use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, Message, MessagesResponse};
@@ -835,11 +835,11 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::turn::{
         RecordingProvider, build_state, cli_context, test_config_with_compaction,
     };
+    use crate::conversation::ConversationScope;
     use crate::error::LlmError;
     use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
     use crate::llm::{Message, MessagesResponse, ToolCall};
