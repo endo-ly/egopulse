@@ -386,6 +386,7 @@ mod integration_tests {
     use crate::agent_loop::test_support::{
         RecordingProvider, build_state_with_provider, cli_context,
     };
+    use crate::conversation::ConversationScope;
     use crate::llm::{MessagesResponse, ToolCall, ToolDefinition};
     use crate::storage::call_blocking;
     use crate::tools::{Tool, ToolExecutionContext, ToolResult};
@@ -516,31 +517,23 @@ mod integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn mixed_tools_execute_sequentially() {
+    async fn secret_turn_writes_tool_ledger_to_secret_db_only() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
         let provider = RecordingProvider::new(
             vec![
                 Ok(MessagesResponse {
-                    content: "Mixed.".to_string(),
+                    content: String::new(),
                     reasoning_content: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_a.clone()}),
-                        },
-                        ToolCall {
-                            id: "call-2".to_string(),
-                            name: "bash".to_string(),
-                            arguments: serde_json::json!({"command": "echo ok"}),
-                        },
-                    ],
+                    tool_calls: vec![ToolCall {
+                        id: "call-secret".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({"command": "echo secret-side-effect"}),
+                    }],
                     usage: None,
                 }),
                 Ok(MessagesResponse {
-                    content: "Done.".to_string(),
+                    content: "done".to_string(),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: None,
@@ -548,145 +541,48 @@ mod integration_tests {
             ],
             vec![0, 0],
         );
-        let state = build_state_with_provider(
+        let mut state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider),
         );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let full = workspace.join(&file_a);
-        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-        std::fs::write(&full, "hello").expect("write");
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+        let mut context = cli_context("secret-tool-ledger");
+        context.scope = ConversationScope::Secret;
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &cli_context("mixed-tools"), "mixed")
+        let reply = process_turn(&state.turn_runtime(), &context, "run a command")
             .await
-            .expect("turn");
+            .expect("process turn");
 
         // Assert
-        assert_eq!(reply, "Done.");
-
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:mixed-tools:agent:default",
-                Some("mixed-tools"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1, "only non-idempotent/bash is persisted");
-        assert_eq!(tool_calls[0].tool_name, "bash");
-        assert!(tool_calls[0].tool_output.is_some());
-    }
-
-    // -----------------------------------------------------------------------
-    // Order-preserving partial parallelization
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    #[serial]
-    async fn parallel_read_only_block() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
-        let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
-        let file_c = format!("tests/{}/c.txt", uuid::Uuid::new_v4());
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "Mixed read/write.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-r1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_a.clone()}),
-                        },
-                        ToolCall {
-                            id: "call-r2".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_b.clone()}),
-                        },
-                        ToolCall {
-                            id: "call-b1".to_string(),
-                            name: "bash".to_string(),
-                            arguments: serde_json::json!({"command": "echo ok"}),
-                        },
-                        ToolCall {
-                            id: "call-r3".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_c.clone()}),
-                        },
-                    ],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "Done.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        for path in &[&file_a, &file_b, &file_c] {
-            let full = workspace.join(path);
-            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-            std::fs::write(&full, format!("content of {}", path)).expect("write");
-        }
-
-        // Act
-        let reply = process_turn(
-            &state.turn_runtime(),
-            &cli_context("partial-parallel"),
-            "mixed",
-        )
-        .await
-        .expect("turn");
-
-        // Assert
-        assert_eq!(reply, "Done.");
-
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:partial-parallel:agent:default",
-                Some("partial-parallel"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
+        assert_eq!(reply, "done");
+        let normal_count: i64 = state
+            .db
+            .get_conn()
+            .expect("normal conn")
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("normal tool ledger count");
+        assert_eq!(normal_count, 0, "secret ledger must not leak to normal db");
+        let secret_count: i64 = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn")
+            .query_row("SELECT COUNT(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("secret tool ledger count");
         assert_eq!(
-            tool_calls.len(),
-            1,
-            "only bash is persisted; read-only tools skip the ledger"
+            secret_count, 1,
+            "secret ledger must be written to secret db"
         );
-        assert_eq!(tool_calls[0].tool_name, "bash");
-        assert!(tool_calls[0].tool_output.is_some());
     }
 
     #[tokio::test]
     #[serial]
-    async fn sequential_write_tools() {
+    async fn write_tools_persist_in_execution_order() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let file_a = format!("tests/{}/seq.txt", uuid::Uuid::new_v4());

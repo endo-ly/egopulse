@@ -982,11 +982,12 @@ async fn send_turn_failure_to_channel(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
     use crate::agent_loop::test_support::RecordingProvider;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn final_provider() -> RecordingProvider {
         RecordingProvider::new(
@@ -998,6 +999,56 @@ mod tests {
             })],
             vec![0],
         )
+    }
+
+    #[derive(Clone)]
+    struct TraceCapture {
+        trace_ids: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl TraceCapture {
+        fn new() -> Self {
+            Self {
+                trace_ids: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn trace_ids(&self) -> Vec<String> {
+            self.trace_ids.lock().expect("trace ids").clone()
+        }
+    }
+
+    struct TraceIdVisitor {
+        trace_id: Option<String>,
+    }
+
+    impl tracing::field::Visit for TraceIdVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "trace_id" {
+                self.trace_id = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for TraceCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "agent_turn" {
+                return;
+            }
+            let mut visitor = TraceIdVisitor { trace_id: None };
+            attrs.record(&mut visitor);
+            if let Some(trace_id) = visitor.trace_id {
+                self.trace_ids.lock().expect("trace ids").push(trace_id);
+            }
+        }
     }
 
     #[test]
@@ -1015,6 +1066,37 @@ mod tests {
         let error = status.recent_errors().pop().expect("recorded error");
         assert_eq!(error.trace_id, "trace-123");
         assert_eq!(error.error_kind, "turn_failure");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_scheduled_turn_generates_trace_id() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(final_provider()),
+        );
+        let context = crate::test_util::cli_context("sched-trace");
+        assert!(context.trace_id.is_empty());
+        let capture = TraceCapture::new();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let turn = crate::runtime::scheduled_turn::ScheduledTurn {
+            turn_id: "turn-1".to_string(),
+            context,
+            input: "scheduled turn".to_string(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
+        };
+
+        // Act
+        execute_scheduled_turn(&state, turn).await;
+
+        // Assert
+        let trace_ids = capture.trace_ids();
+        assert_eq!(trace_ids.len(), 1, "one agent_turn span should be created");
+        assert!(!trace_ids[0].is_empty(), "trace_id must be generated");
     }
 
     #[test]

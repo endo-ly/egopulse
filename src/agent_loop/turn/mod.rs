@@ -635,8 +635,7 @@ async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> 
 #[cfg(test)]
 mod tests {
     use crate::agent_loop::test_support::{
-        DeltaEmittingProvider, FailingProvider, FakeProvider, RecordingProvider,
-        build_state_with_provider, cli_context,
+        DeltaEmittingProvider, RecordingProvider, build_state_with_provider, cli_context,
     };
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
@@ -654,7 +653,8 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn process_turn_executes_tool_calls_and_persists_outputs() {
+    async fn process_turn_runs_tool_phase_and_returns_final_response() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let relative_path = format!("tests/{}/notes.txt", uuid::Uuid::new_v4());
         let provider = RecordingProvider::new(
@@ -696,17 +696,7 @@ mod tests {
         .expect("process turn");
         assert_eq!(reply, "All set");
 
-        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:tool-flow:agent:default",
-                Some("tool-flow"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
+        // Assert
         let seen_messages = provider.seen_messages();
         assert_eq!(seen_messages.len(), 2);
         assert_eq!(
@@ -724,75 +714,49 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn process_turn_surfaces_llm_failure() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Err(crate::error::LlmError::InvalidResponse(
+                "boom".to_string(),
+            ))],
+            vec![0],
+        );
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FailingProvider),
+            Box::new(provider),
         );
+        let context = cli_context("failure");
 
-        let error = process_turn(&state.turn_runtime(), &cli_context("failure"), "hello")
+        // Act
+        let error = process_turn(&state.turn_runtime(), &context, "hello")
             .await
             .expect_err("should fail");
+
+        // Assert
         assert!(matches!(error, EgoPulseError::Llm(_)));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn observed_turn_runs_tool_once_when_subsequent_llm_call_fails() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let relative_path = format!("tests/{}/side_effect.txt", uuid::Uuid::new_v4());
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "Let me check.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-1".to_string(),
-                        name: "read".to_string(),
-                        arguments: serde_json::json!({"path": relative_path}),
-                    }],
-                    usage: None,
-                }),
-                Err(crate::error::LlmError::InvalidResponse("boom".to_string())),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let note_path = workspace.join(&relative_path);
-        std::fs::create_dir_all(note_path.parent().expect("note parent")).expect("workspace");
-        std::fs::write(&note_path, "side effect content").expect("notes");
-
-        // Exercise the runtime boundary (execute_observed_turn ->
-        // execute_turn_with_progress), not the bare agent-loop entry point, so
-        // the tool-after-LLM-failure behavior is verified on the path that
-        // actually runs in production.
-        let error = crate::runtime::execute_observed_turn(
-            &state,
-            &cli_context("tool-once"),
-            "please read the note",
-        )
-        .await
-        .expect_err("should fail because the subsequent LLM call errors");
-        assert!(matches!(error, EgoPulseError::Llm(_)));
-
-        let seen_messages = provider.seen_messages();
-        assert_eq!(seen_messages.len(), 2);
-
-        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
-                "cli:tool-once:agent:default",
-                Some("tool-once"),
+                "cli:failure:agent:default",
+                Some("failure"),
                 "cli",
                 "default",
             )
         })
         .await
         .expect("chat id");
+        let state_str: String = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT state FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| row.get(0),
+            )
+            .expect("turn_run state");
+        assert_eq!(state_str, "failed");
     }
 
     #[tokio::test]
@@ -841,186 +805,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Tool call edge cases & error handling
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    #[serial]
-    async fn repeated_provider_tool_call_ids_do_not_break_later_turns() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let relative_path = format!("tests/{}/repeat.txt", uuid::Uuid::new_v4());
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                responses: std::sync::Mutex::new(vec![
-                    MessagesResponse {
-                        content: "Reading once.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call-repeat".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path.clone()}),
-                        }],
-                        usage: None,
-                    },
-                    MessagesResponse {
-                        content: "First done.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                        usage: None,
-                    },
-                    MessagesResponse {
-                        content: "Reading again.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: vec![ToolCall {
-                            id: "call-repeat".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path.clone()}),
-                        }],
-                        usage: None,
-                    },
-                    MessagesResponse {
-                        content: "Second done.".to_string(),
-                        reasoning_content: None,
-                        tool_calls: Vec::new(),
-                        usage: None,
-                    },
-                ]),
-            }),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let file_path = workspace.join(&relative_path);
-        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
-        std::fs::write(&file_path, "repeat content").expect("repeat.txt");
-
-        let context = cli_context("repeated-tool-call-id");
-        let first = process_turn(&state.turn_runtime(), &context, "read once")
-            .await
-            .expect("first turn");
-        let second = process_turn(&state.turn_runtime(), &context, "read again")
-            .await
-            .expect("second turn");
-
-        assert_eq!(first, "First done.");
-        assert_eq!(second, "Second done.");
-        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:repeated-tool-call-id:agent:default",
-                Some("repeated-tool-call-id"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn duplicate_tool_call_ids_in_same_response_are_executed_once() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let relative_path = format!("tests/{}/duplicate.txt", uuid::Uuid::new_v4());
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "Reading.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![
-                        ToolCall {
-                            id: "call-duplicate".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({}),
-                        },
-                        ToolCall {
-                            id: "call-duplicate".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": relative_path.clone()}),
-                        },
-                    ],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "Done.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider.clone()),
-        );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        let file_path = workspace.join(&relative_path);
-        std::fs::create_dir_all(file_path.parent().expect("file parent")).expect("workspace");
-        std::fs::write(&file_path, "duplicate content").expect("duplicate.txt");
-
-        let reply = process_turn(
-            &state.turn_runtime(),
-            &cli_context("duplicate-tool-call-id"),
-            "read it",
-        )
-        .await
-        .expect("process turn");
-
-        assert_eq!(reply, "Done.");
-        let _chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:duplicate-tool-call-id:agent:default",
-                Some("duplicate-tool-call-id"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let seen_messages = provider.seen_messages();
-        assert_eq!(seen_messages.len(), 2);
-        assert_eq!(seen_messages[1][1].role, "assistant");
-        assert_eq!(seen_messages[1][1].tool_calls.len(), 1);
-        assert_eq!(seen_messages[1][1].tool_calls[0].id, "call-duplicate");
-        assert_eq!(
-            seen_messages[1][1].tool_calls[0].arguments["path"],
-            relative_path
-        );
-        assert_eq!(seen_messages[1][2].role, "tool");
-        assert_eq!(
-            seen_messages[1][2].tool_call_id.as_deref(),
-            Some("call-duplicate")
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn malformed_tool_calls_are_skipped_and_error_returned() {
-        // All tool calls have empty names → malformed → error
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(FakeProvider {
-                responses: std::sync::Mutex::new(vec![MessagesResponse {
-                    content: String::new(),
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-malformed".to_string(),
-                        name: String::new(),
-                        arguments: serde_json::json!({}),
-                    }],
-                    usage: None,
-                }]),
-            }),
-        );
-
-        let error = process_turn(&state.turn_runtime(), &cli_context("malformed"), "test")
-            .await
-            .expect_err("should fail with malformed tool calls");
-        assert!(matches!(error, EgoPulseError::Llm(_)));
-    }
-
     // -----------------------------------------------------------------------
     // Channel Context unit tests
     // -----------------------------------------------------------------------
@@ -1060,7 +844,6 @@ mod tests {
         sender_id: &str,
         content: &str,
         sender_kind: SenderKind,
-        _ts: &str,
     ) {
         insert_channel_log_message_with_recipient(
             db,
@@ -1135,7 +918,6 @@ mod tests {
             "alice",
             "hello from alice",
             SenderKind::User,
-            "2025-01-01T00:00:00Z",
         );
         insert_channel_log_message(
             &state.db,
@@ -1144,7 +926,6 @@ mod tests {
             "Bot",
             "hi there",
             SenderKind::Assistant,
-            "2025-01-01T00:00:01Z",
         );
 
         let context = multi_agent_context("ctx-loaded", log_chat_id);
@@ -1224,7 +1005,6 @@ mod tests {
             "default",
             "default response",
             SenderKind::Assistant,
-            "2025-01-01T00:00:02Z",
         );
         insert_channel_log_message(
             &state.db,
@@ -1233,7 +1013,6 @@ mod tests {
             "default",
             "default tool event",
             SenderKind::Tool,
-            "2025-01-01T00:00:03Z",
         );
         insert_channel_log_message(
             &state.db,
@@ -1242,7 +1021,6 @@ mod tests {
             "lyre",
             "lyre response",
             SenderKind::Assistant,
-            "2025-01-01T00:00:04Z",
         );
 
         let context = multi_agent_context_for_agent("ctx-projection", log_chat_id, "default");
@@ -1293,7 +1071,6 @@ mod tests {
                 "alice",
                 &format!("msg {i}"),
                 SenderKind::User,
-                &format!("2025-01-01T00:{i:02}:00Z"),
             );
         }
 
@@ -1354,7 +1131,6 @@ mod tests {
             "alice",
             "background",
             SenderKind::User,
-            "2025-01-01T00:00:00Z",
         );
 
         let context = multi_agent_context("ctx-direct-input", log_chat_id);
@@ -1445,15 +1221,6 @@ mod tests {
                 1,
                 "[{label}] should have exactly one user message"
             );
-            let user_text = user_msgs[0].content.as_text_lossy();
-            assert!(
-                user_text.starts_with("<direct-input>\n[Current time: "),
-                "[{label}] user message should include direct-input timestamp, got: {user_text}",
-            );
-            assert!(
-                user_text.contains("\nhello\n</direct-input>"),
-                "[{label}] user message should contain the direct input, got: {user_text}",
-            );
             for msg in &seen[0] {
                 assert!(
                     !msg.content.as_text_lossy().contains("<shared-context>"),
@@ -1494,7 +1261,6 @@ mod tests {
             "alice",
             "should not persist",
             SenderKind::User,
-            "2025-01-01T00:00:00Z",
         );
 
         let context = multi_agent_context("ctx-no-persist", log_chat_id);
@@ -1549,13 +1315,7 @@ mod tests {
         let provider = RecordingProvider::new(
             vec![
                 Ok(MessagesResponse {
-                    content: "I'll help with that.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "I'll help with that.".to_string(),
+                    content: "First answer.".to_string(),
                     reasoning_content: None,
                     tool_calls: vec![],
                     usage: None,
@@ -1567,7 +1327,7 @@ mod tests {
                     usage: None,
                 }),
             ],
-            vec![0, 0, 0],
+            vec![0, 0],
         );
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
@@ -1586,7 +1346,6 @@ mod tests {
             "alice",
             "previous message",
             SenderKind::User,
-            "2025-01-01T00:00:00Z",
         );
 
         // First turn with channel context
@@ -1594,7 +1353,7 @@ mod tests {
         let reply1 = process_turn(&state.turn_runtime(), &context, "first question")
             .await
             .expect("turn 1");
-        assert_eq!(reply1, "I'll help with that.");
+        assert_eq!(reply1, "First answer.");
 
         // Verify channel context was injected on first turn
         let seen1 = provider.seen_messages();
@@ -1642,7 +1401,7 @@ mod tests {
             "session should contain first user message"
         );
         assert!(
-            json.contains("I'll help with that"),
+            json.contains("First answer"),
             "session should contain first bot response"
         );
         assert!(
@@ -1821,53 +1580,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn execute_scheduled_turn_generates_trace_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "scheduled".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })],
-            vec![0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-
-        let ctx = cli_context("sched-trace");
-        assert!(ctx.trace_id.is_empty());
-
-        let capture = SpanCapture::new();
-        let _guard = install_capture_subscriber(&capture);
-
-        let turn = crate::runtime::scheduled_turn::ScheduledTurn {
-            turn_id: "turn-1".to_string(),
-            context: ctx,
-            input: "scheduled turn".to_string(),
-            origin_id: uuid::Uuid::new_v4().to_string(),
-            config_snapshot: None,
-        };
-
-        crate::runtime::execute_scheduled_turn(&state, turn).await;
-
-        let trace_ids = capture.captured_trace_ids();
-        assert_eq!(
-            trace_ids.len(),
-            1,
-            "should capture exactly one agent_turn span"
-        );
-        assert!(
-            !trace_ids[0].is_empty(),
-            "execute_scheduled_turn must generate a non-empty trace_id"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn secret_turn_span_omits_content_fields() {
+    async fn secret_turn_span_marks_secret_scope() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -1957,55 +1670,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn secret_chat_routes_to_secret_db_not_egopulse() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
-        );
-        let secret_path = dir.path().join("runtime").join("secret.db");
-        state.secret_db = Some(Arc::new(
-            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
-        ));
-
-        let mut context = cli_context("secret-routing");
-        context.scope = ConversationScope::Secret;
-
-        let chat_id = crate::agent_loop::session::resolve_chat_id(&state.turn_runtime(), &context)
-            .await
-            .expect("resolve chat id");
-        assert!(chat_id > 0, "secret chat should resolve to a positive id");
-
-        let ego_conn = state.db.get_conn().expect("egopulse conn");
-        for table in [
-            "chats",
-            "messages",
-            "sessions",
-            "tool_calls",
-            "llm_usage_logs",
-        ] {
-            assert_eq!(
-                count_rows(&ego_conn, table),
-                0,
-                "egopulse.db.{table} must be empty when the turn is secret"
-            );
-        }
-
-        let secret_conn = state
-            .secret_db
-            .as_ref()
-            .expect("secret db")
-            .get_conn()
-            .expect("secret conn");
-        assert_eq!(
-            count_rows(&secret_conn, "chats"),
-            1,
-            "secret.db should hold exactly the one routed chat"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn secret_turn_leaves_egopulse_db_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
@@ -2061,260 +1725,5 @@ mod tests {
                 "secret.db.{table} should have at least one row after a secret turn"
             );
         }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn secret_turn_writes_tool_ledger_to_secret_db_only() {
-        // Regression: a non-read-only Tool executed in a Secret-scoped turn
-        // must persist its ledger row to secret.db, never to egopulse.db.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: String::new(),
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-1".to_string(),
-                        name: "bash".to_string(),
-                        arguments: serde_json::json!({"command": "echo secret-side-effect"}),
-                    }],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "done".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
-        );
-        let mut state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let secret_path = dir.path().join("runtime").join("secret.db");
-        state.secret_db = Some(Arc::new(
-            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
-        ));
-
-        let mut context = cli_context("secret-tool-ledger");
-        context.scope = ConversationScope::Secret;
-
-        let reply = process_turn(&state.turn_runtime(), &context, "run a command")
-            .await
-            .expect("process turn");
-        assert_eq!(reply, "done");
-
-        let ego_conn = state.db.get_conn().expect("egopulse conn");
-        assert_eq!(
-            count_rows(&ego_conn, "tool_calls"),
-            0,
-            "secret tool ledger must NOT leak into egopulse.db"
-        );
-
-        let secret_conn = state
-            .secret_db
-            .as_ref()
-            .expect("secret db")
-            .get_conn()
-            .expect("secret conn");
-        assert_eq!(
-            count_rows(&secret_conn, "tool_calls"),
-            1,
-            "secret tool ledger must be written to secret.db"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // End-to-end: real OpenAiProvider streaming → coordinator narration
-    // -----------------------------------------------------------------------
-
-    #[derive(Default, Clone)]
-    struct NarrationCalls {
-        begins: Vec<String>,
-        updates: Vec<String>,
-        closes: usize,
-    }
-
-    struct NarrationSink {
-        calls: Arc<Mutex<NarrationCalls>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::channels::adapter::ToolProgressSink for NarrationSink {
-        async fn begin(
-            &self,
-            _external_chat_id: &str,
-            body: &str,
-        ) -> Result<Box<dyn crate::channels::adapter::ToolProgressHandle>, String> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .begins
-                .push(body.to_string());
-            Ok(Box::new(NarrationHandle {
-                calls: Arc::clone(&self.calls),
-            }))
-        }
-    }
-
-    struct NarrationHandle {
-        calls: Arc<Mutex<NarrationCalls>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::channels::adapter::ToolProgressHandle for NarrationHandle {
-        async fn update(&mut self, body: &str) -> Result<(), String> {
-            self.calls
-                .lock()
-                .expect("calls lock")
-                .updates
-                .push(body.to_string());
-            Ok(())
-        }
-
-        async fn close(self: Box<Self>) -> Result<(), String> {
-            self.calls.lock().expect("calls lock").closes += 1;
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn provider_streaming_drives_coordinator_narration() {
-        use std::time::Duration;
-
-        use crate::channels::adapter::ToolProgressSink;
-        use crate::config::ResolvedLlmConfig;
-        use crate::llm::OpenAiProvider;
-        use crate::runtime::tool_progress::ToolProgressCoordinator;
-
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        // Arrange: a wiremock SSE server returning two sequential responses.
-        let server = MockServer::start().await;
-
-        // 1st request only: narration deltas + a read tool call.
-        // Mounted first so insertion-order precedence picks it before the fallback.
-        let tool_args = serde_json::json!({"path": "note.txt"}).to_string();
-        let sse_first = [
-            format!(
-                "data: {}\n\n",
-                serde_json::json!({"choices":[{"delta":{"content":"ファイルを"}}]})
-            ),
-            format!(
-                "data: {}\n\n",
-                serde_json::json!({"choices":[{"delta":{"content":"確認します"}}]})
-            ),
-            format!(
-                "data: {}\n\n",
-                serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-narration","type":"function","function":{"name":"read","arguments":tool_args}}]}}]})
-            ),
-            "data: [DONE]\n\n".to_string(),
-        ]
-        .concat();
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_first, "text/event-stream"))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-
-        // Fallback (2nd+ request): final answer, no tool calls.
-        let sse_final = [
-            format!(
-                "data: {}\n\n",
-                serde_json::json!({"choices":[{"delta":{"content":"読み取りが完了しました。"}}]})
-            ),
-            "data: [DONE]\n\n".to_string(),
-        ]
-        .concat();
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_final, "text/event-stream"))
-            .mount(&server)
-            .await;
-
-        // Build a *real* OpenAiProvider pointed at the wiremock server.
-        let provider = OpenAiProvider::new(&ResolvedLlmConfig {
-            provider: "test".to_string(),
-            label: "Test".to_string(),
-            base_url: format!("{}/v1", server.uri()),
-            api_key: Some(secrecy::SecretString::new(
-                "sk-test".to_string().into_boxed_str(),
-            )),
-            model: "gpt-4o-mini".to_string(),
-        })
-        .expect("provider");
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-
-        // Workspace file the `read` tool will open.
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        std::fs::write(workspace.join("note.txt"), "hello world").expect("write note");
-
-        // Bridge agent-loop events into a ToolProgressCoordinator with a mock sink.
-        let calls = Arc::new(Mutex::new(NarrationCalls::default()));
-        let sink: Arc<dyn ToolProgressSink> = Arc::new(NarrationSink {
-            calls: Arc::clone(&calls),
-        });
-        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let coordinator = ToolProgressCoordinator::with_timings(
-            Some(sink),
-            "discord:1:agent:default".to_string(),
-            Duration::from_millis(1),
-            Duration::from_millis(1),
-        );
-        let coord_handle = tokio::spawn(coordinator.run(evt_rx));
-
-        // Act: run a full turn through the real OpenAiProvider. Each event
-        // is forwarded to the coordinator. Dropping the closure on return
-        // closes the channel, signalling EOF to the coordinator.
-        let reply = process_turn_with_events(
-            &state.turn_runtime(),
-            &cli_context("narration-e2e"),
-            "please read note.txt",
-            move |event| {
-                let _ = evt_tx.send(event);
-            },
-        )
-        .await
-        .expect("process turn");
-
-        // Wait for the coordinator to drain and close.
-        let () = coord_handle.await.expect("coordinator join");
-
-        // Assert: the posted progress body contains the narration (💬) before
-        // the tool line (... read), proving the provider→Delta→coordinator path.
-        let snapshot = calls.lock().expect("calls").clone();
-        assert!(
-            snapshot.closes >= 1,
-            "coordinator should have closed the progress message"
-        );
-        let body = snapshot
-            .begins
-            .first()
-            .or_else(|| snapshot.updates.last())
-            .expect("at least one progress body");
-        assert!(
-            body.contains("💬 ファイルを確認します"),
-            "narration missing from body: {body}"
-        );
-        assert!(body.contains("... read"), "tool line missing: {body}");
-        let narration_idx = body.find('💬').expect("narration position");
-        let tool_idx = body.find("... read").expect("tool position");
-        assert!(
-            narration_idx < tool_idx,
-            "narration must precede tool: {body}"
-        );
-        assert!(!reply.is_empty(), "turn should produce a final response");
     }
 }

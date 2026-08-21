@@ -422,7 +422,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{load_messages_for_turn, persist_phase};
+    use super::{load_messages_for_turn, persist_phase, resolve_chat_id};
     use crate::config::Config;
     use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::LlmError;
@@ -487,6 +487,61 @@ mod tests {
 
     fn build_state_with_provider(state_root: String, llm: Box<dyn LlmProvider>) -> AppState {
         crate::test_util::build_state_with_provider(&state_root, llm)
+    }
+
+    fn count_rows(conn: &rusqlite::Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|error| panic!("count {table}: {error}"))
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn secret_chat_routes_to_secret_db_not_egopulse() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(FakeProvider {
+                response: "unused".to_string(),
+            }),
+        );
+        let secret_path = dir.path().join("runtime").join("secret.db");
+        state.secret_db = Some(Arc::new(
+            crate::storage::Database::new_secret(&secret_path).expect("secret db"),
+        ));
+        let mut context = cli_context("secret-routing");
+        context.scope = ConversationScope::Secret;
+
+        // Act
+        let chat_id = resolve_chat_id(&state.turn_runtime(), &context)
+            .await
+            .expect("resolve chat id");
+
+        // Assert
+        assert!(chat_id > 0, "secret chat should resolve to a positive id");
+        let ego_conn = state.db.get_conn().expect("egopulse conn");
+        for table in [
+            "chats",
+            "messages",
+            "sessions",
+            "tool_calls",
+            "llm_usage_logs",
+        ] {
+            assert_eq!(
+                count_rows(&ego_conn, table),
+                0,
+                "egopulse.db.{table} must be empty when the turn is secret"
+            );
+        }
+        let secret_conn = state
+            .secret_db
+            .as_ref()
+            .expect("secret db")
+            .get_conn()
+            .expect("secret conn");
+        assert_eq!(count_rows(&secret_conn, "chats"), 1);
     }
 
     #[tokio::test]
