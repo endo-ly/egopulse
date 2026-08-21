@@ -282,8 +282,8 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         .llm
         .send_message_streaming(
             request.system_prompt,
-            request.messages,
-            request.tools,
+            Arc::clone(&request.messages),
+            request.tools.clone(),
             request.on_delta,
         )
         .await
@@ -302,19 +302,7 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
             .usage_calibrator
             .record(calibration_key, raw_estimate, usage.input_tokens)
             .await;
-        log_llm_usage(
-            request.state,
-            request.scope,
-            request.chat_id,
-            request.caller_channel,
-            request.llm,
-            usage,
-            request.request_kind,
-            raw_estimate,
-            has_tools,
-            request.usage_log_failure,
-        )
-        .await;
+        log_llm_usage(&request, usage, raw_estimate, has_tools).await;
     }
 
     if response.tool_calls.is_empty() {
@@ -434,12 +422,8 @@ fn model_request_hash(
     let mut hasher = Sha256::new();
     hasher.update(system_prompt.as_bytes());
     hasher.update(b"\x00");
-    match serde_json::to_string(messages) {
-        Ok(json) => hasher.update(json.as_bytes()),
-        Err(_) => {
-            hasher.update(b"messages_serialization_error");
-            hasher.update((messages.len() as u64).to_le_bytes());
-        }
+    if let Ok(json) = serde_json::to_string(messages) {
+        hasher.update(json.as_bytes());
     }
     hasher.update(b"\x00");
     if let Some(tools) = tools_json {
@@ -482,23 +466,19 @@ fn build_assistant_tool_phase(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn log_llm_usage(
-    state: &TurnRuntime,
-    scope: ConversationScope,
-    chat_id: i64,
-    caller_channel: &str,
-    llm: &dyn LlmProvider,
+    request: &ModelStepRequest<'_>,
     usage: &LlmUsage,
-    request_kind: &'static str,
     raw_estimate: usize,
     has_tools: bool,
-    failure_message: &'static str,
 ) {
-    let db = state.db_for(scope);
-    let channel = caller_channel.to_string();
-    let provider = llm.provider_name().to_string();
-    let model = llm.model_name().to_string();
+    let db = request.state.db_for(request.scope);
+    let channel = request.caller_channel.to_string();
+    let provider = request.llm.provider_name().to_string();
+    let model = request.llm.model_name().to_string();
+    let chat_id = request.chat_id;
+    let request_kind = request.request_kind;
+    let failure_message = request.usage_log_failure;
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
     let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);

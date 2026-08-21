@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::r#loop::{MAX_TOOL_ITERATIONS, messages_for_iteration};
+use crate::agent_loop::execution::{MAX_TOOL_ITERATIONS, messages_for_iteration};
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest, ignore_delta};
 use crate::agent_loop::tool_execution::{
     ToolExecutionHooks, ToolExecutor, build_tool_result_phase,
@@ -358,8 +358,8 @@ mod tests {
         // warning boundary, then return a response after the shared guards.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut responses =
-            Vec::with_capacity(crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_ITERATION + 2);
-        for iteration in 1..=(crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_ITERATION + 1) {
+            Vec::with_capacity(crate::agent_loop::execution::FINAL_RESPONSE_WARNING_ITERATION + 2);
+        for iteration in 1..=(crate::agent_loop::execution::FINAL_RESPONSE_WARNING_ITERATION + 1) {
             responses.push(Ok(crate::llm::MessagesResponse {
                 content: format!("Checking result {iteration}"),
                 reasoning_content: None,
@@ -379,7 +379,7 @@ mod tests {
         }));
         let provider = crate::agent_loop::test_support::RecordingProvider::new(
             responses,
-            vec![0; crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_ITERATION + 2],
+            vec![0; crate::agent_loop::execution::FINAL_RESPONSE_WARNING_ITERATION + 2],
         );
         let observer = provider.clone();
         let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
@@ -421,24 +421,24 @@ mod tests {
         assert_eq!(result.output_kind, PulseOutputKind::Notify);
         let seen_messages = observer.seen_messages();
         let warning_message = seen_messages
-            [crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_ITERATION - 1]
+            [crate::agent_loop::execution::FINAL_RESPONSE_WARNING_ITERATION - 1]
             .last()
             .expect("warning guard message");
         assert!(
             warning_message
                 .content
                 .as_text_lossy()
-                .contains(crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_GUARD)
+                .contains(crate::agent_loop::execution::FINAL_RESPONSE_WARNING_GUARD)
         );
         let final_guard_message = seen_messages
-            [crate::agent_loop::r#loop::FINAL_RESPONSE_WARNING_ITERATION + 1]
+            [crate::agent_loop::execution::FINAL_RESPONSE_WARNING_ITERATION + 1]
             .last()
             .expect("final guard message");
         assert!(
             final_guard_message
                 .content
                 .as_text_lossy()
-                .contains(crate::agent_loop::r#loop::FINAL_RESPONSE_GUARD)
+                .contains(crate::agent_loop::execution::FINAL_RESPONSE_GUARD)
         );
     }
 

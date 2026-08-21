@@ -5,9 +5,9 @@
 
 pub(crate) mod compaction;
 pub(crate) mod event;
+pub(crate) mod execution;
 pub(crate) mod formatting;
 pub(crate) mod guards;
-pub(crate) mod r#loop;
 pub(crate) mod model_step;
 pub(crate) mod prompt_builder;
 pub(crate) mod session;

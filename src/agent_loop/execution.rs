@@ -21,7 +21,6 @@ use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, ToolCall};
-use crate::storage::TurnRun;
 
 /// Maximum number of model/tool iterations allowed for one activation.
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
@@ -78,7 +77,6 @@ pub(crate) struct AgentLoopResult {
 pub(crate) struct AgentLoop<'a> {
     state: &'a TurnRuntime,
     context: &'a SurfaceContext,
-    turn: &'a TurnRun,
     prepared: &'a PreparedTurn,
     prompt_ctx: PromptContext<'a>,
     channel_context_msg: Option<Message>,
@@ -92,7 +90,6 @@ impl<'a> AgentLoop<'a> {
     pub(super) fn new(
         state: &'a TurnRuntime,
         context: &'a SurfaceContext,
-        turn: &'a TurnRun,
         prepared: &'a PreparedTurn,
         prompt_ctx: PromptContext<'a>,
         channel_context_msg: Option<Message>,
@@ -110,7 +107,6 @@ impl<'a> AgentLoop<'a> {
         Self {
             state,
             context,
-            turn,
             prepared,
             prompt_ctx,
             channel_context_msg,
@@ -155,7 +151,7 @@ impl<'a> AgentLoop<'a> {
                 scope: self.context.scope,
                 on_delta: &on_delta,
             });
-            let phase_response = match model_runner.run_with_retry(&self.turn.turn_id).await {
+            let phase_response = match model_runner.run_with_retry(&self.prepared.turn_id).await {
                 Ok(response) => response,
                 Err(error) => {
                     let (error, output_published) = error.into_parts();
@@ -176,7 +172,7 @@ impl<'a> AgentLoop<'a> {
                         &mut loop_state.declarative_retry_attempted,
                         &loop_state.messages,
                     )? {
-                        LoopAction::Retry(messages) => loop_state.retry_messages = messages,
+                        LoopAction::Retry(messages) => loop_state.retry_messages = Some(messages),
                         LoopAction::Done {
                             final_content,
                             reasoning_content,
@@ -199,7 +195,7 @@ impl<'a> AgentLoop<'a> {
                         &mut loop_state.declarative_retry_attempted,
                         &loop_state.messages,
                     )? {
-                        LoopAction::Retry(messages) => loop_state.retry_messages = messages,
+                        LoopAction::Retry(messages) => loop_state.retry_messages = Some(messages),
                         LoopAction::Done {
                             final_content,
                             reasoning_content,
@@ -356,7 +352,7 @@ pub(crate) fn messages_for_iteration(
 }
 
 enum LoopAction {
-    Retry(Option<Arc<Vec<Message>>>),
+    Retry(Arc<Vec<Message>>),
     Done {
         final_content: String,
         reasoning_content: Option<String>,
@@ -378,12 +374,12 @@ fn evaluate_end_turn(
     {
         *declarative_retry_attempted = true;
         warn!("declarative-only reply detected; injecting corrective prompt and retrying once");
-        return Ok(LoopAction::Retry(Some(Arc::new(runtime_guard_messages(
+        return Ok(LoopAction::Retry(Arc::new(runtime_guard_messages(
             messages,
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
-        )))));
+        ))));
     }
 
     if !has_displayable_output {
@@ -415,12 +411,12 @@ fn evaluate_malformed_response(
     if !*declarative_retry_attempted && is_declarative_only_reply(&visible_text) {
         *declarative_retry_attempted = true;
         warn!("all tool calls were malformed and reply was declarative-only; retrying once");
-        return Ok(LoopAction::Retry(Some(Arc::new(runtime_guard_messages(
+        return Ok(LoopAction::Retry(Arc::new(runtime_guard_messages(
             messages,
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
-        )))));
+        ))));
     }
 
     Ok(LoopAction::Done {
@@ -581,10 +577,10 @@ mod tests {
         // Assert
         assert!(retry_attempted);
         match action {
-            LoopAction::Retry(Some(retry_messages)) => {
+            LoopAction::Retry(retry_messages) => {
                 assert!(retry_messages.len() > messages.len());
             }
-            LoopAction::Retry(None) | LoopAction::Done { .. } => {
+            LoopAction::Done { .. } => {
                 panic!("declarative response should inject a corrective retry")
             }
         }

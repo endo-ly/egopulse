@@ -11,7 +11,7 @@ Self-hosted AI agent runtime (Rust/Tokio). TUI / Web UI / Discord / Telegram in 
 - `runtime/` - AppState 構築・チャネル起動・ライフサイクル管理。Web / Discord / Telegram を tokio task として同時起動し、graceful shutdownで安全停止。TurnScheduler による同時実行制御と暴走防止も担う
 - `conversation.rs` - ConversationScope / SurfaceContext。チャネル・Runtime・Agent Loop が共有する会話識別コンテキスト
 - `runtime/scheduled_turn.rs` - Runtime が受け付け、queue・dispatch・recoveryする ScheduledTurn の durable 表現・hash・serialization
-- `agent_loop/` - 会話ターン処理。`turn/` が durable Turn を調停し、`loop.rs` が最大 50 イテレーションの Agent Loop、`model_step.rs` が LLM の 1 step、`tool_execution.rs` が Tool 実行を担う
+- `agent_loop/` - 会話ターン処理。`turn/` が durable Turn を調停し、`execution.rs` が最大 50 イテレーションの Agent Loop、`model_step.rs` が LLM の 1 step、`tool_execution.rs` が Tool 実行を担う
 - `channels/` - チャネル実装。Web（Axum + SSE/WebSocket）/ Discord / Telegram / TUI / CLI を統一インターフェース（ChannelAdapter）で扱う
 - `llm/` - LLM プロバイダー抽象化（OpenAI 互換 API）と Codex 認証の解決
 - `config/` - YAML 設定（`~/.egopulse/egopulse.config.yaml`）の読み込み・永続化・モデル/チャネル解決。SecretRef による秘密参照もここ

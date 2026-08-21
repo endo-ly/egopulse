@@ -101,7 +101,7 @@ src/
 │
 ├── agent_loop/          # エージェントループ
 │   ├── mod.rs           # module facade と process_turn() の公開入口
-│   ├── loop.rs          # AgentLoop、LoopState、iteration policy
+│   ├── execution.rs     # AgentLoop、LoopState、iteration policy
 │   ├── model_step.rs    # 1 回の LLM 呼び出し、分類、retry、usage
 │   ├── tool_execution.rs # Tool 実行、ledger、Tool Result 構築
 │   ├── turn/            # durable な 1 Turn の orchestration

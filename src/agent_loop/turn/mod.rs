@@ -15,7 +15,7 @@ use crate::agent_loop::turn::lifecycle::{
 use crate::agent_loop::turn::persistence::TurnPersistence;
 
 use crate::agent_loop::TurnRuntime;
-use crate::agent_loop::r#loop::AgentLoop;
+use crate::agent_loop::execution::AgentLoop;
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
@@ -328,7 +328,6 @@ impl TurnExecutor<'_> {
 
                 // 段階4: 最終応答が得られるまで、LLM 呼び出しとツール実行を反復する。
                 self.run_agent_loop(
-                    &turn,
                     &prepared,
                     prompt_ctx,
                     channel_context_msg,
@@ -392,7 +391,6 @@ impl TurnExecutor<'_> {
             .await?;
             let channel_context_msg = load_channel_context(self.state, self.context).await;
             self.run_agent_loop(
-                turn_run,
                 &prepared,
                 prompt_ctx,
                 channel_context_msg,
@@ -558,7 +556,6 @@ impl TurnExecutor<'_> {
 
     async fn run_agent_loop(
         &self,
-        turn: &TurnRun,
         prepared: &PreparedTurn,
         prompt_ctx: PromptContext<'_>,
         channel_context_msg: Option<Message>,
@@ -568,7 +565,6 @@ impl TurnExecutor<'_> {
         let result = AgentLoop::new(
             self.state,
             self.context,
-            turn,
             prepared,
             prompt_ctx,
             channel_context_msg,
@@ -583,15 +579,15 @@ impl TurnExecutor<'_> {
     async fn persist_agent_loop_result(
         &self,
         prepared: &PreparedTurn,
-        result: crate::agent_loop::r#loop::AgentLoopResult,
+        result: crate::agent_loop::execution::AgentLoopResult,
     ) -> Result<String, EgoPulseError> {
         let final_message_id = format!("turn:{}:final", prepared.turn_id);
-        let mut messages = result.messages;
+        let messages = result.messages;
         let response = self
             .persistence(prepared)
             .persist_final(
                 &final_message_id,
-                &mut messages,
+                messages,
                 result.session_revision,
                 &self.on_event,
                 (result.final_content, result.reasoning_content),
