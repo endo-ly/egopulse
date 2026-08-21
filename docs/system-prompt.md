@@ -41,7 +41,7 @@ LLM に送信される system prompt の構築方法を定義する。
 | ③ Memories | AGENTS.md 存在時 | `<agents>` タグでラップされたルール定義 | `soul_agents.rs:build_agents_section()` |
 | ③.5 Secret | `scope == ConversationScope::Secret` かつ SECRET.md 存在時 | `<secret>` タグでラップされた秘密モード指示 | `soul_agents.rs:load_secret()` → `prompt_builder.rs:build_secret_prompt_section()` |
 | ④ Long-term Memory | 記憶ファイル存在時 | エピソード・意味・展望記憶のXMLブロック | `prompt_builder.rs` |
-| ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `turn.rs` |
+| ⑤ Skills | スキル存在時 | activate_skill ヘッダー + `<available_skills>` カタログ | `prompt_builder.rs` |
 
 各セクション間には `\n\n` が挿入される。
 
