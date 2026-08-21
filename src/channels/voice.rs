@@ -146,7 +146,7 @@ pub(crate) async fn turn(
     };
     match process_request(&state.app_state, request).await {
         Ok(response) => Json(response).into_response(),
-        Err(response) => *response,
+        Err(response) => response,
     }
 }
 
@@ -160,45 +160,45 @@ pub(crate) async fn turn(
 async fn process_request(
     state: &AppState,
     request: VoiceTurnRequest,
-) -> Result<VoiceTurnResponse, Box<Response>> {
+) -> Result<VoiceTurnResponse, Response> {
     let snapshot = state.config_manager.current_blocking();
     let config = &snapshot.config;
     let text = request.text.trim();
     if text.is_empty() {
-        return Err(Box::new(error(
+        return Err(error(
             StatusCode::BAD_REQUEST,
             "invalid_params",
             "text is required",
-        )));
+        ));
     }
     let surface = normalized_component(
         request.surface.as_deref(),
         config.voice_default_surface(),
         "surface",
     )
-    .map_err(|message| Box::new(validation_error_response(message)))?;
+    .map_err(validation_error_response)?;
     let session_key = normalized_component(
         request.session_key.as_deref(),
         config.voice_default_session(),
         "session_key",
     )
-    .map_err(|message| Box::new(validation_error_response(message)))?;
+    .map_err(validation_error_response)?;
     let allowed = config.voice_allowed_surfaces();
     if !allowed.is_empty() && !allowed.iter().any(|candidate| candidate == &surface) {
-        return Err(Box::new(error(
+        return Err(error(
             StatusCode::FORBIDDEN,
             "surface_not_allowed",
             "surface is not allowed",
-        )));
+        ));
     }
     let user_id = normalized_component(request.user_id.as_deref(), "voice-user", "user_id")
-        .map_err(|message| Box::new(validation_error_response(message)))?;
+        .map_err(validation_error_response)?;
     let agent_id = normalized_component(
         request.agent_id.as_deref(),
         config.default_agent.as_str(),
         "agent_id",
     )
-    .map_err(|message| Box::new(validation_error_response(message)))?;
+    .map_err(validation_error_response)?;
     let source = request.source.as_deref().unwrap_or("unknown").trim();
     let surface_thread = format!("{surface}:{session_key}");
     let trace_id = Uuid::new_v4().to_string();
@@ -224,11 +224,11 @@ async fn process_request(
         .await
         .map_err(|err| {
             tracing::error!(error = %err, trace_id, "voice turn failed");
-            Box::new(error(
+            error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "turn_failed",
                 "voice turn failed",
-            ))
+            )
         })?;
 
     Ok(VoiceTurnResponse {
