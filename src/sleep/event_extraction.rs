@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 use crate::agent_loop::formatting::strip_thinking;
-use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
+use crate::agent_loop::tool_execution::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::channels::utils::text::truncate_by_chars;
 use crate::llm::{LlmProvider, Message};
 use crate::storage::{

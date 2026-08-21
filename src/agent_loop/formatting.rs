@@ -1,6 +1,6 @@
 //! メッセージのフォーマット、サニタイズ、表示用テキスト変換。
 
-use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
+use crate::agent_loop::tool_execution::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 use crate::storage::StoredMessage;
 

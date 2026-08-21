@@ -7,11 +7,13 @@ pub(crate) mod compaction;
 pub(crate) mod event;
 pub(crate) mod formatting;
 pub(crate) mod guards;
+pub(crate) mod r#loop;
+pub(crate) mod model_step;
 pub(crate) mod prompt_builder;
 pub(crate) mod session;
 pub(crate) mod session_snapshot;
 pub(crate) mod soul_agents;
-pub(crate) mod tool_phase;
+pub(crate) mod tool_execution;
 pub(crate) mod turn;
 pub(crate) mod turn_runtime;
 

@@ -9,14 +9,15 @@ use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
 
 use crate::agent_loop::TurnRuntime;
+use crate::agent_loop::r#loop::{MAX_TOOL_ITERATIONS, messages_for_iteration};
+use crate::agent_loop::model_step::{AssistantToolPhase, ModelRunner, ModelStep, ModelStepRequest};
 use crate::agent_loop::session::{
     PersistedTurn, load_messages_for_turn_with_limit, persist_phase, persist_phase_messages,
     resolve_chat_id,
 };
-use crate::agent_loop::tool_phase::{
-    AssistantToolPhase, ExecutedToolCall, MAX_TOOL_ITERATIONS, MAX_TOOL_RESULT_TEXT_CHARS,
-    ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse, ToolResultPhase,
-    build_tool_result_phase, messages_for_iteration, send_tool_phase_request_with_empty_retry,
+use crate::agent_loop::tool_execution::{
+    ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
+    ToolResultPhase, build_tool_result_phase,
 };
 use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::{ConversationScope, SurfaceContext};
@@ -967,10 +968,10 @@ impl TurnExecutor<'_> {
         &self,
         prepared: &PreparedTurn,
         loop_state: &mut TurnLoopState,
-        phase_response: ToolPhaseResponse,
+        phase_response: ModelStep,
     ) -> Result<PhaseOutcome, EgoPulseError> {
         match phase_response {
-            ToolPhaseResponse::Final(response) => {
+            ModelStep::Final(response) => {
                 self.complete_model(&prepared.turn_id).await?;
                 match evaluate_end_turn(
                     &response.content,
@@ -990,7 +991,7 @@ impl TurnExecutor<'_> {
                 }
                 Ok(PhaseOutcome::Continue)
             }
-            ToolPhaseResponse::MalformedToolCalls(response) => {
+            ModelStep::MalformedToolCalls(response) => {
                 self.complete_model(&prepared.turn_id).await?;
                 match evaluate_malformed_response(
                     &response.content,
@@ -1010,7 +1011,7 @@ impl TurnExecutor<'_> {
                 }
                 Ok(PhaseOutcome::Continue)
             }
-            ToolPhaseResponse::ToolCalls(assistant_phase) => {
+            ModelStep::ToolCalls(assistant_phase) => {
                 self.complete_model(&prepared.turn_id).await?;
                 self.begin_tools(&prepared.turn_id).await?;
                 self.mark_output_published(&prepared.turn_id).await;
@@ -1382,14 +1383,9 @@ async fn execute_tool_calls(
         })),
     };
 
-    let outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
-        state,
-        tool_context,
-        assistant_message_id,
-        valid_tool_calls,
-        hooks,
-    )
-    .await?;
+    let outcomes = ToolExecutor::new(state, tool_context, hooks)
+        .execute(assistant_message_id, valid_tool_calls)
+        .await?;
 
     Ok(outcomes)
 }
@@ -1571,7 +1567,7 @@ async fn send_model_request_with_retry(
     request_messages: Arc<Vec<Message>>,
     iteration: usize,
     on_event: &EventEmitter,
-) -> Result<ToolPhaseResponse, ModelRequestError> {
+) -> Result<ModelStep, ModelRequestError> {
     let hash = model_request_hash(
         &prepared.system_prompt,
         &request_messages,
@@ -1608,27 +1604,29 @@ async fn send_model_request_with_retry(
             delta_emitter.emit(AgentEvent::Delta { text });
         };
 
-        match send_tool_phase_request_with_empty_retry(
-            ToolPhaseRequest {
-                state,
-                llm: prepared.channel_llm.as_ref(),
-                system_prompt: &prepared.system_prompt,
-                messages: Arc::clone(&retry_messages),
-                tools: Some(Arc::clone(&prepared.tool_defs)),
-                chat_id: prepared.chat_id,
-                caller_channel: &context.channel,
-                request_kind: "agent_loop",
-                usage_log_failure: "llm usage logging failed",
-                log_scope: "agent_loop",
-                send_failure_log: "LLM send_message failed",
-                iteration,
-                scope: context.scope,
-                on_delta: &on_delta,
-            },
-            &mut empty_reply_retry_attempted,
-            Some(output_published.as_ref()),
-        )
-        .await
+        let model_runner = ModelRunner::new(ModelStepRequest {
+            state,
+            llm: prepared.channel_llm.as_ref(),
+            system_prompt: &prepared.system_prompt,
+            messages: Arc::clone(&retry_messages),
+            tools: Some(Arc::clone(&prepared.tool_defs)),
+            chat_id: prepared.chat_id,
+            caller_channel: &context.channel,
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration,
+            scope: context.scope,
+            on_delta: &on_delta,
+        });
+        match model_runner
+            .run(
+                Arc::clone(&retry_messages),
+                &mut empty_reply_retry_attempted,
+                Some(output_published.as_ref()),
+            )
+            .await
         {
             Ok(response) => return Ok(response),
             Err(request_error) => {
@@ -2081,7 +2079,7 @@ mod tests {
         DeltaEmittingProvider, DeltaThenThinkingProvider, FailingProvider, FakeProvider,
         RecordingProvider, SurfaceContext, build_state_with_provider, cli_context,
     };
-    use crate::agent_loop::tool_phase::{
+    use crate::agent_loop::r#loop::{
         FINAL_RESPONSE_GUARD, FINAL_RESPONSE_WARNING_GUARD, FINAL_RESPONSE_WARNING_ITERATION,
     };
     use serial_test::serial;

@@ -3,84 +3,19 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures_util::future::join_all;
 use tracing::warn;
 
 use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::formatting::{
-    format_tool_result, message_to_text, sanitize_assistant_response_text, strip_thinking,
-    summarize_tool_calls_with_content, tool_message_content,
+    sanitize_assistant_response_text, strip_thinking, summarize_tool_calls_with_content,
 };
 use crate::agent_loop::guards::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
-use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
 use crate::storage::call_blocking;
-use crate::storage::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
-use crate::tools::{ToolExecutionContext, ToolResult};
-
-pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
-pub(crate) const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
-
-/// The iteration at which the model is warned that the hard loop limit is near.
-pub(crate) const FINAL_RESPONSE_WARNING_ITERATION: usize = MAX_TOOL_ITERATIONS - 2;
-/// Runtime guard appended to the iteration-48 request to warn the model that
-/// the tool loop is nearing its hard limit and begin final-response preparation.
-pub(crate) const FINAL_RESPONSE_WARNING_GUARD: &str = "[runtime_guard]: The tool loop is near its hard limit. Two model iterations remain after this one. Do not start broad new work; prepare the best concise answer for the user now and state any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
-/// Runtime guard appended to requests in the final-response window to
-/// prioritize a concise final response over starting new broad tool work.
-pub(crate) const FINAL_RESPONSE_GUARD: &str = "[runtime_guard]: The tool loop is at its final response window. Provide the best concise answer to the user now. Do not start broad new work; state what was completed and any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
-
-/// Adds the iteration-specific runtime guard to a request-only copy of `messages`.
-///
-/// The original messages are not modified.
-pub(crate) fn messages_for_iteration(
-    messages: &Arc<Vec<Message>>,
-    iteration: usize,
-) -> Arc<Vec<Message>> {
-    let guard = match iteration {
-        FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_WARNING_GUARD),
-        iteration if iteration > FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_GUARD),
-        _ => None,
-    };
-    let Some(guard) = guard else {
-        return Arc::clone(messages);
-    };
-
-    let mut request_messages = (**messages).clone();
-    request_messages.push(Message::text("user", guard));
-    Arc::new(request_messages)
-}
-
-type ToolStartHook<'a> = Arc<dyn Fn(&ToolCall) + Send + Sync + 'a>;
-type ToolResultHook<'a> = Arc<dyn Fn(&ExecutedToolCall) + Send + Sync + 'a>;
-
-#[derive(Clone)]
-pub(crate) struct ToolExecutionHooks<'a> {
-    pub(crate) on_start: Option<ToolStartHook<'a>>,
-    pub(crate) on_result: Option<ToolResultHook<'a>>,
-}
-
-impl ToolExecutionHooks<'_> {
-    pub(crate) fn none() -> Self {
-        Self {
-            on_start: None,
-            on_result: None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct ExecutedToolCall {
-    pub(crate) tool_call: ToolCall,
-    pub(crate) result: ToolResult,
-    pub(crate) payload: String,
-    pub(crate) message: Message,
-    pub(crate) duration_ms: u128,
-}
 
 pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
@@ -88,21 +23,16 @@ pub(crate) struct AssistantToolPhase {
     pub(crate) tool_calls: Vec<ToolCall>,
 }
 
-pub(crate) struct ToolResultPhase {
-    pub(crate) tool_messages: Vec<Message>,
-    pub(crate) tool_result_preview: String,
-}
-
 pub(crate) fn ignore_delta(_: String) {}
 
-pub(crate) enum ToolPhaseResponse {
+pub(crate) enum ModelStep {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
     ToolCalls(AssistantToolPhase),
 }
 
 #[derive(Clone)]
-pub(crate) struct ToolPhaseRequest<'a> {
+pub(crate) struct ModelStepRequest<'a> {
     pub(crate) state: &'a TurnRuntime,
     pub(crate) llm: &'a dyn LlmProvider,
     pub(crate) system_prompt: &'a str,
@@ -119,14 +49,44 @@ pub(crate) struct ToolPhaseRequest<'a> {
     pub(crate) on_delta: &'a (dyn Fn(String) + Send + Sync),
 }
 
+/// Runs one model step with the fixed dependencies for an agent activation.
+pub(crate) struct ModelRunner<'a> {
+    request: ModelStepRequest<'a>,
+}
+
+impl<'a> ModelRunner<'a> {
+    /// Creates a model runner from the dependencies shared by one turn.
+    pub(crate) fn new(request: ModelStepRequest<'a>) -> Self {
+        Self { request }
+    }
+
+    /// Executes one model step, including the shared empty-response recovery.
+    pub(crate) async fn run(
+        &self,
+        messages: Arc<Vec<Message>>,
+        empty_retry_attempted: &mut bool,
+        output_published: Option<&AtomicBool>,
+    ) -> Result<ModelStep, ModelStepError> {
+        send_model_step_with_empty_retry(
+            ModelStepRequest {
+                messages,
+                ..self.request.clone()
+            },
+            empty_retry_attempted,
+            output_published,
+        )
+        .await
+    }
+}
+
 /// A tool-phase error together with the request payload that can be retried.
 #[derive(Debug)]
-pub(crate) struct ToolPhaseRequestError {
+pub(crate) struct ModelStepError {
     error: EgoPulseError,
     retry_messages: Arc<Vec<Message>>,
 }
 
-impl ToolPhaseRequestError {
+impl ModelStepError {
     fn new(error: EgoPulseError, retry_messages: Arc<Vec<Message>>) -> Self {
         Self {
             error,
@@ -173,9 +133,9 @@ pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str
     valid
 }
 
-pub(crate) async fn send_tool_phase_request(
-    request: ToolPhaseRequest<'_>,
-) -> Result<ToolPhaseResponse, EgoPulseError> {
+pub(crate) async fn send_model_step(
+    request: ModelStepRequest<'_>,
+) -> Result<ModelStep, EgoPulseError> {
     let has_tools = request
         .tools
         .as_ref()
@@ -237,15 +197,15 @@ pub(crate) async fn send_tool_phase_request(
     }
 
     if response.tool_calls.is_empty() {
-        return Ok(ToolPhaseResponse::Final(response));
+        return Ok(ModelStep::Final(response));
     }
 
     let valid_tool_calls = filter_valid_tool_calls(response.tool_calls.clone(), request.log_scope);
     if valid_tool_calls.is_empty() {
-        return Ok(ToolPhaseResponse::MalformedToolCalls(response));
+        return Ok(ModelStep::MalformedToolCalls(response));
     }
 
-    Ok(ToolPhaseResponse::ToolCalls(build_assistant_tool_phase(
+    Ok(ModelStep::ToolCalls(build_assistant_tool_phase(
         response.content,
         response.reasoning_content,
         valid_tool_calls,
@@ -263,26 +223,26 @@ pub(crate) async fn send_tool_phase_request(
 /// caller can retry the same request. When the caller has already published
 /// output for the iteration, the empty response is returned without sending a
 /// guard request because the partial output cannot be safely replayed.
-pub(crate) async fn send_tool_phase_request_with_empty_retry(
-    request: ToolPhaseRequest<'_>,
+pub(crate) async fn send_model_step_with_empty_retry(
+    request: ModelStepRequest<'_>,
     empty_retry_attempted: &mut bool,
     output_published: Option<&AtomicBool>,
-) -> Result<ToolPhaseResponse, ToolPhaseRequestError> {
-    let first_response = send_tool_phase_request(request.clone()).await;
-    if !tool_phase_response_is_empty(&first_response) {
+) -> Result<ModelStep, ModelStepError> {
+    let first_response = send_model_step(request.clone()).await;
+    if !model_step_response_is_empty(&first_response) {
         return first_response
-            .map_err(|error| ToolPhaseRequestError::new(error, Arc::clone(&request.messages)));
+            .map_err(|error| ModelStepError::new(error, Arc::clone(&request.messages)));
     }
 
     if output_published.is_some_and(|published| published.load(Ordering::SeqCst)) {
-        return Err(ToolPhaseRequestError::new(
+        return Err(ModelStepError::new(
             empty_response_after_published_output(),
             Arc::clone(&request.messages),
         ));
     }
 
     if *empty_retry_attempted {
-        return Err(ToolPhaseRequestError::new(
+        return Err(ModelStepError::new(
             empty_response_after_retry(),
             Arc::clone(&request.messages),
         ));
@@ -292,7 +252,7 @@ pub(crate) async fn send_tool_phase_request_with_empty_retry(
     warn!("empty assistant response; injecting runtime guard and retrying once");
 
     let (assistant_text, reasoning_content) = match &first_response {
-        Ok(ToolPhaseResponse::Final(response)) => (
+        Ok(ModelStep::Final(response)) => (
             response.content.as_str(),
             response.reasoning_content.as_deref(),
         ),
@@ -305,29 +265,27 @@ pub(crate) async fn send_tool_phase_request_with_empty_retry(
         EMPTY_REPLY_RUNTIME_GUARD,
     ));
     let retry_messages_for_error = Arc::clone(&retry_messages);
-    let retry_response = send_tool_phase_request(ToolPhaseRequest {
+    let retry_response = send_model_step(ModelStepRequest {
         messages: retry_messages,
         ..request
     })
     .await;
 
-    if tool_phase_response_is_empty(&retry_response) {
-        Err(ToolPhaseRequestError::new(
+    if model_step_response_is_empty(&retry_response) {
+        Err(ModelStepError::new(
             empty_response_after_retry(),
             retry_messages_for_error,
         ))
     } else {
-        retry_response.map_err(|error| ToolPhaseRequestError::new(error, retry_messages_for_error))
+        retry_response.map_err(|error| ModelStepError::new(error, retry_messages_for_error))
     }
 }
 
-fn tool_phase_response_is_empty(response: &Result<ToolPhaseResponse, EgoPulseError>) -> bool {
+fn model_step_response_is_empty(response: &Result<ModelStep, EgoPulseError>) -> bool {
     match response {
         Err(EgoPulseError::Llm(error)) => error.is_empty_response(),
-        Ok(ToolPhaseResponse::Final(response)) => {
-            strip_thinking(response.content.trim()).trim().is_empty()
-        }
-        Ok(ToolPhaseResponse::MalformedToolCalls(_)) | Ok(ToolPhaseResponse::ToolCalls(_)) => false,
+        Ok(ModelStep::Final(response)) => strip_thinking(response.content.trim()).trim().is_empty(),
+        Ok(ModelStep::MalformedToolCalls(_)) | Ok(ModelStep::ToolCalls(_)) => false,
         Err(_) => false,
     }
 }
@@ -364,27 +322,6 @@ pub(crate) fn build_assistant_tool_phase(
         assistant_preview,
         tool_calls,
     }
-}
-
-pub(crate) fn build_tool_result_phase(outcomes: Vec<ExecutedToolCall>) -> ToolResultPhase {
-    let tool_messages = outcomes
-        .into_iter()
-        .map(|outcome| outcome.message)
-        .collect::<Vec<_>>();
-    let tool_result_preview = summarize_tool_result_messages(&tool_messages);
-    ToolResultPhase {
-        tool_messages,
-        tool_result_preview,
-    }
-}
-
-fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
-    let joined = tool_messages
-        .iter()
-        .map(message_to_text)
-        .collect::<Vec<_>>()
-        .join("\n");
-    truncate_by_chars(&joined, MAX_TOOL_RESULT_TEXT_CHARS)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -428,227 +365,6 @@ pub(crate) async fn log_llm_usage(
     .inspect_err(|e| warn!(error = %e, failure_message, "llm usage logging failed"));
 }
 
-pub(crate) async fn execute_tool_calls<'a>(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    valid_tool_calls: Vec<ToolCall>,
-    hooks: ToolExecutionHooks<'a>,
-) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
-    if valid_tool_calls.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let read_only_flags = read_only_flags(state, &valid_tool_calls).await;
-    let mut outcomes = Vec::with_capacity(valid_tool_calls.len());
-    let mut cursor = 0;
-
-    while cursor < valid_tool_calls.len() {
-        if read_only_flags[cursor] {
-            let block_start = cursor;
-            while cursor < valid_tool_calls.len() && read_only_flags[cursor] {
-                cursor += 1;
-            }
-            let block_futures = valid_tool_calls[block_start..cursor]
-                .iter()
-                .cloned()
-                .map(|tool_call| {
-                    execute_single_tool(
-                        state,
-                        tool_context,
-                        assistant_message_id,
-                        tool_call,
-                        hooks.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let block_results = join_all(block_futures).await;
-            for result in block_results {
-                outcomes.push(result?);
-            }
-        } else {
-            outcomes.push(
-                execute_single_tool(
-                    state,
-                    tool_context,
-                    assistant_message_id,
-                    valid_tool_calls[cursor].clone(),
-                    hooks.clone(),
-                )
-                .await?,
-            );
-            cursor += 1;
-        }
-    }
-
-    Ok(outcomes)
-}
-
-async fn read_only_flags(state: &TurnRuntime, valid_tool_calls: &[ToolCall]) -> Vec<bool> {
-    let mut flags = Vec::with_capacity(valid_tool_calls.len());
-    for tool_call in valid_tool_calls {
-        flags.push(state.tools.is_read_only(&tool_call.name).await);
-    }
-    flags
-}
-
-async fn execute_single_tool(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    tool_call: ToolCall,
-    hooks: ToolExecutionHooks<'_>,
-) -> Result<ExecutedToolCall, EgoPulseError> {
-    if let Some(on_start) = &hooks.on_start {
-        on_start(&tool_call);
-    }
-
-    let tool_start = std::time::Instant::now();
-    let is_read_only = state.tools.is_read_only(&tool_call.name).await;
-
-    // Claim the ledger slot before executing so a Tool call is never run
-    // before its durable row exists. Read-only Tools skip the ledger because
-    // they have no side effects and may be safely retried after a crash;
-    // this avoids SQLite write contention during parallel execution.
-    let claim = if is_read_only {
-        ClaimOutcome::Acquired
-    } else {
-        claim_tool_slot(state, tool_context, assistant_message_id, &tool_call).await?
-    };
-
-    let (result, payload, executed) = match claim {
-        ClaimOutcome::Acquired => {
-            // Bind this execution's Tool Call ID into the context so tools
-            // (e.g. `agent_send`) can build per-call idempotency keys.
-            let mut exec_context = tool_context.clone();
-            exec_context.tool_call_id = tool_call.id.clone();
-            let result = state
-                .tools
-                .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
-                .await;
-            let payload = format_tool_result(&tool_call, &result);
-            if !is_read_only {
-                record_tool_outcome(state, tool_context, &tool_call, &result, &payload).await?;
-            }
-            (result, payload, true)
-        }
-        ClaimOutcome::Reused { tool_output } => {
-            // A prior execution already succeeded; return the stored output
-            // without re-running the Tool.
-            let result = ToolResult::success(tool_output.clone());
-            (result, tool_output, false)
-        }
-        ClaimOutcome::Blocked { state: tool_state } => {
-            // The ledger forbids execution (failed / uncertain / in flight).
-            let result = ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
-            let payload = format_tool_result(&tool_call, &result);
-            (result, payload, false)
-        }
-    };
-
-    let duration_ms = tool_start.elapsed().as_millis();
-
-    if executed {
-        crate::runtime::metrics::inc_tool_calls_total(
-            &tool_call.name,
-            if result.is_error { "error" } else { "ok" },
-        );
-    }
-
-    let message = Message {
-        role: "tool".to_string(),
-        content: tool_message_content(&payload, &result),
-        reasoning_content: None,
-        tool_calls: Vec::new(),
-        tool_call_id: Some(tool_call.id.clone()),
-    };
-
-    let outcome = ExecutedToolCall {
-        tool_call,
-        result,
-        payload,
-        message,
-        duration_ms,
-    };
-
-    if let Some(on_result) = &hooks.on_result {
-        on_result(&outcome);
-    }
-
-    Ok(outcome)
-}
-
-/// Claims a Tool execution slot in the `tool_calls` ledger.
-///
-/// The canonical input and its hash are computed before any DB write so the
-/// retry identity is fixed at claim time. Idempotency classification comes
-/// from the [`ToolRegistry`] (derived from each tool's read-only declaration).
-async fn claim_tool_slot(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    assistant_message_id: &str,
-    tool_call: &ToolCall,
-) -> Result<ClaimOutcome, EgoPulseError> {
-    let canonical = canonical_tool_input(&tool_call.name, &tool_call.arguments);
-    let hash = input_hash(&canonical);
-    let tool_input = tool_call.arguments.to_string();
-    let class = state.tools.idempotency_class(&tool_call.name).await;
-    let key = state
-        .tools
-        .idempotency_key(&tool_call.name, &tool_call.arguments)
-        .await;
-    let turn_id = tool_context.turn_id.clone();
-    let chat_id = tool_context.chat_id;
-    let message_id = assistant_message_id.to_string();
-    let tool_call_id = tool_call.id.clone();
-    let tool_name = tool_call.name.clone();
-    let hash_for_closure = hash;
-    let tool_input_for_closure = tool_input;
-    let key_for_closure = key;
-    Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
-        db.claim_tool_execution(ClaimParams {
-            turn_id: &turn_id,
-            chat_id,
-            message_id: &message_id,
-            tool_call_id: &tool_call_id,
-            tool_name: &tool_name,
-            tool_input: &tool_input_for_closure,
-            input_hash: &hash_for_closure,
-            idempotency_class: class,
-            idempotency_key: key_for_closure.as_deref(),
-        })
-    })
-    .await?)
-}
-
-/// Records the Tool execution outcome (success or failure) in the ledger.
-///
-/// `payload` and `result.content` are already sanitized by [`ToolRegistry::execute`],
-/// so no secret reaches the persisted `tool_output` / `error_message`.
-async fn record_tool_outcome(
-    state: &TurnRuntime,
-    tool_context: &ToolExecutionContext,
-    tool_call: &ToolCall,
-    result: &ToolResult,
-    payload: &str,
-) -> Result<(), EgoPulseError> {
-    let turn_id = tool_context.turn_id.clone();
-    let tool_call_id = tool_call.id.clone();
-    if result.is_error {
-        let error_message = result.content.clone();
-        Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
-            db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
-        })
-        .await?)
-    } else {
-        let payload = payload.to_string();
-        Ok(call_blocking(state.db_for(tool_context.scope), move |db| {
-            db.record_tool_success(&turn_id, &tool_call_id, &payload)
-        })
-        .await?)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -656,7 +372,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::agent_loop::formatting::message_to_text;
     use crate::agent_loop::process_turn;
+    use crate::agent_loop::tool_execution::{ExecutedToolCall, build_tool_result_phase};
     use crate::agent_loop::turn::{RecordingProvider, build_state_with_provider, cli_context};
     use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
     use crate::llm::{Message, MessagesResponse, ToolCall, ToolDefinition};
@@ -1004,7 +722,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn send_tool_phase_request_records_usage_calibration_before_payload_move() {
+    async fn send_model_step_records_usage_calibration_before_payload_move() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
@@ -1036,7 +754,7 @@ mod tests {
         }]);
 
         // Act
-        let response = send_tool_phase_request(ToolPhaseRequest {
+        let response = send_model_step(ModelStepRequest {
             state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
@@ -1056,7 +774,7 @@ mod tests {
         .expect("tool phase response");
 
         // Assert
-        assert!(matches!(response, ToolPhaseResponse::Final(_)));
+        assert!(matches!(response, ModelStep::Final(_)));
         let factor = state
             .usage_calibrator
             .factor(&CalibrationKey::new(
@@ -1102,8 +820,8 @@ mod tests {
         let mut retry_attempted = false;
 
         // Act
-        let response = send_tool_phase_request_with_empty_retry(
-            ToolPhaseRequest {
+        let response = send_model_step_with_empty_retry(
+            ModelStepRequest {
                 state: &state.turn_runtime(),
                 llm: llm.as_ref(),
                 system_prompt: "system prompt",
@@ -1129,7 +847,7 @@ mod tests {
         assert!(retry_attempted);
         assert!(matches!(
             response,
-            ToolPhaseResponse::Final(response) if response.content == "recovered response"
+            ModelStep::Final(response) if response.content == "recovered response"
         ));
         let seen_messages = observer.seen_messages();
         assert_eq!(seen_messages.len(), 2);
@@ -1163,8 +881,8 @@ mod tests {
         let mut retry_attempted = false;
 
         // Act
-        let result = send_tool_phase_request_with_empty_retry(
-            ToolPhaseRequest {
+        let result = send_model_step_with_empty_retry(
+            ModelStepRequest {
                 state: &state.turn_runtime(),
                 llm: llm.as_ref(),
                 system_prompt: "system prompt",
@@ -1201,7 +919,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn send_tool_phase_request_skips_calibration_when_usage_missing() {
+    async fn send_model_step_skips_calibration_when_usage_missing() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
@@ -1225,7 +943,7 @@ mod tests {
             .expect("llm");
 
         // Act
-        let response = send_tool_phase_request(ToolPhaseRequest {
+        let response = send_model_step(ModelStepRequest {
             state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
@@ -1245,7 +963,7 @@ mod tests {
         .expect("tool phase response");
 
         // Assert
-        assert!(matches!(response, ToolPhaseResponse::Final(_)));
+        assert!(matches!(response, ModelStep::Final(_)));
         let factor = state
             .usage_calibrator
             .factor(&CalibrationKey::new(
@@ -1260,7 +978,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn send_tool_phase_request_treats_empty_tools_as_no_tools_for_calibration() {
+    async fn send_model_step_treats_empty_tools_as_no_tools_for_calibration() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
@@ -1287,7 +1005,7 @@ mod tests {
             .expect("llm");
 
         // Act
-        let response = send_tool_phase_request(ToolPhaseRequest {
+        let response = send_model_step(ModelStepRequest {
             state: &state.turn_runtime(),
             llm: llm.as_ref(),
             system_prompt: "system prompt",
@@ -1307,7 +1025,7 @@ mod tests {
         .expect("tool phase response");
 
         // Assert
-        assert!(matches!(response, ToolPhaseResponse::Final(_)));
+        assert!(matches!(response, ModelStep::Final(_)));
         let without_tools = state
             .usage_calibrator
             .factor(&CalibrationKey::new(
