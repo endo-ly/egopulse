@@ -83,6 +83,8 @@ pub(crate) struct AgentLoop<'a> {
     prompt_ctx: PromptContext<'a>,
     channel_context_msg: Option<Message>,
     on_event: EventEmitter,
+    lifecycle: TurnLifecycle<'a>,
+    persistence: TurnPersistence<'a>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -96,6 +98,15 @@ impl<'a> AgentLoop<'a> {
         channel_context_msg: Option<Message>,
         on_event: EventEmitter,
     ) -> Self {
+        let lifecycle =
+            TurnLifecycle::new(state, context.scope, &prepared.turn_id, &context.origin_id);
+        let persistence = TurnPersistence::new(
+            state,
+            context,
+            prepared.chat_id,
+            &prepared.turn_id,
+            &prepared.tool_context.agent_id,
+        );
         Self {
             state,
             context,
@@ -104,6 +115,8 @@ impl<'a> AgentLoop<'a> {
             prompt_ctx,
             channel_context_msg,
             on_event,
+            lifecycle,
+            persistence,
         }
     }
 
@@ -150,14 +163,7 @@ impl<'a> AgentLoop<'a> {
                 Err(error) => {
                     let (error, output_published) = error.into_parts();
                     if output_published {
-                        TurnLifecycle::new(
-                            self.state,
-                            self.context.scope,
-                            &self.prepared.turn_id,
-                            &self.context.origin_id,
-                        )
-                        .mark_output_published()
-                        .await;
+                        self.lifecycle.mark_output_published().await;
                     }
                     return Err(error);
                 }
@@ -166,14 +172,7 @@ impl<'a> AgentLoop<'a> {
 
             match phase_response {
                 ModelStep::Final(response) => {
-                    TurnLifecycle::new(
-                        self.state,
-                        self.context.scope,
-                        &self.prepared.turn_id,
-                        &self.context.origin_id,
-                    )
-                    .complete_model()
-                    .await?;
+                    self.lifecycle.complete_model().await?;
                     match evaluate_end_turn(
                         &response.content,
                         response.reasoning_content.as_deref(),
@@ -196,14 +195,7 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
                 ModelStep::MalformedToolCalls(response) => {
-                    TurnLifecycle::new(
-                        self.state,
-                        self.context.scope,
-                        &self.prepared.turn_id,
-                        &self.context.origin_id,
-                    )
-                    .complete_model()
-                    .await?;
+                    self.lifecycle.complete_model().await?;
                     match evaluate_malformed_response(
                         &response.content,
                         response.reasoning_content.as_deref(),
@@ -257,27 +249,15 @@ impl<'a> AgentLoop<'a> {
         loop_state: &mut LoopState,
         assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
     ) -> Result<(), EgoPulseError> {
-        let lifecycle = TurnLifecycle::new(
-            self.state,
-            self.context.scope,
-            &self.prepared.turn_id,
-            &self.context.origin_id,
-        );
-        lifecycle.complete_model().await?;
-        lifecycle.begin_tools().await?;
-        lifecycle.mark_output_published().await;
+        self.lifecycle.complete_model().await?;
+        self.lifecycle.begin_tools().await?;
+        self.lifecycle.mark_output_published().await;
 
         let assistant_message_id = uuid::Uuid::new_v4().to_string();
-        let persistence = TurnPersistence::new(
-            self.state,
-            self.context,
-            self.prepared.chat_id,
-            &self.prepared.turn_id,
-            &self.prepared.tool_context.agent_id,
-        );
         let messages = std::mem::replace(&mut loop_state.messages, Arc::new(Vec::new()));
         let messages = Arc::try_unwrap(messages).unwrap_or_else(|messages| (*messages).clone());
-        let persisted = persistence
+        let persisted = self
+            .persistence
             .persist_tool_call(
                 &assistant_message_id,
                 &assistant_phase,
@@ -288,7 +268,8 @@ impl<'a> AgentLoop<'a> {
         let tool_outcomes = self
             .execute_tools(&assistant_message_id, assistant_phase.tool_calls)
             .await?;
-        let persisted = persistence
+        let persisted = self
+            .persistence
             .persist_tool_results(
                 &assistant_message_id,
                 persisted.messages,
@@ -298,7 +279,7 @@ impl<'a> AgentLoop<'a> {
             .await?;
         loop_state.messages = Arc::new(persisted.messages);
         loop_state.session_revision = Some(persisted.revision);
-        lifecycle.complete_tools().await?;
+        self.lifecycle.complete_tools().await?;
         Ok(())
     }
 
