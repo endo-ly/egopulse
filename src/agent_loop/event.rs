@@ -5,6 +5,7 @@
 //! 各チャネルは受動的な消費者にとどまる。
 
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Represents internal events emitted while the agent processes a turn.
 #[derive(Debug, Clone, Serialize)]
@@ -34,4 +35,30 @@ pub(crate) enum AgentEvent {
     FinalResponse { text: String },
     /// Error occurred.
     Error { message: String },
+}
+
+/// Type-erased callback for agent lifecycle events.
+#[derive(Clone)]
+pub(crate) struct EventEmitter(Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>);
+
+impl EventEmitter {
+    /// Creates a no-op emitter that discards all events.
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    /// Creates an emitter from a concrete callback.
+    pub(crate) fn new<F>(f: F) -> Self
+    where
+        F: Fn(AgentEvent) + Send + Sync + 'static,
+    {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Emits a single event if a callback is registered.
+    pub(crate) fn emit(&self, event: AgentEvent) {
+        if let Some(f) = &self.0 {
+            f(event);
+        }
+    }
 }

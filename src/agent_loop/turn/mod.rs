@@ -3,28 +3,30 @@
 //! セッション復元、LLM 応答、ツール呼び出し、イベント通知、永続化を
 //! 1 本の turn loop としてまとめて扱う。
 
+pub(crate) mod lifecycle;
+pub(crate) mod persistence;
+
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
-use crate::agent_loop::event::AgentEvent;
+use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::formatting::{format_channel_log_message, strip_thinking};
 use crate::agent_loop::guards::{is_declarative_only_reply, runtime_guard_messages};
+use crate::agent_loop::turn::lifecycle::{TurnAcceptance, TurnLifecycle, fail_resume_permanently};
+use crate::agent_loop::turn::persistence::TurnPersistence;
 
 use crate::agent_loop::TurnRuntime;
 use crate::agent_loop::r#loop::{MAX_TOOL_ITERATIONS, messages_for_iteration};
-use crate::agent_loop::model_step::{AssistantToolPhase, ModelRunner, ModelStep, ModelStepRequest};
-use crate::agent_loop::session::{
-    PersistedTurn, load_messages_for_turn_with_limit, persist_phase, persist_phase_messages,
-    resolve_chat_id,
-};
+use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
+use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::agent_loop::tool_execution::{
     ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
-    ToolResultPhase, build_tool_result_phase,
+    build_tool_result_phase,
 };
 use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::{ConversationScope, SurfaceContext};
-use crate::error::{EgoPulseError, LlmError, StorageError};
+use crate::error::{EgoPulseError, LlmError};
 use crate::llm::{LlmProvider, Message, ToolCall, ToolDefinition};
 use crate::runtime::scheduled_turn::deserialize_scheduled_turn;
-use crate::storage::{AcceptOutcome, StoredMessage, TurnRun, TurnRunState, call_blocking};
+use crate::storage::{TurnRun, TurnRunState, call_blocking};
 use crate::tools::ToolExecutionContext;
 use chrono::{Datelike, Utc};
 use chrono_tz::Tz;
@@ -44,36 +46,6 @@ pub(crate) const MAX_LLM_RETRIES: usize = 3;
 /// Base backoff (milliseconds) for exponential LLM retry. Doubled per attempt.
 const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
 
-/// Type-erased callback for agent lifecycle events (iteration, tool start, final response).
-///
-/// Wraps `Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>` so callers and
-/// internal helpers avoid a generic `F` parameter that proliferates through
-/// every function signature.
-#[derive(Clone)]
-pub(crate) struct EventEmitter(Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>);
-
-impl EventEmitter {
-    /// Creates a no-op emitter that discards all events.
-    fn none() -> Self {
-        Self(None)
-    }
-
-    /// Creates an emitter from a concrete callback.
-    fn new<F>(f: F) -> Self
-    where
-        F: Fn(AgentEvent) + Send + Sync + 'static,
-    {
-        Self(Some(Arc::new(f)))
-    }
-
-    /// Emits a single event if a callback is registered.
-    fn emit(&self, event: AgentEvent) {
-        if let Some(f) = &self.0 {
-            f(event);
-        }
-    }
-}
-
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
     state: &'a TurnRuntime,
@@ -92,26 +64,6 @@ enum TurnAction {
         final_content: String,
         reasoning_content: Option<String>,
     },
-}
-
-/// Outcome of idempotent Turn acceptance.
-enum TurnAcceptance {
-    /// A fresh `accepted` Turn created by this call; the caller owns execution.
-    Proceed(Box<TurnRun>),
-    /// The Turn was already `completed`; replay its saved final response
-    /// without re-invoking the LLM.
-    Completed(String),
-    /// The Turn already exists and is non-terminal — another executor (or a
-    /// prior crash) owns it. The caller must **not** start a second executor;
-    /// the carried message is returned to the caller and emitted as a final
-    /// response so every ingress (Web `done`, channel reply) observes a
-    /// terminal outcome for this duplicate request.
-    InProgress(String),
-    /// The Turn already terminated in a non-success state (`failed` /
-    /// `uncertain` / `cancelled`). The caller informs the user via the carried
-    /// message but does not re-execute (re-running could duplicate side
-    /// effects). The message is also emitted as a final response.
-    Terminated(String),
 }
 
 /// An LLM model-iteration failure paired with whether any external output
@@ -422,32 +374,6 @@ pub(crate) async fn resume_input_committed_turn(
     executor.resume_run(&persisted.input, &snapshot, &run).await
 }
 
-/// Marks an unrecoverable resume target `failed` so the turn dispatcher stops
-/// retrying a turn that can never be reconstructed.
-async fn fail_resume_permanently(
-    state: &TurnRuntime,
-    scope: ConversationScope,
-    turn_id: &str,
-    reason: &str,
-) {
-    let turn_id = turn_id.to_string();
-    let reason = reason.to_string();
-    let turn_id_for_db = turn_id.clone();
-    let reason_for_db = reason.clone();
-    if let Err(e) = call_blocking(state.db_for(scope), move |db| {
-        db.fail_turn(
-            &turn_id_for_db,
-            TurnRunState::Failed,
-            "validation",
-            &reason_for_db,
-        )
-    })
-    .await
-    {
-        warn!(error = %e, %turn_id, "failed to mark unrecoverable resume turn as failed");
-    }
-}
-
 async fn process_turn_inner(
     state: &TurnRuntime,
     context: &SurfaceContext,
@@ -494,9 +420,16 @@ impl TurnExecutor<'_> {
             let request_key = self.resolve_request_key();
             let payload_hash =
                 crate::runtime::scheduled_turn::canonical_request_hash(self.context, user_input);
-            let acceptance = self
-                .accept_turn(chat_id, &request_key, &payload_hash, &snapshot)
-                .await?;
+            let acceptance = TurnLifecycle::accept(
+                self.state,
+                self.context.scope,
+                chat_id,
+                &request_key,
+                &payload_hash,
+                &self.context.origin_id,
+                &snapshot,
+            )
+            .await?;
             let turn = match acceptance {
                 TurnAcceptance::Completed(saved) => {
                     self.on_event.emit(AgentEvent::FinalResponse {
@@ -558,8 +491,14 @@ impl TurnExecutor<'_> {
             match result {
                 Ok(response) => Ok(response),
                 Err(error) => {
-                    self.record_failure_excluding_conflict(&turn.turn_id, &error)
-                        .await;
+                    TurnLifecycle::new(
+                        self.state,
+                        self.context.scope,
+                        &turn.turn_id,
+                        &self.context.origin_id,
+                    )
+                    .record_failure_excluding_conflict(&error)
+                    .await;
                     Err(error)
                 }
             }
@@ -626,8 +565,14 @@ impl TurnExecutor<'_> {
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
-                self.record_failure_excluding_conflict(&turn_run.turn_id, &error)
-                    .await;
+                TurnLifecycle::new(
+                    self.state,
+                    self.context.scope,
+                    &turn_run.turn_id,
+                    &self.context.origin_id,
+                )
+                .record_failure_excluding_conflict(&error)
+                .await;
                 Err(error)
             }
         }
@@ -639,129 +584,6 @@ impl TurnExecutor<'_> {
         } else {
             self.context.request_key.clone()
         }
-    }
-
-    async fn accept_turn(
-        &self,
-        chat_id: i64,
-        request_key: &str,
-        payload_hash: &str,
-        snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
-    ) -> Result<TurnAcceptance, EgoPulseError> {
-        let scope = self.context.scope;
-        let request_key = request_key.to_string();
-        let payload_hash = payload_hash.to_string();
-        let config_revision = snapshot.revision as i64;
-        let config_fingerprint = snapshot.fingerprint.clone();
-        let origin_id = self.context.origin_id.clone();
-        let run = call_blocking(self.state.db_for(scope), move |db| {
-            db.accept_or_get_turn(crate::storage::AcceptTurnParams {
-                chat_id,
-                request_key: &request_key,
-                config_revision,
-                config_fingerprint: Some(&config_fingerprint),
-                request_payload_hash: &payload_hash,
-                origin_id: Some(&origin_id),
-                scheduled_request_json: None,
-            })
-        })
-        .await?;
-
-        match run {
-            AcceptOutcome::Created(run) => Ok(TurnAcceptance::Proceed(Box::new(run))),
-            AcceptOutcome::Existing(run) => match run.state {
-                TurnRunState::Accepted => Ok(TurnAcceptance::Proceed(Box::new(run))),
-                TurnRunState::Completed => {
-                    let final_message_id = run.final_message_id.clone().ok_or_else(|| {
-                        EgoPulseError::Internal(
-                            "completed turn_run has no final_message_id".to_string(),
-                        )
-                    })?;
-                    let content = call_blocking(self.state.db_for(scope), move |db| {
-                        db.get_message_content(&final_message_id)
-                    })
-                    .await?
-                    .ok_or_else(|| {
-                        EgoPulseError::Internal(
-                            "completed turn_run final message is missing".to_string(),
-                        )
-                    })?;
-                    Ok(TurnAcceptance::Completed(content))
-                }
-                other if other.is_terminal() => Ok(TurnAcceptance::Terminated(format!(
-                    "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
-                ))),
-                _ => Ok(TurnAcceptance::InProgress(
-                    "このリクエストはすでに処理中です。".to_string(),
-                )),
-            },
-        }
-    }
-
-    async fn fail_turn(&self, turn_id: &str, error: &EgoPulseError) {
-        let scope = self.context.scope;
-        let turn_id_owned = turn_id.to_string();
-        let run = match call_blocking(self.state.db_for(scope), move |db| {
-            db.get_turn_run(&turn_id_owned)
-        })
-        .await
-        {
-            Ok(run) => run,
-            Err(e) => {
-                warn!(error = %e, turn_id, "failed to load turn_run for failure recording");
-                return;
-            }
-        };
-        if run.state.is_terminal() {
-            return;
-        }
-        let target = if run.output_published {
-            TurnRunState::Uncertain
-        } else {
-            TurnRunState::Failed
-        };
-        let error_kind = error.error_kind();
-        let error_message = sanitize_error_message(error);
-        let turn_id_for_fail = turn_id.to_string();
-        let origin_id = self.context.origin_id.clone();
-        // When the origin is known, fail the turn and terminate the origin
-        // atomically in one transaction so a crash between the two commits
-        // cannot leave a terminal turn with a non-terminal origin (which
-        // would let the dispatcher re-dispatch accepted child turns after a
-        // restart).
-        let result = if origin_id.is_empty() {
-            call_blocking(self.state.db_for(scope), move |db| {
-                db.fail_turn(&turn_id_for_fail, target, error_kind, &error_message)
-            })
-            .await
-        } else {
-            let terminal_reason =
-                crate::runtime::turn_scheduler::StopReason::LlmFailure.to_string();
-            call_blocking(self.state.db_for(scope), move |db| {
-                db.fail_turn_and_terminate_origin(
-                    &turn_id_for_fail,
-                    target,
-                    error_kind,
-                    &error_message,
-                    &origin_id,
-                    &terminal_reason,
-                )
-            })
-            .await
-        };
-        if let Err(e) = result {
-            warn!(error = %e, turn_id, "failed to record turn_run failure");
-        }
-    }
-
-    /// Records a turn failure unless the error is a benign concurrency
-    /// conflict (this executor lost the execution-right CAS to another owner).
-    /// A conflict must never terminate the winner's active turn.
-    async fn record_failure_excluding_conflict(&self, turn_id: &str, error: &EgoPulseError) {
-        if matches!(error, EgoPulseError::TurnConcurrencyConflict) {
-            return;
-        }
-        self.fail_turn(turn_id, error).await;
     }
 
     fn turn_span(&self) -> tracing::Span {
@@ -780,6 +602,15 @@ impl TurnExecutor<'_> {
             origin_id = %self.context.origin_id,
             chain_depth = self.context.chain_depth,
             scope = %self.context.scope,
+        )
+    }
+
+    fn lifecycle(&self, turn_id: &str) -> TurnLifecycle<'_> {
+        TurnLifecycle::new(
+            self.state,
+            self.context.scope,
+            turn_id,
+            &self.context.origin_id,
         )
     }
 
@@ -870,11 +701,14 @@ impl TurnExecutor<'_> {
         user_input: &str,
         prompt_ctx: &PromptContext<'_>,
     ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
-        persist_user_turn_with_compaction(
+        TurnPersistence::new(
             self.state,
             self.context,
             prepared.chat_id,
             &prepared.turn_id,
+            &prepared.tool_context.agent_id,
+        )
+        .persist_user_input(
             &prepared.input_message_id,
             &prepared.user_message,
             user_input,
@@ -917,7 +751,9 @@ impl TurnExecutor<'_> {
                     output_published,
                 }) => {
                     if output_published {
-                        self.mark_output_published(&prepared.turn_id).await;
+                        self.lifecycle(&prepared.turn_id)
+                            .mark_output_published()
+                            .await;
                     }
                     return Err(error);
                 }
@@ -953,17 +789,6 @@ impl TurnExecutor<'_> {
         )))
     }
 
-    async fn mark_output_published(&self, turn_id: &str) {
-        let turn_id = turn_id.to_string();
-        if let Err(e) = call_blocking(self.state.db_for(self.context.scope), move |db| {
-            db.mark_turn_output_published(&turn_id)
-        })
-        .await
-        {
-            warn!(error = %e, "failed to mark turn_run output_published");
-        }
-    }
-
     async fn handle_phase_response(
         &self,
         prepared: &PreparedTurn,
@@ -972,7 +797,7 @@ impl TurnExecutor<'_> {
     ) -> Result<PhaseOutcome, EgoPulseError> {
         match phase_response {
             ModelStep::Final(response) => {
-                self.complete_model(&prepared.turn_id).await?;
+                self.lifecycle(&prepared.turn_id).complete_model().await?;
                 match evaluate_end_turn(
                     &response.content,
                     response.reasoning_content.as_deref(),
@@ -992,7 +817,7 @@ impl TurnExecutor<'_> {
                 Ok(PhaseOutcome::Continue)
             }
             ModelStep::MalformedToolCalls(response) => {
-                self.complete_model(&prepared.turn_id).await?;
+                self.lifecycle(&prepared.turn_id).complete_model().await?;
                 match evaluate_malformed_response(
                     &response.content,
                     response.reasoning_content.as_deref(),
@@ -1012,51 +837,49 @@ impl TurnExecutor<'_> {
                 Ok(PhaseOutcome::Continue)
             }
             ModelStep::ToolCalls(assistant_phase) => {
-                self.complete_model(&prepared.turn_id).await?;
-                self.begin_tools(&prepared.turn_id).await?;
-                self.mark_output_published(&prepared.turn_id).await;
-                let (updated_messages, session_revision) = execute_and_persist_tools(
+                let lifecycle = self.lifecycle(&prepared.turn_id);
+                lifecycle.complete_model().await?;
+                lifecycle.begin_tools().await?;
+                lifecycle.mark_output_published().await;
+                let assistant_message_id = uuid::Uuid::new_v4().to_string();
+                let persistence = TurnPersistence::new(
+                    self.state,
+                    self.context,
+                    prepared.chat_id,
+                    &prepared.turn_id,
+                    &prepared.tool_context.agent_id,
+                );
+                let persisted = persistence
+                    .persist_tool_call(
+                        &assistant_message_id,
+                        &assistant_phase,
+                        Arc::try_unwrap(Arc::clone(&loop_state.messages))
+                            .unwrap_or_else(|messages| (*messages).clone()),
+                        loop_state.session_revision,
+                    )
+                    .await?;
+                let tool_outcomes = execute_tool_calls(
                     self.state,
                     &self.on_event,
                     &prepared.tool_context,
-                    Arc::clone(&loop_state.messages),
-                    loop_state.session_revision,
-                    assistant_phase,
+                    &assistant_message_id,
+                    assistant_phase.tool_calls,
                 )
                 .await?;
-                loop_state.messages = updated_messages;
-                loop_state.session_revision = session_revision;
-                self.complete_tools(&prepared.turn_id).await?;
+                let persisted = persistence
+                    .persist_tool_results(
+                        &assistant_message_id,
+                        persisted.messages,
+                        build_tool_result_phase(tool_outcomes),
+                        Some(persisted.revision),
+                    )
+                    .await?;
+                loop_state.messages = Arc::new(persisted.messages);
+                loop_state.session_revision = Some(persisted.revision);
+                lifecycle.complete_tools().await?;
                 Ok(PhaseOutcome::ToolsExecuted)
             }
         }
-    }
-
-    async fn complete_model(&self, turn_id: &str) -> Result<(), EgoPulseError> {
-        let turn_id = turn_id.to_string();
-        call_blocking(self.state.db_for(self.context.scope), move |db| {
-            db.complete_turn_model(&turn_id)
-        })
-        .await?;
-        Ok(())
-    }
-
-    async fn begin_tools(&self, turn_id: &str) -> Result<(), EgoPulseError> {
-        let turn_id = turn_id.to_string();
-        call_blocking(self.state.db_for(self.context.scope), move |db| {
-            db.begin_turn_tools(&turn_id)
-        })
-        .await?;
-        Ok(())
-    }
-
-    async fn complete_tools(&self, turn_id: &str) -> Result<(), EgoPulseError> {
-        let turn_id = turn_id.to_string();
-        call_blocking(self.state.db_for(self.context.scope), move |db| {
-            db.complete_turn_tools(&turn_id)
-        })
-        .await?;
-        Ok(())
     }
 
     async fn finish_turn(
@@ -1067,37 +890,25 @@ impl TurnExecutor<'_> {
         reasoning_content: Option<String>,
     ) -> Result<PhaseOutcome, EgoPulseError> {
         let final_message_id = format!("turn:{}:final", prepared.turn_id);
-        let response = persist_and_finalize(
+        let response = TurnPersistence::new(
             self.state,
-            self.context.scope,
+            self.context,
             prepared.chat_id,
-            &self.context.agent_id,
-            &final_message_id,
             &prepared.turn_id,
+            &self.context.agent_id,
+        )
+        .persist_final(
+            &final_message_id,
             &mut loop_state.messages,
             loop_state.session_revision,
             &self.on_event,
             (final_content, reasoning_content),
         )
         .await?;
-        self.mark_output_published(&prepared.turn_id).await;
-        self.complete_turn(&prepared.turn_id, &final_message_id)
-            .await?;
+        let lifecycle = self.lifecycle(&prepared.turn_id);
+        lifecycle.mark_output_published().await;
+        lifecycle.complete(&final_message_id).await?;
         Ok(PhaseOutcome::Finished(response))
-    }
-
-    async fn complete_turn(
-        &self,
-        turn_id: &str,
-        final_message_id: &str,
-    ) -> Result<(), EgoPulseError> {
-        let turn_id = turn_id.to_string();
-        let final_message_id = final_message_id.to_string();
-        call_blocking(self.state.db_for(self.context.scope), move |db| {
-            db.complete_turn(&turn_id, &final_message_id)
-        })
-        .await?;
-        Ok(())
     }
 }
 
@@ -1184,173 +995,6 @@ fn evaluate_malformed_response(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn persist_and_finalize(
-    state: &TurnRuntime,
-    scope: ConversationScope,
-    chat_id: i64,
-    agent_id: &str,
-    final_message_id: &str,
-    turn_id: &str,
-    messages: &mut Arc<Vec<Message>>,
-    session_revision: Option<i64>,
-    on_event: &EventEmitter,
-    response: (String, Option<String>),
-) -> Result<String, EgoPulseError> {
-    let (final_content, reasoning_content) = response;
-    let mut assistant_message = Message::text("assistant", final_content.clone());
-    assistant_message.reasoning_content = reasoning_content;
-    let mut updated = Arc::try_unwrap(std::mem::replace(messages, Arc::new(Vec::new())))
-        .unwrap_or_else(|arc| (*arc).clone());
-    updated.push(assistant_message.clone());
-
-    let mut stored = StoredMessage::assistant(chat_id, agent_id.to_string(), final_content.clone());
-    stored.id = final_message_id.to_string();
-    stored.turn_id = Some(turn_id.to_string());
-    let _persisted = persist_phase(
-        state,
-        scope,
-        stored,
-        assistant_message,
-        &updated,
-        session_revision,
-    )
-    .await?;
-
-    *messages = Arc::new(updated);
-
-    on_event.emit(AgentEvent::FinalResponse {
-        text: final_content.clone(),
-    });
-    Ok(final_content)
-}
-
-async fn execute_and_persist_tools(
-    state: &TurnRuntime,
-    on_event: &EventEmitter,
-    tool_context: &ToolExecutionContext,
-    messages: Arc<Vec<Message>>,
-    session_revision: Option<i64>,
-    assistant_phase: AssistantToolPhase,
-) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
-    let assistant_message_id = uuid::Uuid::new_v4().to_string();
-    let messages_vec = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
-    let persisted = persist_tool_call_assistant_message(
-        state,
-        tool_context.scope,
-        tool_context.chat_id,
-        &tool_context.agent_id,
-        &assistant_message_id,
-        &tool_context.turn_id,
-        &assistant_phase,
-        messages_vec,
-        session_revision,
-    )
-    .await?;
-    let mut messages = persisted.messages;
-    let session_revision = Some(persisted.revision);
-
-    let tool_outcomes = execute_tool_calls(
-        state,
-        on_event,
-        tool_context,
-        &assistant_message_id,
-        assistant_phase.tool_calls,
-    )
-    .await?;
-    let tool_result_phase = build_tool_result_phase(tool_outcomes);
-    let persisted = persist_tool_result_messages(
-        state,
-        tool_context.scope,
-        tool_context.chat_id,
-        &tool_context.agent_id,
-        &assistant_message_id,
-        &tool_context.turn_id,
-        messages,
-        tool_result_phase,
-        session_revision,
-    )
-    .await?;
-    messages = persisted.messages;
-    let session_revision = Some(persisted.revision);
-
-    Ok((Arc::new(messages), session_revision))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn persist_tool_call_assistant_message(
-    state: &TurnRuntime,
-    scope: ConversationScope,
-    chat_id: i64,
-    agent_id: &str,
-    assistant_message_id: &str,
-    turn_id: &str,
-    assistant_phase: &AssistantToolPhase,
-    mut messages: Vec<Message>,
-    session_revision: Option<i64>,
-) -> Result<PersistedTurn, EgoPulseError> {
-    let assistant_message = assistant_phase.assistant_message.clone();
-    messages.push(assistant_message.clone());
-
-    persist_phase(
-        state,
-        scope,
-        StoredMessage {
-            id: assistant_message_id.to_string(),
-            turn_id: Some(turn_id.to_string()),
-            ..StoredMessage::assistant(
-                chat_id,
-                agent_id.to_string(),
-                assistant_phase.assistant_preview.clone(),
-            )
-        },
-        assistant_message,
-        &messages,
-        session_revision,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn persist_tool_result_messages(
-    state: &TurnRuntime,
-    scope: ConversationScope,
-    chat_id: i64,
-    agent_id: &str,
-    assistant_message_id: &str,
-    turn_id: &str,
-    messages: Vec<Message>,
-    tool_result_phase: ToolResultPhase,
-    session_revision: Option<i64>,
-) -> Result<PersistedTurn, EgoPulseError> {
-    let ToolResultPhase {
-        tool_messages,
-        tool_result_preview,
-    } = tool_result_phase;
-    if tool_messages.is_empty() {
-        return Ok(PersistedTurn {
-            revision: session_revision.unwrap_or(0),
-            messages,
-        });
-    }
-
-    let mut messages_with_tools = messages;
-    messages_with_tools.extend(tool_messages.iter().cloned());
-    let mut tool_summary =
-        StoredMessage::assistant(chat_id, agent_id.to_string(), tool_result_preview);
-    tool_summary.turn_id = Some(turn_id.to_string());
-    tool_summary.parent_message_id = Some(assistant_message_id.to_string());
-    persist_phase_messages(
-        state,
-        scope,
-        tool_summary,
-        tool_messages,
-        &messages_with_tools,
-        session_revision,
-    )
-    .await
-}
-
 async fn execute_tool_calls(
     state: &TurnRuntime,
     on_event: &EventEmitter,
@@ -1390,107 +1034,6 @@ async fn execute_tool_calls(
     Ok(outcomes)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn persist_user_turn_with_compaction(
-    state: &TurnRuntime,
-    context: &SurfaceContext,
-    chat_id: i64,
-    turn_id: &str,
-    input_message_id: &str,
-    user_message: &Message,
-    user_input: &str,
-    llm: &std::sync::Arc<dyn crate::llm::LlmProvider>,
-    prompt_ctx: &PromptContext<'_>,
-    config_snapshot: &crate::config::manager::ConfigSnapshot,
-) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
-    let config = &config_snapshot.config;
-    let mut loaded = crate::agent_loop::session::load_messages_for_turn_with_limit(
-        state,
-        context.scope,
-        chat_id,
-        config.max_history_messages,
-    )
-    .await?;
-    let mut stored_message = StoredMessage::user(
-        chat_id,
-        context.surface_user.clone(),
-        user_input.to_string(),
-    );
-    stored_message.id = input_message_id.to_string();
-    stored_message.turn_id = Some(turn_id.to_string());
-
-    for attempt in 0..2 {
-        let current_messages = std::mem::replace(&mut loaded.messages, Arc::new(Vec::new()));
-        let mut candidate_messages =
-            Arc::try_unwrap(current_messages).unwrap_or_else(|arc| (*arc).clone());
-        candidate_messages.push(user_message.clone());
-        let candidate_messages = maybe_compact_messages(
-            state,
-            context,
-            chat_id,
-            &candidate_messages,
-            llm,
-            prompt_ctx,
-            config,
-        )
-        .await?;
-
-        let persist_result = crate::agent_loop::session::commit_user_turn_input(
-            state,
-            context.scope,
-            stored_message.clone(),
-            &candidate_messages,
-            loaded.session_revision,
-            turn_id,
-            config_snapshot,
-        )
-        .await;
-        let persisted = match persist_result {
-            Ok(persisted) => persisted,
-            Err(error) => {
-                loaded = handle_user_turn_persist_error(
-                    state,
-                    context.scope,
-                    chat_id,
-                    attempt,
-                    error,
-                    config.max_history_messages,
-                )
-                .await?;
-                continue;
-            }
-        };
-
-        return Ok((Arc::new(persisted.messages), Some(persisted.revision)));
-    }
-
-    Err(EgoPulseError::Storage(
-        StorageError::SessionSnapshotConflict,
-    ))
-}
-
-async fn handle_user_turn_persist_error(
-    state: &TurnRuntime,
-    scope: ConversationScope,
-    chat_id: i64,
-    attempt: usize,
-    error: EgoPulseError,
-    max_history_messages: usize,
-) -> Result<crate::agent_loop::session::LoadedSession, EgoPulseError> {
-    match persist_phase_conflict_outcome(attempt, error) {
-        PersistConflictOutcome::Reload => {
-            crate::agent_loop::session::load_messages_for_turn_with_limit(
-                state,
-                scope,
-                chat_id,
-                max_history_messages,
-            )
-            .await
-        }
-        PersistConflictOutcome::Return(error) => Err(error),
-    }
-}
-
 async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> Option<Message> {
     let log_chat_id = context.channel_log_chat_id?;
     let agent_id = context.agent_id.clone();
@@ -1521,20 +1064,6 @@ async fn load_channel_context(state: &TurnRuntime, context: &SurfaceContext) -> 
              <shared-context>\n{formatted}\n</shared-context>"
         ),
     ))
-}
-
-fn persist_phase_conflict_outcome(attempt: usize, error: EgoPulseError) -> PersistConflictOutcome {
-    match error {
-        EgoPulseError::Storage(StorageError::SessionSnapshotConflict) if attempt == 0 => {
-            PersistConflictOutcome::Reload
-        }
-        other => PersistConflictOutcome::Return(other),
-    }
-}
-
-enum PersistConflictOutcome {
-    Reload,
-    Return(EgoPulseError),
 }
 
 /// Sends one model iteration with bounded in-place retry.
@@ -1696,13 +1225,6 @@ fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
         return Duration::from_secs(*secs);
     }
     Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
-}
-
-/// Short, sanitized summary of an error for the `turn_runs.error_message`
-/// column. Never echoes the full error (which may carry request bodies).
-fn sanitize_error_message(error: &EgoPulseError) -> String {
-    let summary = error.user_facing_summary();
-    truncate_by_chars(&summary, 200)
 }
 
 #[cfg(test)]
