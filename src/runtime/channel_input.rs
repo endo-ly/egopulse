@@ -8,14 +8,12 @@ use std::sync::Arc;
 use std::sync::{OnceLock, Weak};
 
 use crate::agent_loop::session::resolve_chat_id;
-use crate::agent_loop::{
-    ConversationScope, ScheduledTurn, SurfaceContext, canonical_request_hash,
-    serialize_scheduled_turn,
-};
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::runtime::metrics;
-use crate::runtime::turn_scheduler::{RejectReason, ScheduleResult, SubmitOutcome};
+use crate::runtime::turn::{RejectReason, ScheduleResult, SubmitOutcome};
+use crate::runtime::turn::{ScheduledTurn, canonical_request_hash, serialize_scheduled_turn};
 use crate::storage::{AcceptOutcome, AcceptTurnParams};
 use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
@@ -356,7 +354,7 @@ async fn durably_accept_turn(
     scheduled: &ScheduledTurn,
 ) -> Result<AcceptOutcome, EgoPulseError> {
     let scope = scheduled.context.scope;
-    let chat_id = resolve_chat_id(&state.turn_runtime(), &scheduled.context).await?;
+    let chat_id = resolve_chat_id(&state.turn_dependencies(), &scheduled.context).await?;
     let request_hash = canonical_request_hash(&scheduled.context, &scheduled.input);
     let scheduled_json = serialize_scheduled_turn(scheduled)?;
     let snapshot = scheduled

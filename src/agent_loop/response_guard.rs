@@ -73,9 +73,9 @@ pub(crate) fn is_declarative_only_reply(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
-    use crate::agent_loop::turn::{FakeProvider, build_state_with_provider, cli_context};
+    use crate::agent_loop::test_support::{FakeProvider, build_state_with_provider, cli_context};
+    use crate::conversation::ConversationScope;
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
     use serial_test::serial;
@@ -126,9 +126,13 @@ mod tests {
             }),
         );
 
-        let error = process_turn(&state.turn_runtime(), &cli_context("empty-guard"), "hello")
-            .await
-            .expect_err("should fail after retry");
+        let error = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("empty-guard"),
+            "hello",
+        )
+        .await
+        .expect_err("should fail after retry");
         assert!(matches!(error, EgoPulseError::Llm(_)));
     }
 
@@ -157,7 +161,7 @@ mod tests {
         );
 
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("declarative-guard"),
             "help me",
         )
@@ -177,7 +181,7 @@ mod tests {
         .await
         .expect("chat id");
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -220,7 +224,7 @@ mod tests {
         );
 
         let reply = process_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &cli_context("malformed-declarative"),
             "test",
         )

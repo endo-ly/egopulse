@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::agent_loop::ScheduledTurn;
+use super::ScheduledTurn;
 use crate::runtime::metrics;
 use crate::storage::RecoveredOrigin;
 
@@ -727,7 +727,7 @@ pub(crate) fn evaluate_stop_conditions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::SurfaceContext;
+    use crate::conversation::SurfaceContext;
 
     fn test_context(agent_id: &str) -> SurfaceContext {
         SurfaceContext::new(

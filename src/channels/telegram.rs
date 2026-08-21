@@ -23,7 +23,6 @@ use teloxide::prelude::*;
 use teloxide::types::{FileId, MessageEntityKind};
 use tracing::{debug, error, info, warn};
 
-use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{
     ChannelAdapter, PreparedAttachment, ToolProgressHandle, ToolProgressSink,
@@ -31,6 +30,7 @@ use crate::channels::adapter::{
 use crate::channels::utils::text::{floor_char_boundary, keep_tail, split_text};
 use crate::config::TelegramChatConfig;
 use crate::config::manager::ConfigSnapshot;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 use crate::slash_commands::{self, SlashCommandOutcome, process_slash_command};
 
@@ -1071,7 +1071,7 @@ async fn handle_message(
 
     let outcome =
         crate::runtime::submit_agent_turn(&handler.app_state, context, combined_text).await;
-    if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
+    if let crate::runtime::turn::SubmitOutcome::Rejected(reason) = outcome {
         warn!(reason = %reason, "telegram turn rejected: origin or scheduler at capacity");
         let _ = bot
             .send_message(
@@ -1203,9 +1203,9 @@ mod tests {
             .entry(crate::config::ChannelName::new("telegram"))
             .or_default()
             .telegram_channels = Some(channels);
-        Arc::new(crate::agent_loop::turn::build_state(
+        Arc::new(crate::agent_loop::test_support::build_state(
             config,
-            Box::new(crate::agent_loop::turn::FakeProvider {
+            Box::new(crate::agent_loop::test_support::FakeProvider {
                 responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
                     content: "ok".to_string(),
                     reasoning_content: None,

@@ -7,9 +7,9 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::TurnRuntime;
-use crate::agent_loop::formatting::{message_to_archive_text, message_to_text, strip_thinking};
+use crate::agent_loop::TurnDependencies;
+use crate::agent_loop::message_format::{message_to_archive_text, message_to_text, strip_thinking};
+use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, Message, MessagesResponse};
@@ -46,7 +46,7 @@ pub(crate) struct PromptContext<'a> {
 }
 
 pub(crate) async fn maybe_compact_messages(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
@@ -93,7 +93,7 @@ pub(crate) async fn maybe_compact_messages(
 }
 
 pub(crate) async fn force_compact(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
@@ -228,7 +228,7 @@ enum SummarizeOutcome {
 }
 
 async fn safety_compact(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     input: SafetyCompactInput<'_>,
 ) -> Result<Vec<Message>, EgoPulseError> {
     archive_current_conversation(
@@ -278,7 +278,7 @@ async fn safety_compact(
 }
 
 async fn archive_current_conversation(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     messages: &[Message],
@@ -325,7 +325,7 @@ fn select_compaction_slices(
 
 #[allow(clippy::too_many_arguments)]
 async fn summarize_old_messages(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     old_messages: &[Message],
@@ -398,7 +398,7 @@ async fn send_summary_request(
 }
 
 async fn log_summarizer_usage(
-    state: &TurnRuntime,
+    state: &TurnDependencies,
     context: &SurfaceContext,
     chat_id: i64,
     llm: &std::sync::Arc<dyn LlmProvider>,
@@ -835,11 +835,11 @@ fn can_merge_compacted_messages(left: &Message, right: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::ConversationScope;
     use crate::agent_loop::process_turn;
-    use crate::agent_loop::turn::{
+    use crate::agent_loop::test_support::{
         RecordingProvider, build_state, cli_context, test_config_with_compaction,
     };
+    use crate::conversation::ConversationScope;
     use crate::error::LlmError;
     use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
     use crate::llm::{Message, MessagesResponse, ToolCall};
@@ -1119,8 +1119,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("compaction-success");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1147,7 +1146,7 @@ mod tests {
         .await
         .expect("save session");
 
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
         assert_eq!(reply, "final answer");
@@ -1176,7 +1175,7 @@ mod tests {
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -1228,8 +1227,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("compaction-fallback");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1256,7 +1254,7 @@ mod tests {
         .await
         .expect("save session");
 
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
         assert_eq!(reply, "final answer");
@@ -1285,7 +1283,7 @@ mod tests {
         );
 
         let loaded = crate::agent_loop::session::load_messages_for_turn(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             ConversationScope::Normal,
             chat_id,
         )
@@ -1322,13 +1320,12 @@ mod tests {
             })],
             vec![0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-threshold");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let messages = vec![
@@ -1338,7 +1335,7 @@ mod tests {
         ];
 
         let result = force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             1,
             &messages,
@@ -1370,13 +1367,12 @@ mod tests {
             })],
             vec![0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-recent");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let messages = vec![
@@ -1390,7 +1386,7 @@ mod tests {
         ];
 
         let result = force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             1,
             &messages,
@@ -1419,12 +1415,12 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(state_root.clone(), 40, 1);
+        let config = test_config_with_compaction(state_root.clone(), 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-archive");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let chat_id: i64 = 42;
@@ -1434,7 +1430,7 @@ mod tests {
         ];
 
         force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             chat_id,
             &messages,
@@ -1474,7 +1470,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(state_root, 40, 1);
+        let config = test_config_with_compaction(state_root, 1);
         let mut state = build_state(config, Box::new(provider));
         let secret_path = dir.path().join("runtime").join("secret.db");
         state.secret_db = Some(Arc::new(
@@ -1484,7 +1480,7 @@ mod tests {
         context.scope = ConversationScope::Secret;
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let chat_id: i64 = 77;
@@ -1494,7 +1490,7 @@ mod tests {
         ];
 
         force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             chat_id,
             &messages,
@@ -1550,12 +1546,12 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(state_root, 40, 1);
+        let config = test_config_with_compaction(state_root, 1);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("archive-normal-routing");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let chat_id: i64 = 88;
@@ -1565,7 +1561,7 @@ mod tests {
         ];
 
         force_compact(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             chat_id,
             &messages,
@@ -1631,8 +1627,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("compaction-usage");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1659,7 +1654,7 @@ mod tests {
         .await
         .expect("save session");
 
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
         assert_eq!(reply, "final answer");
@@ -1698,14 +1693,14 @@ mod tests {
             vec![0],
         );
         let mut config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 1);
         config.default_context_window_tokens = 10_000;
         config.compaction_threshold_ratio = 0.80;
         let state = build_state(config, Box::new(provider));
         let context = cli_context("calibrated-trigger");
         let snapshot = state.config_manager.current_blocking();
         let llm = state
-            .turn_runtime()
+            .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
         let key = CalibrationKey::new("test", "test-model", "agent_loop", false);
@@ -1721,7 +1716,7 @@ mod tests {
 
         // Act
         let result = maybe_compact_messages(
-            &state.turn_runtime(),
+            &state.turn_dependencies(),
             &context,
             1,
             &messages,
@@ -1771,8 +1766,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("compaction-calibration");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1800,7 +1794,7 @@ mod tests {
         .expect("save session");
 
         // Act
-        let reply = process_turn(&state.turn_runtime(), &context, "fresh question")
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
             .await
             .expect("process turn");
 

@@ -1,6 +1,6 @@
 //! メッセージのフォーマット、サニタイズ、表示用テキスト変換。
 
-use crate::agent_loop::tool_phase::MAX_TOOL_RESULT_TEXT_CHARS;
+use crate::agent_loop::tool_execution::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 use crate::storage::StoredMessage;
 
@@ -274,7 +274,7 @@ pub(crate) fn format_channel_log_message(msg: &StoredMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::turn::tool_result_message;
+    use crate::agent_loop::test_support::tool_result_message;
     use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 
     #[test]

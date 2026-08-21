@@ -1,34 +1,35 @@
-//! Turn execution runtime: narrows [`AppState`] to the fields a [`TurnExecutor`]
+//! Dependency boundary for Turn execution: narrows [`AppState`] to the fields a [`TurnExecutor`]
 //! actually needs.
 //!
 //! All Turn execution paths (Agent loop, Prompt builder, Compaction, Tool
-//! phase, Session persistence) receive `&TurnRuntime` instead of `&AppState`,
-//! eliminating accidental dependency on scheduling / channel / observability
-//! state.
+//! phase, Session persistence) receive `&TurnDependencies` instead of `&AppState`,
+//! keeping scheduler, channel dispatch, and runtime observability outside the
+//! execution boundary.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use crate::agent_loop::ConversationScope;
 use crate::config::{Config, ConfigManager, ResolvedLlmConfig};
+use crate::conversation::ConversationScope;
 use crate::error::EgoPulseError;
 use crate::llm::LlmProvider;
 use crate::memory::MemoryLoader;
 use crate::runtime::ScopedStorage;
-use crate::runtime::turn_scheduler::ActiveTurnTracker;
+use crate::runtime::turn::ActiveTurnTracker;
 use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
 
 /// Narrow dependency bundle for Turn execution.
 ///
-/// Constructed once per Turn via [`crate::runtime::AppState::turn_runtime`].
-/// Holds only the services that participate in model/tool loop execution,
-/// leaving scheduling (`TurnScheduler`, `TurnTracker`, `ActiveTurns`),
+/// Constructed once per Turn via [`crate::runtime::AppState::turn_dependencies`].
+/// Holds only the services that participate in model/tool loop execution.
+/// Scheduler queues and chain tracking (`TurnScheduler`, `TurnTracker`),
 /// channel dispatch (`ChannelRegistry`), and runtime observability
-/// (`RuntimeStatus`) on the caller side.
-pub(crate) struct TurnRuntime {
+/// (`RuntimeStatus`) stay on the caller side. `ActiveTurnTracker` is included
+/// only for Turn-boundary activity bookkeeping owned by `TurnExecutor`.
+pub(crate) struct TurnDependencies {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,
     pub(crate) config_manager: Arc<ConfigManager>,
@@ -37,14 +38,14 @@ pub(crate) struct TurnRuntime {
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn LlmProvider>>>>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) skills: Arc<SkillManager>,
-    pub(crate) soul_agents: Arc<crate::agent_loop::soul_agents::SoulAgentsLoader>,
+    pub(crate) soul_agents: Arc<crate::agent_loop::prompt::SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) assets: Arc<crate::assets::AssetStore>,
     pub(crate) usage_calibrator: Arc<crate::llm::calibration::UsageCalibrator>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
 }
 
-impl TurnRuntime {
+impl TurnDependencies {
     /// Returns an owned handle to the appropriate database for `scope`.
     ///
     /// # Panics
@@ -99,7 +100,7 @@ impl TurnRuntime {
     /// resolved configuration fails.
     pub(crate) fn llm_for_context_with_snapshot(
         &self,
-        context: &crate::agent_loop::SurfaceContext,
+        context: &crate::conversation::SurfaceContext,
         snapshot: &crate::config::manager::ConfigSnapshot,
     ) -> Result<Arc<dyn LlmProvider>, EgoPulseError> {
         if let Some(provider) = self.llm_override.clone() {

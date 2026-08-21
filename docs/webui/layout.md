@@ -94,7 +94,7 @@ Sidebar の第1セクション。必ず表示する。
 }
 ```
 
-`active` フィールドは内部で `ActiveTurnTracker::is_active(agent_id)` を呼んで判定する（既存の `src/runtime/turn_scheduler.rs` に tracker が存在する）。
+`active` フィールドは内部で `ActiveTurnTracker::is_active(agent_id)` を呼んで判定する（既存の `src/runtime/turn/scheduler.rs` に tracker が存在する）。
 
 **polling 戦略**：`/api/agents` を5秒間隔でポーリングし、`active` フィールドを更新する。これにより最大5秒の遅延で StatusDot が active 状態に切り替わる。
 

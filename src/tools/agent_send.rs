@@ -9,12 +9,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent_loop::{ConversationScope, ScheduledTurn, SurfaceContext};
 use crate::config::{AgentConfig, AgentId};
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::llm::ToolDefinition;
 use crate::runtime::TurnIntake;
-use crate::runtime::turn_scheduler::SubmitOutcome;
-use crate::runtime::turn_scheduler::{StopReason, evaluate_stop_conditions};
+use crate::runtime::turn::ScheduledTurn;
+use crate::runtime::turn::SubmitOutcome;
+use crate::runtime::turn::{StopReason, evaluate_stop_conditions};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
 
@@ -306,9 +307,9 @@ impl Tool for AgentSendTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::deserialize_scheduled_turn;
     use crate::channels::adapter::ChannelRegistry;
     use crate::config::{AgentConfig, AgentId};
+    use crate::runtime::turn::deserialize_scheduled_turn;
     use crate::runtime::{AppState, build_sleep_app_state_with_path};
     use crate::test_util::test_config;
     use crate::tools::Tool;
@@ -787,9 +788,9 @@ mod tests {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::agent_loop::deserialize_scheduled_turn;
     use crate::channels::adapter::ChannelRegistry;
     use crate::config::{AgentConfig, AgentId};
+    use crate::runtime::turn::deserialize_scheduled_turn;
     use crate::runtime::{AppState, build_sleep_app_state_with_path};
     use crate::storage::{MessageKind, SenderKind, call_blocking};
     use crate::test_util::test_config;
@@ -920,7 +921,7 @@ mod integration_tests {
         crate::config::persist::save_config_with_secrets(&config, &config_path)
             .expect("save initial config");
 
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![Ok(crate::llm::MessagesResponse {
                 content: "queued response".to_string(),
                 reasoning_content: None,
@@ -953,7 +954,7 @@ mod integration_tests {
             turn_id: "blocker".to_string(),
             origin_id: "blocker-origin".to_string(),
             context: {
-                let mut context = crate::agent_loop::SurfaceContext::new(
+                let mut context = crate::conversation::SurfaceContext::new(
                     "discord".to_string(),
                     "scheduler".to_string(),
                     "123".to_string(),
@@ -968,7 +969,7 @@ mod integration_tests {
         };
         assert!(matches!(
             state.turn_scheduler.submit(blocker),
-            crate::runtime::turn_scheduler::ScheduleResult::Started(_)
+            crate::runtime::turn::ScheduleResult::Started(_)
         ));
 
         let mut parent_context = test_context_with_agent("lyre");

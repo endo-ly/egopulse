@@ -31,9 +31,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::agent_loop::ConversationScope;
 use crate::config::Config;
 use crate::config::secret_ref::dotenv_path;
+use crate::conversation::ConversationScope;
 use crate::llm::ToolDefinition;
 use crate::skills::SkillManager;
 

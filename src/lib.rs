@@ -8,6 +8,7 @@ pub(crate) mod assets;
 pub(crate) mod builtin_skills;
 pub mod channels;
 pub mod config;
+pub(crate) mod conversation;
 pub mod error;
 pub(crate) mod llm;
 pub(crate) mod memory;

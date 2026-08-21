@@ -421,7 +421,7 @@ Environment variables:
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
 - catalog 生成: [egopulse/src/skills.rs](../../egopulse/src/skills.rs) `build_skills_catalog()`
-- prompt への埋め込み: [egopulse/src/agent_loop/turn.rs](../../egopulse/src/agent_loop/turn.rs)
+- prompt への埋め込み: [egopulse/src/agent_loop/turn/mod.rs](../../egopulse/src/agent_loop/turn/mod.rs) と [egopulse/src/agent_loop/prompt/builder.rs](../../egopulse/src/agent_loop/prompt/builder.rs)
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 

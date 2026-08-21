@@ -4,13 +4,13 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::ConversationScope;
 use crate::assets::AssetStore;
 use crate::channels::adapter::ChannelRegistry;
 use crate::config::{
     AgentConfig, AgentId, ChannelConfig, ChannelName, Config, ProviderConfig, ProviderId,
     secret_ref::ResolvedValue,
 };
+use crate::conversation::ConversationScope;
 use crate::memory::MemoryLoader;
 use crate::runtime::{AppState, AppStateParts, RuntimeStatus};
 use crate::skills::SkillManager;
@@ -115,9 +115,7 @@ pub(crate) fn build_state_with_config(
         tools: Arc::new(ToolRegistry::new(&config, skills)),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-        soul_agents: Arc::new(crate::agent_loop::soul_agents::SoulAgentsLoader::new(
-            &config,
-        )),
+        soul_agents: Arc::new(crate::agent_loop::prompt::SoulAgentsLoader::new(&config)),
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
@@ -195,9 +193,7 @@ pub(crate) fn build_state_for_restart_simulation(
         tools: Arc::new(ToolRegistry::new(&config, skills)),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-        soul_agents: Arc::new(crate::agent_loop::soul_agents::SoulAgentsLoader::new(
-            &config,
-        )),
+        soul_agents: Arc::new(crate::agent_loop::prompt::SoulAgentsLoader::new(&config)),
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
@@ -207,8 +203,8 @@ pub(crate) fn build_state_for_restart_simulation(
 }
 
 /// テスト用 CLI SurfaceContext。
-pub(crate) fn cli_context(session: &str) -> crate::agent_loop::SurfaceContext {
-    crate::agent_loop::SurfaceContext {
+pub(crate) fn cli_context(session: &str) -> crate::conversation::SurfaceContext {
+    crate::conversation::SurfaceContext {
         channel: "cli".to_string(),
         surface_user: "user".to_string(),
         surface_thread: session.to_string(),

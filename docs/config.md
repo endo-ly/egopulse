@@ -852,11 +852,11 @@ Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで保持�
 
 ### 12.4 再起動後の Turn 復旧
 
-過去の Config snapshot は DB へ保存しない。起動時の Turn 復旧（[session-lifecycle.md §10.3](./session-lifecycle.md#103-crash-recovery)）は fail-stop であり、未端末 Turn を `config_fingerprint` の一致・不一致に関わらず停止状態へ移す。`config_fingerprint` は受付時の Config 同一性記録として保持されるが、自動再開の判定には用いない。
+過去の Config snapshot は DB へ保存しない。起動時の Turn 復旧（[session-lifecycle.md §10.3](./session-lifecycle.md#103-crash-recovery)）は状態と durable payload の有無で未端末 Turn を分類する。`accepted` / `input_committed` の durable Turn は再投入され、`input_committed` の resume では保存済み `config_fingerprint` と現在の Config snapshot の一致も検証する。不一致の場合は安全な再開条件を満たさないため `failed` とする。
 
 | 条件 | 扱い |
 |---|---|
-| 未端末 Turn | `accepted` / `input_committed` は `failed`、それ以上の状態は `uncertain` へ停止。fingerprint に関わらず自動再開しない |
+| 未端末 Turn | durable payload がある `accepted` / `input_committed` は再投入する。`input_committed` は fingerprint を含む resume 検証に失敗した場合 `failed`、それ以上の状態は `uncertain` へ停止 |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
 ### 12.5 Provider cache

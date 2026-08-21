@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::ConversationScope;
-use crate::agent_loop::SurfaceContext;
-use crate::agent_loop::tool_phase::{
-    MAX_TOOL_ITERATIONS, ToolExecutionHooks, ToolPhaseRequest, ToolPhaseResponse,
-    build_tool_result_phase, ignore_delta, messages_for_iteration,
-    send_tool_phase_request_with_empty_retry,
+use crate::agent_loop::loop_runner::{MAX_TOOL_ITERATIONS, messages_for_iteration};
+use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest, ignore_delta};
+use crate::agent_loop::tool_execution::{
+    ToolExecutionHooks, ToolExecutor, build_tool_result_phase,
 };
+use crate::conversation::ConversationScope;
+use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;
@@ -82,8 +82,8 @@ pub(crate) async fn run_activation_with_snapshot(
         agent_id.to_string(),
     );
 
-    let turn_runtime = state.turn_runtime();
-    let channel_llm = turn_runtime
+    let turn_dependencies = state.turn_dependencies();
+    let channel_llm = turn_dependencies
         .llm_for_context_with_snapshot(&context, &config_snapshot)
         .inspect_err(|e| {
             warn!(
@@ -111,8 +111,8 @@ pub(crate) async fn run_activation_with_snapshot(
         tool_call_id: String::new(),
     };
 
-    let system_prompt = crate::agent_loop::prompt_builder::build_system_prompt_with_config(
-        &turn_runtime,
+    let system_prompt = crate::agent_loop::prompt::build_system_prompt_with_config(
+        &turn_dependencies,
         &context,
         &config_snapshot.config,
     );
@@ -123,31 +123,29 @@ pub(crate) async fn run_activation_with_snapshot(
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let mut empty_reply_retry_attempted = false;
         let request_messages = messages_for_iteration(&messages, iteration);
-        let phase_response = send_tool_phase_request_with_empty_retry(
-            ToolPhaseRequest {
-                state: &state.turn_runtime(),
-                llm: channel_llm.as_ref(),
-                system_prompt: &system_prompt,
-                messages: request_messages,
-                tools: Some(Arc::clone(&tool_defs)),
-                chat_id,
-                caller_channel: &context.channel,
-                request_kind: "pulse",
-                usage_log_failure: "pulse llm usage logging failed",
-                log_scope: "pulse",
-                send_failure_log: "pulse LLM send_message failed",
-                iteration,
-                scope: ConversationScope::Normal,
-                on_delta: &ignore_delta,
-            },
-            &mut empty_reply_retry_attempted,
-            None,
-        )
-        .await
-        .map_err(|error| error.into_error())?;
+        let model_runner = ModelRunner::new(ModelStepRequest {
+            state: &turn_dependencies,
+            llm: channel_llm.as_ref(),
+            system_prompt: &system_prompt,
+            messages: Arc::clone(&request_messages),
+            tools: Some(Arc::clone(&tool_defs)),
+            chat_id,
+            caller_channel: &context.channel,
+            request_kind: "pulse",
+            usage_log_failure: "pulse llm usage logging failed",
+            log_scope: "pulse",
+            send_failure_log: "pulse LLM send_message failed",
+            iteration,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+        let phase_response = model_runner
+            .run(&mut empty_reply_retry_attempted, None)
+            .await
+            .map_err(|error| error.into_error())?;
 
         let assistant_phase = match phase_response {
-            ToolPhaseResponse::Final(response) => {
+            ModelStep::Final(response) => {
                 let output_text = response.content.trim().to_string();
                 let output_kind = classify_output(&output_text);
                 return Ok(ActivationResult {
@@ -156,7 +154,7 @@ pub(crate) async fn run_activation_with_snapshot(
                     tool_phases,
                 });
             }
-            ToolPhaseResponse::MalformedToolCalls(response) => {
+            ModelStep::MalformedToolCalls(response) => {
                 let output_text = response.content.trim().to_string();
                 let output_kind = classify_output(&output_text);
                 return Ok(ActivationResult {
@@ -165,17 +163,16 @@ pub(crate) async fn run_activation_with_snapshot(
                     tool_phases,
                 });
             }
-            ToolPhaseResponse::ToolCalls(assistant_phase) => assistant_phase,
+            ModelStep::ToolCalls(assistant_phase) => assistant_phase,
         };
         let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
 
-        let tool_outcomes = crate::agent_loop::tool_phase::execute_tool_calls(
-            &state.turn_runtime(),
+        let tool_outcomes = ToolExecutor::new(
+            &turn_dependencies,
             &tool_context,
-            &assistant_message_id,
-            assistant_phase.tool_calls.clone(),
             ToolExecutionHooks::none(),
         )
+        .execute(&assistant_message_id, assistant_phase.tool_calls.clone())
         .await?;
         let tool_result_phase = build_tool_result_phase(tool_outcomes);
 
@@ -363,9 +360,11 @@ mod tests {
         // Arrange: keep the activation in the Tool phase until the shared
         // warning boundary, then return a response after the shared guards.
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut responses =
-            Vec::with_capacity(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 2);
-        for iteration in 1..=(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1) {
+        let mut responses = Vec::with_capacity(
+            crate::agent_loop::loop_runner::FINAL_RESPONSE_WARNING_ITERATION + 2,
+        );
+        for iteration in 1..=(crate::agent_loop::loop_runner::FINAL_RESPONSE_WARNING_ITERATION + 1)
+        {
             responses.push(Ok(crate::llm::MessagesResponse {
                 content: format!("Checking result {iteration}"),
                 reasoning_content: None,
@@ -383,9 +382,9 @@ mod tests {
             tool_calls: Vec::new(),
             usage: None,
         }));
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             responses,
-            vec![0; crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 2],
+            vec![0; crate::agent_loop::loop_runner::FINAL_RESPONSE_WARNING_ITERATION + 2],
         );
         let observer = provider.clone();
         let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
@@ -427,24 +426,24 @@ mod tests {
         assert_eq!(result.output_kind, PulseOutputKind::Notify);
         let seen_messages = observer.seen_messages();
         let warning_message = seen_messages
-            [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION - 1]
+            [crate::agent_loop::loop_runner::FINAL_RESPONSE_WARNING_ITERATION - 1]
             .last()
             .expect("warning guard message");
         assert!(
             warning_message
                 .content
                 .as_text_lossy()
-                .contains(crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_GUARD)
+                .contains(crate::agent_loop::loop_runner::FINAL_RESPONSE_WARNING_GUARD)
         );
         let final_guard_message = seen_messages
-            [crate::agent_loop::tool_phase::FINAL_RESPONSE_WARNING_ITERATION + 1]
+            [crate::agent_loop::loop_runner::FINAL_RESPONSE_WARNING_ITERATION + 1]
             .last()
             .expect("final guard message");
         assert!(
             final_guard_message
                 .content
                 .as_text_lossy()
-                .contains(crate::agent_loop::tool_phase::FINAL_RESPONSE_GUARD)
+                .contains(crate::agent_loop::loop_runner::FINAL_RESPONSE_GUARD)
         );
     }
 
@@ -453,7 +452,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().to_str().expect("utf8").to_string();
 
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![Ok(crate::llm::MessagesResponse {
                 content: "PULSE_OK".to_string(),
                 reasoning_content: None,
@@ -531,7 +530,7 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().to_str().expect("utf8").to_string();
-        let provider = crate::agent_loop::turn::RecordingProvider::new(
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![
                 Err(crate::error::LlmError::InvalidResponse(
                     "assistant content was empty (output_items=1)".to_string(),
@@ -587,7 +586,7 @@ mod tests {
         let retry_message = seen_messages[1].last().expect("runtime guard message");
         assert_eq!(retry_message.role, "user");
         assert!(
-            crate::agent_loop::formatting::message_to_text(retry_message)
+            crate::agent_loop::message_format::message_to_text(retry_message)
                 .contains("no user-visible text")
         );
     }

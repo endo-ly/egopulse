@@ -7,7 +7,7 @@
 /// 2. Extracts JSON from markdown code blocks (```` ```json ... ``` ````).
 /// 3. Extracts the outermost `{ … }` span to remove preamble text.
 pub(crate) fn normalize_llm_response(raw: &str) -> String {
-    let stripped = crate::agent_loop::formatting::strip_thinking(raw);
+    let stripped = crate::agent_loop::message_format::strip_thinking(raw);
 
     if let Some(json) = extract_json_from_code_block(&stripped) {
         return json;

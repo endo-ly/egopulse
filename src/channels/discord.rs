@@ -22,7 +22,6 @@ use serenity::model::id::{ChannelId, UserId};
 use serenity::prelude::*;
 use tracing::{error, info, warn};
 
-use crate::agent_loop::{ConversationScope, SurfaceContext};
 use crate::channels::adapter::ConversationKind;
 use crate::channels::adapter::{
     ChannelAdapter, PreparedAttachment, ToolProgressHandle, ToolProgressSink, TurnActivity,
@@ -30,6 +29,7 @@ use crate::channels::adapter::{
 use crate::channels::utils::text::{keep_tail, split_text};
 use crate::config::DiscordChannelConfig;
 use crate::config::manager::ConfigSnapshot;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::runtime::{AppState, ChannelLogKey, HumanChannelLogMessage};
 
 /// Discord API リクエストのタイムアウト (秒)。
@@ -953,7 +953,7 @@ impl EventHandler for Handler {
 
         let outcome =
             crate::runtime::submit_agent_turn(&self.app_state, context, combined_text).await;
-        if let crate::runtime::turn_scheduler::SubmitOutcome::Rejected(reason) = outcome {
+        if let crate::runtime::turn::SubmitOutcome::Rejected(reason) = outcome {
             warn!(reason = %reason, "discord turn rejected: origin or scheduler at capacity");
             let _ = msg
                 .channel_id
@@ -1293,9 +1293,9 @@ mod tests {
             .entry(crate::config::ChannelName::new("discord"))
             .or_default()
             .discord_channels = Some(channels);
-        Arc::new(crate::agent_loop::turn::build_state(
+        Arc::new(crate::agent_loop::test_support::build_state(
             config,
-            Box::new(crate::agent_loop::turn::FakeProvider {
+            Box::new(crate::agent_loop::test_support::FakeProvider {
                 responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
                     content: "ok".to_string(),
                     reasoning_content: None,

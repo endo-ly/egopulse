@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::agent_loop;
-use crate::agent_loop::SurfaceContext;
+use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
 use crate::runtime::AppState;
 use crate::storage::{SessionSummary, call_blocking};
@@ -156,7 +156,7 @@ impl TuiApp {
     }
 
     async fn refresh_sessions(&mut self) -> Result<(), EgoPulseError> {
-        self.sessions = agent_loop::list_sessions(&self.state.turn_runtime()).await?;
+        self.sessions = agent_loop::list_sessions(&self.state.turn_dependencies()).await?;
         if self.sessions.is_empty() {
             self.selected = 0;
         } else {
@@ -185,7 +185,7 @@ impl TuiApp {
             default_agent,
         );
         let messages =
-            agent_loop::load_session_messages(&self.state.turn_runtime(), &context).await?;
+            agent_loop::load_session_messages(&self.state.turn_dependencies(), &context).await?;
         self.view = View::Chat(Box::new(ChatState {
             context,
             input: String::new(),
@@ -228,7 +228,7 @@ impl TuiApp {
             default_agent,
         );
         let messages =
-            agent_loop::load_session_messages(&self.state.turn_runtime(), &context).await?;
+            agent_loop::load_session_messages(&self.state.turn_dependencies(), &context).await?;
         self.view = View::Chat(Box::new(ChatState {
             context,
             input: String::new(),
@@ -253,7 +253,7 @@ impl TuiApp {
 
 /// Starts the Ratatui application for browsing and chatting with sessions.
 pub(crate) async fn run(state: Arc<AppState>) -> Result<(), EgoPulseError> {
-    let sessions = agent_loop::list_sessions(&state.turn_runtime()).await?;
+    let sessions = agent_loop::list_sessions(&state.turn_dependencies()).await?;
     let mut app = TuiApp::new(state.clone(), sessions);
     if app.sessions.is_empty() {
         app.status = "No sessions yet. Press n to create one.".to_string();
@@ -562,7 +562,7 @@ fn start_send(app: &mut TuiApp, prompt: String) {
     let send_prompt = prompt.clone();
     // 送信はバックグラウンド task に逃がし、描画ループを止めない。
     let handle = tokio::spawn(async move {
-        agent_loop::send_turn(&state.turn_runtime(), &context, &send_prompt).await
+        agent_loop::send_turn(&state.turn_dependencies(), &context, &send_prompt).await
     });
     chat.pending_send = Some(PendingSend { prompt, handle });
 }

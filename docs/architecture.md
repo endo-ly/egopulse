@@ -67,7 +67,7 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 | **ランタイム** | 依存注入、チャネル起動、ライフサイクル管理 | `runtime/` |
 | **チャネル** | 外部プラットフォームとの通信、受信イベントの正規化 | `channels/` |
 | **エージェントループ** | 会話ターン処理、LLM 呼び出し、ツール実行 | `agent_loop/` |
-| **ドメインサービス** | LLM 抽象化、ツール、セッション管理、SOUL/AGENTS 読み込み | `llm/`, `tools/`, `agent_loop/session.rs`, `agent_loop/soul_agents.rs` |
+| **ドメインサービス** | LLM 抽象化、ツール、セッション管理、SOUL/AGENTS 読み込み | `llm/`, `tools/`, `agent_loop/session.rs`, `agent_loop/prompt/` |
 | **インフラ** | 永続化、設定、セキュリティ | `storage/`, `config/`, `tools/mcp.rs`, `skills.rs` |
 
 ---
@@ -78,6 +78,7 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 src/
 ├── main.rs              # CLI エントリポイント (ask / chat / run / setup / gateway / update / sleep / events)
 ├── lib.rs               # 全モジュールの公開インターフェース
+├── conversation.rs       # ConversationScope / SurfaceContext
 ├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
 ├── assets/              # 組み込みスキル等のアセット実体
 ├── builtin_skills.rs    # 組み込みスキル定義
@@ -86,31 +87,42 @@ src/
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, InstanceGuard, build_app_state(), start_channels()
 │   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
-│   ├── turn_dispatch.rs # durable turn の復旧・dispatch・scheduled turn 実行
-│   ├── turn_scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
+│   ├── turn/            # Scheduled Turn subsystem
+│   │   ├── mod.rs       # Runtime Turn facade
+│   │   ├── scheduled.rs # durable ScheduledTurn の表現・hash・serialization
+│   │   ├── scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
+│   │   ├── dispatch.rs  # durable turn の復旧・dispatch・scheduled turn 実行
+│   │   └── progress.rs  # ツール進捗表示コーディネータ
 │   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
 │   ├── backup_scheduler.rs # 定期 SQLite backup スケジューラ
 │   ├── config_reload.rs # Config ホットリロード（YAML + .env 監視）
-│   ├── tool_progress.rs # ツール進捗表示コーディネータ
 │   ├── gateway.rs       # systemd サービス管理
 │   ├── logging.rs       # ログ初期化
 │   ├── metrics.rs       # メトリクス初期化・ヘルパー（内部 Prometheus レコーダー）
-│   └── runtime_status.rs # RuntimeStatus (インメモリヘルスサマリー)
+│   └── status.rs        # RuntimeStatus (インメモリヘルスサマリー)
 │
 ├── agent_loop/          # エージェントループ
-│   ├── mod.rs           # SurfaceContext, process_turn()
-│   ├── turn.rs          # LLM 呼び出し、ツール実行、compaction
-│   ├── turn_runtime.rs  # TurnRuntime (Turn の受付・状態遷移・model/tool loop・復旧判断)
-│   ├── tool_phase.rs    # Tool 実行 phase
+│   ├── mod.rs           # module facade と process_turn() の公開入口
+│   ├── loop_runner.rs   # AgentLoop、LoopState、iteration policy
+│   ├── model_step.rs    # 1 回の LLM 呼び出し、分類、retry、usage
+│   ├── tool_execution.rs # Tool 実行、ledger、Tool Result 構築
+│   ├── compaction.rs    # コンテキスト圧縮 + アーカイブ
+│   ├── response_guard.rs # empty / declarative response guard
+│   ├── message_format.rs # Message / Tool Result の表現変換
+│   ├── event.rs         # AgentEvent 型
+│   ├── prompt/          # System Prompt の assembly と source
+│   │   ├── mod.rs       # Prompt module facade
+│   │   ├── builder.rs   # システムプロンプト構築
+│   │   ├── sources.rs   # SOUL.md / AGENTS.md / SECRET.md 読み込み
+│   │   └── templates/   # 静的プロンプトテンプレート
+│   ├── turn/            # durable な 1 Turn の orchestration
+│   │   ├── mod.rs       # TurnExecutor、準備、AgentLoop 呼び出し、final completion
+│   │   ├── lifecycle.rs # acceptance、state 遷移、resume 検証、failure
+│   │   ├── persistence.rs # Message / Session snapshot の Turn 単位保存
+│   │   └── dependencies.rs # Turn 実行に必要な依存境界
 │   ├── session.rs       # セッションロード・保存、競合解決
 │   ├── session_snapshot.rs # セッションスナップショット構築
-│   ├── event.rs         # AgentEvent 型
-│   ├── prompt_builder.rs # システムプロンプト構築
-│   ├── prompts/         # プロンプトテンプレート
-│   ├── compaction.rs    # コンテキスト圧縮 + アーカイブ
-│   ├── formatting.rs    # 出力フォーマット
-│   ├── guards.rs        # 各種チェック
-│   └── soul_agents.rs   # SOUL.md / AGENTS.md 読み込み
+│   └── test_support.rs  # テスト用 Provider / fixture
 │
 ├── channels/            # チャネル実装
 │   ├── mod.rs           # ChannelAdapter trait, ChannelRegistry
@@ -254,12 +266,12 @@ impl AppState {
 }
 ```
 
-### TurnRuntime
+### TurnDependencies
 
-Turn 実行の中心処理は巨大な `AppState` を直接参照せず、`TurnRuntime` を経由する。`TurnRuntime` は狭い repository 境界を通じて Turn の受付・状態遷移・model/tool loop・復旧判断を担う。
+Turn 実行の中心処理は巨大な `AppState` を直接参照せず、`TurnDependencies` を経由する。`TurnDependencies` は Turn 実行に必要な依存だけを束ね、scheduler・channel dispatch・runtime observability から Agent Loop を分離する。
 
 ```text
-TurnRuntime
+TurnDependencies
 ├── ConfigManager          — immutable Config snapshot、更新境界、変更通知（revision / fingerprint）
 ├── Database
 │   ├── chat.rs            — chats / messages / sessions の原子的更新（revision CAS）
@@ -269,7 +281,7 @@ TurnRuntime
 └── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
 ```
 
-Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / agent_send）は同じ `TurnRuntime` へ到達する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照。
+Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / agent_send）は同じ `TurnDependencies` へ到達する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照。
 
 ### SurfaceContext
 
@@ -292,6 +304,27 @@ pub(crate) struct SurfaceContext {
 ```
 
 `channel` フィールドはモデル解決の profile lookup キーとしても機能する。`resolve_llm_for_agent_channel` は `agent.profiles[channel]` を参照し、チャネル別のプロバイダー/モデルオーバーライドを解決する（詳細は [config.md §4](./config.md#4-モデル解決チェーン)）。
+
+### Agent Loop と durable Turn の境界
+
+通常の Turn は `TurnExecutor` が durable な処理順序を所有し、Agent Loop の内部反復は `AgentLoop` に委譲する。
+
+```text
+TurnExecutor
+  ├─ TurnLifecycle::accept / resume validation
+  ├─ Turn preparation
+  ├─ TurnPersistence::persist_user_input
+  ├─ AgentLoop::run
+  │    ├─ ModelRunner::run_with_retry
+  │    ├─ TurnPersistence::persist_tool_call
+  │    ├─ ToolExecutor::execute
+  │    ├─ TurnPersistence::persist_tool_results
+  │    └─ compaction and next iteration
+  ├─ TurnPersistence::persist_final
+  └─ TurnLifecycle::complete
+```
+
+`AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
 
 ---
 
@@ -417,15 +450,15 @@ deadline 付きで停止する。
 | **Graceful Shutdown** | `runtime/supervisor.rs` | 長寿命 task と Turn を所有し、deadline 付きで順序停止 |
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
-| **Read-only Parallel** | `agent_loop/turn.rs` | `is_read_only()` が真のツールは並列実行 |
+| **Read-only Parallel** | `agent_loop/tool_execution.rs` | `is_read_only()` が真のツールは並列実行 |
 | **Sleep Batch** | `sleep/orchestrator.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
-| **Active Turn Tracker** | `runtime/turn_scheduler.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
-| **Turn Scheduler** | `runtime/turn_scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
-| **Stop Condition Evaluator** | `runtime/turn_scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
-| **Turn Tracker** | `runtime/turn_scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
-| **Conversation Scope Routing** | `runtime/` / `agent_loop/turn_runtime.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnRuntime::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
-| **Tool Progress Coordinator** | `runtime/tool_progress.rs` | `AgentEvent` ストリームを購読し A3 遅延型 × B2 編集式累積ログでチャネル進捗を駆動。sink（Discord/Telegram）は投稿・編集・残置のみ担い、状態機械・遅延タイマー・間引きは coordinator が一元管理 |
+| **Active Turn Tracker** | `runtime/turn/scheduler.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
+| **Turn Scheduler** | `runtime/turn/scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
+| **Stop Condition Evaluator** | `runtime/turn/scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
+| **Turn Tracker** | `runtime/turn/scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
+| **Conversation Scope Routing** | `runtime/` / `agent_loop/turn/dependencies.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnDependencies::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
+| **Tool Progress Coordinator** | `runtime/turn/progress.rs` | `AgentEvent` ストリームを購読し A3 遅延型 × B2 編集式累積ログでチャネル進捗を駆動。sink（Discord/Telegram）は投稿・編集・残置のみ担い、状態機械・遅延タイマー・間引きは coordinator が一元管理 |
 
 ---
 
@@ -443,7 +476,7 @@ deadline 付きで停止する。
 #### ライフサイクル
 
 1. **コンテキスト構築**: チャネルアダプタが YAML 設定の `secret: true` を読み取り、`SurfaceContext.scope = ConversationScope::Secret` を設定
-2. **ストレージルーティング**: `AppState::db_for(scope)` で DB を、`TurnRuntime::storage_for(scope)` で DB + archive root を一意に解決
+2. **ストレージルーティング**: `AppState::db_for(scope)` で DB を、`TurnDependencies::storage_for(scope)` で DB + archive root を一意に解決
 3. **Turn 全体への伝播**: `SurfaceContext.scope` が `ToolExecutionContext.scope` 経由で turn 全体に伝播し、session 読込・message 保存・compaction・LLM usage log のすべてが同じスコープの DB にルーティングされる
 
 #### 構造的保証

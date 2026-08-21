@@ -9,7 +9,9 @@ Self-hosted AI agent runtime (Rust/Tokio). TUI / Web UI / Discord / Telegram in 
 - **Agent-First 設計**: `agent_id` を支配的識別子とし、同一ランタイム上に複数のエージェントが独立した記憶を持って並立・委譲し合う。チャネルもツールもすべてエージェントに紐づく
 - `main.rs` / `lib.rs` - CLI エントリポイント（`chat` / `run` / `ask` / `setup` / `gateway`）とモジュール公開インターフェース
 - `runtime/` - AppState 構築・チャネル起動・ライフサイクル管理。Web / Discord / Telegram を tokio task として同時起動し、graceful shutdownで安全停止。TurnScheduler による同時実行制御と暴走防止も担う
-- `agent_loop/` - 会話ターン処理。システムプロンプト構築・LLM 呼び出し・ツール実行を最大 50 イテレーション繰り返し、セッションのロード/保存・compactionを行う
+- `conversation.rs` - ConversationScope / SurfaceContext。チャネル・Runtime・Agent Loop が共有する会話識別コンテキスト
+- `runtime/turn/` - Scheduled Turn の durable 表現、scheduler、dispatch、Tool Progress を束ねる Runtime subsystem
+- `agent_loop/` - 会話ターン処理。`turn/` が durable Turn を調停し、`loop_runner.rs` が最大 50 イテレーションの Agent Loop、`model_step.rs` が LLM の 1 step、`tool_execution.rs` が Tool 実行を担う。Prompt 関連は `prompt/` に集約する
 - `channels/` - チャネル実装。Web（Axum + SSE/WebSocket）/ Discord / Telegram / TUI / CLI を統一インターフェース（ChannelAdapter）で扱う
 - `llm/` - LLM プロバイダー抽象化（OpenAI 互換 API）と Codex 認証の解決
 - `config/` - YAML 設定（`~/.egopulse/egopulse.config.yaml`）の読み込み・永続化・モデル/チャネル解決。SecretRef による秘密参照もここ
