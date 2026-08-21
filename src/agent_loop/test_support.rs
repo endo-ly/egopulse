@@ -58,8 +58,6 @@ pub(crate) struct FakeProvider {
     pub(crate) responses: std::sync::Mutex<Vec<crate::llm::MessagesResponse>>,
 }
 
-pub(crate) struct FailingProvider;
-
 #[derive(Clone)]
 pub(crate) struct RecordingProvider {
     responses:
@@ -79,37 +77,6 @@ impl LlmProvider for FakeProvider {
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         let mut locked = self.responses.lock().expect("responses");
         Ok(locked.remove(0))
-    }
-
-    async fn send_message_streaming(
-        &self,
-        system: &str,
-        messages: Arc<Vec<Message>>,
-        tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
-        on_delta: &(dyn Fn(String) + Send + Sync),
-    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-        let _ = on_delta;
-        self.send_message(system, messages, tools).await
-    }
-
-    fn provider_name(&self) -> &str {
-        "test"
-    }
-
-    fn model_name(&self) -> &str {
-        "test-model"
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmProvider for FailingProvider {
-    async fn send_message(
-        &self,
-        _system: &str,
-        _messages: Arc<Vec<Message>>,
-        _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
-    ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-        Err(crate::error::LlmError::InvalidResponse("boom".to_string()))
     }
 
     async fn send_message_streaming(
@@ -208,7 +175,6 @@ pub(crate) fn test_config(state_root: String) -> crate::config::Config {
 
 pub(crate) fn test_config_with_compaction(
     state_root: String,
-    _max_session_messages: usize,
     compact_keep_recent: usize,
 ) -> crate::config::Config {
     let mut config = crate::test_util::test_config(&state_root);

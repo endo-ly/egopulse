@@ -1119,8 +1119,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("compaction-success");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1228,8 +1227,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("compaction-fallback");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1322,8 +1320,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-threshold");
         let snapshot = state.config_manager.current_blocking();
@@ -1370,8 +1367,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-recent");
         let snapshot = state.config_manager.current_blocking();
@@ -1419,7 +1415,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(state_root.clone(), 40, 1);
+        let config = test_config_with_compaction(state_root.clone(), 1);
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("force-compact-archive");
         let snapshot = state.config_manager.current_blocking();
@@ -1474,7 +1470,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(state_root, 40, 1);
+        let config = test_config_with_compaction(state_root, 1);
         let mut state = build_state(config, Box::new(provider));
         let secret_path = dir.path().join("runtime").join("secret.db");
         state.secret_db = Some(Arc::new(
@@ -1550,7 +1546,7 @@ mod tests {
             })],
             vec![0],
         );
-        let config = test_config_with_compaction(state_root, 40, 1);
+        let config = test_config_with_compaction(state_root, 1);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("archive-normal-routing");
         let snapshot = state.config_manager.current_blocking();
@@ -1631,8 +1627,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("compaction-usage");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -1698,7 +1693,7 @@ mod tests {
             vec![0],
         );
         let mut config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 40, 1);
+            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 1);
         config.default_context_window_tokens = 10_000;
         config.compaction_threshold_ratio = 0.80;
         let state = build_state(config, Box::new(provider));
@@ -1771,8 +1766,7 @@ mod tests {
             ],
             vec![0, 0],
         );
-        let config =
-            test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 4, 2);
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
         let state = build_state(config, Box::new(provider));
         let context = cli_context("compaction-calibration");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
