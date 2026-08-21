@@ -1563,7 +1563,7 @@ mod tests {
         // are executed; this only occupies tracker capacity so the next fresh
         // origin must be refused at acceptance rather than accepted and later
         // dropped.
-        for i in 0..crate::runtime::turn::scheduler::MAX_TRACKED_ORIGINS {
+        for i in 0..crate::runtime::turn::MAX_TRACKED_ORIGINS {
             app_state
                 .turn_tracker
                 .reserve(&format!("fill-{i}"))

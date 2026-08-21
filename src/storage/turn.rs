@@ -50,7 +50,7 @@ pub(crate) struct TurnRun {
     pub updated_at: String,
     pub finished_at: Option<String>,
     pub request_payload_hash: Option<String>,
-    /// Serialized accepted request ([`crate::runtime::turn::scheduled::PersistedScheduledTurnV1`]),
+    /// Serialized accepted request ([`crate::runtime::turn::ScheduledTurn`]),
     /// present once the turn has been durably accepted. Lets a restarted runtime
     /// rebuild the `SurfaceContext` without re-delivering the platform event.
     pub scheduled_request_json: Option<String>,

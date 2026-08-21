@@ -14,9 +14,6 @@ pub(crate) fn build_system_prompt_with_config(
     context: &SurfaceContext,
     config: &crate::config::Config,
 ) -> String {
-    let channel = &context.channel;
-    let thread = &context.surface_thread;
-
     let mut prompt = String::new();
     if let Some(soul_section) = build_soul_prompt_section(state, context) {
         prompt.push_str(&soul_section);
@@ -50,23 +47,15 @@ pub(crate) fn build_system_prompt_with_config(
         prompt.push_str(&skills_section);
     }
 
-    debug_assert!(prompt.contains(channel));
-    debug_assert!(prompt.contains(thread));
+    debug_assert!(prompt.contains(&context.channel));
+    debug_assert!(prompt.contains(&context.surface_thread));
     prompt
 }
 
 fn build_soul_prompt_section(state: &TurnDependencies, context: &SurfaceContext) -> Option<String> {
-    let soul_content = state.soul_agents.load_soul(
-        &context.channel,
-        &context.surface_thread,
-        Some(&context.agent_id),
-    )?;
+    let soul_content = state.soul_agents.load_soul(Some(&context.agent_id))?;
 
-    Some(
-        state
-            .soul_agents
-            .build_soul_section(&soul_content, &context.channel),
-    )
+    Some(state.soul_agents.build_soul_section(&soul_content))
 }
 
 fn build_model_instructions_section(
@@ -107,11 +96,9 @@ fn build_agents_prompt_section(
     state: &TurnDependencies,
     context: &SurfaceContext,
 ) -> Option<String> {
-    state.soul_agents.build_agents_section(
-        &context.channel,
-        &context.surface_thread,
-        Some(&context.agent_id),
-    )
+    state
+        .soul_agents
+        .build_agents_section(Some(&context.agent_id))
 }
 
 fn build_secret_prompt_section(

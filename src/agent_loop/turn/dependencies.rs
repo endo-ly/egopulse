@@ -3,8 +3,8 @@
 //!
 //! All Turn execution paths (Agent loop, Prompt builder, Compaction, Tool
 //! phase, Session persistence) receive `&TurnDependencies` instead of `&AppState`,
-//! eliminating accidental dependency on scheduling / channel / observability
-//! state.
+//! keeping scheduler, channel dispatch, and runtime observability outside the
+//! execution boundary.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -24,10 +24,11 @@ use crate::tools::ToolRegistry;
 /// Narrow dependency bundle for Turn execution.
 ///
 /// Constructed once per Turn via [`crate::runtime::AppState::turn_dependencies`].
-/// Holds only the services that participate in model/tool loop execution,
-/// leaving scheduling (`TurnScheduler`, `TurnTracker`, `ActiveTurns`),
+/// Holds only the services that participate in model/tool loop execution.
+/// Scheduler queues and chain tracking (`TurnScheduler`, `TurnTracker`),
 /// channel dispatch (`ChannelRegistry`), and runtime observability
-/// (`RuntimeStatus`) on the caller side.
+/// (`RuntimeStatus`) stay on the caller side. `ActiveTurnTracker` is included
+/// only for Turn-boundary activity bookkeeping owned by `TurnExecutor`.
 pub(crate) struct TurnDependencies {
     pub(crate) db: Arc<Database>,
     pub(crate) secret_db: Option<Arc<Database>>,
@@ -37,7 +38,7 @@ pub(crate) struct TurnDependencies {
     pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn LlmProvider>>>>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) skills: Arc<SkillManager>,
-    pub(crate) soul_agents: Arc<crate::agent_loop::prompt::sources::SoulAgentsLoader>,
+    pub(crate) soul_agents: Arc<crate::agent_loop::prompt::SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
     pub(crate) assets: Arc<crate::assets::AssetStore>,
     pub(crate) usage_calibrator: Arc<crate::llm::calibration::UsageCalibrator>,

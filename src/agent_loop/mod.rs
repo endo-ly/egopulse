@@ -1,7 +1,7 @@
-//! 会話ターン処理とセッション解決を束ねるモジュール。
+//! Agent の 1 Turn 実行を構成するモジュール群。
 //!
-//! 各チャネルから渡された surface 情報をもとに永続セッションを特定し、
-//! エージェントの 1 ターン処理へ橋渡しする。
+//! Turn orchestration、Agent Loop、model step、tool execution、prompt、
+//! session/compactionを責務別に分離する。
 
 pub(crate) mod compaction;
 pub(crate) mod event;

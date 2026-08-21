@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
+use super::scheduler;
+use super::{ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
 use crate::agent_loop::resume_input_committed_turn;
 use crate::config::manager::ConfigSnapshot;
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::runtime::status::RuntimeStatus;
-use crate::runtime::turn::{ScheduledTurn, deserialize_scheduled_turn};
-use crate::runtime::turn::{ToolProgressCoordinator, scheduler};
 use crate::runtime::{AppState, Criticality, TaskKind, TaskSpec, channel_input, metrics};
 use crate::storage::{
     DISPATCHER_BATCH_LIMIT, DURABLE_PAYLOAD_INVALID_ERROR_KIND, Database, TurnRunState,
@@ -1493,7 +1493,7 @@ mod tests {
         state.supervisor.start_accepting();
 
         let session_key = "cli:session-blk1:agent:default";
-        let max_queued = crate::runtime::turn::scheduler::MAX_QUEUED_TURNS_PER_SESSION;
+        let max_queued = super::super::scheduler::MAX_QUEUED_TURNS_PER_SESSION;
         // Fill the per-session queue: 1 started + max_queued queued.
         for i in 0..=max_queued {
             let mut ctx = crate::test_util::cli_context("session-blk1");

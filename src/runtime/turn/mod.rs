@@ -1,9 +1,9 @@
 //! Runtime turn subsystem: durable representation, scheduling, dispatch, and progress.
 
-pub(crate) mod dispatch;
-pub(crate) mod progress;
-pub(crate) mod scheduled;
-pub(crate) mod scheduler;
+mod dispatch;
+mod progress;
+mod scheduled;
+mod scheduler;
 
 pub(crate) use dispatch::{execute_observed_turn, execute_scheduled_turn};
 pub(in crate::runtime) use dispatch::{
@@ -17,3 +17,6 @@ pub(crate) use scheduler::{
     ActiveTurnTracker, RejectReason, ScheduleResult, StopReason, SubmitOutcome, TurnScheduler,
     TurnTracker, evaluate_stop_conditions,
 };
+
+#[cfg(test)]
+pub(crate) use scheduler::MAX_TRACKED_ORIGINS;

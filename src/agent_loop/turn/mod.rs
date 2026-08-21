@@ -488,7 +488,7 @@ impl TurnExecutor<'_> {
             tool_call_id: String::new(),
         };
         let config_snapshot = Arc::clone(snapshot);
-        let system_prompt = crate::agent_loop::prompt::builder::build_system_prompt_with_config(
+        let system_prompt = crate::agent_loop::prompt::build_system_prompt_with_config(
             self.state,
             self.context,
             &config_snapshot.config,

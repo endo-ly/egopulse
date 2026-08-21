@@ -115,9 +115,7 @@ pub(crate) fn build_state_with_config(
         tools: Arc::new(ToolRegistry::new(&config, skills)),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-        soul_agents: Arc::new(crate::agent_loop::prompt::sources::SoulAgentsLoader::new(
-            &config,
-        )),
+        soul_agents: Arc::new(crate::agent_loop::prompt::SoulAgentsLoader::new(&config)),
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),
@@ -195,9 +193,7 @@ pub(crate) fn build_state_for_restart_simulation(
         tools: Arc::new(ToolRegistry::new(&config, skills)),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
-        soul_agents: Arc::new(crate::agent_loop::prompt::sources::SoulAgentsLoader::new(
-            &config,
-        )),
+        soul_agents: Arc::new(crate::agent_loop::prompt::SoulAgentsLoader::new(&config)),
         memory_loader: Arc::new(MemoryLoader::new(
             std::path::PathBuf::from(&config.state_root).join("agents"),
         )),

@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::agent_loop::prompt::sources::SoulAgentsLoader;
+use crate::agent_loop::prompt::SoulAgentsLoader;
 use crate::assets::AssetStore;
 use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
@@ -211,9 +211,10 @@ impl AppState {
     /// Builds a [`crate::agent_loop::TurnDependencies`] from the subset of this
     /// `AppState` that Turn execution actually needs.
     ///
-    /// Scheduling, channel dispatch, and runtime observability fields are
-    /// intentionally omitted so that Turn logic cannot accidentally depend on
-    /// them.
+    /// Scheduler queues and chain tracking, channel dispatch, and runtime
+    /// observability remain on `AppState` so Turn logic cannot depend on them.
+    /// The active-turn tracker is the exception: `TurnExecutor` owns its
+    /// begin/end activity bookkeeping at the Turn boundary.
     pub(crate) fn turn_dependencies(&self) -> crate::agent_loop::TurnDependencies {
         crate::agent_loop::TurnDependencies {
             db: Arc::clone(&self.db),

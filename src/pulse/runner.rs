@@ -111,7 +111,7 @@ pub(crate) async fn run_activation_with_snapshot(
         tool_call_id: String::new(),
     };
 
-    let system_prompt = crate::agent_loop::prompt::builder::build_system_prompt_with_config(
+    let system_prompt = crate::agent_loop::prompt::build_system_prompt_with_config(
         &turn_dependencies,
         &context,
         &config_snapshot.config,

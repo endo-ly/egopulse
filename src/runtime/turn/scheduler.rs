@@ -4,8 +4,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::ScheduledTurn;
 use crate::runtime::metrics;
-use crate::runtime::turn::ScheduledTurn;
 use crate::storage::RecoveredOrigin;
 
 /// In-flight turn tracker used by the sleep scheduler to defer scheduled
