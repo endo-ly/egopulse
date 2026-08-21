@@ -24,9 +24,6 @@ pub(crate) const MAX_LLM_RETRIES: usize = 3;
 /// Base backoff (milliseconds) for exponential LLM retry.
 const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
 
-/// Upper bound for a server-provided `Retry-After` backoff.
-const LLM_RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
-
 pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
     pub(crate) assistant_preview: String,
@@ -458,7 +455,7 @@ fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
         ..
     }) = error
     {
-        return Duration::from_secs(*secs).min(LLM_RETRY_AFTER_CAP);
+        return Duration::from_secs(*secs);
     }
     Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
 }
@@ -616,7 +613,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_retry_backoff_caps_server_delay_and_preserves_short_delay() {
+    fn llm_retry_backoff_preserves_server_delay() {
         // Arrange
         let long_delay = EgoPulseError::Llm(crate::error::LlmError::ApiError {
             status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -630,11 +627,11 @@ mod tests {
         });
 
         // Act
-        let capped = llm_retry_backoff(1, &long_delay);
+        let long_delay = llm_retry_backoff(1, &long_delay);
         let preserved = llm_retry_backoff(1, &short_delay);
 
         // Assert
-        assert_eq!(capped, LLM_RETRY_AFTER_CAP);
+        assert_eq!(long_delay, Duration::from_secs(3_600));
         assert_eq!(preserved, Duration::from_secs(7));
     }
 
