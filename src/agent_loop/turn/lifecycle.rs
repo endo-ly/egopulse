@@ -2,8 +2,9 @@
 
 use crate::agent_loop::TurnRuntime;
 use crate::channels::utils::text::truncate_by_chars;
-use crate::conversation::ConversationScope;
+use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
+use crate::runtime::scheduled_turn::{ScheduledTurn, deserialize_scheduled_turn};
 use crate::runtime::turn_scheduler::StopReason;
 use crate::storage::{AcceptOutcome, TurnRun, TurnRunState, call_blocking};
 use tracing::warn;
@@ -18,6 +19,15 @@ pub(crate) enum TurnAcceptance {
     InProgress(String),
     /// The Turn already terminated in a non-success state.
     Terminated(String),
+}
+
+/// Resolves the idempotency key used to accept a user request.
+pub(crate) fn resolve_request_key(context: &SurfaceContext) -> String {
+    if context.request_key.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        context.request_key.clone()
+    }
 }
 
 /// Owns durable state transitions for one Turn.
@@ -239,6 +249,101 @@ pub(crate) async fn fail_resume_permanently(
     {
         warn!(error = %error, %turn_id_owned, "failed to mark unrecoverable resume turn as failed");
     }
+}
+
+/// Validates and decodes a durable `input_committed` resume target.
+pub(crate) async fn validate_resume(
+    runtime: &TurnRuntime,
+    scope: ConversationScope,
+    turn_id: &str,
+    run: &TurnRun,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+) -> Result<ScheduledTurn, EgoPulseError> {
+    if run.state != TurnRunState::InputCommitted {
+        return Err(EgoPulseError::TurnConcurrencyConflict);
+    }
+
+    let scheduled_json = match run.scheduled_request_json.clone() {
+        Some(json) => json,
+        None => {
+            fail_resume_permanently(
+                runtime,
+                scope,
+                turn_id,
+                "resume target has no scheduled request",
+            )
+            .await;
+            return Err(EgoPulseError::Internal(
+                "resume target turn has no scheduled request".to_string(),
+            ));
+        }
+    };
+    if run.output_published {
+        fail_resume_permanently(
+            runtime,
+            scope,
+            turn_id,
+            "resume target already published output",
+        )
+        .await;
+        return Err(EgoPulseError::Internal(
+            "resume target turn already published output".to_string(),
+        ));
+    }
+
+    let persisted = match deserialize_scheduled_turn(&scheduled_json) {
+        Ok(persisted) => persisted,
+        Err(error) => {
+            fail_resume_permanently(
+                runtime,
+                scope,
+                turn_id,
+                "failed to decode scheduled request",
+            )
+            .await;
+            return Err(EgoPulseError::Internal(format!(
+                "failed to decode scheduled request for resume: {error}"
+            )));
+        }
+    };
+
+    if let Some(fingerprint) = &run.config_fingerprint {
+        if !fingerprint.is_empty() && fingerprint != &snapshot.fingerprint {
+            fail_resume_permanently(
+                runtime,
+                scope,
+                turn_id,
+                "config fingerprint mismatch on resume",
+            )
+            .await;
+            return Err(EgoPulseError::Internal(
+                "config fingerprint mismatch on resume".to_string(),
+            ));
+        }
+    }
+
+    let input_message_id = format!("turn:{turn_id}:input");
+    let input_exists = call_blocking(runtime.db_for(scope), {
+        let id = input_message_id;
+        move |db| db.get_message_content(&id)
+    })
+    .await
+    .map_err(EgoPulseError::from)?
+    .is_some();
+    if !input_exists {
+        fail_resume_permanently(
+            runtime,
+            scope,
+            turn_id,
+            "resume target input message missing",
+        )
+        .await;
+        return Err(EgoPulseError::Internal(
+            "resume target input message is missing".to_string(),
+        ));
+    }
+
+    Ok(persisted)
 }
 
 fn sanitize_error_message(error: &EgoPulseError) -> String {
