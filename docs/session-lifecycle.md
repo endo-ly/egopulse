@@ -191,7 +191,7 @@ Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実�
 
 ### Agent Loop の実行境界
 
-durable Turn の外側の順序は `agent_loop/turn/mod.rs` の `TurnExecutor` が管理し、LLM と Tool の反復は `agent_loop/execution.rs` の `AgentLoop` が管理する。1 回の model step は `agent_loop/model_step.rs`、Tool の ledger claim・実行・結果生成は `agent_loop/tool_execution.rs`、Message と Session snapshot の保存は `agent_loop/turn/persistence.rs`、DB 上の Turn 状態遷移は `agent_loop/turn/lifecycle.rs` が担当する。
+durable Turn の外側の順序は `agent_loop/turn/mod.rs` の `TurnExecutor` が管理し、LLM と Tool の反復は `agent_loop/loop_runner.rs` の `AgentLoop` が管理する。1 回の model step は `agent_loop/model_step.rs`、Tool の ledger claim・実行・結果生成は `agent_loop/tool_execution.rs`、Message と Session snapshot の保存は `agent_loop/turn/persistence.rs`、DB 上の Turn 状態遷移は `agent_loop/turn/lifecycle.rs` が担当する。
 
 ```text
 accept / resume validation
@@ -339,7 +339,7 @@ Sleep Batch も session クリア前に `archive_conversation_blocking`（compac
 
 ### Compaction Archive の出力先分離
 
-`TurnRuntime::storage_for(scope)` で解決される archive root に従い、Secret スコープの compaction アーカイブは `runtime/secret_groups/` に出力される。Normal スコープは `runtime/groups/` のまま。
+`TurnDependencies::storage_for(scope)` で解決される archive root に従い、Secret スコープの compaction アーカイブは `runtime/secret_groups/` に出力される。Normal スコープは `runtime/groups/` のまま。
 
 ```text
 Normal: <state_root>/runtime/groups/<channel>/<chat_id>/conversations/
