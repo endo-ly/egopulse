@@ -104,7 +104,7 @@ fn summarize_tool_result_messages(tool_messages: &[Message]) -> String {
         .join("\n");
     truncate_by_chars(&joined, MAX_TOOL_RESULT_TEXT_CHARS)
 }
-pub(crate) async fn execute_tool_calls<'a>(
+async fn execute_tool_calls<'a>(
     state: &TurnRuntime,
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,

@@ -1,4 +1,4 @@
-//! Shared LLM tool-phase utilities used by normal turns and Pulse activations.
+//! Shared one-step LLM execution used by normal turns and Pulse activations.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -195,7 +195,7 @@ impl<'a> ModelRunner<'a> {
     }
 }
 
-/// A tool-phase error together with the request payload that can be retried.
+/// A model-step error together with the request payload that can be retried.
 #[derive(Debug)]
 pub(crate) struct ModelStepError {
     error: EgoPulseError,
@@ -233,7 +233,7 @@ impl ModelStepError {
     }
 }
 
-pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str) -> Vec<ToolCall> {
+fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str) -> Vec<ToolCall> {
     let mut index_by_id = std::collections::HashMap::new();
     let mut valid = Vec::new();
 
@@ -261,9 +261,7 @@ pub(crate) fn filter_valid_tool_calls(tool_calls: Vec<ToolCall>, log_scope: &str
     valid
 }
 
-pub(crate) async fn send_model_step(
-    request: ModelStepRequest<'_>,
-) -> Result<ModelStep, EgoPulseError> {
+async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, EgoPulseError> {
     let has_tools = request
         .tools
         .as_ref()
@@ -340,7 +338,7 @@ pub(crate) async fn send_model_step(
     )))
 }
 
-/// Sends one tool phase and recovers once from an empty assistant response.
+/// Sends one model step and recovers once from an empty assistant response.
 ///
 /// The same recovery contract is used by normal Turns and Pulse activations.
 /// A parser-level empty response and a parsed response containing only hidden
@@ -351,7 +349,7 @@ pub(crate) async fn send_model_step(
 /// caller can retry the same request. When the caller has already published
 /// output for the iteration, the empty response is returned without sending a
 /// guard request because the partial output cannot be safely replayed.
-pub(crate) async fn send_model_step_with_empty_retry(
+async fn send_model_step_with_empty_retry(
     request: ModelStepRequest<'_>,
     empty_retry_attempted: &mut bool,
     output_published: Option<&AtomicBool>,
@@ -463,7 +461,7 @@ fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
     Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
 }
 
-pub(crate) fn build_assistant_tool_phase(
+fn build_assistant_tool_phase(
     content: String,
     reasoning_content: Option<String>,
     tool_calls: Vec<ToolCall>,
@@ -486,7 +484,7 @@ pub(crate) fn build_assistant_tool_phase(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn log_llm_usage(
+async fn log_llm_usage(
     state: &TurnRuntime,
     scope: ConversationScope,
     chat_id: i64,
