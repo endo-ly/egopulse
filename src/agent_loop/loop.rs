@@ -432,6 +432,100 @@ fn evaluate_malformed_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::process_turn;
+    use crate::agent_loop::test_support::{
+        RecordingProvider, build_state_with_provider, cli_context,
+    };
+    use crate::conversation::ConversationScope;
+    use crate::llm::{MessagesResponse, ToolCall};
+    use crate::storage::call_blocking;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    #[serial]
+    async fn late_tool_loop_requests_final_response_at_hard_cap() {
+        // Arrange: keep the model in the Tool phase until the warning boundary,
+        // then return a final response after the shared runtime guards.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut responses = Vec::with_capacity(FINAL_RESPONSE_WARNING_ITERATION + 2);
+        for iteration in 1..=(FINAL_RESPONSE_WARNING_ITERATION + 1) {
+            responses.push(Ok(MessagesResponse {
+                content: format!("Checking result {iteration}"),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("cap-ls-{iteration}"),
+                    name: "ls".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+                usage: None,
+            }));
+        }
+        responses.push(Ok(MessagesResponse {
+            content: "The available results are complete.".to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        }));
+        let provider =
+            RecordingProvider::new(responses, vec![0; FINAL_RESPONSE_WARNING_ITERATION + 2]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = cli_context("late-tool-loop");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "inspect the workspace")
+            .await
+            .expect("late tool loop should finalize");
+
+        // Assert: the final response is returned at the hard-cap boundary.
+        assert_eq!(reply, "The available results are complete.");
+
+        let seen_messages = provider.seen_messages();
+        let warning_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION - 1]
+            .last()
+            .expect("warning guard message");
+        assert!(
+            warning_message
+                .content
+                .as_text_lossy()
+                .contains(FINAL_RESPONSE_WARNING_GUARD)
+        );
+        let final_guard_message = seen_messages[FINAL_RESPONSE_WARNING_ITERATION + 1]
+            .last()
+            .expect("final guard message");
+        assert!(
+            final_guard_message
+                .content
+                .as_text_lossy()
+                .contains(FINAL_RESPONSE_GUARD)
+        );
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:late-tool-loop:agent:default",
+                Some("late-tool-loop"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_runtime(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("session");
+        assert!(loaded.messages.iter().all(|message| {
+            let text = message.content.as_text_lossy();
+            !text.contains(FINAL_RESPONSE_WARNING_GUARD) && !text.contains(FINAL_RESPONSE_GUARD)
+        }));
+    }
 
     #[test]
     fn messages_for_iteration_adds_warning_guards_only_in_final_window() {

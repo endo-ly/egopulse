@@ -267,3 +267,140 @@ fn persist_phase_conflict_outcome(attempt: usize, error: EgoPulseError) -> Persi
         other => PersistConflictOutcome::Return(other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::agent_loop::process_turn;
+    use crate::agent_loop::test_support::{
+        RecordingProvider, build_state_with_provider, cli_context,
+    };
+    use crate::conversation::SurfaceContext;
+    use crate::llm::{MessagesResponse, ToolCall};
+    use crate::runtime::AppState;
+    use crate::storage::call_blocking;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    fn context_with_request_key(session: &str, request_key: &str) -> SurfaceContext {
+        let mut context = cli_context(session);
+        context.request_key = request_key.to_string();
+        context
+    }
+
+    /// A persisted message row's Turn-linkage fields, in `seq` order.
+    struct MessageLink {
+        id: String,
+        turn_id: Option<String>,
+        parent_message_id: Option<String>,
+    }
+
+    fn message_turn_links(state: &AppState, chat_id: i64) -> Vec<MessageLink> {
+        let conn = state.db.get_conn().expect("conn");
+        let mut stmt = conn
+            .prepare(
+                "SELECT seq, id, turn_id, parent_message_id FROM messages
+                 WHERE chat_id = ?1 ORDER BY seq",
+            )
+            .expect("prepare");
+        stmt.query_map(rusqlite::params![chat_id], |row| {
+            Ok(MessageLink {
+                id: row.get(1)?,
+                turn_id: row.get(2)?,
+                parent_message_id: row.get(3)?,
+            })
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn turn_stamps_turn_id_on_all_persisted_messages() {
+        // Arrange: a Turn that runs one tool call, then finalizes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/turnid.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "checking".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-turnid".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "done".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let note_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("dir");
+        std::fs::write(&note_path, "content").expect("file");
+        let context = context_with_request_key("turn-id-links", "cli:turnid:1");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "read the note")
+            .await
+            .expect("turn");
+        assert_eq!(reply, "done");
+
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:turn-id-links:agent:default",
+                Some("turn-id-links"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+
+        // Assert: every persisted message carries the owning Turn id. The Tool
+        // Result message also references the issuing assistant message as its
+        // parent.
+        let turn_id: String = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT turn_id FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| row.get(0),
+            )
+            .expect("turn_id");
+        let rows = message_turn_links(&state, chat_id);
+        assert!(!rows.is_empty(), "turn must persist messages");
+        for link in &rows {
+            assert_eq!(
+                link.turn_id.as_deref(),
+                Some(turn_id.as_str()),
+                "every message must carry the owning turn_id"
+            );
+        }
+        // The Tool Result message is the one with a parent_message_id, and it
+        // points at the Tool Call assistant message.
+        let parents: Vec<String> = rows
+            .iter()
+            .filter_map(|link| link.parent_message_id.clone())
+            .collect();
+        assert_eq!(parents.len(), 1, "exactly the Tool Result carries a parent");
+        assert!(
+            rows.iter().any(|link| link.id == parents[0]),
+            "parent_message_id must reference a persisted assistant message"
+        );
+    }
+}

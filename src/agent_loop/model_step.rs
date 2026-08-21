@@ -534,8 +534,11 @@ mod tests {
     use crate::agent_loop::formatting::message_to_text;
     use crate::agent_loop::process_turn;
     use crate::agent_loop::test_support::{
-        RecordingProvider, build_state_with_provider, cli_context,
+        DeltaThenFailProvider, DeltaThenThinkingProvider, RecordingProvider,
+        build_state_with_provider, cli_context,
     };
+    use crate::conversation::SurfaceContext;
+    use crate::error::EgoPulseError;
     use crate::llm::calibration::{CalibrationKey, DEFAULT_FACTOR};
     use crate::llm::{Message, MessagesResponse, ToolCall, ToolDefinition};
     use crate::storage::call_blocking;
@@ -546,6 +549,12 @@ mod tests {
             name: name.to_string(),
             arguments,
         }
+    }
+
+    fn context_with_request_key(session: &str, request_key: &str) -> SurfaceContext {
+        let mut context = cli_context(session);
+        context.request_key = request_key.to_string();
+        context
     }
 
     #[test]
@@ -1121,5 +1130,276 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         panic!("usage logs were not written within the polling timeout");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retryable_llm_error_is_retried_within_same_iteration() {
+        // Arrange: fail twice with 429 (retry_after=0 for a fast test), then
+        // succeed on the third attempt.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = context_with_request_key("retry", "cli:retry:1");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("turn");
+
+        // Assert: the same iteration was retried and eventually succeeded.
+        assert_eq!(reply, "recovered");
+        assert_eq!(
+            provider.seen_messages().len(),
+            3,
+            "LLM must be called 3 times (2 retries + 1 success)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_guard_retry_reuses_guard_messages_after_transient_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered after guarded retry".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = context_with_request_key("empty-guard-transient", "cli:empty-guard:1");
+
+        // Act
+        let reply = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("turn should recover with the guarded request");
+
+        // Assert
+        assert_eq!(reply, "recovered after guarded retry");
+        let seen_messages = provider.seen_messages();
+        assert_eq!(seen_messages.len(), 3);
+        let first_guard = seen_messages[1].last().expect("first guard message");
+        let second_guard = seen_messages[2].last().expect("second guard message");
+        assert!(message_to_text(first_guard).contains("no user-visible text"));
+        assert_eq!(message_to_text(first_guard), message_to_text(second_guard));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn partial_delta_published_prevents_retry_and_marks_uncertain() {
+        // Arrange: a provider that emits a delta then fails with a retryable
+        // error. Because output was published, retry is refused.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(DeltaThenFailProvider {
+                delta: "partial".to_string(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let context = context_with_request_key("partial-delta", "cli:partial:1");
+
+        // Act
+        let error = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect_err("should fail after partial delta");
+
+        // Assert: no retry (called once), and the Turn is uncertain because a
+        // delta was published.
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must not retry after a delta was published"
+        );
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:partial-delta:agent:default",
+                Some("partial-delta"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let (state_str, output_published): (String, i64) = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT state, output_published FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn_run row");
+        assert_eq!(state_str, "uncertain", "published output -> uncertain");
+        assert_eq!(output_published, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn thinking_only_response_after_delta_skips_empty_guard_and_marks_uncertain() {
+        // Arrange: the provider publishes a delta, then returns only hidden
+        // thinking. The partial output makes a guarded retry unsafe.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(DeltaThenThinkingProvider {
+                delta: "partial".to_string(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let context = context_with_request_key("thinking-only-after-delta", "cli:thinking-only:1");
+
+        // Act
+        let error = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect_err("should fail after published output");
+
+        // Assert: the empty-response guard must not issue a second LLM call,
+        // and the Turn must stop as uncertain because output was published.
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must not retry a thinking-only response after a delta"
+        );
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:thinking-only-after-delta:agent:default",
+                Some("thinking-only-after-delta"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let (state_str, output_published): (String, i64) = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT state, output_published FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn_run row");
+        assert_eq!(state_str, "uncertain", "published output -> uncertain");
+        assert_eq!(output_published, 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tool_call_saved_prevents_whole_turn_retry_on_later_failure() {
+        // Arrange: first response carries a Tool Call; the second LLM call
+        // fails. The Turn must end uncertain (output was published via the
+        // Tool Call) and the Tool must not be re-executed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/tc.txt", uuid::Uuid::new_v4());
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "reading".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-tc-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: None,
+                }),
+                Err(crate::error::LlmError::InvalidResponse("boom".to_string())),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let note_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("dir");
+        std::fs::write(&note_path, "content").expect("file");
+        let context = context_with_request_key("tc-fail", "cli:tc-fail:1");
+
+        // Act
+        let error = process_turn(&state.turn_runtime(), &context, "read the note")
+            .await
+            .expect_err("should fail on the second LLM call");
+
+        // Assert
+        assert!(matches!(error, EgoPulseError::Llm(_)));
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:tc-fail:agent:default",
+                Some("tc-fail"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let state_str: String = state
+            .db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT state FROM turn_runs WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+                |row| row.get(0),
+            )
+            .expect("turn_run row");
+        assert_eq!(
+            state_str, "uncertain",
+            "Tool Call was published -> uncertain, not failed"
+        );
     }
 }

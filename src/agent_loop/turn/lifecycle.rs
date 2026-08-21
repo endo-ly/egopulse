@@ -351,3 +351,283 @@ pub(crate) async fn validate_resume(
 fn sanitize_error_message(error: &EgoPulseError) -> String {
     truncate_by_chars(&error.user_facing_summary(), 200)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::agent_loop::event::AgentEvent;
+    use crate::agent_loop::test_support::{
+        RecordingProvider, build_state_with_provider, cli_context,
+    };
+    use crate::agent_loop::{process_turn, process_turn_with_events};
+    use crate::conversation::SurfaceContext;
+    use crate::llm::MessagesResponse;
+    use crate::runtime::AppState;
+    use crate::storage::call_blocking;
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    fn context_with_request_key(session: &str, request_key: &str) -> SurfaceContext {
+        let mut context = cli_context(session);
+        context.request_key = request_key.to_string();
+        context
+    }
+
+    fn turn_run_count(state: &AppState, chat_id: i64) -> i64 {
+        let conn = state.db.get_conn().expect("conn");
+        conn.query_row(
+            "SELECT COUNT(*) FROM turn_runs WHERE chat_id = ?1",
+            rusqlite::params![chat_id],
+            |row| row.get(0),
+        )
+        .expect("count turn_runs")
+    }
+
+    fn user_message_count(state: &AppState, chat_id: i64) -> i64 {
+        let conn = state.db.get_conn().expect("conn");
+        conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = ?1 AND sender_kind = 'user'",
+            rusqlite::params![chat_id],
+            |row| row.get(0),
+        )
+        .expect("count user messages")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn same_request_key_accepts_one_turn_and_one_user_message() {
+        // Arrange: a provider whose first response is final so the turn completes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "hello back".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = context_with_request_key("dup-accept", "cli:duplicate:1");
+
+        // Act: accept the same request_key twice.
+        let first = process_turn(&state.turn_runtime(), &context, "hi")
+            .await
+            .expect("first turn");
+        let second = process_turn(&state.turn_runtime(), &context, "hi")
+            .await
+            .expect("second turn");
+
+        // Assert: the completed result is reused, so the response matches and
+        // only one Turn / one user message exists.
+        assert_eq!(first, "hello back");
+        assert_eq!(second, "hello back");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:dup-accept:agent:default",
+                Some("dup-accept"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        assert_eq!(turn_run_count(&state, chat_id), 1, "exactly one turn_run");
+        assert_eq!(
+            user_message_count(&state, chat_id),
+            1,
+            "exactly one user message"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn completed_turn_re_acceptance_does_not_invoke_llm() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "final answer".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let context = context_with_request_key("reuse", "cli:reuse:1");
+
+        // Act: run once (consumes the response), then re-accept.
+        let first = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("first");
+        let second = process_turn(&state.turn_runtime(), &context, "hello")
+            .await
+            .expect("second");
+
+        // Assert: the LLM was called exactly once; the second call reused the
+        // saved final message.
+        assert_eq!(first, "final answer");
+        assert_eq!(second, "final answer");
+        assert_eq!(
+            provider.seen_messages().len(),
+            1,
+            "completed turn re-acceptance must not call the LLM"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn duplicate_in_progress_request_returns_terminal_event_and_response() {
+        // Arrange: seed a non-terminal turn_runs row so the re-accept resolves
+        // to InProgress (another executor owns it).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(vec![], vec![]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let session = "dup-inprogress";
+        let request_key = "cli:dup-ip:1";
+        let context = context_with_request_key(session, request_key);
+        let chat_id = call_blocking(Arc::clone(&state.db), {
+            let session = session.to_string();
+            move |db| {
+                db.resolve_or_create_chat_id(
+                    "cli",
+                    &format!("cli:{session}:agent:default"),
+                    Some(&session),
+                    "cli",
+                    "default",
+                )
+            }
+        })
+        .await
+        .expect("chat id");
+        let payload_hash =
+            crate::runtime::scheduled_turn::canonical_request_hash(&context, "hello");
+        {
+            let conn = state.db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO turn_runs
+                     (turn_id, chat_id, request_key, state, config_revision,
+                      config_fingerprint, request_payload_hash, accepted_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'model_pending', 1, 'fp', ?4, 't', 't')",
+                rusqlite::params![
+                    &format!("seed-{session}"),
+                    chat_id,
+                    request_key,
+                    &payload_hash
+                ],
+            )
+            .expect("seed turn_runs");
+        }
+
+        // Act: a duplicate request for the in-progress Turn must terminate.
+        let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&collected);
+        let reply = process_turn_with_events(&state.turn_runtime(), &context, "hello", move |ev| {
+            collector.lock().expect("collector").push(ev);
+        })
+        .await
+        .expect("turn");
+
+        // Assert: a non-empty terminal message is returned and a FinalResponse
+        // event is emitted, and the owning executor's LLM is never invoked.
+        assert!(
+            !reply.is_empty(),
+            "in-progress duplicate must return a terminal message"
+        );
+        let events = collected.lock().expect("events");
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                AgentEvent::FinalResponse { text } if text == &reply
+            )),
+            "in-progress duplicate must emit a matching FinalResponse event"
+        );
+        assert!(
+            provider.seen_messages().is_empty(),
+            "duplicate request must not invoke the LLM"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn terminated_turn_re_acceptance_returns_terminal_event_and_response() {
+        // Arrange: seed a terminal (uncertain) turn_runs row so the re-accept
+        // resolves to Terminated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(vec![], vec![]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        let session = "dup-terminated";
+        let request_key = "cli:dup-term:1";
+        let context = context_with_request_key(session, request_key);
+        let chat_id = call_blocking(Arc::clone(&state.db), {
+            let session = session.to_string();
+            move |db| {
+                db.resolve_or_create_chat_id(
+                    "cli",
+                    &format!("cli:{session}:agent:default"),
+                    Some(&session),
+                    "cli",
+                    "default",
+                )
+            }
+        })
+        .await
+        .expect("chat id");
+        let payload_hash =
+            crate::runtime::scheduled_turn::canonical_request_hash(&context, "hello");
+        {
+            let conn = state.db.get_conn().expect("conn");
+            conn.execute(
+                "INSERT INTO turn_runs
+                     (turn_id, chat_id, request_key, state, config_revision,
+                      config_fingerprint, request_payload_hash, accepted_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'uncertain', 1, 'fp', ?4, 't', 't')",
+                rusqlite::params![
+                    &format!("seed-{session}"),
+                    chat_id,
+                    request_key,
+                    &payload_hash
+                ],
+            )
+            .expect("seed turn_runs");
+        }
+
+        // Act
+        let collected: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collector = Arc::clone(&collected);
+        let reply = process_turn_with_events(&state.turn_runtime(), &context, "hello", move |ev| {
+            collector.lock().expect("collector").push(ev);
+        })
+        .await
+        .expect("turn");
+
+        // Assert: a non-empty terminal message is returned and a FinalResponse
+        // event is emitted, with no LLM call.
+        assert!(
+            !reply.is_empty(),
+            "terminated re-acceptance must return a terminal message"
+        );
+        let events = collected.lock().expect("events");
+        assert!(
+            events.iter().any(|ev| matches!(
+                ev,
+                AgentEvent::FinalResponse { text } if text == &reply
+            )),
+            "terminated re-acceptance must emit a matching FinalResponse event"
+        );
+        assert!(provider.seen_messages().is_empty());
+    }
+}
