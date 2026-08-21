@@ -37,10 +37,8 @@ impl ScheduledTurn {
 }
 
 /// Canonical (order-independent) serialization of a turn request. Fields are
-/// declared in the sorted-key order a `BTreeMap` would produce, so the digest
-/// matches the original map-based implementation byte-for-byte (locked by a
-/// unit test) while avoiding the per-call `BTreeMap` + `serde_json::Value`
-/// allocations on the acceptance hot path.
+/// declared in sorted-key order so the resulting digest remains stable while
+/// avoiding per-call map allocations.
 #[derive(Serialize)]
 struct CanonicalRequest<'a> {
     agent_id: &'a str,
@@ -151,11 +149,8 @@ mod tests {
 
     #[test]
     fn canonical_request_hash_matches_sorted_key_reference() {
-        // Lock the canonical serialization: the borrowed-struct implementation
-        // must produce the exact same digest as the original sorted-key
-        // `BTreeMap` approach for every shape of input (with/without
-        // channel_log_chat_id, unicode input, empty fields). This keeps durable
-        // request hashes stable across the refactor.
+        // Verify the canonical serialization against representative request
+        // shapes so durable request hashes remain stable.
         use std::collections::BTreeMap;
 
         fn reference(context: &SurfaceContext, input: &str) -> String {

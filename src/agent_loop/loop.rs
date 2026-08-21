@@ -89,7 +89,7 @@ pub(crate) struct AgentLoop<'a> {
 
 impl<'a> AgentLoop<'a> {
     /// Creates an Agent Loop with dependencies fixed for one Turn.
-    pub(crate) fn new(
+    pub(super) fn new(
         state: &'a TurnRuntime,
         context: &'a SurfaceContext,
         turn: &'a TurnRun,
@@ -155,10 +155,7 @@ impl<'a> AgentLoop<'a> {
                 scope: self.context.scope,
                 on_delta: &on_delta,
             });
-            let phase_response = match model_runner
-                .run_with_retry(&self.turn.turn_id, Arc::clone(&request_messages))
-                .await
-            {
+            let phase_response = match model_runner.run_with_retry(&self.turn.turn_id).await {
                 Ok(response) => response,
                 Err(error) => {
                     let (error, output_published) = error.into_parts();
@@ -224,7 +221,7 @@ impl<'a> AgentLoop<'a> {
             }
 
             loop_state.reset_retry_guards_after_tool_phase();
-            if let Ok(compacted) = maybe_compact_messages(
+            match maybe_compact_messages(
                 self.state,
                 self.context,
                 self.prepared.chat_id,
@@ -235,7 +232,12 @@ impl<'a> AgentLoop<'a> {
             )
             .await
             {
-                loop_state.messages = Arc::new(compacted);
+                Ok(compacted) => loop_state.messages = Arc::new(compacted),
+                Err(error) => warn!(
+                    iteration,
+                    error = %error,
+                    "message compaction failed; continuing with uncompacted messages"
+                ),
             }
         }
 

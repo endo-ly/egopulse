@@ -128,12 +128,14 @@ async fn execute_tool_calls<'a>(
             let block_futures = valid_tool_calls[block_start..cursor]
                 .iter()
                 .cloned()
-                .map(|tool_call| {
+                .zip(read_only_flags[block_start..cursor].iter().copied())
+                .map(|(tool_call, is_read_only)| {
                     execute_single_tool(
                         state,
                         tool_context,
                         assistant_message_id,
                         tool_call,
+                        is_read_only,
                         hooks.clone(),
                     )
                 })
@@ -149,6 +151,7 @@ async fn execute_tool_calls<'a>(
                     tool_context,
                     assistant_message_id,
                     valid_tool_calls[cursor].clone(),
+                    read_only_flags[cursor],
                     hooks.clone(),
                 )
                 .await?,
@@ -173,6 +176,7 @@ async fn execute_single_tool(
     tool_context: &ToolExecutionContext,
     assistant_message_id: &str,
     tool_call: ToolCall,
+    is_read_only: bool,
     hooks: ToolExecutionHooks<'_>,
 ) -> Result<ExecutedToolCall, EgoPulseError> {
     if let Some(on_start) = &hooks.on_start {
@@ -180,7 +184,6 @@ async fn execute_single_tool(
     }
 
     let tool_start = std::time::Instant::now();
-    let is_read_only = state.tools.is_read_only(&tool_call.name).await;
 
     // Claim the ledger slot before executing so a Tool call is never run
     // before its durable row exists. Read-only Tools skip the ledger because
@@ -394,11 +397,52 @@ mod tests {
 mod integration_tests {
     use serial_test::serial;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Barrier;
 
     use crate::agent_loop::process_turn;
     use crate::agent_loop::turn::{RecordingProvider, build_state_with_provider, cli_context};
-    use crate::llm::{MessagesResponse, ToolCall};
+    use crate::llm::{MessagesResponse, ToolCall, ToolDefinition};
     use crate::storage::call_blocking;
+    use crate::tools::{Tool, ToolExecutionContext, ToolResult};
+
+    struct ConcurrentReadTool {
+        barrier: Arc<Barrier>,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ConcurrentReadTool {
+        fn name(&self) -> &str {
+            "concurrent_read"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "Test-only read-only tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &ToolExecutionContext,
+        ) -> ToolResult {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            self.barrier.wait().await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ToolResult::success("concurrent result".to_string())
+        }
+
+        fn is_read_only(&self) -> bool {
+            true
+        }
+    }
     // -----------------------------------------------------------------------
     // Tool execution strategy
     // -----------------------------------------------------------------------
@@ -406,9 +450,11 @@ mod integration_tests {
     #[tokio::test]
     #[serial]
     async fn parallel_read_only_tools_execute_concurrently() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
-        let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
+        let barrier = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
         let provider = RecordingProvider::new(
             vec![
                 Ok(MessagesResponse {
@@ -417,13 +463,13 @@ mod integration_tests {
                     tool_calls: vec![
                         ToolCall {
                             id: "call-1".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_a.clone()}),
+                            name: "concurrent_read".to_string(),
+                            arguments: serde_json::json!({}),
                         },
                         ToolCall {
                             id: "call-2".to_string(),
-                            name: "read".to_string(),
-                            arguments: serde_json::json!({"path": file_b.clone()}),
+                            name: "concurrent_read".to_string(),
+                            arguments: serde_json::json!({}),
                         },
                     ],
                     usage: None,
@@ -437,25 +483,34 @@ mod integration_tests {
             ],
             vec![0, 0],
         );
-        let state = build_state_with_provider(
+        let mut state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider),
         );
-        let workspace = state.config.workspace_dir().expect("workspace_dir");
-        for path in &[&file_a, &file_b] {
-            let full = workspace.join(path);
-            std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-            std::fs::write(&full, format!("content of {}", path)).expect("write");
-        }
+        Arc::get_mut(&mut state.tools)
+            .expect("tool registry is uniquely owned")
+            .register_tool(Box::new(ConcurrentReadTool {
+                barrier,
+                active,
+                max_active: Arc::clone(&max_active),
+            }));
 
-        let reply = process_turn(
-            &state.turn_runtime(),
-            &cli_context("parallel-read"),
-            "read both",
+        // Act
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            process_turn(
+                &state.turn_runtime(),
+                &cli_context("parallel-read"),
+                "read both",
+            ),
         )
         .await
+        .expect("read-only tools should overlap")
         .expect("turn");
+
+        // Assert
         assert_eq!(reply, "Done.");
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
@@ -479,6 +534,7 @@ mod integration_tests {
     #[tokio::test]
     #[serial]
     async fn mixed_tools_execute_sequentially() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
         let provider = RecordingProvider::new(
@@ -518,9 +574,12 @@ mod integration_tests {
         std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
         std::fs::write(&full, "hello").expect("write");
 
+        // Act
         let reply = process_turn(&state.turn_runtime(), &cli_context("mixed-tools"), "mixed")
             .await
             .expect("turn");
+
+        // Assert
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -545,16 +604,13 @@ mod integration_tests {
     }
 
     // -----------------------------------------------------------------------
-    // Usage logging
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
     // Order-preserving partial parallelization
     // -----------------------------------------------------------------------
 
     #[tokio::test]
     #[serial]
     async fn parallel_read_only_block() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let file_a = format!("tests/{}/a.txt", uuid::Uuid::new_v4());
         let file_b = format!("tests/{}/b.txt", uuid::Uuid::new_v4());
@@ -608,6 +664,7 @@ mod integration_tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
+        // Act
         let reply = process_turn(
             &state.turn_runtime(),
             &cli_context("partial-parallel"),
@@ -615,6 +672,8 @@ mod integration_tests {
         )
         .await
         .expect("turn");
+
+        // Assert
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -645,6 +704,7 @@ mod integration_tests {
     #[tokio::test]
     #[serial]
     async fn sequential_write_tools() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let file_a = format!("tests/{}/seq.txt", uuid::Uuid::new_v4());
         let provider = RecordingProvider::new(
@@ -690,9 +750,12 @@ mod integration_tests {
         )
         .expect("dir");
 
+        // Act
         let reply = process_turn(&state.turn_runtime(), &cli_context("seq-write"), "write it")
             .await
             .expect("turn");
+
+        // Assert
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
@@ -720,6 +783,7 @@ mod integration_tests {
     #[tokio::test]
     #[serial]
     async fn preserves_transcript_order() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let file_a = format!("tests/{}/order.txt", uuid::Uuid::new_v4());
         let file_b = format!("tests/{}/order2.txt", uuid::Uuid::new_v4());
@@ -767,6 +831,7 @@ mod integration_tests {
             std::fs::write(&full, format!("content of {}", path)).expect("write");
         }
 
+        // Act
         let reply = process_turn(
             &state.turn_runtime(),
             &cli_context("transcript-order"),
@@ -774,6 +839,8 @@ mod integration_tests {
         )
         .await
         .expect("turn");
+
+        // Assert
         assert_eq!(reply, "Done.");
 
         let seen = provider.seen_messages();

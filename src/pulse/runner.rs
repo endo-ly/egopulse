@@ -140,7 +140,7 @@ pub(crate) async fn run_activation_with_snapshot(
             on_delta: &ignore_delta,
         });
         let phase_response = model_runner
-            .run(request_messages, &mut empty_reply_retry_attempted, None)
+            .run(&mut empty_reply_retry_attempted, None)
             .await
             .map_err(|error| error.into_error())?;
 

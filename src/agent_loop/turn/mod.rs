@@ -43,20 +43,20 @@ impl Drop for ActiveTurnGuard<'_> {
     }
 }
 
-pub(crate) struct PreparedTurn {
-    pub(crate) turn_id: String,
-    pub(crate) chat_id: i64,
-    pub(crate) tool_context: ToolExecutionContext,
-    pub(crate) system_prompt: String,
-    pub(crate) channel_llm: Arc<dyn LlmProvider>,
-    pub(crate) tool_defs: Arc<Vec<ToolDefinition>>,
-    pub(crate) tools_json: Option<String>,
-    pub(crate) user_message: Message,
-    pub(crate) input_message_id: String,
+pub(super) struct PreparedTurn {
+    pub(super) turn_id: String,
+    pub(super) chat_id: i64,
+    pub(super) tool_context: ToolExecutionContext,
+    pub(super) system_prompt: String,
+    pub(super) channel_llm: Arc<dyn LlmProvider>,
+    pub(super) tool_defs: Arc<Vec<ToolDefinition>>,
+    pub(super) tools_json: Option<String>,
+    pub(super) user_message: Message,
+    pub(super) input_message_id: String,
     /// Immutable Config snapshot acquired at Turn start. All downstream
     /// processing must use this snapshot rather than re-reading ConfigManager,
     /// preventing generation-mixing when config changes mid-flight.
-    pub(crate) config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+    pub(super) config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 }
 
 struct TurnExecutor<'a> {
@@ -342,14 +342,9 @@ impl TurnExecutor<'_> {
             match result {
                 Ok(response) => Ok(response),
                 Err(error) => {
-                    TurnLifecycle::new(
-                        self.state,
-                        self.context.scope,
-                        &turn.turn_id,
-                        &self.context.origin_id,
-                    )
-                    .record_failure_excluding_conflict(&error)
-                    .await;
+                    self.lifecycle(&turn.turn_id)
+                        .record_failure_excluding_conflict(&error)
+                        .await;
                     Err(error)
                 }
             }
@@ -416,14 +411,9 @@ impl TurnExecutor<'_> {
         match result {
             Ok(response) => Ok(response),
             Err(error) => {
-                TurnLifecycle::new(
-                    self.state,
-                    self.context.scope,
-                    &turn_run.turn_id,
-                    &self.context.origin_id,
-                )
-                .record_failure_excluding_conflict(&error)
-                .await;
+                self.lifecycle(&turn_run.turn_id)
+                    .record_failure_excluding_conflict(&error)
+                    .await;
                 Err(error)
             }
         }
@@ -454,6 +444,16 @@ impl TurnExecutor<'_> {
             self.context.scope,
             turn_id,
             &self.context.origin_id,
+        )
+    }
+
+    fn persistence(&self, prepared: &PreparedTurn) -> TurnPersistence<'_> {
+        TurnPersistence::new(
+            self.state,
+            self.context,
+            prepared.chat_id,
+            &prepared.turn_id,
+            &prepared.tool_context.agent_id,
         )
     }
 
@@ -544,22 +544,16 @@ impl TurnExecutor<'_> {
         user_input: &str,
         prompt_ctx: &PromptContext<'_>,
     ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
-        TurnPersistence::new(
-            self.state,
-            self.context,
-            prepared.chat_id,
-            &prepared.turn_id,
-            &prepared.tool_context.agent_id,
-        )
-        .persist_user_input(
-            &prepared.input_message_id,
-            &prepared.user_message,
-            user_input,
-            &prepared.channel_llm,
-            prompt_ctx,
-            prepared.config_snapshot.as_ref(),
-        )
-        .await
+        self.persistence(prepared)
+            .persist_user_input(
+                &prepared.input_message_id,
+                &prepared.user_message,
+                user_input,
+                &prepared.channel_llm,
+                prompt_ctx,
+                prepared.config_snapshot.as_ref(),
+            )
+            .await
     }
 
     async fn run_agent_loop(
@@ -593,21 +587,16 @@ impl TurnExecutor<'_> {
     ) -> Result<String, EgoPulseError> {
         let final_message_id = format!("turn:{}:final", prepared.turn_id);
         let mut messages = result.messages;
-        let response = TurnPersistence::new(
-            self.state,
-            self.context,
-            prepared.chat_id,
-            &prepared.turn_id,
-            &prepared.tool_context.agent_id,
-        )
-        .persist_final(
-            &final_message_id,
-            &mut messages,
-            result.session_revision,
-            &self.on_event,
-            (result.final_content, result.reasoning_content),
-        )
-        .await?;
+        let response = self
+            .persistence(prepared)
+            .persist_final(
+                &final_message_id,
+                &mut messages,
+                result.session_revision,
+                &self.on_event,
+                (result.final_content, result.reasoning_content),
+            )
+            .await?;
         let lifecycle = self.lifecycle(&prepared.turn_id);
         lifecycle.mark_output_published().await;
         lifecycle.complete(&final_message_id).await?;

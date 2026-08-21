@@ -113,9 +113,23 @@ impl<'a> TurnLifecycle<'a> {
         }
     }
 
+    async fn transition<F>(&self, apply: F) -> Result<(), EgoPulseError>
+    where
+        F: FnOnce(&crate::storage::Database, &str) -> Result<(), crate::error::StorageError>
+            + Send
+            + 'static,
+    {
+        let turn_id = self.turn_id.clone();
+        call_blocking(self.runtime.db_for(self.scope), move |db| {
+            apply(db, &turn_id)
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Marks model output as externally published.
     pub(crate) async fn mark_output_published(&self) {
-        let turn_id = self.turn_id.to_string();
+        let turn_id = self.turn_id.clone();
         if let Err(error) = call_blocking(self.runtime.db_for(self.scope), move |db| {
             db.mark_turn_output_published(&turn_id)
         })
@@ -127,37 +141,25 @@ impl<'a> TurnLifecycle<'a> {
 
     /// Marks the current model iteration complete.
     pub(crate) async fn complete_model(&self) -> Result<(), EgoPulseError> {
-        let turn_id = self.turn_id.to_string();
-        call_blocking(self.runtime.db_for(self.scope), move |db| {
-            db.complete_turn_model(&turn_id)
-        })
-        .await?;
-        Ok(())
+        self.transition(|db, turn_id| db.complete_turn_model(turn_id))
+            .await
     }
 
     /// Marks the tool phase as started.
     pub(crate) async fn begin_tools(&self) -> Result<(), EgoPulseError> {
-        let turn_id = self.turn_id.to_string();
-        call_blocking(self.runtime.db_for(self.scope), move |db| {
-            db.begin_turn_tools(&turn_id)
-        })
-        .await?;
-        Ok(())
+        self.transition(|db, turn_id| db.begin_turn_tools(turn_id))
+            .await
     }
 
     /// Marks the tool phase as complete.
     pub(crate) async fn complete_tools(&self) -> Result<(), EgoPulseError> {
-        let turn_id = self.turn_id.to_string();
-        call_blocking(self.runtime.db_for(self.scope), move |db| {
-            db.complete_turn_tools(&turn_id)
-        })
-        .await?;
-        Ok(())
+        self.transition(|db, turn_id| db.complete_turn_tools(turn_id))
+            .await
     }
 
     /// Completes the Turn with its persisted final message.
     pub(crate) async fn complete(&self, final_message_id: &str) -> Result<(), EgoPulseError> {
-        let turn_id = self.turn_id.to_string();
+        let turn_id = self.turn_id.clone();
         let final_message_id = final_message_id.to_string();
         call_blocking(self.runtime.db_for(self.scope), move |db| {
             db.complete_turn(&turn_id, &final_message_id)
@@ -168,7 +170,7 @@ impl<'a> TurnLifecycle<'a> {
 
     /// Records failure or uncertainty according to the durable publication state.
     pub(crate) async fn fail(&self, error: &EgoPulseError) {
-        let turn_id = self.turn_id.to_string();
+        let turn_id = self.turn_id.clone();
         let run = match call_blocking(self.runtime.db_for(self.scope), {
             let turn_id = turn_id.clone();
             move |db| db.get_turn_run(&turn_id)
@@ -198,7 +200,7 @@ impl<'a> TurnLifecycle<'a> {
             })
             .await
         } else {
-            let origin_id = self.origin_id.to_string();
+            let origin_id = self.origin_id.clone();
             let terminal_reason = StopReason::LlmFailure.to_string();
             call_blocking(self.runtime.db_for(self.scope), move |db| {
                 db.fail_turn_and_terminate_origin(

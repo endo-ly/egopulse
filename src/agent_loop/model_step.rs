@@ -24,6 +24,9 @@ pub(crate) const MAX_LLM_RETRIES: usize = 3;
 /// Base backoff (milliseconds) for exponential LLM retry.
 const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
 
+/// Upper bound for a server-provided `Retry-After` backoff.
+const LLM_RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
+
 pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
     pub(crate) assistant_preview: String,
@@ -70,15 +73,11 @@ impl<'a> ModelRunner<'a> {
     /// Executes one model step, including the shared empty-response recovery.
     pub(crate) async fn run(
         &self,
-        messages: Arc<Vec<Message>>,
         empty_retry_attempted: &mut bool,
         output_published: Option<&AtomicBool>,
     ) -> Result<ModelStep, ModelStepError> {
         send_model_step_with_empty_retry(
-            ModelStepRequest {
-                messages,
-                ..self.request.clone()
-            },
+            self.request.clone(),
             empty_retry_attempted,
             output_published,
         )
@@ -89,11 +88,10 @@ impl<'a> ModelRunner<'a> {
     pub(crate) async fn run_with_retry(
         &self,
         turn_id: &str,
-        messages: Arc<Vec<Message>>,
     ) -> Result<ModelStep, ModelRequestError> {
         let hash = model_request_hash(
             self.request.system_prompt,
-            &messages,
+            &self.request.messages,
             self.request
                 .tools
                 .as_deref()
@@ -123,7 +121,7 @@ impl<'a> ModelRunner<'a> {
 
         let output_published = Arc::new(AtomicBool::new(false));
         let mut empty_reply_retry_attempted = false;
-        let mut retry_messages = messages;
+        let mut retry_messages = Arc::clone(&self.request.messages);
         for attempt in 1..=MAX_LLM_RETRIES {
             let published_flag = Arc::clone(&output_published);
             let caller_on_delta = self.request.on_delta;
@@ -439,8 +437,12 @@ fn model_request_hash(
     let mut hasher = Sha256::new();
     hasher.update(system_prompt.as_bytes());
     hasher.update(b"\x00");
-    if let Ok(json) = serde_json::to_string(messages) {
-        hasher.update(json.as_bytes());
+    match serde_json::to_string(messages) {
+        Ok(json) => hasher.update(json.as_bytes()),
+        Err(_) => {
+            hasher.update(b"messages_serialization_error");
+            hasher.update((messages.len() as u64).to_le_bytes());
+        }
     }
     hasher.update(b"\x00");
     if let Some(tools) = tools_json {
@@ -456,7 +458,7 @@ fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
         ..
     }) = error
     {
-        return Duration::from_secs(*secs);
+        return Duration::from_secs(*secs).min(LLM_RETRY_AFTER_CAP);
     }
     Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
 }
@@ -529,6 +531,7 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
     use crate::agent_loop::formatting::message_to_text;
@@ -612,9 +615,33 @@ mod tests {
         assert_eq!(phase.assistant_preview, "Reading notes [tool_call] read");
     }
 
+    #[test]
+    fn llm_retry_backoff_caps_server_delay_and_preserves_short_delay() {
+        // Arrange
+        let long_delay = EgoPulseError::Llm(crate::error::LlmError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body_preview: "rate limited".to_string(),
+            retry_after_secs: Some(3_600),
+        });
+        let short_delay = EgoPulseError::Llm(crate::error::LlmError::ApiError {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            body_preview: "rate limited".to_string(),
+            retry_after_secs: Some(7),
+        });
+
+        // Act
+        let capped = llm_retry_backoff(1, &long_delay);
+        let preserved = llm_retry_backoff(1, &short_delay);
+
+        // Assert
+        assert_eq!(capped, LLM_RETRY_AFTER_CAP);
+        assert_eq!(preserved, Duration::from_secs(7));
+    }
+
     #[tokio::test]
     #[serial]
     async fn process_turn_logs_llm_usage_on_agent_loop() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![Ok(MessagesResponse {
@@ -633,6 +660,7 @@ mod tests {
             Box::new(provider.clone()),
         );
 
+        // Act
         let reply = process_turn(
             &state.turn_runtime(),
             &cli_context("usage-log-single"),
@@ -640,6 +668,8 @@ mod tests {
         )
         .await
         .expect("process turn");
+
+        // Assert
         assert_eq!(reply, "hello world");
 
         // Verify LLM resolution: exactly one call with the right system prompt.
@@ -1009,6 +1039,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn process_turn_logs_each_iteration() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let relative_path = format!("tests/{}/data.txt", uuid::Uuid::new_v4());
         let provider = RecordingProvider::new(
@@ -1047,6 +1078,7 @@ mod tests {
         std::fs::create_dir_all(file_path.parent().expect("parent")).expect("dirs");
         std::fs::write(&file_path, "data").expect("file");
 
+        // Act
         let reply = process_turn(
             &state.turn_runtime(),
             &cli_context("usage-log-multi"),
@@ -1054,6 +1086,8 @@ mod tests {
         )
         .await
         .expect("process turn");
+
+        // Assert
         assert_eq!(reply, "done");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
