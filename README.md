@@ -77,3 +77,9 @@ See [config.md](./docs/config.md) for details.
 | Deployment | [deploy.md](./docs/deploy.md) |
 | DB schema | [db.md](./docs/db.md) |
 | WebUI API | [api.md](./docs/api.md) |
+
+---
+
+## License
+
+Licensed under either of [MIT](./LICENSE-MIT) or [Apache License 2.0](./LICENSE-APACHE) at your option.

@@ -48,7 +48,7 @@ GitHub Releases から直接ダウンロードする。
 mkdir -p "$HOME/.local/bin"
 
 # 最新のリリースバイナリをダウンロード（x86_64 Linux の場合）
-# 完全なURLは GitHub Releases で確認してください
+# <version> はリリースのバージョン（例: 2026.8.1）。完全なURLは GitHub Releases で確認してください
 curl -fsSL -o egopulse.tar.gz "https://github.com/endo-ly/egopulse/releases/latest/download/egopulse-<version>-x86_64-unknown-linux-gnu.tar.gz"
 tar -xzf egopulse.tar.gz
 install -m 0755 egopulse "$HOME/.local/bin/egopulse"
@@ -357,42 +357,43 @@ curl -sS \
 
 ## 6. リリースプロセス
 
-main ブランチで CI が成功した commit に対してのみ GitHub Release が作成される。CI が失敗した commit へはタグ・Release ともに作成されない。
+リリースは `Cargo.toml` の `version` が駆動する。main ブランチで CI が成功した commit のうち、`Cargo.toml` の version が最新 GitHub Release のタグと異なる場合にのみ Release が作成される。つまり「version を bump して main にマージすること」がリリースアクションであり、bump を含まないマージでは何も起こらない。
 
 ### 自動リリースの仕組み
 
 ```text
-main へマージ → CI workflow 実行
+Cargo.toml の version を bump して main へマージ → CI workflow 実行
          ↓
 CI が success で完了 → release workflow が workflow_run で起動
          ↓
-CI run の head SHA をリリース対象 SHA として固定
+CI run の head SHA をチェックアウトし、Cargo.toml の version を読む
          ↓
-候補タグ名を計算（まだ作成しない）
-         ↓
-Web asset をビルド → Rust release binary を各 target で並列ビルド
-         ↓
-全 artifact ビルド成功後のみタグを作成・push
-         ↓
-同じ SHA / タグで GitHub Release を作成し全バイナリ + SHA256SUMS.txt を添付
+version からタグ v{version} を算出し、最新 Release のタグと比較
+         ├─ 同一 → 何もせず終了（skip）
+         └─ 異なる → Web asset をビルドし、Rust release binary を各 target で並列ビルド
+                  ↓
+         全 artifact ビルド成功後に GitHub Release を作成し、
+         全バイナリ + SHA256SUMS.txt を添付
 ```
 
-CI・Web build・いずれかの target build が失敗した commit にはタグが作成されない。手動リリースが必要な場合は main 上で CI を `workflow_dispatch` で再実行し、その成功 run から Release を起動する（Release 単体の `workflow_dispatch` は存在しない）。
+- リリース対象 SHA は常に「CI が success で完了した commit」に固定される。CI・Web build・いずれかの target build が失敗した commit はリリースされない
+- Release workflow 単体の `workflow_dispatch` は存在しない。手動で再リリースしたい場合は main 上の該当 commit に対して CI を `workflow_dispatch` で再実行し、その成功 run から Release を起動する
 
 ### タグ命名規則
 
-`{YYYYMMDD}.{run_number}`
+`v{MAJOR.MINOR.PATCH}`（CalVer）
 
-例: `20260404.1`
+例: `v2026.8.1`
 
-- `YYYYMMDD` はリリース対象 commit の committer date（実行時の壁時計時刻ではないため、同一 SHA の再実行でタグ名が安定する）
-- `run_number` は release workflow の run 番号
+- version は `Cargo.toml` の `version` と完全一致する
+- 同じ日の複数回リリースは patch を increment する（例: `2026.8.1` → `2026.8.2`）
+- 一度公開したタグ・バージョンの再発行はしない。やり直す場合は version を上げて再リリースする
 
-### タグ衝突・再実行の挙動
+### 再実行・失敗時の挙動
 
-- 候補タグが同一 SHA に既に存在する場合は再利用する（Release 作成だけ失敗した再実行でタグを増殖させない）
-- 候補タグが異なる SHA に存在する場合はタグを付け替えず明示的に失敗する
-- Release が既に存在する場合は asset を再アップロード（`--clobber`）し、別 Release を増殖させない
+- release workflow は同時に 1 run のみ実行され、直列に処理される（concurrency 設定）
+- publish job だけが失敗した場合は Actions の re-run failed jobs で修復できる。publish job は Release が既に存在する場合でもエラーにせず asset を上書き再アップロード（`--clobber`）するため、途中まで作成された Release は再実行で完走する
+- ビルド系 job が失敗した場合は原因を修正した commit を main にマージし、version を上げて再リリースする
 
 ### リリース対象ターゲット
 

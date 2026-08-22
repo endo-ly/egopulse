@@ -1,9 +1,10 @@
 name: Release
 
-# Release runs only after the CI workflow on `main` completes successfully.
-# The released SHA is always the CI run's head SHA, so "tested code",
-# "shipped code", and "tagged code" stay on the same commit. The tag is created
-# only after every artifact build succeeds; it is never pushed first.
+# Releases are driven by the version in Cargo.toml. After a CI run on `main`
+# succeeds, the workflow compares Cargo.toml's version against the latest
+# release tag. If the version changed, it builds and publishes a new release
+# (tag v<version>); otherwise nothing happens. Merging a version bump is the
+# release action, so merges without a bump never release.
 on:
   workflow_run:
     workflows: [CI]
@@ -12,10 +13,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
 
-# Release workflows must run sequentially because release tags are allocated
-# from the highest existing release serial.
+# Release workflows must run sequentially so each run compares against the
+# latest published release.
 concurrency:
   group: release-main
   cancel-in-progress: false
@@ -30,72 +30,64 @@ jobs:
 
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+
     outputs:
-      release_tag: ${{ steps.tag.outputs.release_tag }}
-      release_version: ${{ steps.version.outputs.version }}
-      head_sha: ${{ steps.sha.outputs.head_sha }}
+      skip: ${{ steps.version.outputs.skip }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      head_sha: ${{ steps.version.outputs.head_sha }}
 
     steps:
       - name: Resolve CI head SHA
         id: sha
-        run: echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+        run: echo "head_sha=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout CI SHA
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.sha.outputs.head_sha }}
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Read version from Cargo.toml
+      - name: Compute release tag or skip
         id: version
-        run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "//;s/"//')
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Compute candidate tag
-        id: tag
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          COMMIT_DATE=$(
-            git show -s \
-              --format=%cd \
-              --date=format:'%Y%m%d' \
-              "${HEAD_SHA}"
+          HEAD_SHA="${{ steps.sha.outputs.head_sha }}"
+          VERSION=$(
+            grep -m1 '^version' Cargo.toml |
+              sed 's/version = "//;s/"//'
           )
-
-          # Reuse an existing release tag for the same commit.
-          EXISTING_TAG=$(
-            git tag --points-at "${HEAD_SHA}" |
-              sed -nE '/^[0-9]{8}\.[0-9]+$/p' |
-              sort -V |
-              tail -n 1
-          )
-
-          if [ -n "${EXISTING_TAG}" ]; then
-            RELEASE_TAG="${EXISTING_TAG}"
-            echo "Reusing release tag ${RELEASE_TAG} for ${HEAD_SHA}"
-          else
-            # N in YYYYMMDD.N is a repository-wide release serial.
-            MAX_NUMBER=$(
-              git tag -l |
-                sed -nE 's/^[0-9]{8}\.([0-9]+)$/\1/p' |
-                sort -n |
-                tail -n 1
-            )
-
-            NEXT_NUMBER=$((10#${MAX_NUMBER:-0} + 1))
-            RELEASE_TAG="${COMMIT_DATE}.${NEXT_NUMBER}"
-
-            echo "Allocated release tag ${RELEASE_TAG} for ${HEAD_SHA}"
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Cargo.toml version '${VERSION}' must be MAJOR.MINOR.PATCH (CalVer), e.g. 2026.8.1"
+            exit 1
           fi
 
-          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          RELEASED_TAG=$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+              --jq '.tag_name' 2>/dev/null || true
+          )
+
+          if [ "v${VERSION}" = "${RELEASED_TAG}" ]; then
+            echo "Version ${VERSION} already released as ${RELEASED_TAG}; skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Releasing v${VERSION} (previous: ${RELEASED_TAG:-none})"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          fi
 
   build-web:
     name: Build Web Assets
     needs: [compute-version]
+    if: ${{ needs.compute-version.outputs.skip != 'true' && needs.compute-version.outputs.tag != '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -114,7 +106,7 @@ jobs:
 
       - name: Build embedded web assets
         env:
-          EGOPULSE_RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
+          EGOPULSE_RELEASE_TAG: ${{ needs.compute-version.outputs.tag }}
         run: |
           npm --prefix web ci
           npm --prefix web run build
@@ -130,6 +122,7 @@ jobs:
     name: Build ${{ matrix.target.label }}
     runs-on: ${{ matrix.target.os }}
     needs: [compute-version, build-web]
+    if: ${{ needs.compute-version.outputs.skip != 'true' && needs.compute-version.outputs.tag != '' }}
 
     strategy:
       fail-fast: false
@@ -177,13 +170,13 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          EGOPULSE_RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
+          EGOPULSE_RELEASE_TAG: ${{ needs.compute-version.outputs.tag }}
         run: cargo build --release
 
       - name: Package archive
         shell: bash
         env:
-          RELEASE_VERSION: ${{ needs.compute-version.outputs.release_version }}
+          RELEASE_VERSION: ${{ needs.compute-version.outputs.version }}
         run: |
           ASSET_NAME="egopulse-${RELEASE_VERSION}-${{ matrix.target.asset_triple }}.tar.gz"
           tar -czf "${ASSET_NAME}" \
@@ -202,22 +195,16 @@ jobs:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: [compute-version, build-assets]
+    if: ${{ needs.compute-version.outputs.skip != 'true' && needs.compute-version.outputs.tag != '' }}
 
     permissions:
       contents: write
 
     env:
-      RELEASE_TAG: ${{ needs.compute-version.outputs.release_tag }}
+      RELEASE_TAG: ${{ needs.compute-version.outputs.tag }}
       HEAD_SHA: ${{ needs.compute-version.outputs.head_sha }}
 
     steps:
-      - name: Checkout CI SHA
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ env.HEAD_SHA }}
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -230,60 +217,23 @@ jobs:
           cd dist
           sha256sum *.tar.gz > SHA256SUMS.txt
 
-      - name: Create or reuse release tag
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          git fetch --tags origin
-
-          if EXISTING_SHA=$(
-            git rev-parse \
-              --verify \
-              "refs/tags/${RELEASE_TAG}^{commit}" \
-              2>/dev/null
-          ); then
-            if [ "${EXISTING_SHA}" = "${HEAD_SHA}" ]; then
-              echo "Tag ${RELEASE_TAG} already exists at ${HEAD_SHA}; reusing"
-            else
-              echo "::error::Tag ${RELEASE_TAG} points at ${EXISTING_SHA}, expected ${HEAD_SHA}"
-              exit 1
-            fi
-          else
-            gh api \
-              --method POST \
-              "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f "ref=refs/tags/${RELEASE_TAG}" \
-              -f "sha=${HEAD_SHA}" \
-              >/dev/null
-
-            echo "Created tag ${RELEASE_TAG} at ${HEAD_SHA}"
-          fi
-
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-
           if gh release view "${RELEASE_TAG}" \
             --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-
-            echo "Release ${RELEASE_TAG} already exists; uploading assets"
-
-            gh release upload "${RELEASE_TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              dist/*.tar.gz \
-              dist/SHA256SUMS.txt \
-              --clobber
+            echo "Release ${RELEASE_TAG} already exists; re-uploading assets"
           else
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "${RELEASE_TAG}" \
               --generate-notes \
-              --target "${HEAD_SHA}" \
-              dist/*.tar.gz \
-              dist/SHA256SUMS.txt
+              --target "${HEAD_SHA}"
           fi
+
+          gh release upload "${RELEASE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS.txt \
+            --clobber
