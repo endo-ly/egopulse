@@ -16,7 +16,7 @@ use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent, ToolCall};
 use crate::storage::{
     SenderKind, SessionSnapshot, SessionSummary, StoredMessage, ToolCall as StoredToolCall,
-    call_blocking,
+    ToolState, call_blocking,
 };
 
 #[derive(Debug, Clone)]
@@ -98,6 +98,20 @@ fn stored_history_to_messages(
             .push(tool_call);
     }
 
+    let mut restored_calls_by_message = HashMap::<String, Vec<RestoredToolCall>>::new();
+    for stored in &stored_messages {
+        if stored.sender_kind == SenderKind::Assistant && stored.parent_message_id.is_none() {
+            let ledger_calls = calls_by_message
+                .get(&stored.id)
+                .cloned()
+                .unwrap_or_default();
+            let restored_calls = restore_tool_calls(&stored.id, &stored.content, &ledger_calls);
+            if !restored_calls.is_empty() {
+                restored_calls_by_message.insert(stored.id.clone(), restored_calls);
+            }
+        }
+    }
+
     let mut history = Vec::with_capacity(stored_messages.len());
     for stored in stored_messages {
         match stored.sender_kind {
@@ -106,30 +120,25 @@ fn stored_history_to_messages(
             SenderKind::Tool => history.push(Message::text("tool", stored.content)),
             SenderKind::Assistant => {
                 if let Some(parent_id) = stored.parent_message_id.as_deref() {
-                    if let Some(calls) = calls_by_message.get(parent_id) {
-                        let mut restored_result = false;
-                        for call in calls {
-                            if let Some(output) = call.tool_output.as_deref() {
-                                history.push(tool_result_message(&call.id, output));
-                                restored_result = true;
-                            }
-                        }
-                        if restored_result {
+                    if let Some(calls) = restored_calls_by_message.get(parent_id) {
+                        let restored_results = restore_tool_results(&stored.content, calls);
+                        if !restored_results.is_empty() {
+                            history.extend(restored_results);
                             continue;
                         }
                     }
 
                     // Tool summaries for read-only tools do not have a ledger
-                    // row. Keep them as tool messages so an internal preview
-                    // cannot be rendered as an Assistant response.
+                    // row. Keep an unstructured summary rather than dropping
+                    // the result when structured reconstruction is unavailable.
                     history.push(Message::text("tool", stored.content));
                     continue;
                 }
 
-                if let Some(calls) = calls_by_message.get(&stored.id) {
+                if let Some(calls) = restored_calls_by_message.get(&stored.id) {
                     let mut message =
                         Message::text("assistant", strip_tool_call_preview(&stored.content));
-                    message.tool_calls = calls.iter().map(tool_call_message).collect();
+                    message.tool_calls = calls.iter().map(|call| call.call.clone()).collect();
                     history.push(message);
                 } else {
                     history.push(Message::text("assistant", stored.content));
@@ -138,6 +147,127 @@ fn stored_history_to_messages(
         }
     }
     history
+}
+
+#[derive(Debug, Clone)]
+struct RestoredToolCall {
+    call: ToolCall,
+    ledger: Option<StoredToolCall>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolResultPreview {
+    is_error: bool,
+    content: String,
+}
+
+fn restore_tool_calls(
+    message_id: &str,
+    content: &str,
+    ledger_calls: &[StoredToolCall],
+) -> Vec<RestoredToolCall> {
+    let preview_names = tool_call_preview_names(content);
+    let mut unmatched_ledger = ledger_calls.to_vec();
+    let mut restored = Vec::with_capacity(preview_names.len().max(ledger_calls.len()));
+
+    for (index, name) in preview_names.into_iter().enumerate() {
+        if let Some(ledger_index) = unmatched_ledger
+            .iter()
+            .position(|call| call.tool_name == name)
+        {
+            let ledger = unmatched_ledger.remove(ledger_index);
+            restored.push(RestoredToolCall {
+                call: tool_call_message(&ledger),
+                ledger: Some(ledger),
+            });
+        } else {
+            restored.push(RestoredToolCall {
+                call: synthetic_tool_call(message_id, index, name),
+                ledger: None,
+            });
+        }
+    }
+
+    restored.extend(unmatched_ledger.into_iter().map(|ledger| RestoredToolCall {
+        call: tool_call_message(&ledger),
+        ledger: Some(ledger),
+    }));
+    restored
+}
+
+fn tool_call_preview_names(content: &str) -> Vec<String> {
+    content
+        .split_once("[tool_call]")
+        .map(|(_, names)| {
+            names
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn synthetic_tool_call(message_id: &str, index: usize, name: String) -> ToolCall {
+    ToolCall {
+        id: format!("restored:{message_id}:{index}"),
+        name,
+        arguments: serde_json::json!({}),
+    }
+}
+
+fn restore_tool_results(summary: &str, calls: &[RestoredToolCall]) -> Vec<Message> {
+    let previews = tool_result_previews(summary);
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| match call.ledger.as_ref() {
+            Some(ledger) => persisted_tool_result_message(ledger),
+            None => {
+                let preview = previews.get(index).cloned().unwrap_or(ToolResultPreview {
+                    is_error: true,
+                    content: "tool result was not persisted".to_string(),
+                });
+                preview_tool_result_message(&call.call, preview)
+            }
+        })
+        .collect()
+}
+
+fn tool_result_previews(summary: &str) -> Vec<ToolResultPreview> {
+    let mut previews = Vec::new();
+    for line in summary.lines() {
+        let line = line.trim_end_matches('\r');
+        let parsed = line
+            .strip_prefix("[tool_result]: ")
+            .map(|content| ToolResultPreview {
+                is_error: false,
+                content: content.to_string(),
+            })
+            .or_else(|| {
+                line.strip_prefix("[tool_error]: ")
+                    .map(|content| ToolResultPreview {
+                        is_error: true,
+                        content: content.to_string(),
+                    })
+            });
+
+        if let Some(preview) = parsed {
+            previews.push(preview);
+        } else if let Some(previous) = previews.last_mut() {
+            previous.content.push('\n');
+            previous.content.push_str(line);
+        }
+    }
+
+    if previews.is_empty() && !summary.trim().is_empty() {
+        previews.push(ToolResultPreview {
+            is_error: false,
+            content: summary.to_string(),
+        });
+    }
+    previews
 }
 
 fn tool_call_message(call: &StoredToolCall) -> ToolCall {
@@ -157,6 +287,41 @@ fn tool_result_message(call_id: &str, output: &str) -> Message {
         tool_calls: Vec::new(),
         tool_call_id: Some(call_id.to_string()),
     }
+}
+
+fn persisted_tool_result_message(call: &StoredToolCall) -> Message {
+    if call.state == ToolState::Succeeded {
+        if let Some(output) = call.tool_output.as_deref() {
+            return tool_result_message(&call.id, output);
+        }
+    }
+
+    let error = call.error_message.as_deref().unwrap_or_else(|| {
+        if call.state == ToolState::Succeeded {
+            "tool result is missing from the persisted ledger"
+        } else {
+            "tool call did not complete"
+        }
+    });
+    let error = call
+        .error_kind
+        .as_deref()
+        .map_or_else(|| error.to_string(), |kind| format!("{kind}: {error}"));
+    let payload = serde_json::json!({
+        "tool": call.tool_name,
+        "status": "error",
+        "result": error,
+    });
+    tool_result_message(&call.id, &payload.to_string())
+}
+
+fn preview_tool_result_message(call: &ToolCall, preview: ToolResultPreview) -> Message {
+    let payload = serde_json::json!({
+        "tool": call.name,
+        "status": if preview.is_error { "error" } else { "success" },
+        "result": preview.content,
+    });
+    tool_result_message(&call.id, &payload.to_string())
 }
 
 fn strip_tool_call_preview(content: &str) -> String {
@@ -514,7 +679,8 @@ mod tests {
     };
     use crate::runtime::AppState;
     use crate::storage::{
-        MessageKind, SenderKind, StoredMessage, ToolCall as StoredToolCall, call_blocking,
+        MessageKind, SenderKind, StoredMessage, ToolCall as StoredToolCall, ToolState,
+        call_blocking,
     };
 
     struct FakeProvider {
@@ -581,6 +747,28 @@ mod tests {
         .unwrap_or_else(|error| panic!("count {table}: {error}"))
     }
 
+    fn stored_tool_call(
+        id: &str,
+        message_id: &str,
+        tool_name: &str,
+        state: ToolState,
+        tool_output: Option<&str>,
+        error_kind: Option<&str>,
+        error_message: Option<&str>,
+    ) -> StoredToolCall {
+        StoredToolCall {
+            id: id.to_string(),
+            message_id: message_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_input: "{}".to_string(),
+            tool_output: tool_output.map(ToString::to_string),
+            timestamp: format!("2024-01-01T00:00:0{id}Z"),
+            state,
+            error_kind: error_kind.map(ToString::to_string),
+            error_message: error_message.map(ToString::to_string),
+        }
+    }
+
     #[test]
     fn transcript_history_reconstructs_tool_cards_from_messages_and_ledger() {
         // Arrange
@@ -608,6 +796,9 @@ mod tests {
             tool_input: r#"{"command":"pwd"}"#.to_string(),
             tool_output: Some(r#"{"tool":"shell","status":"success","result":"/tmp"}"#.to_string()),
             timestamp: "2024-01-01T00:00:01Z".to_string(),
+            state: ToolState::Succeeded,
+            error_kind: None,
+            error_message: None,
         }];
 
         // Act
@@ -625,6 +816,178 @@ mod tests {
             history[3].content.as_text_lossy(),
             "The working directory is /tmp."
         );
+    }
+
+    #[test]
+    fn transcript_history_reconstructs_failed_tool_as_error() {
+        // Arrange
+        let mut assistant = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "running [tool_call] shell".to_string(),
+        );
+        assistant.id = "assistant-failed".to_string();
+        let mut tool_summary = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "[tool_error]: permission denied".to_string(),
+        );
+        tool_summary.parent_message_id = Some(assistant.id.clone());
+        let calls = vec![stored_tool_call(
+            "failed-call",
+            &assistant.id,
+            "shell",
+            ToolState::Failed,
+            None,
+            Some("tool_error"),
+            Some("permission denied"),
+        )];
+
+        // Act
+        let history = stored_history_to_messages(vec![assistant, tool_summary], calls);
+
+        // Assert
+        assert_eq!(history[0].tool_calls[0].id, "failed-call");
+        assert_eq!(history[1].tool_call_id.as_deref(), Some("failed-call"));
+        assert!(crate::agent_loop::message_format::is_tool_error_message(
+            &history[1]
+        ));
+        assert!(
+            history[1]
+                .content
+                .as_text_lossy()
+                .contains("permission denied")
+        );
+    }
+
+    #[test]
+    fn transcript_history_reconstructs_read_only_tool_from_preview() {
+        // Arrange
+        let mut assistant = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "checking [tool_call] read".to_string(),
+        );
+        assistant.id = "assistant-read-only".to_string();
+        let mut tool_summary = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "[tool_result]: file contents".to_string(),
+        );
+        tool_summary.parent_message_id = Some(assistant.id.clone());
+
+        // Act
+        let history = stored_history_to_messages(vec![assistant, tool_summary], Vec::new());
+
+        // Assert
+        assert_eq!(history.len(), 2, "read-only tool must remain visible");
+        assert_eq!(history[0].tool_calls.len(), 1);
+        assert_eq!(history[0].tool_calls[0].name, "read");
+        assert_eq!(history[1].role, "tool");
+        assert_eq!(
+            history[1].tool_call_id.as_deref(),
+            Some("restored:assistant-read-only:0")
+        );
+        assert!(!crate::agent_loop::message_format::is_tool_error_message(
+            &history[1]
+        ));
+        assert!(history[1].content.as_text_lossy().contains("file contents"));
+    }
+
+    #[test]
+    fn transcript_history_reconstructs_mixed_read_only_and_ledger_tools() {
+        // Arrange
+        let mut assistant = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "checking [tool_call] read, write".to_string(),
+        );
+        assistant.id = "assistant-mixed".to_string();
+        let mut tool_summary = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "[tool_result]: file contents\n[tool_result]: written".to_string(),
+        );
+        tool_summary.parent_message_id = Some(assistant.id.clone());
+        let calls = vec![stored_tool_call(
+            "write-call",
+            &assistant.id,
+            "write",
+            ToolState::Succeeded,
+            Some(r#"{"tool":"write","status":"success","result":"written"}"#),
+            None,
+            None,
+        )];
+
+        // Act
+        let history = stored_history_to_messages(vec![assistant, tool_summary], calls);
+
+        // Assert
+        assert_eq!(
+            history[0]
+                .tool_calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "write"]
+        );
+        assert_eq!(
+            history[1].tool_call_id.as_deref(),
+            Some("restored:assistant-mixed:0")
+        );
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("write-call"));
+        assert!(history[1].content.as_text_lossy().contains("file contents"));
+        assert!(history[2].content.as_text_lossy().contains("written"));
+    }
+
+    #[test]
+    fn transcript_history_matches_success_and_failure_to_each_call() {
+        // Arrange
+        let mut assistant = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "attempt [tool_call] write, shell".to_string(),
+        );
+        assistant.id = "assistant-success-failure".to_string();
+        let mut tool_summary = StoredMessage::assistant(
+            1,
+            "default".to_string(),
+            "[tool_result]: written\n[tool_error]: permission denied".to_string(),
+        );
+        tool_summary.parent_message_id = Some(assistant.id.clone());
+        let calls = vec![
+            stored_tool_call(
+                "success-call",
+                &assistant.id,
+                "write",
+                ToolState::Succeeded,
+                Some(r#"{"tool":"write","status":"success","result":"written"}"#),
+                None,
+                None,
+            ),
+            stored_tool_call(
+                "failure-call",
+                &assistant.id,
+                "shell",
+                ToolState::Failed,
+                None,
+                Some("tool_error"),
+                Some("permission denied"),
+            ),
+        ];
+
+        // Act
+        let history = stored_history_to_messages(vec![assistant, tool_summary], calls);
+
+        // Assert
+        assert_eq!(history[1].tool_call_id.as_deref(), Some("success-call"));
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("failure-call"));
+        assert!(!crate::agent_loop::message_format::is_tool_error_message(
+            &history[1]
+        ));
+        assert!(crate::agent_loop::message_format::is_tool_error_message(
+            &history[2]
+        ));
     }
 
     #[tokio::test]
