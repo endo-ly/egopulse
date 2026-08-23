@@ -6,7 +6,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-const MAX_LINES: usize = 8;
+const MAX_VISIBLE_LINES: usize = 8;
 const MAX_HISTORY: usize = 50;
 
 /// A cursor position measured in Unicode scalar values.
@@ -103,7 +103,7 @@ impl Composer {
     }
 
     pub(crate) fn height(&self) -> u16 {
-        self.lines.len().clamp(1, MAX_LINES) as u16
+        self.lines.len().clamp(1, MAX_VISIBLE_LINES) as u16
     }
 
     pub(crate) fn completion(&self) -> Option<&CompletionState> {
@@ -322,9 +322,6 @@ impl Composer {
     }
 
     fn split_line(&mut self) {
-        if self.lines.len() >= MAX_LINES {
-            return;
-        }
         let byte_index = char_to_byte_index(&self.lines[self.cursor.line], self.cursor.column);
         let tail = self.lines[self.cursor.line].split_off(byte_index);
         self.lines.insert(self.cursor.line + 1, tail);
@@ -729,6 +726,21 @@ mod tests {
         // Assert
         assert_eq!(composer.lines(), &["a".to_string(), "日本語".to_string()]);
         assert_eq!(composer.cursor(), Cursor { line: 1, column: 3 });
+    }
+
+    #[test]
+    fn paste_preserves_lines_beyond_visible_limit() {
+        // Arrange
+        let mut composer = Composer::new();
+        let pasted = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+
+        // Act
+        composer.handle(InputEvent::Paste(pasted.to_string()));
+
+        // Assert
+        assert_eq!(composer.text(), pasted);
+        assert_eq!(composer.lines().len(), 10);
+        assert_eq!(composer.height(), 8);
     }
 
     #[test]

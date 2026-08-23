@@ -44,6 +44,12 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
             "-p/--print cannot be used with a subcommand",
         ));
     }
+    if cli.session.is_some() && cli.command.is_some() {
+        return Err(Cli::command().error(
+            ErrorKind::ArgumentConflict,
+            "--session can only be used with the interactive TUI or --print",
+        ));
+    }
     Ok(())
 }
 
@@ -498,6 +504,13 @@ mod tests {
     #[test]
     fn parse_print_conflicts_with_subcommands() {
         let result = parse_cli_from(&["egopulse", "-p", "run"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_conflicts_with_subcommands() {
+        let result = parse_cli_from(&["egopulse", "--session", "local", "run"]);
 
         assert!(result.is_err());
     }

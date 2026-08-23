@@ -185,23 +185,33 @@ fn draw_composer(frame: &mut ratatui::Frame<'_>, area: Rect, composer: &Composer
     let cursor = composer.cursor();
     let visible_lines = area.height.saturating_sub(2) as usize;
     let scroll = cursor.line.saturating_sub(visible_lines.saturating_sub(1)) as u16;
+    let content_width = area.width.saturating_sub(2).max(1) as usize;
+    let line = composer.lines().get(cursor.line).map_or("", String::as_str);
+    let cursor_width = line_width_until(line, cursor.column);
+    let horizontal_scroll = cursor_width.saturating_sub(content_width.saturating_sub(1));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
-            .scroll((scroll, 0))
+            .scroll((scroll, horizontal_scroll.min(u16::MAX as usize) as u16))
             .block(Block::default().borders(Borders::ALL).title(" Message ")),
         area,
     );
 
-    let line = composer.lines().get(cursor.line).map_or("", String::as_str);
-    let cursor_x = area
-        .x
-        .saturating_add(1)
-        .saturating_add(line.chars().take(cursor.column).collect::<String>().width() as u16);
+    let cursor_x_offset = cursor_width
+        .saturating_sub(horizontal_scroll)
+        .min(content_width.saturating_sub(1)) as u16;
+    let cursor_x = area.x.saturating_add(1).saturating_add(cursor_x_offset);
     let cursor_y = area
         .y
         .saturating_add(1)
         .saturating_add(cursor.line.saturating_sub(scroll as usize) as u16);
     frame.set_cursor_position((cursor_x, cursor_y));
+}
+
+fn line_width_until(line: &str, column: usize) -> usize {
+    line.chars()
+        .take(column)
+        .map(|character| character.width().unwrap_or(0))
+        .sum()
 }
 
 fn draw_status(
@@ -221,7 +231,7 @@ fn draw_status(
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw(status),
-        Span::styled("  Ctrl-C/q quit", Style::default().fg(Color::DarkGray)),
+        Span::styled("  Ctrl-C/Ctrl-D quit", Style::default().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -296,20 +306,37 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, sessions: &Sessions
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_loop::event::AgentEvent;
+    use crate::channels::tui::composer::InputEvent;
     use crate::conversation::SurfaceContext;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use serde_json::json;
 
-    #[test]
-    fn test_backend_contains_composer_and_status() {
-        // Arrange
-        let context = SurfaceContext::new(
+    fn context() -> SurfaceContext {
+        SurfaceContext::new(
             "tui".to_string(),
             "local_user".to_string(),
             "session".to_string(),
             "tui".to_string(),
             "default".to_string(),
-        );
+        )
+    }
+
+    fn rendered(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn test_backend_contains_composer_and_status() {
+        // Arrange
+        let context = context();
         let transcript = Transcript::new();
         let composer = Composer::new();
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("test terminal");
@@ -332,15 +359,137 @@ mod tests {
             .expect("draw succeeds");
 
         // Assert
-        let rendered: String = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
+        let rendered = rendered(&terminal);
         assert!(rendered.contains("Message"));
         assert!(rendered.contains("Ready"));
         assert!(rendered.contains("test-model"));
+    }
+
+    #[test]
+    fn completion_popup_lists_candidates() {
+        // Arrange
+        let context = context();
+        let transcript = Transcript::new();
+        let mut composer = Composer::new();
+        composer.set_completion_candidates(["/model", "/models"]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("test terminal");
+
+        // Act
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    DrawState {
+                        context: &context,
+                        transcript: &transcript,
+                        composer: &composer,
+                        status: "Ready",
+                        model: "test-model",
+                        sessions: None,
+                    },
+                );
+            })
+            .expect("draw succeeds");
+
+        // Assert
+        let rendered = rendered(&terminal);
+        assert!(rendered.contains("Commands"));
+        assert!(rendered.contains("/model"));
+        assert!(rendered.contains("/models"));
+    }
+
+    #[test]
+    fn tool_card_shows_pending_and_result_states() {
+        // Arrange
+        let context = context();
+        let mut transcript = Transcript::new();
+        transcript.begin_turn("run");
+        transcript.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            input: json!({"command": "pwd"}),
+        });
+        let composer = Composer::new();
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("test terminal");
+
+        // Act
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    DrawState {
+                        context: &context,
+                        transcript: &transcript,
+                        composer: &composer,
+                        status: "Working…",
+                        model: "test-model",
+                        sessions: None,
+                    },
+                );
+            })
+            .expect("draw pending tool");
+
+        // Assert
+        let pending = rendered(&terminal);
+        assert!(pending.contains("… shell"));
+
+        // Act
+        transcript.apply_agent_event(AgentEvent::ToolResult {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            is_error: false,
+            preview: "/tmp".to_string(),
+            duration_ms: 12,
+        });
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    DrawState {
+                        context: &context,
+                        transcript: &transcript,
+                        composer: &composer,
+                        status: "Working…",
+                        model: "test-model",
+                        sessions: None,
+                    },
+                );
+            })
+            .expect("draw completed tool");
+
+        // Assert
+        let completed = rendered(&terminal);
+        assert!(completed.contains("✓ shell"));
+        assert!(completed.contains("/tmp (12ms)"));
+    }
+
+    #[test]
+    fn long_line_keeps_cursor_inside_composer() {
+        // Arrange
+        let context = context();
+        let transcript = Transcript::new();
+        let mut composer = Composer::new();
+        composer.handle(InputEvent::Paste("01234567890123456789".to_string()));
+        let mut terminal = Terminal::new(TestBackend::new(12, 10)).expect("test terminal");
+
+        // Act
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    DrawState {
+                        context: &context,
+                        transcript: &transcript,
+                        composer: &composer,
+                        status: "Ready",
+                        model: "test-model",
+                        sessions: None,
+                    },
+                );
+            })
+            .expect("draw succeeds");
+
+        // Assert
+        terminal.backend_mut().assert_cursor_position((10, 6));
     }
 }

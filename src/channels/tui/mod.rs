@@ -401,11 +401,9 @@ impl TuiApp {
                     }
                     SlashCommandOutcome::NotHandled => self.start_agent_turn(prompt),
                 }
-                if !self.busy {
-                    self.status = "Ready".to_string();
-                }
                 if handled {
                     self.busy = false;
+                    self.status = "Ready".to_string();
                     self.insert_pending(terminal)?;
                     self.dispatch_queued_prompt();
                 }
@@ -516,7 +514,7 @@ async fn load_context(
             SurfaceContext::new(
                 chat_info.channel,
                 "local_user".to_string(),
-                persisted_thread(&summary, &agent_id),
+                persisted_thread(&summary),
                 chat_info.chat_type,
                 agent_id,
             )
@@ -538,22 +536,8 @@ fn new_context(state: &AppState, session: String) -> SurfaceContext {
     )
 }
 
-fn persisted_thread(summary: &SessionSummary, agent_id: &str) -> String {
-    let prefix = format!("{}:", summary.channel);
-    let mut thread = summary
-        .external_chat_id
-        .strip_prefix(&prefix)
-        .unwrap_or(&summary.external_chat_id)
-        .to_string();
-    let suffix = format!(":agent:{agent_id}");
-    if let Some(stripped) = thread.strip_suffix(&suffix) {
-        thread = stripped.to_string();
-    }
-    if thread.is_empty() {
-        summary.surface_thread.clone()
-    } else {
-        thread
-    }
+fn persisted_thread(summary: &SessionSummary) -> String {
+    summary.surface_thread.clone()
 }
 
 fn model_for(state: &AppState, context: &SurfaceContext) -> String {

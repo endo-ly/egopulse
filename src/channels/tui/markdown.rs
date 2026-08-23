@@ -1,5 +1,7 @@
 //! Markdown-to-ratatui rendering for committed assistant blocks.
 
+use std::sync::OnceLock;
+
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,6 +34,20 @@ struct Renderer {
 struct CodeBlockState {
     language: Option<String>,
     content: String,
+}
+
+struct HighlightAssets {
+    syntax_set: SyntaxSet,
+    theme_set: ThemeSet,
+}
+
+static HIGHLIGHT_ASSETS: OnceLock<HighlightAssets> = OnceLock::new();
+
+fn highlight_assets() -> &'static HighlightAssets {
+    HIGHLIGHT_ASSETS.get_or_init(|| HighlightAssets {
+        syntax_set: SyntaxSet::load_defaults_newlines(),
+        theme_set: ThemeSet::load_defaults(),
+    })
 }
 
 impl Renderer {
@@ -237,13 +253,13 @@ impl Renderer {
     }
 
     fn render_code_block(&mut self, content: &str, language: Option<&str>) {
-        let syntax_set = SyntaxSet::load_defaults_newlines();
-        let theme_set = ThemeSet::load_defaults();
-        let syntax = language.and_then(|language| syntax_set.find_syntax_by_token(language));
-        let theme = theme_set
+        let assets = highlight_assets();
+        let syntax = language.and_then(|language| assets.syntax_set.find_syntax_by_token(language));
+        let theme = assets
+            .theme_set
             .themes
             .get("base16-ocean.dark")
-            .or_else(|| theme_set.themes.values().next())
+            .or_else(|| assets.theme_set.themes.values().next())
             .expect("syntect ships at least one default theme");
         let mut highlighter = syntax.map(|syntax| HighlightLines::new(syntax, theme));
         let mut emitted = false;
@@ -254,7 +270,7 @@ impl Renderer {
             self.append_text("│ ", Style::default().fg(Color::DarkGray));
             let source_line = source_line.trim_end_matches(['\r', '\n']);
             if let Some(highlighter) = &mut highlighter {
-                match highlighter.highlight_line(source_line, &syntax_set) {
+                match highlighter.highlight_line(source_line, &assets.syntax_set) {
                     Ok(ranges) => {
                         for (style, text) in ranges {
                             self.append_text(text, syntect_style(style));
@@ -319,13 +335,13 @@ mod tests {
             lines[0]
                 .spans
                 .iter()
-                .any(|span| span.style == span.style.add_modifier(Modifier::BOLD))
+                .any(|span| span.style.has_modifier(Modifier::BOLD))
         );
         assert!(
             lines[0]
                 .spans
                 .iter()
-                .any(|span| span.style == span.style.add_modifier(Modifier::UNDERLINED))
+                .any(|span| span.style.has_modifier(Modifier::UNDERLINED))
         );
     }
 
