@@ -1,6 +1,7 @@
 //! Conversation transcript and active-turn state.
 
 use crate::agent_loop::event::AgentEvent;
+use crate::agent_loop::message_format::{is_tool_error_message, tool_result_body};
 use crate::llm::Message;
 
 /// A committed conversation block that can be sent to terminal scrollback.
@@ -28,7 +29,7 @@ pub(crate) enum ToolStatus {
     Completed {
         is_error: bool,
         preview: String,
-        duration_ms: u128,
+        duration_ms: Option<u128>,
     },
 }
 
@@ -56,13 +57,31 @@ impl Transcript {
     /// Builds a transcript from messages already persisted for a session.
     pub(crate) fn from_messages(messages: &[Message]) -> Self {
         let mut transcript = Self::new();
+        let mut blocks = Vec::new();
         for message in messages {
             let content = message.content.as_text_lossy();
             match message.role.as_str() {
-                "user" => transcript.commit(Block::User(content)),
-                "assistant" | "system" | "tool" => transcript.commit(Block::Assistant(content)),
-                _ => transcript.commit(Block::Assistant(content)),
+                "user" => blocks.push(Block::User(content)),
+                "assistant" => {
+                    if !content.trim().is_empty() {
+                        blocks.push(Block::Assistant(content));
+                    }
+                    blocks.extend(message.tool_calls.iter().map(|tool_call| {
+                        Block::Tool(ToolBlock {
+                            call_id: tool_call.id.clone(),
+                            name: tool_call.name.clone(),
+                            input: summarize_json(&tool_call.arguments),
+                            status: ToolStatus::Running,
+                        })
+                    }));
+                }
+                "tool" => restore_tool_result(&mut blocks, message),
+                "system" => blocks.push(Block::Assistant(content)),
+                _ => blocks.push(Block::Assistant(content)),
             }
+        }
+        for block in blocks {
+            transcript.commit(block);
         }
         transcript
     }
@@ -128,7 +147,7 @@ impl Transcript {
                     card.status = ToolStatus::Completed {
                         is_error,
                         preview,
-                        duration_ms,
+                        duration_ms: Some(duration_ms),
                     };
                 } else {
                     active.tool_cards.push(ToolBlock {
@@ -138,7 +157,7 @@ impl Transcript {
                         status: ToolStatus::Completed {
                             is_error,
                             preview,
-                            duration_ms,
+                            duration_ms: Some(duration_ms),
                         },
                     });
                 }
@@ -174,6 +193,35 @@ impl Transcript {
     }
 }
 
+fn restore_tool_result(blocks: &mut Vec<Block>, message: &Message) {
+    let preview = crate::channels::utils::text::truncate_by_chars(
+        &tool_result_body(&message.content.as_text_lossy()),
+        120,
+    );
+    let status = ToolStatus::Completed {
+        is_error: is_tool_error_message(message),
+        preview,
+        duration_ms: None,
+    };
+
+    if let Some(tool_call_id) = message.tool_call_id.as_deref()
+        && let Some(Block::Tool(tool)) = blocks
+            .iter_mut()
+            .rev()
+            .find(|block| matches!(block, Block::Tool(tool) if tool.call_id == tool_call_id))
+    {
+        tool.status = status;
+        return;
+    }
+
+    blocks.push(Block::Tool(ToolBlock {
+        call_id: message.tool_call_id.clone().unwrap_or_default(),
+        name: "tool".to_string(),
+        input: String::new(),
+        status,
+    }));
+}
+
 fn summarize_json(value: &serde_json::Value) -> String {
     let text = value.to_string().replace(['\n', '\r'], " ");
     crate::channels::utils::text::truncate_by_chars(&text, 120)
@@ -182,6 +230,7 @@ fn summarize_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::{Message, MessageContent, ToolCall};
     use serde_json::json;
 
     #[test]
@@ -237,10 +286,64 @@ mod tests {
                 status: ToolStatus::Completed {
                     is_error: false,
                     preview: "/tmp".to_string(),
-                    duration_ms: 12,
+                    duration_ms: Some(12),
                 },
             })
         );
+    }
+
+    #[test]
+    fn persisted_tool_messages_restore_as_tool_cards() {
+        // Arrange
+        let messages = vec![
+            Message::text("user", "inspect"),
+            Message {
+                role: "assistant".to_string(),
+                content: MessageContent::text(""),
+                reasoning_content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: json!({"command": "pwd"}),
+                }],
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: MessageContent::text(
+                    r#"{"tool":"shell","status":"success","result":"/tmp"}"#,
+                ),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-1".to_string()),
+            },
+            Message::text("assistant", "The working directory is /tmp."),
+        ];
+
+        // Act
+        let mut transcript = Transcript::from_messages(&messages);
+        let pending = transcript.drain_pending();
+
+        // Assert
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(pending[0], Block::User(ref text) if text == "inspect"));
+        assert!(matches!(
+            pending[1],
+            Block::Tool(ToolBlock {
+                ref name,
+                ref status,
+                ..
+            }) if name == "shell"
+                && *status == ToolStatus::Completed {
+                    is_error: false,
+                    preview: "/tmp".to_string(),
+                    duration_ms: None,
+                }
+        ));
+        assert!(matches!(
+            pending[2],
+            Block::Assistant(ref text) if text == "The working directory is /tmp."
+        ));
     }
 
     #[test]

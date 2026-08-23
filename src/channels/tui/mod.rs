@@ -14,6 +14,7 @@ use std::io::{self, Stdout};
 use std::sync::Arc;
 
 use crossterm::cursor::MoveToColumn;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
@@ -62,14 +63,21 @@ impl TuiSession {
         }
 
         enable_raw_mode().map_err(|error| TuiError::InitFailed(error.to_string()))?;
-        let stdout = io::stdout();
+        let mut stdout = io::stdout();
+        if let Err(error) = execute!(stdout, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(TuiError::InitFailed(error.to_string()));
+        }
+
         let terminal = Terminal::with_options(
-            CrosstermBackend::new(stdout),
+            CrosstermBackend::new(io::stdout()),
             TerminalOptions {
                 viewport: Viewport::Inline(INLINE_VIEWPORT_HEIGHT),
             },
         )
         .map_err(|error| {
+            let mut stdout = io::stdout();
+            let _ = execute!(stdout, DisableBracketedPaste);
             let _ = disable_raw_mode();
             TuiError::InitFailed(error.to_string())
         })?;
@@ -82,8 +90,9 @@ impl Drop for TuiSession {
     fn drop(&mut self) {
         let _ = self.terminal.show_cursor();
         let _ = self.terminal.clear();
-        let _ = disable_raw_mode();
         let mut stdout = io::stdout();
+        let _ = execute!(stdout, DisableBracketedPaste);
+        let _ = disable_raw_mode();
         let _ = execute!(
             stdout,
             Clear(ClearType::FromCursorDown),
@@ -248,7 +257,7 @@ impl TuiApp {
             return;
         }
 
-        let candidates = slash_commands::completion_candidates(prefix);
+        let candidates = completion_candidates(prefix);
         if candidates.len() == 1 && candidates[0] == prefix {
             self.composer.clear_completion();
         } else {
@@ -285,7 +294,7 @@ impl TuiApp {
         let state = Arc::clone(&self.state);
         let context = self.context.clone();
         let tx = self.runtime_tx.clone();
-        tokio::spawn(async move {
+        self.state.supervisor.spawn_turn(async move {
             let outcome =
                 slash_commands::process_slash_command(&state, &context, &prompt, None).await;
             let _ = tx.send(RuntimeEvent::SlashFinished { prompt, outcome });
@@ -301,7 +310,7 @@ impl TuiApp {
         let context = self.context.clone();
         let event_tx = self.runtime_tx.clone();
         let completion_tx = self.runtime_tx.clone();
-        tokio::spawn(async move {
+        self.state.supervisor.spawn_turn(async move {
             let result = agent_loop::process_turn_with_events(
                 &dependencies,
                 &context,
@@ -320,7 +329,7 @@ impl TuiApp {
         self.status = "Loading sessions…".to_string();
         let state = Arc::clone(&self.state);
         let tx = self.runtime_tx.clone();
-        tokio::spawn(async move {
+        self.state.supervisor.spawn_turn(async move {
             let result = agent_loop::list_sessions(&state.turn_dependencies()).await;
             let _ = tx.send(RuntimeEvent::SessionsLoaded(result));
         });
@@ -331,6 +340,7 @@ impl TuiApp {
             SessionAction::Close => {
                 self.sessions = None;
                 self.status = "Ready".to_string();
+                self.dispatch_queued_prompt();
             }
             SessionAction::Open(summary) => {
                 self.sessions = None;
@@ -349,7 +359,7 @@ impl TuiApp {
         self.status = "Loading session…".to_string();
         let state = Arc::clone(&self.state);
         let tx = self.runtime_tx.clone();
-        tokio::spawn(async move {
+        self.state.supervisor.spawn_turn(async move {
             let result = load_context(&state, startup).await;
             let _ = tx.send(RuntimeEvent::SessionLoaded(result));
         });
@@ -403,6 +413,7 @@ impl TuiApp {
                 }
                 if handled {
                     self.busy = false;
+                    self.model = model_for(&self.state, &self.context);
                     self.status = "Ready".to_string();
                     self.insert_pending(terminal)?;
                     self.dispatch_queued_prompt();
@@ -415,7 +426,10 @@ impl TuiApp {
                         self.sessions = Some(SessionsOverlay::new(sessions));
                         self.status = "Select a session".to_string();
                     }
-                    Err(error) => self.status = error.user_message(),
+                    Err(error) => {
+                        self.status = error.user_message();
+                        self.dispatch_queued_prompt();
+                    }
                 }
             }
             RuntimeEvent::SessionLoaded(result) => {
@@ -429,7 +443,10 @@ impl TuiApp {
                         self.insert_pending(terminal)?;
                         self.dispatch_queued_prompt();
                     }
-                    Err(error) => self.status = error.user_message(),
+                    Err(error) => {
+                        self.status = error.user_message();
+                        self.dispatch_queued_prompt();
+                    }
                 }
             }
         }
@@ -463,10 +480,18 @@ pub(crate) async fn run(
     let shutdown = state.supervisor.shutdown_token();
     let mut redraw_tick = tokio::time::interval(MAX_FRAME_INTERVAL);
     let mut dirty = true;
+    let mut critical_failure = None;
 
     loop {
         tokio::select! {
             _ = redraw_tick.tick() => {
+                if let Some(outcome) = state.supervisor.poll_long_lived() {
+                    let summary = outcome.failure_summary();
+                    state.runtime_status.record_critical_task_failure(&summary);
+                    tracing::warn!(task = %outcome.name(), result = ?outcome.result(), %summary, "critical task exited; initiating TUI shutdown");
+                    critical_failure = Some(summary);
+                    break;
+                }
                 if dirty {
                     app.draw(&mut terminal)?;
                     dirty = false;
@@ -491,6 +516,9 @@ pub(crate) async fn run(
     }
 
     state.supervisor.shutdown().await;
+    if let Some(message) = critical_failure {
+        return Err(EgoPulseError::Internal(message));
+    }
     Ok(())
 }
 
@@ -540,6 +568,25 @@ fn persisted_thread(summary: &SessionSummary) -> String {
     summary.surface_thread.clone()
 }
 
+const TUI_ONLY_COMMANDS: &[&str] = &["/sessions"];
+
+fn completion_candidates(prefix: &str) -> Vec<String> {
+    let prefix = prefix.trim_start();
+    if !prefix.starts_with('/') || prefix.split_whitespace().count() != 1 {
+        return Vec::new();
+    }
+
+    let normalized_prefix = prefix.to_ascii_lowercase();
+    let mut candidates = slash_commands::completion_candidates(prefix);
+    candidates.extend(
+        TUI_ONLY_COMMANDS
+            .iter()
+            .filter(|command| command.starts_with(&normalized_prefix))
+            .map(|command| (*command).to_string()),
+    );
+    candidates
+}
+
 fn model_for(state: &AppState, context: &SurfaceContext) -> String {
     let config = state.current_config();
     config
@@ -576,5 +623,28 @@ fn agent_status(event: &AgentEvent) -> String {
         ),
         AgentEvent::FinalResponse { .. } => "Ready".to_string(),
         AgentEvent::Error { .. } => "Turn failed".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::completion_candidates;
+
+    #[test]
+    fn completion_includes_tui_only_sessions_command() {
+        // Arrange / Act
+        let candidates = completion_candidates("/se");
+
+        // Assert
+        assert_eq!(candidates, ["/sessions"]);
+    }
+
+    #[test]
+    fn completion_keeps_shared_commands() {
+        // Arrange / Act
+        let candidates = completion_candidates("/mo");
+
+        // Assert
+        assert_eq!(candidates, ["/models", "/model"]);
     }
 }

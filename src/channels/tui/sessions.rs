@@ -1,6 +1,7 @@
 //! Session overlay state and startup selection.
 
 use crossterm::event::{KeyCode, KeyEvent};
+use std::ops::Range;
 
 use crate::storage::SessionSummary;
 
@@ -34,6 +35,17 @@ impl SessionsOverlay {
 
     pub(crate) fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// Returns the smallest session window that keeps the selection visible.
+    pub(crate) fn visible_range(&self, max_items: usize) -> Range<usize> {
+        let visible_count = max_items.max(1).min(self.sessions.len());
+        let max_start = self.sessions.len().saturating_sub(visible_count);
+        let start = self
+            .selected
+            .saturating_sub(visible_count.saturating_sub(1))
+            .min(max_start);
+        start..start + visible_count
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> SessionAction {
@@ -144,5 +156,28 @@ mod tests {
 
         // Assert
         assert_eq!(choice, StartupSession::Named("new-name".to_string()));
+    }
+
+    #[test]
+    fn visible_range_keeps_selected_session_on_screen() {
+        // Arrange
+        let sessions = (0..20)
+            .map(|index| summary(&format!("session-{index}")))
+            .collect();
+        let mut overlay = SessionsOverlay::new(sessions);
+
+        // Act
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        overlay.handle_key(KeyEvent::from(KeyCode::Char('j')));
+
+        // Assert
+        let visible = overlay.visible_range(5);
+        assert_eq!(visible, 3..8);
+        assert!(visible.contains(&overlay.selected()));
     }
 }

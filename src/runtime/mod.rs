@@ -837,17 +837,7 @@ async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
 
     loop {
         if let Some(outcome) = state.supervisor.poll_long_lived() {
-            let summary = match outcome.result() {
-                supervisor::TaskResult::Ok => {
-                    format!("critical task '{}' exited unexpectedly", outcome.name())
-                }
-                supervisor::TaskResult::Err(msg) => {
-                    format!("critical task '{}' failed: {msg}", outcome.name())
-                }
-                supervisor::TaskResult::Panic => {
-                    format!("critical task '{}' panicked", outcome.name())
-                }
-            };
+            let summary = outcome.failure_summary();
             state.runtime_status.record_critical_task_failure(&summary);
             tracing::warn!(
                 task = %outcome.name(),

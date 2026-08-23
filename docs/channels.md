@@ -311,10 +311,11 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 ### データフロー
 
 - **入力**: crossterm `EventStream` から key / paste / resize を受信
-- **送信**: `agent_loop::process_turn_with_events` を `tokio::spawn` し、`AgentEvent` を mpsc で TUI へ転送
+- **送信**: `RuntimeSupervisor` が所有する turn task で `agent_loop::process_turn_with_events` を実行し、`AgentEvent` を mpsc で TUI へ転送
 - **確定出力**: ユーザー発言、最終応答、確定ツールカード、エラーを `terminal.insert_before()` で一度だけスクロールバックへ出力
 - **再描画**: dirty フラグを 16ms 間隔で coalesce し、高頻度の Delta をまとめて表示
 - **同時実行**: ターンは 1 件。実行中の追加送信は 1 件だけ保留し、完了後に自動送信
+- **端末ライフサイクル**: raw mode と bracketed paste mode を TUI の生成・破棄に合わせて有効化・解除する
 
 ### 起動とセッション
 
@@ -322,10 +323,11 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 - `--session` 省略時は最終更新セッションを開き、保存済みセッションがなければ新規コンテキストを作る
 - `--session` に未知の名前を指定した場合は、その名前の新規 TUI セッションを作る
 - 起動時の端末高さが 10 行未満の場合はエラー終了する
+- セッション履歴の tool call / tool result はツールカードとして復元する
 
 ### コンポーザ操作
 
-`Enter` は送信、`Alt+Enter` / `Shift+Enter` は改行、上下キーは行移動（行端では履歴移動）、`Ctrl+Left` / `Alt+B` と `Ctrl+Right` / `Alt+F` は単語移動に使う。`Ctrl+W` / `Ctrl+U` / `Ctrl+K` は削除操作、`Tab` はスラッシュコマンド候補の確定、`Esc` は候補を閉じる。空入力での `Ctrl+C` は終了し、入力中の `Ctrl+C` は入力を消去する。
+`Enter` は送信、`Alt+Enter` / `Shift+Enter` は改行、上下キーは行移動（行端では履歴移動）、`Ctrl+Left` / `Alt+B` と `Ctrl+Right` / `Alt+F` は単語移動に使う。`Ctrl+W` / `Ctrl+U` / `Ctrl+K` は削除操作、`Tab` はスラッシュコマンド候補の確定、`Esc` は候補を閉じる。空入力での `Ctrl+C` は終了し、入力中の `Ctrl+C` は入力を消去する。スラッシュ補完には共通コマンドに加えて TUI 専用の `/sessions` を表示する。
 
 ### 制約
 

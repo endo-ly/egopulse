@@ -137,6 +137,17 @@ impl TaskOutcome {
     pub(crate) fn result(&self) -> &TaskResult {
         &self.result
     }
+
+    /// Formats the failure summary consumed by runtime frontends.
+    pub(crate) fn failure_summary(&self) -> String {
+        match &self.result {
+            TaskResult::Ok => format!("critical task '{}' exited unexpectedly", self.name()),
+            TaskResult::Err(message) => {
+                format!("critical task '{}' failed: {message}", self.name())
+            }
+            TaskResult::Panic => format!("critical task '{}' panicked", self.name()),
+        }
+    }
 }
 
 /// Owns runtime tasks and orchestrates graceful shutdown.

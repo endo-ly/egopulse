@@ -63,27 +63,37 @@ pub(crate) async fn list_sessions(
         .map_err(EgoPulseError::from)
 }
 
-/// Loads a session history and converts it into plain LLM messages.
+/// Loads a session history while preserving tool calls and tool results.
 pub(crate) async fn load_session_messages(
     state: &TurnDependencies,
     context: &SurfaceContext,
 ) -> Result<Vec<Message>, EgoPulseError> {
     let chat_id = resolve_chat_id(state, context).await?;
-    let history = call_blocking(state.db_for(context.scope), move |db| {
-        db.get_all_messages(chat_id)
+    let max_history_messages = state.current_config().max_history_messages;
+    let snapshot = call_blocking(state.db_for(context.scope), move |db| {
+        db.load_session_snapshot(chat_id, max_history_messages)
     })
     .await?;
-    Ok(history
-        .into_iter()
-        .map(|message| {
-            let role = match message.sender_kind {
-                SenderKind::Assistant | SenderKind::Tool => "assistant",
-                SenderKind::User => "user",
-                SenderKind::System => "system",
-            };
-            Message::text(role, message.content)
+    if snapshot.messages_json.is_none() {
+        let history = call_blocking(state.db_for(context.scope), move |db| {
+            db.get_all_messages(chat_id)
         })
-        .collect())
+        .await?;
+        return Ok(history
+            .into_iter()
+            .map(|message| {
+                let role = match message.sender_kind {
+                    SenderKind::Assistant => "assistant",
+                    SenderKind::Tool => "tool",
+                    SenderKind::User => "user",
+                    SenderKind::System => "system",
+                };
+                Message::text(role, message.content)
+            })
+            .collect());
+    }
+    let loaded = snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await?;
+    Ok((*loaded.messages).clone())
 }
 
 /// Loads the trimmed session snapshot used as input for the next agent turn.

@@ -163,11 +163,11 @@ fn render_tool(tool: &ToolBlock) -> Vec<Line<'static>> {
             } else {
                 Style::default().fg(Color::Green)
             };
-            (
-                if *is_error { "×" } else { "✓" },
-                style,
-                format!("{preview} ({duration_ms}ms)"),
-            )
+            let detail = duration_ms.map_or_else(
+                || preview.clone(),
+                |duration_ms| format!("{preview} ({duration_ms}ms)"),
+            );
+            (if *is_error { "×" } else { "✓" }, style, detail)
         }
     };
     vec![Line::from(vec![
@@ -270,10 +270,13 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, sessions: &Sessions
             Line::from("n: new  Esc: close"),
         ]
     } else {
+        let visible = sessions.visible_range(area.height.saturating_sub(2) as usize);
         sessions
             .sessions()
             .iter()
             .enumerate()
+            .skip(visible.start)
+            .take(visible.len())
             .map(|(index, session)| {
                 let marker = if index == sessions.selected() {
                     "▸"
