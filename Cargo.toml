@@ -33,7 +33,11 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 rusqlite = { version = "0.39", features = ["bundled"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 pulldown-cmark = "0.13"
-syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+syntect = {
+    version = "5.2",
+    default-features = false,
+    features = ["default-syntaxes", "default-themes", "regex-fancy"],
+}
 unicode-width = "0.2"
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
