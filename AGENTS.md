@@ -7,12 +7,12 @@ Self-hosted AI agent runtime (Rust/Tokio). TUI / Web UI / Discord / Telegram in 
 リポジトリは `src/`(Rust 単一バイナリ) / `web/`(React Web UI) / `docs/`(仕様書) / `scripts/`(セットアップ) からなる。以下は `src/` の主要モジュール。
 
 - **Agent-First 設計**: `agent_id` を支配的識別子とし、同一ランタイム上に複数のエージェントが独立した記憶を持って並立・委譲し合う。チャネルもツールもすべてエージェントに紐づく
-- `main.rs` / `lib.rs` - CLI エントリポイント（`chat` / `run` / `ask` / `setup` / `gateway`）とモジュール公開インターフェース
+- `main.rs` / `lib.rs` - CLI エントリポイント（引数なしの TUI / `-p` headless / `run` / `setup` / `gateway`）とモジュール公開インターフェース
 - `runtime/` - AppState 構築・チャネル起動・ライフサイクル管理。Web / Discord / Telegram を tokio task として同時起動し、graceful shutdownで安全停止。TurnScheduler による同時実行制御と暴走防止も担う
 - `conversation.rs` - ConversationScope / SurfaceContext。チャネル・Runtime・Agent Loop が共有する会話識別コンテキスト
 - `runtime/turn/` - Scheduled Turn の durable 表現、scheduler、dispatch、Tool Progress を束ねる Runtime subsystem
 - `agent_loop/` - 会話ターン処理。`turn/` が durable Turn を調停し、`loop_runner.rs` が最大 50 イテレーションの Agent Loop、`model_step.rs` が LLM の 1 step、`tool_execution.rs` が Tool 実行を担う。Prompt 関連は `prompt/` に集約する
-- `channels/` - チャネル実装。Web（Axum + SSE/WebSocket）/ Discord / Telegram / TUI / CLI を統一インターフェース（ChannelAdapter）で扱う
+- `channels/` - チャネル実装。Web（Axum + SSE/WebSocket）/ Discord / Telegram / TUI を統一インターフェース（ChannelAdapter）で扱い、CLI headless は root の `-p` から runtime へ接続する
 - `llm/` - LLM プロバイダー抽象化（OpenAI 互換 API）と Codex 認証の解決
 - `config/` - YAML 設定（`~/.egopulse/egopulse.config.yaml`）の読み込み・永続化・モデル/チャネル解決。SecretRef による秘密参照もここ
 - `storage/` - SQLite（WAL モード）永続化。会話・メッセージ・セッション・ツール呼び出し・LLM 利用量を保存。マイグレーション管理も含む

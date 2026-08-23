@@ -74,6 +74,18 @@ pub async fn ask_in_session(
     prompt: &str,
 ) -> Result<String, EgoPulseError> {
     let state = crate::runtime::build_app_state(config).await?;
+    ask_in_session_with_state(&state, session, prompt).await
+}
+
+/// Sends a one-shot prompt within a named persistent session on an initialized state.
+///
+/// # Errors
+/// Returns [`EgoPulseError`] when the turn cannot be processed or Ctrl-C interrupts it.
+pub async fn ask_in_session_with_state(
+    state: &crate::runtime::AppState,
+    session: &str,
+    prompt: &str,
+) -> Result<String, EgoPulseError> {
     let context = SurfaceContext {
         channel: "cli".to_string(),
         surface_user: "local_user".to_string(),

@@ -38,12 +38,14 @@ pub fn init_logging(level: &str) -> Result<(), LoggingError> {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
+            .with_writer(std::io::stderr)
             .json()
             .try_init()
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)
+            .with_writer(std::io::stderr)
             .try_init()
     };
 
