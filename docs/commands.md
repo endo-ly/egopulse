@@ -18,7 +18,7 @@ CLI サブコマンドとチャットスラッシュコマンドの完全仕様�
 
 | コマンド | 引数 | 説明 | 設定必須 |
 |---|---|---|:---:|
-| `egopulse` | なし | ローカル TUI（セッションブラウザ + チャット） | 必須 |
+| `egopulse` | `[--session <SESSION>]` | ローカル Inline TUI | 必須 |
 | `egopulse setup` | なし | 対話型設定ウィザード（非シークレット入力は表示、API key / Bot Token は hidden） | 不要 |
 | `egopulse -p [PROMPT]` | `[--session <SESSION>]` / `[--continue]` | 非対話プロンプト、応答だけを stdout に出力 | 必須 |
 | `egopulse run` | なし | 有効チャネルを一括起動（前景実行） | 必須 |
@@ -27,7 +27,7 @@ CLI サブコマンドとチャットスラッシュコマンドの完全仕様�
 | `egopulse events extract` | `[--agent] [--from] [--to]` | 過去セッションからエピソードイベントを再抽出（バックフィル） | 必須 |
 | `egopulse update` | なし | 最新リリースに更新 | 不要 |
 
-`-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は、TTY でない stdin から読み込む。`PROMPT` と stdin の両方がある場合は、両者を空行 2 つで連結する。`--session` は指定セッションを再開し、`--continue` は最終更新セッションを再開する。成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。プロンプトがない場合は終了コード 2、それ以外のエラーは 1、Ctrl-C は 0 で終了する。引数なしの `egopulse` は TUI を起動する。
+`-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は、TTY でない stdin から読み込む。`PROMPT` と stdin の両方がある場合は、両者を空行 2 つで連結する。headless 実行の `--session` は指定セッションを再開し、`--continue` は最終更新セッションを再開する。引数なしの `egopulse` では `--session` が指定セッションを開き、省略時は最終更新セッションまたは新規コンテキストを Inline TUI で開く。headless の成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。プロンプトがない場合は終了コード 2、それ以外のエラーは 1、Ctrl-C は 0 で終了する。
 
 ### 1.2 グローバルオプション
 
@@ -109,6 +109,7 @@ Telegram / Discord / TUI / Web チャット のいずれかで `/` から始ま�
 |---|---|---|
 | `/new` | なし | 新規セッションを開始。現在のセッション snapshot とメッセージ履歴をクリア |
 | `/compact` | なし | 手動 Safety Compaction をトリガー。閾値に関わらず現在のセッションを要約 |
+| `/sessions` | なし | TUI で保存済みセッションの切替オーバーレイを開く（TUI 専用） |
 
 #### プロバイダー・モデル操作
 
