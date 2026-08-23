@@ -978,7 +978,7 @@ impl EventHandler for Handler {
             .iter()
             .map(|c| {
                 let builder =
-                    serenity::builder::CreateCommand::new(c.name).description(c.description);
+                    serenity::builder::CreateCommand::new(c.names[0]).description(c.description);
                 if c.usage.contains('[') {
                     builder.add_option(
                         serenity::builder::CreateCommandOption::new(

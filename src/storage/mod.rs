@@ -299,6 +299,9 @@ pub(crate) struct ToolCall {
     pub tool_input: String,
     pub tool_output: Option<String>,
     pub timestamp: String,
+    pub state: ToolState,
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
 }
 
 define_enum! {

@@ -44,6 +44,12 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
             "-p/--print cannot be used with a subcommand",
         ));
     }
+    if cli.session.is_some() && cli.command.is_some() {
+        return Err(Cli::command().error(
+            ErrorKind::ArgumentConflict,
+            "--session can only be used with the interactive TUI or --print",
+        ));
+    }
     Ok(())
 }
 
@@ -65,12 +71,7 @@ struct Cli {
     #[arg(requires = "print", value_name = "PROMPT")]
     prompt: Option<String>,
     /// Persistent session to continue.
-    #[arg(
-        long,
-        value_name = "SESSION",
-        requires = "print",
-        conflicts_with = "continue_"
-    )]
+    #[arg(long, value_name = "SESSION", conflicts_with = "continue_")]
     session: Option<String>,
     /// Continue the most recently updated session.
     #[arg(long = "continue", requires = "print", conflicts_with = "session")]
@@ -290,7 +291,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
             unreachable!("handled without config")
         }
-        None => runtime::run_tui(config, resolved_config_path)
+        None => runtime::run_tui(config, resolved_config_path, cli.session.as_deref())
             .await
             .map_err(Into::into),
     }
@@ -492,8 +493,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_for_tui() {
+        let cli = Cli::try_parse_from(["egopulse", "--session", "local"]).expect("parse");
+
+        assert!(!cli.print);
+        assert_eq!(cli.session.as_deref(), Some("local"));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
     fn parse_print_conflicts_with_subcommands() {
         let result = parse_cli_from(&["egopulse", "-p", "run"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_conflicts_with_subcommands() {
+        let result = parse_cli_from(&["egopulse", "--session", "local", "run"]);
 
         assert!(result.is_err());
     }

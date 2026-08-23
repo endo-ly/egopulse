@@ -642,9 +642,13 @@ pub async fn list_session_names(state: &AppState) -> Result<Vec<String>, EgoPuls
 }
 
 /// Starts the local TUI channel with a fully built application state.
-pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(), EgoPulseError> {
+pub async fn run_tui(
+    config: Config,
+    config_path: Option<PathBuf>,
+    session: Option<&str>,
+) -> Result<(), EgoPulseError> {
     let state = build_app_state_with_path(config, config_path).await?;
-    channels::tui::run(state).await
+    channels::tui::run(state, session).await
 }
 
 fn spawn_web_channel(state: &Arc<AppState>) -> bool {
@@ -833,17 +837,7 @@ async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
 
     loop {
         if let Some(outcome) = state.supervisor.poll_long_lived() {
-            let summary = match outcome.result() {
-                supervisor::TaskResult::Ok => {
-                    format!("critical task '{}' exited unexpectedly", outcome.name())
-                }
-                supervisor::TaskResult::Err(msg) => {
-                    format!("critical task '{}' failed: {msg}", outcome.name())
-                }
-                supervisor::TaskResult::Panic => {
-                    format!("critical task '{}' panicked", outcome.name())
-                }
-            };
+            let summary = outcome.failure_summary();
             state.runtime_status.record_critical_task_failure(&summary);
             tracing::warn!(
                 task = %outcome.name(),

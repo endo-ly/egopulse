@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use rusqlite::{OptionalExtension, params};
 
 use sha2::{Digest, Sha256};
@@ -18,7 +20,8 @@ impl Database {
     ) -> Result<Vec<ToolCall>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
-            "SELECT id, message_id, tool_name, tool_input, tool_output, timestamp
+            "SELECT id, message_id, tool_name, tool_input, tool_output, timestamp,
+                    state, error_kind, error_message
              FROM tool_calls WHERE chat_id = ?1 ORDER BY timestamp",
         )?;
         let calls = stmt
@@ -30,6 +33,9 @@ impl Database {
                     tool_input: row.get(3)?,
                     tool_output: row.get(4)?,
                     timestamp: row.get(5)?,
+                    state: parse_row_enum!(row, 6, ToolState)?,
+                    error_kind: row.get(7)?,
+                    error_message: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -551,6 +557,15 @@ mod tests {
             "2024-01-01T00:00:01Z",
         )
         .expect("insert second");
+        db.get_conn()
+            .expect("conn")
+            .execute(
+                "UPDATE tool_calls
+                 SET state = 'failed', error_kind = 'tool_error', error_message = 'denied'
+                 WHERE id = 'tool-1' AND chat_id = ?1 AND message_id = 'message-2'",
+                params![chat_id],
+            )
+            .expect("mark second failed");
 
         let calls = db.get_tool_calls_for_chat(chat_id).expect("tool calls");
         assert_eq!(calls.len(), 2, "composite PK scopes by message");
@@ -558,6 +573,9 @@ mod tests {
         assert_eq!(calls[1].message_id, "message-2");
         assert_eq!(calls[0].tool_output.as_deref(), Some(r#"{"result":"ok"}"#));
         assert!(calls[1].tool_output.is_none());
+        assert_eq!(calls[1].state, ToolState::Failed);
+        assert_eq!(calls[1].error_kind.as_deref(), Some("tool_error"));
+        assert_eq!(calls[1].error_message.as_deref(), Some("denied"));
     }
 
     #[test]

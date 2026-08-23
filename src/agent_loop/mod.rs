@@ -17,12 +17,11 @@ pub(crate) mod test_support;
 pub(crate) mod tool_execution;
 pub(crate) mod turn;
 
-pub(crate) use session::{list_sessions, load_session_messages, resolve_chat_id};
+pub(crate) use session::{list_sessions, load_transcript_history, resolve_chat_id};
 pub(crate) use turn::dependencies::TurnDependencies;
 #[cfg(test)]
 pub(crate) use turn::process_turn;
 pub use turn::{ask_in_session, ask_in_session_with_state};
 pub(crate) use turn::{
     process_turn_with_events, process_turn_with_events_and_snapshot, resume_input_committed_turn,
-    send_turn,
 };

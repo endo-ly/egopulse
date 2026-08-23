@@ -1107,7 +1107,7 @@ pub(crate) async fn start_telegram_bot_for_bot(
 
         let commands: Vec<BotCommand> = slash_commands::all_commands()
             .iter()
-            .map(|c| BotCommand::new(c.name, c.description))
+            .map(|c| BotCommand::new(c.names[0], c.description))
             .collect();
         if let Err(e) = bot.set_my_commands(commands).await {
             warn!("Telegram: failed to set bot commands: {e}");
@@ -1472,13 +1472,13 @@ mod tests {
         let registry = crate::slash_commands::all_commands();
         let bot_commands: Vec<BotCommand> = registry
             .iter()
-            .map(|c| BotCommand::new(c.name, c.description))
+            .map(|c| BotCommand::new(c.names[0], c.description))
             .collect();
 
         assert_eq!(bot_commands.len(), registry.len());
 
         for (bot_cmd, reg) in bot_commands.iter().zip(registry.iter()) {
-            assert_eq!(bot_cmd.command, reg.name);
+            assert_eq!(bot_cmd.command, reg.names[0]);
             assert_eq!(bot_cmd.description, reg.description);
         }
     }

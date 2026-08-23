@@ -129,6 +129,10 @@ pub(crate) async fn handle_slash_command(
     let command = bare_command.to_ascii_lowercase();
     let _args = parts.get(1).copied().unwrap_or("");
 
+    if !is_catalog_command(&command) {
+        return None;
+    }
+
     match command.as_str() {
         "/new" => handle_new(state, context.scope, chat_id).await,
         "/compact" => handle_compact(state, chat_id, context).await,
@@ -339,68 +343,91 @@ async fn handle_llm_profile(
 // Command Metadata Registry
 // ---------------------------------------------------------------------------
 
-/// スラッシュコマンド定義のメタデータ。
-///
-/// 各チャネル (Telegram, Discord, WebUI) はこのレジストリを通じて
-/// コマンド名・説明・使用法を参照する。
-pub(crate) struct CommandDef {
-    /// コマンド名（`/` なし）。
-    pub name: &'static str,
+/// Slash command metadata shared by chat channels and the TUI composer.
+pub(crate) struct SlashCommandSpec {
+    /// Command names without the leading slash.
+    pub names: &'static [&'static str],
     /// コマンドの短い説明。
     pub description: &'static str,
     /// 使用例（`/` で始まる）。
     pub usage: &'static str,
 }
 
-/// 登録済みコマンド一覧を返す。
-pub(crate) const fn all_commands() -> &'static [CommandDef] {
-    &[
-        CommandDef {
-            name: "new",
-            description: "Clear current session",
-            usage: "/new",
-        },
-        CommandDef {
-            name: "compact",
-            description: "Force compact session",
-            usage: "/compact",
-        },
-        CommandDef {
-            name: "status",
-            description: "Show current status",
-            usage: "/status",
-        },
-        CommandDef {
-            name: "skills",
-            description: "List available skills",
-            usage: "/skills",
-        },
-        CommandDef {
-            name: "restart",
-            description: "Restart the bot",
-            usage: "/restart",
-        },
-        CommandDef {
-            name: "providers",
-            description: "List LLM providers",
-            usage: "/providers",
-        },
-        CommandDef {
-            name: "provider",
-            description: "Show/switch provider",
-            usage: "/provider [name]",
-        },
-        CommandDef {
-            name: "models",
-            description: "List models",
-            usage: "/models",
-        },
-        CommandDef {
-            name: "model",
-            description: "Show/switch model",
-            usage: "/model [name]",
-        },
-    ]
+/// The canonical command catalog.
+pub(crate) const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        names: &["new"],
+        description: "Clear current session",
+        usage: "/new",
+    },
+    SlashCommandSpec {
+        names: &["compact"],
+        description: "Force compact session",
+        usage: "/compact",
+    },
+    SlashCommandSpec {
+        names: &["status"],
+        description: "Show current status",
+        usage: "/status",
+    },
+    SlashCommandSpec {
+        names: &["skills"],
+        description: "List available skills",
+        usage: "/skills",
+    },
+    SlashCommandSpec {
+        names: &["restart"],
+        description: "Restart the bot",
+        usage: "/restart",
+    },
+    SlashCommandSpec {
+        names: &["providers"],
+        description: "List LLM providers",
+        usage: "/providers",
+    },
+    SlashCommandSpec {
+        names: &["provider"],
+        description: "Show/switch provider",
+        usage: "/provider [name]",
+    },
+    SlashCommandSpec {
+        names: &["models"],
+        description: "List models",
+        usage: "/models",
+    },
+    SlashCommandSpec {
+        names: &["model"],
+        description: "Show/switch model",
+        usage: "/model [name]",
+    },
+];
+
+/// Returns the canonical command catalog for channel integrations.
+pub(crate) const fn all_commands() -> &'static [SlashCommandSpec] {
+    SLASH_COMMANDS
+}
+
+/// Returns slash commands matching the first input token.
+pub(crate) fn completion_candidates(prefix: &str) -> Vec<String> {
+    let prefix = prefix.trim_start();
+    if !prefix.starts_with('/') || prefix.split_whitespace().count() != 1 {
+        return Vec::new();
+    }
+
+    let prefix = prefix.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .flat_map(|spec| spec.names.iter().copied())
+        .map(|name| format!("/{name}"))
+        .filter(|name| name.starts_with(&prefix))
+        .collect()
+}
+
+fn is_catalog_command(command: &str) -> bool {
+    SLASH_COMMANDS
+        .iter()
+        .flat_map(|spec| spec.names.iter().copied())
+        .any(|name| name == command.trim_start_matches('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -769,8 +796,8 @@ mod tests {
     use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
 
     use super::{
-        SlashCommandOutcome, all_commands, handle_slash_command, is_slash_command,
-        process_slash_command,
+        SLASH_COMMANDS, SlashCommandOutcome, all_commands, completion_candidates,
+        handle_slash_command, is_slash_command, process_slash_command,
     };
 
     // -- is_slash_command tests ---------------------------------------------------
@@ -1159,7 +1186,7 @@ mod tests {
         assert!(response.contains("Compacted"), "response: {response}");
     }
 
-    // -- CommandDef registry tests -----------------------------------------------
+    // -- Slash command catalog tests ---------------------------------------------
 
     #[test]
     fn all_commands_returns_all() {
@@ -1168,7 +1195,7 @@ mod tests {
 
         // Assert: 9 コマンドが返る
         assert_eq!(commands.len(), 9);
-        let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+        let names: Vec<&str> = commands.iter().map(|c| c.names[0]).collect();
         assert!(names.contains(&"new"));
         assert!(names.contains(&"compact"));
         assert!(names.contains(&"status"));
@@ -1185,23 +1212,27 @@ mod tests {
         // Arrange & Act
         let commands = all_commands();
 
-        // Assert: 各 CommandDef のメタデータが有効
+        // Assert: 各コマンドのメタデータが有効
         for cmd in commands {
-            assert!(!cmd.name.is_empty(), "name must not be empty");
+            assert!(!cmd.names.is_empty(), "names must not be empty");
+            assert!(
+                cmd.names.iter().all(|name| !name.is_empty()),
+                "names must not contain empty values"
+            );
             assert!(
                 !cmd.description.is_empty(),
                 "description for '{}' must not be empty",
-                cmd.name
+                cmd.names[0]
             );
             assert!(
                 !cmd.usage.is_empty(),
                 "usage for '{}' must not be empty",
-                cmd.name
+                cmd.names[0]
             );
             assert!(
                 cmd.usage.starts_with('/'),
                 "usage for '{}' must start with '/': got '{}'",
-                cmd.name,
+                cmd.names[0],
                 cmd.usage
             );
         }
@@ -1213,9 +1244,46 @@ mod tests {
         let commands = all_commands();
 
         // Assert: name が重複しない
-        let names: Vec<&str> = commands.iter().map(|c| c.name).collect();
+        let names: Vec<&str> = commands
+            .iter()
+            .flat_map(|c| c.names.iter().copied())
+            .collect();
         let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
         assert_eq!(names.len(), unique.len());
+    }
+
+    #[test]
+    fn catalog_covers_dispatch_names() {
+        // Arrange
+        let dispatched = [
+            "new",
+            "compact",
+            "status",
+            "skills",
+            "restart",
+            "providers",
+            "provider",
+            "models",
+            "model",
+        ];
+
+        // Act
+        let catalog: std::collections::HashSet<&str> = SLASH_COMMANDS
+            .iter()
+            .flat_map(|spec| spec.names.iter().copied())
+            .collect();
+
+        // Assert
+        assert!(dispatched.iter().all(|name| catalog.contains(name)));
+    }
+
+    #[test]
+    fn completion_filters_by_prefix() {
+        // Arrange / Act
+        let candidates = completion_candidates("/mo");
+
+        // Assert
+        assert_eq!(candidates, ["/models", "/model"]);
     }
 
     // -- Step 4: SurfaceContext agent_id propagation tests --------------------------
