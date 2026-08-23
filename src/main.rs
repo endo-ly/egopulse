@@ -213,7 +213,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
             Ok(path) => path,
             Err(ConfigError::AutoConfigNotFound { .. }) => {
                 // 引数なし起動だけは初回体験を優先し、エラーではなく setup への案内を返す。
-                if cli.command.is_none() {
+                if is_tui_launch(cli) {
                     eprintln!("No configuration found. Run 'egopulse setup' to create one.");
                     return Ok(());
                 }
@@ -296,6 +296,10 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
     }
 }
 
+fn is_tui_launch(cli: &Cli) -> bool {
+    !cli.print && cli.command.is_none()
+}
+
 fn read_piped_stdin() -> Result<Option<String>, EgoPulseError> {
     let stdin = io::stdin();
     if stdin.is_terminal() {
@@ -356,32 +360,36 @@ async fn run_headless(
     continue_: bool,
     prompt: &str,
 ) -> Result<(), CliError> {
-    let response = if session.is_some() || continue_ {
-        let state = runtime::build_app_state(config)
+    let (target, existing_state) = if continue_ {
+        let state = runtime::build_app_state(config.clone())
             .await
             .map_err(CliError::Runtime)?;
-        let session_names = if continue_ {
-            runtime::list_session_names(&state)
-                .await
-                .map_err(CliError::Runtime)?
-        } else {
-            Vec::new()
-        };
-        let target = select_ask_target(session, continue_, &session_names)?;
-        let AskTarget::Session(session) = target else {
-            unreachable!("session target is required for stateful headless execution");
-        };
-        agent_loop::ask_in_session_with_state(&state, &session, prompt)
+        let session_names = runtime::list_session_names(&state)
             .await
-            .map_err(CliError::Runtime)
+            .map_err(CliError::Runtime)?;
+        (
+            select_ask_target(session, true, &session_names)?,
+            Some(state),
+        )
     } else {
-        let target = select_ask_target(None, false, &[])?;
-        let AskTarget::OneShot = target else {
-            unreachable!("one-shot headless execution has no session target");
-        };
-        runtime::ask(config, prompt)
+        (select_ask_target(session, false, &[])?, None)
+    };
+
+    let response = match target {
+        AskTarget::Session(session) => {
+            let state = match existing_state {
+                Some(state) => state,
+                None => runtime::build_app_state(config)
+                    .await
+                    .map_err(CliError::Runtime)?,
+            };
+            agent_loop::ask_in_session_with_state(&state, &session, prompt)
+                .await
+                .map_err(CliError::Runtime)
+        }
+        AskTarget::OneShot => runtime::ask(config, prompt)
             .await
-            .map_err(CliError::Runtime)
+            .map_err(CliError::Runtime),
     };
 
     match response {
@@ -495,6 +503,15 @@ mod tests {
         let result = Cli::try_parse_from(["egopulse", "hello"]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn only_no_argument_launch_is_tui() {
+        let tui = Cli::try_parse_from(["egopulse"]).expect("parse");
+        let headless = Cli::try_parse_from(["egopulse", "-p", "hello"]).expect("parse");
+
+        assert!(is_tui_launch(&tui));
+        assert!(!is_tui_launch(&headless));
     }
 
     #[test]
