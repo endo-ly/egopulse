@@ -108,18 +108,6 @@ pub async fn ask_in_session_with_state(
     }
 }
 
-/// Processes a turn and aborts cleanly when Ctrl-C is received.
-pub(crate) async fn send_turn(
-    state: &TurnDependencies,
-    context: &SurfaceContext,
-    prompt: &str,
-) -> Result<String, EgoPulseError> {
-    tokio::select! {
-        response = process_turn(state, context, prompt) => response,
-        _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
-    }
-}
-
 /// Formats the current time as a human-readable string with weekday and IANA timezone.
 ///
 /// Example: `2026-05-25 (Mon) 14:32:19 Asia/Tokyo`

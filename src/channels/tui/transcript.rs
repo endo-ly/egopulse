@@ -67,10 +67,6 @@ impl Transcript {
         transcript
     }
 
-    pub(crate) fn committed(&self) -> &[Block] {
-        &self.committed
-    }
-
     pub(crate) fn active(&self) -> Option<&ActiveTurn> {
         self.active.as_ref()
     }
@@ -263,11 +259,12 @@ mod tests {
 
         // Assert
         assert!(transcript.active().is_none());
+        let pending = transcript.drain_pending();
+        assert_eq!(pending.len(), 2);
         assert_eq!(
-            transcript.committed().last(),
+            pending.last(),
             Some(&Block::Assistant("**final**".to_string()))
         );
-        assert_eq!(transcript.drain_pending().len(), 2);
     }
 
     #[test]
@@ -284,7 +281,7 @@ mod tests {
         // Assert
         assert!(transcript.active().is_none());
         assert_eq!(
-            transcript.committed().last(),
+            transcript.drain_pending().last(),
             Some(&Block::Error("failed".to_string()))
         );
     }
