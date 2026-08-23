@@ -245,7 +245,11 @@ impl TuiApp {
         match effect {
             Effect::None => {}
             Effect::Quit => {}
-            Effect::Send(prompt) => self.submit_prompt(prompt),
+            Effect::Send(prompt) => {
+                if self.submit_prompt(prompt) {
+                    self.composer.accept_submission();
+                }
+            }
         }
     }
 
@@ -265,17 +269,19 @@ impl TuiApp {
         }
     }
 
-    fn submit_prompt(&mut self, prompt: String) {
+    fn submit_prompt(&mut self, prompt: String) -> bool {
         if self.busy {
-            if self.pending_prompt.is_none() {
-                self.pending_prompt = Some(prompt);
+            if queue_prompt(&mut self.pending_prompt, prompt) {
                 self.status = "Turn running — queued one prompt".to_string();
+                true
             } else {
                 self.status = "Turn running — queue is full".to_string();
+                false
             }
-            return;
+        } else {
+            self.dispatch_prompt(prompt);
+            true
         }
-        self.dispatch_prompt(prompt);
     }
 
     fn dispatch_prompt(&mut self, prompt: String) {
@@ -463,6 +469,14 @@ impl TuiApp {
     }
 }
 
+fn queue_prompt(pending_prompt: &mut Option<String>, prompt: String) -> bool {
+    if pending_prompt.is_some() {
+        return false;
+    }
+    *pending_prompt = Some(prompt);
+    true
+}
+
 /// Starts the inline TUI.
 pub(crate) async fn run(
     state: Arc<AppState>,
@@ -550,7 +564,8 @@ async fn load_context(
         StartupSession::Named(name) => new_context(state, name),
         StartupSession::New => new_context(state, new_session_name()),
     };
-    let messages = agent_loop::load_session_messages(&state.turn_dependencies(), &context).await?;
+    let messages =
+        agent_loop::load_transcript_history(&state.turn_dependencies(), &context).await?;
     Ok(LoadedContext { context, messages })
 }
 
@@ -628,7 +643,7 @@ fn agent_status(event: &AgentEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::completion_candidates;
+    use super::{completion_candidates, queue_prompt};
 
     #[test]
     fn completion_includes_tui_only_sessions_command() {
@@ -646,5 +661,18 @@ mod tests {
 
         // Assert
         assert_eq!(candidates, ["/models", "/model"]);
+    }
+
+    #[test]
+    fn full_prompt_queue_rejects_second_prompt() {
+        // Arrange
+        let mut pending = Some("first".to_string());
+
+        // Act
+        let accepted = queue_prompt(&mut pending, "second".to_string());
+
+        // Assert
+        assert!(!accepted);
+        assert_eq!(pending.as_deref(), Some("first"));
     }
 }

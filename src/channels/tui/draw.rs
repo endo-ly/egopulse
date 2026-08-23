@@ -70,12 +70,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, state: DrawState<'_>) {
 pub(super) fn render_block(block: &TranscriptBlock, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
     match block {
-        TranscriptBlock::User(text) => vec![Line::from(vec![Span::styled(
-            format!("You: {text}"),
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )])],
+        TranscriptBlock::User(text) => render_user(text, width),
         TranscriptBlock::Assistant(text) => {
             let mut lines = vec![Line::from(Span::styled(
                 "Assistant",
@@ -92,6 +87,51 @@ pub(super) fn render_block(block: &TranscriptBlock, width: usize) -> Vec<Line<'s
             Style::default().fg(Color::Red),
         ))],
     }
+}
+
+fn render_user(text: &str, width: usize) -> Vec<Line<'static>> {
+    let prefix = "You: ";
+    let indent = " ".repeat(prefix.width());
+    let first_width = width.saturating_sub(prefix.width()).max(1);
+    let continuation_width = width.saturating_sub(indent.width()).max(1);
+    let style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+
+    for (logical_index, logical_line) in text.split('\n').enumerate() {
+        let line_width = if logical_index == 0 {
+            first_width
+        } else {
+            continuation_width
+        };
+        for chunk in wrap_line(logical_line, line_width) {
+            let label = if lines.is_empty() { prefix } else { &indent };
+            lines.push(Line::from(Span::styled(format!("{label}{chunk}"), style)));
+        }
+    }
+
+    lines
+}
+
+fn wrap_line(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if character_width > 0 && current_width > 0 && current_width + character_width > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(character);
+        current_width += character_width;
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn draw_active_turn(frame: &mut ratatui::Frame<'_>, area: Rect, transcript: &Transcript) {
@@ -334,6 +374,35 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn user_block_preserves_newlines_and_wraps_continuations() {
+        // Arrange
+        let block = TranscriptBlock::User("first\nsecond".to_string());
+
+        // Act
+        let lines = render_block(&block, 20);
+
+        // Assert
+        assert_eq!(lines.len(), 2);
+        assert_eq!(line_text(&lines[0]), "You: first");
+        assert_eq!(line_text(&lines[1]), "     second");
+
+        // Act
+        let wrapped = render_block(&TranscriptBlock::User("123456789".to_string()), 10);
+
+        // Assert
+        assert_eq!(wrapped.len(), 2);
+        assert_eq!(line_text(&wrapped[0]), "You: 12345");
+        assert_eq!(line_text(&wrapped[1]), "     6789");
     }
 
     #[test]

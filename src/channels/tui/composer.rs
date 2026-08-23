@@ -281,10 +281,14 @@ impl Composer {
         if self.is_empty() {
             return Effect::None;
         }
+        Effect::Send(self.text())
+    }
+
+    /// Commits the current send request after the owning UI accepts it.
+    pub(crate) fn accept_submission(&mut self) {
         let text = self.text();
-        self.push_history(text.clone());
+        self.push_history(text);
         self.clear();
-        Effect::Send(text)
     }
 
     fn clear(&mut self) {
@@ -678,6 +682,12 @@ mod tests {
 
         // Assert
         assert_eq!(effect, Effect::Send("hello".to_string()));
+        assert_eq!(composer.text(), "hello");
+
+        // Act: the caller accepts the send request.
+        composer.accept_submission();
+
+        // Assert
         assert!(composer.is_empty());
     }
 
@@ -689,6 +699,7 @@ mod tests {
             composer.handle(key(KeyCode::Enter, KeyModifiers::NONE)),
             Effect::Send("first".to_string())
         );
+        composer.accept_submission();
         type_text(&mut composer, "draft");
 
         // Act
@@ -704,6 +715,7 @@ mod tests {
         // Arrange
         let mut composer = Composer::with_text("first");
         composer.handle(key(KeyCode::Enter, KeyModifiers::NONE));
+        composer.accept_submission();
         composer.handle(InputEvent::Paste("line1\nline2".to_string()));
         composer.handle(key(KeyCode::Home, KeyModifiers::NONE));
 
