@@ -65,12 +65,7 @@ struct Cli {
     #[arg(requires = "print", value_name = "PROMPT")]
     prompt: Option<String>,
     /// Persistent session to continue.
-    #[arg(
-        long,
-        value_name = "SESSION",
-        requires = "print",
-        conflicts_with = "continue_"
-    )]
+    #[arg(long, value_name = "SESSION", conflicts_with = "continue_")]
     session: Option<String>,
     /// Continue the most recently updated session.
     #[arg(long = "continue", requires = "print", conflicts_with = "session")]
@@ -290,7 +285,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
             unreachable!("handled without config")
         }
-        None => runtime::run_tui(config, resolved_config_path)
+        None => runtime::run_tui(config, resolved_config_path, cli.session.as_deref())
             .await
             .map_err(Into::into),
     }

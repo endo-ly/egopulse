@@ -642,9 +642,13 @@ pub async fn list_session_names(state: &AppState) -> Result<Vec<String>, EgoPuls
 }
 
 /// Starts the local TUI channel with a fully built application state.
-pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(), EgoPulseError> {
+pub async fn run_tui(
+    config: Config,
+    config_path: Option<PathBuf>,
+    session: Option<&str>,
+) -> Result<(), EgoPulseError> {
     let state = build_app_state_with_path(config, config_path).await?;
-    channels::tui::run(state).await
+    channels::tui::run(state, session).await
 }
 
 fn spawn_web_channel(state: &Arc<AppState>) -> bool {
