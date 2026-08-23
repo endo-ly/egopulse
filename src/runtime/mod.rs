@@ -629,6 +629,18 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
     }
 }
 
+/// Returns the logical session names ordered from most recently updated to oldest.
+///
+/// # Errors
+/// Returns [`EgoPulseError`] when the session database cannot be queried.
+pub async fn list_session_names(state: &AppState) -> Result<Vec<String>, EgoPulseError> {
+    let sessions = call_blocking(Arc::clone(&state.db), |db| db.list_sessions()).await?;
+    Ok(sessions
+        .into_iter()
+        .map(|session| session.surface_thread)
+        .collect())
+}
+
 /// Starts the local TUI channel with a fully built application state.
 pub async fn run_tui(config: Config, config_path: Option<PathBuf>) -> Result<(), EgoPulseError> {
     let state = build_app_state_with_path(config, config_path).await?;
