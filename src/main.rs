@@ -487,6 +487,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_session_for_tui() {
+        let cli = Cli::try_parse_from(["egopulse", "--session", "local"]).expect("parse");
+
+        assert!(!cli.print);
+        assert_eq!(cli.session.as_deref(), Some("local"));
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
     fn parse_print_conflicts_with_subcommands() {
         let result = parse_cli_from(&["egopulse", "-p", "run"]);
 

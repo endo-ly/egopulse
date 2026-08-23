@@ -242,8 +242,8 @@ impl TuiApp {
 
     fn update_completion(&mut self) {
         let text = self.composer.text();
-        let prefix = text.trim_start().split_whitespace().next().unwrap_or("");
-        if !prefix.starts_with('/') || text.trim_start().split_whitespace().count() > 1 {
+        let prefix = text.split_whitespace().next().unwrap_or("");
+        if !prefix.starts_with('/') || text.split_whitespace().count() > 1 {
             self.composer.clear_completion();
             return;
         }
