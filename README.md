@@ -34,7 +34,7 @@ After startup, the WebUI is available at http://127.0.0.1:10961 in your browser.
 |---|---|---|
 | Gateway | `egopulse gateway install` | Start Web / Discord / Telegram as a service |
 | Stop gateway | `egopulse gateway stop` | Stop the systemd service (registration is kept) |
-| CLI chat | `egopulse chat` | Chat directly from the terminal |
+| CLI headless | `egopulse -p "your prompt"` | Run a prompt directly from the terminal |
 | TUI | `egopulse` | Session browser + chat (in interactive mode, press `q` to exit) |
 
 See [channels.md](./docs/channels.md) for Discord / Telegram configuration.

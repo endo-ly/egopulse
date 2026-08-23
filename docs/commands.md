@@ -20,13 +20,14 @@ CLI サブコマンドとチャットスラッシュコマンドの完全仕様�
 |---|---|---|:---:|
 | `egopulse` | なし | ローカル TUI（セッションブラウザ + チャット） | 必須 |
 | `egopulse setup` | なし | 対話型設定ウィザード（非シークレット入力は表示、API key / Bot Token は hidden） | 不要 |
-| `egopulse ask <PROMPT>` | `[--session <SESSION>]` | 単発プロンプト、結果を stdout に出力 | 必須 |
-| `egopulse chat` | `[--session <SESSION>]` | 永続化 CLI チャットセッション | 必須 |
+| `egopulse -p [PROMPT]` | `[--session <SESSION>]` / `[--continue]` | 非対話プロンプト、応答だけを stdout に出力 | 必須 |
 | `egopulse run` | なし | 有効チャネルを一括起動（前景実行） | 必須 |
 | `egopulse gateway <ACTION>` | 下記参照 | systemd サービス管理 | 必須 |
 | `egopulse sleep` | `[--agent <AGENT>]` | 手動 sleep batch を実行（長期記憶の処理） | 必須 |
 | `egopulse events extract` | `[--agent] [--from] [--to]` | 過去セッションからエピソードイベントを再抽出（バックフィル） | 必須 |
 | `egopulse update` | なし | 最新リリースに更新 | 不要 |
+
+`-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は、TTY でない stdin から読み込む。`PROMPT` と stdin の両方がある場合は、両者を空行 2 つで連結する。`--session` は指定セッションを再開し、`--continue` は最終更新セッションを再開する。成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。プロンプトがない場合は終了コード 2、それ以外のエラーは 1、Ctrl-C は 0 で終了する。引数なしの `egopulse` は TUI を起動する。
 
 ### 1.2 グローバルオプション
 
@@ -92,7 +93,7 @@ egopulse gateway status --json # JSON 形式
 
 ## 2. チャットスラッシュコマンド
 
-Telegram / Discord / CLI チャット / TUI / Web チャット のいずれかで `/` から始まるメッセージとして送信する。セッション管理・モデル切替・システム操作を担当する。
+Telegram / Discord / TUI / Web チャット のいずれかで `/` から始まるメッセージとして送信する。セッション管理・モデル切替・システム操作を担当する。
 
 ### 2.1 設計原則
 

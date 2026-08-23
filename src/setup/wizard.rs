@@ -133,7 +133,7 @@ pub(crate) fn build_done_message(
 
     lines.push(String::new());
     lines.push("Next steps:".into());
-    lines.push("  - Start chatting now:          egopulse chat".into());
+    lines.push("  - Start chatting now:          egopulse".into());
     lines.push("  - Install as a systemd service: egopulse gateway install".into());
     lines.push(format!("  - Edit configuration:          {config_path}"));
     lines.push("  - Add more agents:             edit the \"agents\" section in the YAML".into());
@@ -677,7 +677,8 @@ mod tests {
         let message = build_done_message(&inputs, config_path, None);
 
         assert!(message.contains(config_path));
-        assert!(message.contains("egopulse chat"));
+        assert!(message.contains("Start chatting now:          egopulse"));
+        assert!(!message.contains("egopulse chat"));
         assert!(message.contains("egopulse gateway install"));
         assert!(message.contains("agents"));
         assert!(message.contains(WEB_UI_URL));
