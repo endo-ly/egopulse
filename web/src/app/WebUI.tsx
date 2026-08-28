@@ -11,14 +11,42 @@ import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
 import { createSessionKey, fetchSessions } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
+import { buildRoutePath, parseRoute, type AppRoute } from "./router";
 import type { TabId } from "./navigation";
 
 const DEFAULT_SESSION_KEY = "main";
 
+function currentPathname(): string | null {
+  try {
+    return globalThis.location.pathname;
+  } catch {
+    return null;
+  }
+}
+
+function navigatePath(path: string, replace: boolean): void {
+  try {
+    const url = new URL(globalThis.location.href);
+    if (url.pathname === path) return;
+    url.pathname = path;
+    globalThis.history[replace ? "replaceState" : "pushState"](null, "", url.toString());
+  } catch {
+    // Non-browser environment: nothing to sync.
+  }
+}
+
+function initialRoute(): AppRoute | null {
+  const pathname = currentPathname();
+  return pathname === null ? null : parseRoute(pathname);
+}
+
 export function WebUI() {
-  const [activeTab, setActiveTab] = useState<TabId>("chat");
-  const [selectedAgent, setSelectedAgent] = useState("");
-  const [selectedSession, setSelectedSession] = useState(DEFAULT_SESSION_KEY);
+  const bootRoute = useMemo(initialRoute, []);
+  const [activeTab, setActiveTab] = useState<TabId>(bootRoute?.tab ?? "chat");
+  const [selectedAgent, setSelectedAgent] = useState(bootRoute?.agentId ?? "");
+  const [selectedSession, setSelectedSession] = useState(
+    bootRoute?.sessionKey ?? DEFAULT_SESSION_KEY,
+  );
   // Tracks whether the user explicitly chose a session (sidebar, palette, or new
   // session). The auto-select effect must not clobber an explicit selection —
   // otherwise a freshly created session is instantly replaced by the first
@@ -87,15 +115,79 @@ export function WebUI() {
     }
   }, [selectedAgent, selectedSession, sessions, sessionExplicit]);
 
-  const handleSelectSession = useCallback((key: string) => {
-    setSelectedSession(key);
-    setSessionExplicit(true);
+  // Reflects auto-derived selection changes in the URL. User actions push
+  // their own history entry beforehand, so this only ever replaces.
+  useEffect(() => {
+    const path = buildRoutePath({
+      tab: activeTab,
+      agentId: selectedAgent,
+      sessionKey:
+        activeTab === "chat" &&
+        (sessionExplicit || selectedSession !== DEFAULT_SESSION_KEY)
+          ? selectedSession
+          : null,
+    });
+    if (path !== null) navigatePath(path, true);
+  }, [activeTab, selectedAgent, selectedSession, sessionExplicit]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const pathname = currentPathname();
+      const route = pathname === null ? null : parseRoute(pathname);
+      if (!route) return;
+      setActiveTab(route.tab);
+      if (route.agentId) setSelectedAgent(route.agentId);
+      if (route.tab === "chat" && route.sessionKey) {
+        setSelectedSession(route.sessionKey);
+        setSessionExplicit(true);
+      } else {
+        setSessionExplicit(false);
+      }
+    };
+    globalThis.addEventListener("popstate", onPopState);
+    return () => globalThis.removeEventListener("popstate", onPopState);
   }, []);
 
-  const handleSelectAgent = useCallback((id: string) => {
-    setSelectedAgent(id);
-    setSessionExplicit(false);
-  }, []);
+  const handleSelectSession = useCallback(
+    (key: string) => {
+      setSelectedSession(key);
+      setSessionExplicit(true);
+      const path = buildRoutePath({
+        tab: activeTab,
+        agentId: selectedAgent,
+        sessionKey: key,
+      });
+      if (path !== null) navigatePath(path, false);
+    },
+    [activeTab, selectedAgent],
+  );
+
+  const handleSelectAgent = useCallback(
+    (id: string) => {
+      setSelectedAgent(id);
+      setSessionExplicit(false);
+      const path = buildRoutePath({ tab: activeTab, agentId: id, sessionKey: null });
+      if (path !== null) navigatePath(path, false);
+    },
+    [activeTab],
+  );
+
+  const handleTabChange = useCallback(
+    (tab: TabId) => {
+      setActiveTab(tab);
+      const path = buildRoutePath({
+        tab,
+        agentId: selectedAgent,
+        sessionKey:
+          tab === "chat" &&
+          (sessionExplicit || selectedSession !== DEFAULT_SESSION_KEY)
+            ? selectedSession
+            : null,
+      });
+      if (path !== null) navigatePath(path, false);
+    },
+    [selectedAgent, selectedSession, sessionExplicit],
+  );
 
   const handleSessionResolved = useCallback((key: string) => {
     setSelectedSession(key);
@@ -103,9 +195,18 @@ export function WebUI() {
   }, []);
 
   const handleNewSession = () => {
-    setSelectedSession(createSessionKey());
+    const key = createSessionKey();
+    setSelectedSession(key);
     setSessionExplicit(true);
     setActiveTab("chat");
+    // Push the draft session so a reload keeps the unsent draft scoped to
+    // this agent; the replace effect keeps it current once it resolves.
+    const path = buildRoutePath({
+      tab: "chat",
+      agentId: selectedAgent,
+      sessionKey: key,
+    });
+    if (path !== null) navigatePath(path, false);
   };
 
   const transport = useChatTransport({
@@ -119,6 +220,13 @@ export function WebUI() {
       invalidateQueries(`history:${selectedSession}`);
     },
   });
+
+  // A dropped connection surfaces an error banner once; recovering clears it.
+  useEffect(() => {
+    if (transport.connectionState === "open") {
+      setTransportError(null);
+    }
+  }, [transport.connectionState]);
 
   const selectedSessionData = sessions.find(
     (session) => session.session_key === selectedSession,
@@ -188,7 +296,7 @@ export function WebUI() {
         selectedSession={selectedSession}
         activeTab={activeTab}
         healthStatus={transport.connectionState === "closed" ? "degraded" : "ok"}
-        onTabChange={setActiveTab}
+        onTabChange={handleTabChange}
         onSelectAgent={handleSelectAgent}
         onSelectSession={handleSelectSession}
         onOpenPalette={() => setPaletteOpen(true)}
