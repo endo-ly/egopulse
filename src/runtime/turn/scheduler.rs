@@ -746,6 +746,7 @@ mod tests {
             input: "hello".to_string(),
             origin_id: origin_id.to_string(),
             config_snapshot: None,
+            received_at: None,
         }
     }
 

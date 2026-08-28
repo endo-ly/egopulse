@@ -4,6 +4,40 @@ use crate::agent_loop::tool_execution::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 use crate::storage::StoredMessage;
 
+/// Formats a user input in the representation shared by initial turns and
+/// same-Turn follow-ups.
+pub(crate) fn format_direct_input(input: &str, received_at: &str, timezone: &str) -> String {
+    let timestamp = format_current_time_at(received_at, timezone);
+    format!("<direct-input>\n[Current time: {timestamp}]\n{input}\n</direct-input>")
+}
+
+fn format_current_time_at(received_at: &str, timezone: &str) -> String {
+    use chrono::{DateTime, Datelike, Utc};
+    use chrono_tz::Tz;
+
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
+    let time = DateTime::parse_from_rfc3339(received_at)
+        .map(|value| value.with_timezone(&tz))
+        .unwrap_or_else(|_| Utc::now().with_timezone(&tz));
+    let weekday = match time.weekday().number_from_monday() {
+        1 => "Mon",
+        2 => "Tue",
+        3 => "Wed",
+        4 => "Thu",
+        5 => "Fri",
+        6 => "Sat",
+        7 => "Sun",
+        _ => "???",
+    };
+    format!(
+        "{} ({}) {} {}",
+        time.format("%Y-%m-%d"),
+        weekday,
+        time.format("%H:%M:%S"),
+        tz,
+    )
+}
+
 pub(crate) fn format_tool_result(
     tool_call: &ToolCall,
     result: &crate::tools::ToolResult,
@@ -276,6 +310,16 @@ mod tests {
     use super::*;
     use crate::agent_loop::test_support::tool_result_message;
     use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
+
+    #[test]
+    fn direct_input_uses_the_durable_acceptance_time_and_timezone() {
+        let formatted = format_direct_input("follow-up", "2026-08-28T12:34:56Z", "Asia/Tokyo");
+
+        assert_eq!(
+            formatted,
+            "<direct-input>\n[Current time: 2026-08-28 (Fri) 21:34:56 Asia/Tokyo]\nfollow-up\n</direct-input>"
+        );
+    }
 
     #[test]
     fn message_to_text_preserves_plain_text() {

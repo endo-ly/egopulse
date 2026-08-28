@@ -951,6 +951,27 @@ impl EventHandler for Handler {
             "Discord message received"
         );
 
+        if !msg.author.bot {
+            match crate::runtime::try_stage_tool_followup(
+                &self.app_state,
+                context.clone(),
+                combined_text.clone(),
+            )
+            .await
+            {
+                Ok(crate::runtime::ToolFollowupOutcome::Accepted) => return,
+                Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {}
+                Err(error) => {
+                    warn!(error = %error, "Discord follow-up rejected during Tool phase");
+                    let _ = msg
+                        .channel_id
+                        .say(&ctx, "The agent cannot accept that follow-up right now.")
+                        .await;
+                    return;
+                }
+            }
+        }
+
         let outcome =
             crate::runtime::submit_agent_turn(&self.app_state, context, combined_text).await;
         if let crate::runtime::turn::SubmitOutcome::Rejected(reason) = outcome {

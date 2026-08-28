@@ -127,8 +127,12 @@ execute_scheduled_turn():
 ### `messages`
 
 - 役割: 表示用・一覧用の message レコード（**append-only**）
-- 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`
+- 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`, `seq`, `turn_id`
 - `/new` や compaction では削除されない。セッションクリアは `sessions.messages_json` のリセットのみ行う
+
+`seq` は message lifecycle の境界である。`seq IS NOT NULL` の行だけが committed conversation history であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。
+
+Tool 実行中の human follow-up は staged message として保存され、`turn_id` に `tools_pending` の current Turn を持つ。Tool Result の保存と `complete_tools()` が成功した直後、staged rows を timestamp と message ID の FIFO で committed history と session snapshot へ同一トランザクションで反映する。
 
 ### `sessions`
 
@@ -219,6 +223,24 @@ turn 中の保存は phase ごとに進む。
 5. 各 phase の結果を通常の persistence に流す
 
 compaction は保存の別系統ではなく、「保存前に session を整形する段」として扱う。
+
+### Tool 実行中の human follow-up
+
+`turn_runs.state = tools_pending` の Turn に対する通常の human input は、各 Surface の runtime intake がまず staged follow-up として受理できるかを判定する。受理時は request key を message ID として `(chat_id, request_key)` の重複を検査し、sender と本文が一致する再送だけを idempotent success とする。異なる sender または本文の再利用は conflict として拒否する。
+
+staging の成功は SQLite の `COMMIT` 後にだけ Surface へ返す。current Turn の Tool phase が先に完了した場合は `tools_pending` が存在しないため、入力は従来の通常 Turn submission へ進む。staged message の未消費数にも session 単位と DB scope 単位の durable pending 上限を適用する。
+
+Tool phase は途中で中断せず、保存順序は次の通りである。
+
+```text
+assistant Tool Call
+  → Tool Result 全件
+  → complete_tools()
+  → staged human follow-up を FIFO で commit
+  → 次の model iteration
+```
+
+commit 後に `UserInputInjected` event を発行するため、ライブ表示も Tool Result の後に follow-up を描画できる。follow-up の sender、正規化済み本文、受信時刻は staged row の値をそのまま保持する。Direct Input の `[Current time: ...]` は initial input と同じ formatter を使い、follow-up の durable acceptance timestamp を利用する。
 
 ---
 
@@ -406,7 +428,7 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 
 ### 10.3 crash recovery
 
-起動時の recovery は2段階で構成される。まず `recover_interrupted_turns()` が未端末 Turn を分類し、続いて `TurnDispatcher` が実行可能な Turn を再実行する。再開条件を証明できない Turn を推測で再開せず、すべて停止状態へ移す。
+起動時の recovery は、Tool と Turn の状態を復元した後、terminal Turn に残った staged follow-up を通常の durable Turn として再投入し、続いて `TurnDispatcher` が実行可能な Turn を再実行する。再開条件を証明できない Turn を推測で再開せず、すべて停止状態へ移す。
 
 #### `recover_interrupted_turns()` の分類
 
@@ -424,7 +446,9 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 
 #### TurnDispatcher による再実行
 
-`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査し、`accepted` / `input_committed` で残された Turn を検出して再投入する。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed → model_pending`）が重複実行を安全に排除する。`input_committed` で resume 検証（input message、session snapshot、保存済み Config fingerprint の整合性）に失敗した Turn は `failed` へ移行する。
+`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査する。まず terminal Turn に紐づく `seq IS NULL` の human message を、target Turn の `scheduled_request_json` から復元した routing context に重ねて新しい root Turn へ promotion する。staged message の sender、本文、message ID、受信 timestamp は新しい `ScheduledTurn` に引き継ぐ。新しい Turn の durable acceptance 後にだけ元の staged row を削除するため、accept 後の再起動でも同じ request key の Turn を再利用できる。
+
+続いて `accepted` / `input_committed` で残された Turn を検出して再投入する。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed → model_pending`）が重複実行を安全に排除する。`input_committed` で resume 検証（input message、session snapshot、保存済み Config fingerprint の整合性）に失敗した Turn は `failed` へ移行する。dispatcher の terminal staged promotion は通常 scan と startup recovery で同じ operation を使い、各 DB scope を独立して処理する。
 
 Dispatcher が保存済み `scheduled_request_json` の JSON 構文、必須フィールド、型、または version を解釈できない場合は、決定的な復旧不能として Turn を `failed` に移行する。このとき `error_kind` は `durable_payload_invalid`、`error_message` は固定の sanitized 文言とし、payload の内容や deserializer の詳細をログ・DBへ保存しない。`origin_id` がある場合は Turn の失敗と origin の terminal reason を同一 transaction で記録する。DB 読み取り失敗と scheduler の容量不足は一時障害として扱い、Turn を `accepted` / `input_committed` のまま次の tick で再試行する。
 

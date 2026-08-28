@@ -1069,6 +1069,29 @@ async fn handle_message(
         "Telegram message received"
     );
 
+    if !author_is_bot {
+        match crate::runtime::try_stage_tool_followup(
+            &handler.app_state,
+            context.clone(),
+            combined_text.clone(),
+        )
+        .await
+        {
+            Ok(crate::runtime::ToolFollowupOutcome::Accepted) => return Ok(()),
+            Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {}
+            Err(error) => {
+                warn!(error = %error, "Telegram follow-up rejected during Tool phase");
+                send_telegram_response(
+                    &bot,
+                    msg.chat.id,
+                    "The agent cannot accept that follow-up right now.",
+                )
+                .await;
+                return Ok(());
+            }
+        }
+    }
+
     let outcome =
         crate::runtime::submit_agent_turn(&handler.app_state, context, combined_text).await;
     if let crate::runtime::turn::SubmitOutcome::Rejected(reason) = outcome {

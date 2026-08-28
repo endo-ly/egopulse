@@ -115,6 +115,37 @@ export interface ToolResultPayload {
   durationMs: number;
 }
 
+export interface UserInputPayload {
+  messageId: string;
+  senderId: string;
+  text: string;
+  timestamp: string;
+}
+
+export function reduceUserInput(
+  state: ChatState,
+  payload: UserInputPayload,
+): ChatState {
+  if (state.messages.some((message) => message.id === payload.messageId)) {
+    return state;
+  }
+
+  return {
+    ...state,
+    messages: [
+      ...state.messages,
+      {
+        id: payload.messageId,
+        sender_id: payload.senderId,
+        sender_kind: "user",
+        content: payload.text,
+        timestamp: payload.timestamp,
+        message_kind: "message",
+      },
+    ],
+  };
+}
+
 interface ToolContent {
   tool: string;
   status: "pending" | "success" | "error";

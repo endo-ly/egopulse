@@ -12,12 +12,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::auth;
-use super::stream::{SendRequest, start_stream_run};
+use super::stream::{SendRequest, resolve_send_request, start_stream_run};
 use super::{RunEvent, WEB_ACTOR, WebState};
 
 #[derive(Deserialize)]
@@ -161,10 +161,17 @@ struct GatewayChatContent {
     text: String,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveChatSend {
+    run_id: String,
+    session_key: String,
+}
+
 struct SocketRequestContext<'a> {
     tx: &'a mpsc::UnboundedSender<Message>,
     connected: &'a AtomicBool,
     in_flight_chat_sends: &'a Arc<AtomicUsize>,
+    active_chat_send: &'a Arc<Mutex<Option<ActiveChatSend>>>,
     conn_id: &'a str,
 }
 
@@ -232,6 +239,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
 
     let connected = Arc::new(AtomicBool::new(false));
     let in_flight_chat_sends = Arc::new(AtomicUsize::new(0));
+    let active_chat_send = Arc::new(Mutex::new(None));
 
     // 接続完了前は connect を期限付きで待ち、以降は通常の受信ループとして扱う。
     while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
@@ -268,6 +276,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     tx: &out_tx,
                     connected: &connected,
                     in_flight_chat_sends: &in_flight_chat_sends,
+                    active_chat_send: &active_chat_send,
                     conn_id: &conn_id,
                 };
                 if handle_request(&state, request_context, id, method, params).await {
@@ -358,7 +367,13 @@ fn handle_connect(
             },
             features: ConnectFeatures {
                 methods: vec!["connect", "chat.send"],
-                events: vec!["connect.challenge", "chat", "tool_start", "tool_result"],
+                events: vec![
+                    "connect.challenge",
+                    "chat",
+                    "tool_start",
+                    "tool_result",
+                    "user_input",
+                ],
             },
         },
     )
@@ -382,28 +397,69 @@ async fn handle_chat_send(
         }
     };
 
-    if !try_acquire_chat_send(context.in_flight_chat_sends) {
-        return send_error(
-            context.tx,
-            id,
-            "busy",
-            "another chat.send is still running".to_string(),
+    let request = SendRequest {
+        session_key: Some(payload.session_key),
+        message: payload.message,
+        request_id: payload.request_id,
+    };
+
+    if let Some(active) = context.active_chat_send.lock().await.clone() {
+        let resolved = match resolve_send_request(state, &request, WEB_ACTOR).await {
+            Ok(resolved) => resolved,
+            Err((status, message)) => {
+                return send_error(
+                    context.tx,
+                    id,
+                    if status == StatusCode::BAD_REQUEST {
+                        "invalid_params"
+                    } else {
+                        "internal_error"
+                    },
+                    message,
+                )
+                .is_err();
+            }
+        };
+
+        if resolved.session_key != active.session_key
+            || crate::slash_commands::is_slash_command(&resolved.message)
+        {
+            return send_busy(context.tx, id);
+        }
+
+        match crate::runtime::try_stage_tool_followup(
+            &state.app_state,
+            resolved.context,
+            resolved.message,
         )
-        .is_err();
+        .await
+        {
+            Ok(crate::runtime::ToolFollowupOutcome::Accepted) => {
+                return send_response(
+                    context.tx,
+                    id,
+                    ChatAckPayload {
+                        run_id: active.run_id,
+                        status: "queued",
+                    },
+                )
+                .is_err();
+            }
+            Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {
+                return send_busy(context.tx, id);
+            }
+            Err(error) => {
+                return send_error(context.tx, id, "busy", error.to_string()).is_err();
+            }
+        }
+    }
+
+    if !try_acquire_chat_send(context.in_flight_chat_sends) {
+        return send_busy(context.tx, id);
     }
 
     let in_flight_permit = InFlightChatPermit::new(context.in_flight_chat_sends.clone());
-    let started = match start_stream_run(
-        state.clone(),
-        SendRequest {
-            session_key: Some(payload.session_key),
-            message: payload.message,
-            request_id: payload.request_id,
-        },
-        WEB_ACTOR,
-    )
-    .await
-    {
+    let started = match start_stream_run(state.clone(), request, WEB_ACTOR).await {
         Ok(started) => started,
         Err((status, message)) => {
             drop(in_flight_permit);
@@ -421,6 +477,11 @@ async fn handle_chat_send(
         }
     };
 
+    *context.active_chat_send.lock().await = Some(ActiveChatSend {
+        run_id: started.run_id.clone(),
+        session_key: started.session_key.clone(),
+    });
+
     if send_response(
         context.tx,
         id,
@@ -431,6 +492,7 @@ async fn handle_chat_send(
     )
     .is_err()
     {
+        context.active_chat_send.lock().await.take();
         return true;
     }
 
@@ -438,10 +500,21 @@ async fn handle_chat_send(
         state.clone(),
         context.tx.clone(),
         in_flight_permit,
+        context.active_chat_send.clone(),
         started.run_id,
         started.session_key,
     );
     false
+}
+
+fn send_busy(tx: &mpsc::UnboundedSender<Message>, id: &str) -> bool {
+    send_error(
+        tx,
+        id,
+        "busy",
+        "another chat.send is still running".to_string(),
+    )
+    .is_err()
 }
 
 fn try_acquire_chat_send(in_flight_chat_sends: &AtomicUsize) -> bool {
@@ -456,12 +529,20 @@ fn spawn_chat_stream_forwarder(
     state: WebState,
     tx: mpsc::UnboundedSender<Message>,
     stream_permit: InFlightChatPermit,
+    active_chat_send: Arc<Mutex<Option<ActiveChatSend>>>,
     run_id: String,
     session_key: String,
 ) {
     tokio::spawn(async move {
         let _stream_permit = stream_permit;
-        forward_chat_stream(state, tx, run_id, session_key).await;
+        forward_chat_stream(state, tx, run_id.clone(), session_key).await;
+        let mut active = active_chat_send.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|current| current.run_id == run_id)
+        {
+            *active = None;
+        }
     });
 }
 
@@ -602,6 +683,12 @@ fn forward_run_event(
                 return false;
             };
             send_event(tx, "tool_result", payload).is_err()
+        }
+        "user_input" => {
+            let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
+                return false;
+            };
+            send_event(tx, "user_input", payload).is_err()
         }
         _ => false,
     }
@@ -949,11 +1036,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let active_chat_send = Arc::new(Mutex::new(None));
 
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
             in_flight_chat_sends: &in_flight,
+            active_chat_send: &active_chat_send,
             conn_id: "test-conn",
         };
 
@@ -975,6 +1064,133 @@ mod tests {
         let payload = &parsed["payload"];
         assert!(payload["runId"].as_str().is_some(), "runId must be present");
         assert_eq!(payload["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_stages_same_session_follow_up_and_acks_active_run() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id(
+                "web",
+                "web:active-follow-up:agent:default",
+                None,
+                "web",
+                "default",
+            )
+            .expect("create chat");
+        let turn_id = match state
+            .app_state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "active-turn-request",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: "payload",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept active turn")
+        {
+            crate::storage::AcceptOutcome::Created(run) => run.turn_id,
+            crate::storage::AcceptOutcome::Existing(_) => panic!("expected new turn"),
+        };
+        state
+            .app_state
+            .db
+            .get_conn()
+            .expect("connection")
+            .execute(
+                "UPDATE turn_runs SET state = 'tools_pending' WHERE turn_id = ?1",
+                rusqlite::params![&turn_id],
+            )
+            .expect("seed tools pending state");
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let active_chat_send = Arc::new(Mutex::new(Some(ActiveChatSend {
+            run_id: "active-run".to_string(),
+            session_key: format!("chat:{chat_id}"),
+        })));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            in_flight_chat_sends: &in_flight,
+            active_chat_send: &active_chat_send,
+            conn_id: "test-conn",
+        };
+        let resolved = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some(format!("chat:{chat_id}")),
+                message: "follow-up".to_string(),
+                request_id: Some("follow-up-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve follow-up");
+        assert_eq!(resolved.session_key, format!("chat:{chat_id}"));
+
+        // Act
+        let stopped = handle_chat_send(
+            &state,
+            context,
+            "req-follow-up",
+            serde_json::json!({
+                "sessionKey": format!("chat:{chat_id}"),
+                "message": "follow-up",
+                "requestId": "follow-up-request"
+            }),
+        )
+        .await;
+
+        // Assert
+        assert!(!stopped);
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(response["ok"], true, "response={response}");
+        assert_eq!(response["payload"]["runId"], "active-run");
+        assert_eq!(response["payload"]["status"], "queued");
+        let staged = state
+            .app_state
+            .db
+            .list_staged_user_messages(&turn_id)
+            .expect("staged message");
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].id, "web:follow-up-request");
+        assert_eq!(staged[0].content, "follow-up");
+    }
+
+    #[test]
+    fn ws_forwards_user_input_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let sequence = AtomicU64::new(1);
+        let event = RunEvent {
+            id: 1,
+            event: "user_input".to_string(),
+            data: serde_json::json!({
+                "messageId": "web:req-2",
+                "senderId": "web-user",
+                "text": "follow-up",
+                "timestamp": "2026-08-28T12:00:00Z"
+            })
+            .to_string(),
+        };
+
+        assert!(!forward_run_event(&tx, "run-1", "sess-1", &sequence, event));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["event"], "user_input");
+        assert_eq!(parsed["payload"]["messageId"], "web:req-2");
     }
 
     #[test]

@@ -31,6 +31,14 @@ pub(crate) enum AgentEvent {
         /// LLM-issued tool call id. Disambiguates concurrent same-name tools.
         call_id: String,
     },
+    /// A human message accepted during the Tool phase and committed after its
+    /// Tool Results. The event is emitted only after the database commit.
+    UserInputInjected {
+        message_id: String,
+        sender_id: String,
+        text: String,
+        timestamp: String,
+    },
     /// Final response.
     FinalResponse { text: String },
     /// Error occurred.

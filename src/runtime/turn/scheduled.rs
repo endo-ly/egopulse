@@ -21,6 +21,9 @@ pub(crate) struct ScheduledTurn {
     pub input: String,
     /// Origin ID: UUID tracking all turns caused by a single human input.
     pub origin_id: String,
+    /// Timestamp captured at durable input acceptance. Recovery preserves it
+    /// so the LLM direct-input metadata does not change after promotion.
+    pub received_at: Option<String>,
     /// Immutable configuration selected at turn acceptance.
     ///
     /// This is populated for live turns before durable acceptance and carried
@@ -92,6 +95,9 @@ pub(crate) struct PersistedScheduledTurnV1 {
     pub context: SurfaceContext,
     /// The input text for this turn.
     pub input: String,
+    /// Original durable acceptance timestamp, absent in older payloads.
+    #[serde(default)]
+    pub received_at: Option<String>,
 }
 
 /// Current durable scheduled-turn payload version.
@@ -107,6 +113,7 @@ pub(crate) fn serialize_scheduled_turn(turn: &ScheduledTurn) -> Result<String, E
         version: SCHEDULED_TURN_VERSION,
         context: turn.context.clone(),
         input: turn.input.clone(),
+        received_at: turn.received_at.clone(),
     };
     serde_json::to_string(&payload)
         .map_err(|e| EgoPulseError::Internal(format!("serialize scheduled turn: {e}")))
@@ -139,6 +146,7 @@ pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, Eg
         context: payload.context.clone(),
         input: payload.input,
         origin_id: payload.context.origin_id.clone(),
+        received_at: payload.received_at,
         config_snapshot: None,
     })
 }
@@ -239,6 +247,7 @@ mod tests {
             input: "hello world".to_string(),
             origin_id: "origin-1".to_string(),
             config_snapshot: None,
+            received_at: Some("2026-01-02T03:04:05Z".to_string()),
         };
 
         // Act

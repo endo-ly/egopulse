@@ -60,6 +60,15 @@ struct ErrorPayload {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct UserInputPayload {
+    message_id: String,
+    sender_id: String,
+    text: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ReplayMetaPayload {
     replay_truncated: bool,
     oldest_event_id: Option<u64>,
@@ -88,6 +97,13 @@ pub(super) struct StreamQuery {
 pub(super) struct StartedRun {
     pub run_id: String,
     pub session_key: String,
+}
+
+#[derive(Debug)]
+pub(super) struct ResolvedSend {
+    pub message: String,
+    pub session_key: String,
+    pub context: SurfaceContext,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,6 +232,50 @@ async fn resolve_new_web_session(
     Ok((format!("chat:{chat_id}"), context))
 }
 
+pub(super) async fn resolve_send_request(
+    state: &WebState,
+    request: &SendRequest,
+    actor: &str,
+) -> Result<ResolvedSend, (StatusCode, String)> {
+    let message = request.message.trim().to_string();
+    if message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message is required".to_string()));
+    }
+
+    let raw_session_key = request.session_key.as_deref().unwrap_or("main");
+    let parsed_chat_id = parse_chat_id_from_session_key(raw_session_key);
+    let (session_key, mut context) = if let Some(chat_id) = parsed_chat_id {
+        let db = Arc::clone(&state.app_state.db);
+        let chat_info = call_blocking(db, move |db| db.get_chat_by_id(chat_id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        match chat_info {
+            Some(info) => (
+                format!("chat:{chat_id}"),
+                surface_context_from_chat_info(info, actor),
+            ),
+            None => resolve_new_web_session(state, raw_session_key, actor).await?,
+        }
+    } else {
+        resolve_new_web_session(state, raw_session_key, actor).await?
+    };
+
+    if let Some(id) = request
+        .request_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        context.request_key = format!("web:{id}");
+    }
+
+    Ok(ResolvedSend {
+        message,
+        session_key,
+        context,
+    })
+}
+
 fn web_surface_thread_from_external_chat_id(external_chat_id: &str, agent_id: &str) -> String {
     let thread = external_chat_id
         .strip_prefix("web:")
@@ -251,38 +311,11 @@ pub(super) async fn start_stream_run(
     request: SendRequest,
     actor: &str,
 ) -> Result<StartedRun, (StatusCode, String)> {
-    let message = request.message.trim().to_string();
-    if message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "message is required".to_string()));
-    }
-
-    let raw_session_key = request.session_key.as_deref().unwrap_or("main");
-    let parsed_chat_id = parse_chat_id_from_session_key(raw_session_key);
-
-    let (session_key, mut context) = if let Some(chat_id) = parsed_chat_id {
-        let db = Arc::clone(&state.app_state.db);
-        let chat_info = call_blocking(db, move |db| db.get_chat_by_id(chat_id))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        match chat_info {
-            Some(info) => (
-                format!("chat:{chat_id}"),
-                surface_context_from_chat_info(info, actor),
-            ),
-            None => resolve_new_web_session(&state, raw_session_key, actor).await?,
-        }
-    } else {
-        resolve_new_web_session(&state, raw_session_key, actor).await?
-    };
-
-    if let Some(id) = request
-        .request_id
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        context.request_key = format!("web:{id}");
-    }
+    let ResolvedSend {
+        message,
+        session_key,
+        context,
+    } = resolve_send_request(&state, &request, actor).await?;
 
     let run_id = Uuid::new_v4().to_string();
     state.run_hub.create(&run_id, actor.to_string()).await;
@@ -413,6 +446,26 @@ pub(super) async fn start_stream_run(
                                     is_error,
                                     preview,
                                     duration_ms,
+                                })
+                                .unwrap_or_default(),
+                            )
+                            .await;
+                    }
+                    AgentEvent::UserInputInjected {
+                        message_id,
+                        sender_id,
+                        text,
+                        timestamp,
+                    } => {
+                        run_hub
+                            .publish(
+                                &run_id_for_events,
+                                "user_input",
+                                serde_json::to_string(&UserInputPayload {
+                                    message_id,
+                                    sender_id,
+                                    text,
+                                    timestamp,
                                 })
                                 .unwrap_or_default(),
                             )

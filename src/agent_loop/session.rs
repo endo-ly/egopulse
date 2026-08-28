@@ -579,7 +579,7 @@ fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
     }
 }
 
-async fn serialize_snapshot(
+pub(crate) async fn serialize_snapshot(
     assets: Arc<AssetStore>,
     messages: Vec<Message>,
 ) -> Result<String, EgoPulseError> {

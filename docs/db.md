@@ -228,6 +228,8 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 
 NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未割当行が複数存在しても衝突しない。
 
+`seq IS NOT NULL` が committed conversation history の境界である。`seq IS NULL` の user/message 行は Tool phase 中に durable staging された未消費の follow-up であり、履歴・session preview・Sleep source には含めない。staged row は `turn_id` に current `tools_pending` Turn を持ち、Tool phase 完了後に FIFO で seq を割り当て、session snapshot、`chats.revision`、`chats.next_message_seq` と同一トランザクションで commit する。
+
 **操作**:
 - `store_message(msg)` — `INSERT OR REPLACE`
 - `store_message_only(msg)` — セッションを更新せずメッセージのみ保存。Channel Log (agent_send, system_event) 向け
@@ -588,6 +590,8 @@ Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実�
 | request_payload_hash | TEXT | nullable | 受付時の user input 本文 hash。再受付で同一 `request_key` に異なる本文が渡された場合に拒否する |
 | scheduled_request_json | TEXT | nullable | accepted Turn の実行要求（`PersistedScheduledTurn` の versioned JSON）。再起動後に Dispatcher がこれから再実行する |
 | origin_id | TEXT | nullable | Agent Send chain の identity。root Turn は自身の `turn_id`、子 Turn は親の `origin_id` を継承する |
+
+`scheduled_request_json` の `PersistedScheduledTurn` には、通常受付または terminal staged promotion 時の human input 受信時刻 `received_at` も保存する。promotion では staged message の timestamp を引き継ぐため、再起動後も Direct Input の時刻表示と message provenance が変わらない。
 
 *UNIQUE 制約は `(chat_id, request_key)` の複合。同じ受付を再受付した場合は新規 Turn を作らず既存 Turn を返す。
 

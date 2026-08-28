@@ -376,6 +376,12 @@ pub enum StorageError {
     /// in-transaction guarantee as [`Self::TurnSessionQueueFull`].
     #[error("storage_turn_global_queue_full")]
     TurnGlobalQueueFull,
+    /// The durable staged follow-up queue for one conversation reached its capacity.
+    #[error("storage_tool_followup_session_capacity_full")]
+    ToolFollowupSessionCapacityFull,
+    /// The durable staged follow-up queue for this database reached its capacity.
+    #[error("storage_tool_followup_scope_capacity_full")]
+    ToolFollowupScopeCapacityFull,
     /// 同一 `turn_id + tool_call_id` で異なる input hash で claim された。
     /// 実行前に拒否し、結果を推測しない。
     #[error(

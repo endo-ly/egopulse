@@ -232,6 +232,7 @@ impl Tool for AgentSendTool {
             context: target_context,
             input: target_input,
             config_snapshot: context.config_snapshot.clone(),
+            received_at: Some(chrono::Utc::now().to_rfc3339()),
         };
 
         let delivered = match self.intake.submit(scheduled).await {
@@ -966,6 +967,7 @@ mod integration_tests {
             },
             input: "blocker".to_string(),
             config_snapshot: Some(state.config_manager.current_blocking()),
+            received_at: None,
         };
         assert!(matches!(
             state.turn_scheduler.submit(blocker),

@@ -162,6 +162,13 @@ impl Transcript {
                     });
                 }
             }
+            AgentEvent::UserInputInjected { text, .. } => {
+                let cards = std::mem::take(&mut self.ensure_active().tool_cards);
+                for card in cards {
+                    self.commit(Block::Tool(card));
+                }
+                self.commit(Block::User(text));
+            }
             AgentEvent::FinalResponse { text } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
@@ -368,6 +375,39 @@ mod tests {
             pending.last(),
             Some(&Block::Assistant("**final**".to_string()))
         );
+    }
+
+    #[test]
+    fn injected_user_input_commits_after_tool_cards() {
+        // Arrange
+        let mut transcript = Transcript::new();
+        transcript.begin_turn("hello");
+        transcript.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            input: json!({"command": "pwd"}),
+        });
+        transcript.apply_agent_event(AgentEvent::ToolResult {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            is_error: false,
+            preview: "/tmp".to_string(),
+            duration_ms: 12,
+        });
+
+        // Act
+        transcript.apply_agent_event(AgentEvent::UserInputInjected {
+            message_id: "tui:follow-up".to_string(),
+            sender_id: "user-b".to_string(),
+            text: "follow-up".to_string(),
+            timestamp: "2026-08-28T12:00:00Z".to_string(),
+        });
+
+        // Assert
+        let pending = transcript.drain_pending();
+        assert_eq!(pending.len(), 3);
+        assert!(matches!(pending[1], Block::Tool(_)));
+        assert_eq!(pending[2], Block::User("follow-up".to_string()));
     }
 
     #[test]

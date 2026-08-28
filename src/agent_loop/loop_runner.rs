@@ -272,6 +272,17 @@ impl<'a> AgentLoop<'a> {
         loop_state.messages = Arc::new(persisted.messages);
         loop_state.session_revision = Some(persisted.revision);
         self.lifecycle.complete_tools().await?;
+        let persisted = self
+            .persistence
+            .commit_staged_user_messages(
+                Arc::clone(&loop_state.messages),
+                loop_state.session_revision,
+                &self.prepared.config_snapshot,
+                &self.on_event,
+            )
+            .await?;
+        loop_state.messages = Arc::new(persisted.messages);
+        loop_state.session_revision = Some(persisted.revision);
         Ok(())
     }
 
@@ -429,8 +440,42 @@ mod tests {
     use crate::conversation::ConversationScope;
     use crate::llm::{MessagesResponse, ToolCall};
     use crate::storage::call_blocking;
+    use crate::tools::{Tool, ToolExecutionContext, ToolResult};
     use serial_test::serial;
     use std::sync::Arc;
+
+    struct BlockingTool {
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        started_notify: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "wait_test"
+        }
+
+        fn definition(&self) -> crate::llm::ToolDefinition {
+            crate::llm::ToolDefinition {
+                name: "wait_test".to_string(),
+                description: "test-only blocking tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            input: serde_json::Value,
+            _context: &ToolExecutionContext,
+        ) -> ToolResult {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started_notify.notify_waiters();
+            self.release.notified().await;
+            ToolResult::success(format!("released: {input}"))
+        }
+    }
 
     #[tokio::test]
     #[serial]
@@ -519,6 +564,202 @@ mod tests {
             let text = message.content.as_text_lossy();
             !text.contains(FINAL_RESPONSE_WARNING_GUARD) && !text.contains(FINAL_RESPONSE_GUARD)
         }));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tool_phase_followups_commit_after_all_tool_results_in_fifo_order() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "running checks".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "wait-a".to_string(),
+                            name: "wait_test".to_string(),
+                            arguments: serde_json::json!({"name": "a"}),
+                        },
+                        ToolCall {
+                            id: "wait-b".to_string(),
+                            name: "wait_test".to_string(),
+                            arguments: serde_json::json!({"name": "b"}),
+                        },
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "done with follow-ups".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started_notify = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        );
+        Arc::get_mut(&mut state.tools)
+            .expect("test state owns tool registry")
+            .register_tool(Box::new(BlockingTool {
+                started: Arc::clone(&started),
+                started_notify: Arc::clone(&started_notify),
+                release: Arc::clone(&release),
+            }));
+        let state = Arc::new(state);
+        let context = cli_context("follow-up-integration");
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+        let runtime = state.turn_dependencies();
+        let turn_context = context.clone();
+        let turn = tokio::spawn(async move {
+            crate::agent_loop::process_turn_with_events(
+                &runtime,
+                &turn_context,
+                "inspect everything",
+                move |event| event_log.lock().expect("events").push(event),
+            )
+            .await
+        });
+
+        // Act: wait until the durable Turn has entered its Tool phase, then
+        // stage two messages from different human senders before releasing the
+        // two Tool calls.
+        started_notify.notified().await;
+        let mut follow_up_b = context.clone();
+        follow_up_b.surface_user = "user-b".to_string();
+        follow_up_b.request_key = "cli:follow-up-b".to_string();
+        let mut follow_up_c = context.clone();
+        follow_up_c.surface_user = "user-c".to_string();
+        follow_up_c.request_key = "cli:follow-up-c".to_string();
+        assert_eq!(
+            crate::runtime::try_stage_tool_followup(
+                &state,
+                follow_up_b,
+                "follow-up B".to_string(),
+            )
+            .await
+            .expect("stage B"),
+            crate::runtime::ToolFollowupOutcome::Accepted
+        );
+        assert_eq!(
+            crate::runtime::try_stage_tool_followup(
+                &state,
+                follow_up_c,
+                "follow-up C".to_string(),
+            )
+            .await
+            .expect("stage C"),
+            crate::runtime::ToolFollowupOutcome::Accepted
+        );
+        release.notify_waiters();
+        while started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            started_notify.notified().await;
+        }
+        release.notify_waiters();
+        let reply = turn.await.expect("turn task").expect("turn result");
+
+        // Assert
+        assert_eq!(reply, "done with follow-ups");
+        let (last_tool_result, first_injected, injected) = {
+            let event_log = events.lock().expect("events");
+            let last_tool_result = event_log
+                .iter()
+                .enumerate()
+                .filter_map(|(index, event)| {
+                    matches!(event, AgentEvent::ToolResult { .. }).then_some(index)
+                })
+                .max()
+                .expect("Tool results emitted");
+            let first_injected = event_log
+                .iter()
+                .enumerate()
+                .find_map(|(index, event)| {
+                    matches!(event, AgentEvent::UserInputInjected { .. }).then_some(index)
+                })
+                .expect("follow-up event emitted");
+            let injected: Vec<(String, String)> = event_log
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::UserInputInjected {
+                        sender_id, text, ..
+                    } => Some((sender_id.clone(), text.clone())),
+                    _ => None,
+                })
+                .collect();
+            (last_tool_result, first_injected, injected)
+        };
+        assert!(last_tool_result < first_injected);
+        assert_eq!(
+            injected,
+            vec![
+                ("user-b".to_string(), "follow-up B".to_string()),
+                ("user-c".to_string(), "follow-up C".to_string()),
+            ]
+        );
+
+        let chat_id = call_blocking(Arc::clone(&state.db), |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:follow-up-integration:agent:default",
+                Some("follow-up-integration"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("history");
+        let followups: Vec<_> = history
+            .iter()
+            .filter(|message| message.content.starts_with("follow-up"))
+            .collect();
+        assert_eq!(followups.len(), 2);
+        assert_eq!(followups[0].content, "follow-up B");
+        assert_eq!(followups[0].sender_id, "user-b");
+        assert_eq!(followups[1].content, "follow-up C");
+        assert_eq!(followups[1].sender_id, "user-c");
+        assert!(followups.iter().all(|message| message.seq.is_some()));
+        assert!(
+            followups.iter().all(|message| {
+                chrono::DateTime::parse_from_rfc3339(&message.timestamp).is_ok()
+            })
+        );
+
+        let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
+            db.load_session_snapshot(chat_id, 50)
+        })
+        .await
+        .expect("session snapshot");
+        let snapshot_json = snapshot.messages_json.expect("snapshot exists");
+        assert!(snapshot_json.contains("follow-up B"));
+        assert!(snapshot_json.contains("follow-up C"));
+        assert!(
+            call_blocking(Arc::clone(&state.db), move |db| {
+                let conn = db.get_conn()?;
+                let turn_id: String = conn.query_row(
+                    "SELECT turn_id FROM turn_runs WHERE chat_id = ?1",
+                    rusqlite::params![chat_id],
+                    |row| row.get(0),
+                )?;
+                Ok::<bool, crate::error::StorageError>(
+                    db.list_staged_user_messages(&turn_id)?.is_empty(),
+                )
+            })
+            .await
+            .expect("staged rows")
+        );
     }
 
     #[test]

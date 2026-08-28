@@ -9,9 +9,9 @@ pub(crate) mod persistence;
 
 use crate::agent_loop::compaction::PromptContext;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
-use crate::agent_loop::message_format::format_channel_log_message;
+use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
-    TurnAcceptance, TurnLifecycle, resolve_request_key, validate_resume,
+    TurnAcceptance, TurnAcceptanceRequest, TurnLifecycle, resolve_request_key, validate_resume,
 };
 use crate::agent_loop::turn::persistence::TurnPersistence;
 
@@ -21,10 +21,10 @@ use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message, ToolDefinition};
+use crate::runtime::turn::{ScheduledTurn, serialize_scheduled_turn};
 use crate::storage::{TurnRun, call_blocking};
 use crate::tools::ToolExecutionContext;
-use chrono::{Datelike, Utc};
-use chrono_tz::Tz;
+use chrono::Utc;
 use std::sync::Arc;
 use tracing::Instrument;
 use tracing::warn;
@@ -54,6 +54,7 @@ pub(super) struct PreparedTurn {
     pub(super) tools_json: Option<String>,
     pub(super) user_message: Message,
     pub(super) input_message_id: String,
+    pub(super) received_at: String,
     /// Immutable Config snapshot acquired at Turn start. All downstream
     /// processing must use this snapshot rather than re-reading ConfigManager,
     /// preventing generation-mixing when config changes mid-flight.
@@ -65,6 +66,7 @@ struct TurnExecutor<'a> {
     context: &'a SurfaceContext,
     on_event: EventEmitter,
     config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
+    received_at: Option<String>,
 }
 
 /// Sends a one-shot prompt within a named persistent session.
@@ -108,38 +110,13 @@ pub async fn ask_in_session_with_state(
     }
 }
 
-/// Formats the current time as a human-readable string with weekday and IANA timezone.
-///
-/// Example: `2026-05-25 (Mon) 14:32:19 Asia/Tokyo`
-fn format_current_time(tz: &str) -> String {
-    let tz: Tz = tz.parse().unwrap_or(chrono_tz::UTC);
-    let now = Utc::now().with_timezone(&tz);
-    let weekday = match now.weekday().number_from_monday() {
-        1 => "Mon",
-        2 => "Tue",
-        3 => "Wed",
-        4 => "Thu",
-        5 => "Fri",
-        6 => "Sat",
-        7 => "Sun",
-        _ => "???",
-    };
-    format!(
-        "{} ({}) {} {}",
-        now.format("%Y-%m-%d"),
-        weekday,
-        now.format("%H:%M:%S"),
-        tz,
-    )
-}
-
 /// Processes one user turn against the persisted session state.
 pub(crate) async fn process_turn(
     state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    process_turn_inner(state, context, user_input, EventEmitter::none(), None).await
+    process_turn_inner(state, context, user_input, EventEmitter::none(), None, None).await
 }
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
@@ -158,18 +135,18 @@ where
         user_input,
         EventEmitter::new(on_event),
         None,
+        None,
     )
     .await
 }
 
-/// Processes a user turn with a caller-supplied Config snapshot and emits
-/// lifecycle events for streaming consumers.
-pub(crate) async fn process_turn_with_events_and_snapshot<F>(
+pub(crate) async fn process_turn_with_events_and_snapshot_and_received_at<F>(
     state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
     on_event: F,
     config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+    received_at: Option<String>,
 ) -> Result<String, EgoPulseError>
 where
     F: Fn(AgentEvent) + Send + Sync + 'static,
@@ -180,6 +157,7 @@ where
         user_input,
         EventEmitter::new(on_event),
         Some(config_snapshot),
+        received_at,
     )
     .await
 }
@@ -215,6 +193,7 @@ pub(crate) async fn resume_input_committed_turn(
 
     let snapshot = config_snapshot;
     let persisted = validate_resume(state, scope, turn_id, &run, &snapshot).await?;
+    let received_at = persisted.received_at.clone();
     let context = persisted.context;
 
     let executor = TurnExecutor {
@@ -222,8 +201,11 @@ pub(crate) async fn resume_input_committed_turn(
         context: &context,
         on_event: EventEmitter::none(),
         config_snapshot: Some(Arc::clone(&snapshot)),
+        received_at: None,
     };
-    executor.resume_run(&persisted.input, &snapshot, &run).await
+    executor
+        .resume_run(&persisted.input, received_at.as_deref(), &snapshot, &run)
+        .await
 }
 
 async fn process_turn_inner(
@@ -232,12 +214,14 @@ async fn process_turn_inner(
     user_input: &str,
     on_event: EventEmitter,
     config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
+    received_at: Option<String>,
 ) -> Result<String, EgoPulseError> {
     let executor = TurnExecutor {
         state,
         context,
         on_event,
         config_snapshot,
+        received_at,
     };
 
     executor.run(user_input).await
@@ -270,16 +254,33 @@ impl TurnExecutor<'_> {
                 .unwrap_or_else(|| self.state.config_manager.current_blocking());
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = resolve_request_key(self.context);
+            let received_at = self
+                .received_at
+                .clone()
+                .unwrap_or_else(|| Utc::now().to_rfc3339());
+            let mut persisted_context = self.context.clone();
+            persisted_context.request_key = request_key.clone();
+            let scheduled_request_json = serialize_scheduled_turn(&ScheduledTurn {
+                turn_id: String::new(),
+                context: persisted_context,
+                input: user_input.to_string(),
+                origin_id: self.context.origin_id.clone(),
+                received_at: Some(received_at.clone()),
+                config_snapshot: Some(Arc::clone(&snapshot)),
+            })?;
             let payload_hash =
                 crate::runtime::turn::canonical_request_hash(self.context, user_input);
             let acceptance = TurnLifecycle::accept(
                 self.state,
                 self.context.scope,
-                chat_id,
-                &request_key,
-                &payload_hash,
-                &self.context.origin_id,
-                &snapshot,
+                TurnAcceptanceRequest {
+                    chat_id,
+                    request_key: &request_key,
+                    payload_hash: &payload_hash,
+                    origin_id: &self.context.origin_id,
+                    snapshot: &snapshot,
+                    scheduled_request_json: Some(&scheduled_request_json),
+                },
             )
             .await?;
             let turn = match acceptance {
@@ -310,7 +311,7 @@ impl TurnExecutor<'_> {
             let result = async {
                 // 段階1: セッションを変更する前に、このターンで使う依存を解決する。
                 let prepared = self
-                    .prepare_turn(user_input, &turn.turn_id, &snapshot)
+                    .prepare_turn(user_input, &turn.turn_id, &snapshot, Some(&received_at))
                     .await?;
                 let prompt_ctx = PromptContext {
                     system_prompt: &prepared.system_prompt,
@@ -360,6 +361,7 @@ impl TurnExecutor<'_> {
     async fn resume_run(
         &self,
         user_input: &str,
+        received_at: Option<&str>,
         snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
         turn_run: &TurnRun,
     ) -> Result<String, EgoPulseError> {
@@ -374,7 +376,7 @@ impl TurnExecutor<'_> {
         let result = async move {
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let prepared = self
-                .prepare_turn(user_input, &turn_run.turn_id, snapshot)
+                .prepare_turn(user_input, &turn_run.turn_id, snapshot, received_at)
                 .await?;
             let prompt_ctx = PromptContext {
                 system_prompt: &prepared.system_prompt,
@@ -460,6 +462,7 @@ impl TurnExecutor<'_> {
         user_input: &str,
         turn_id: &str,
         snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
+        received_at: Option<&str>,
     ) -> Result<PreparedTurn, EgoPulseError> {
         let chat_id = resolve_chat_id(self.state, self.context)
             .await
@@ -505,13 +508,12 @@ impl TurnExecutor<'_> {
                 );
             })?;
 
-        let timestamp_line = format!(
-            "[Current time: {}]\n",
-            format_current_time(&config_snapshot.config.timezone)
-        );
+        let received_at = received_at
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
         let user_message = Message::text(
             "user",
-            format!("<direct-input>\n{timestamp_line}{user_input}\n</direct-input>"),
+            format_direct_input(user_input, &received_at, &config_snapshot.config.timezone),
         );
 
         let tool_defs = self.state.tools.definitions_async().await;
@@ -532,6 +534,7 @@ impl TurnExecutor<'_> {
             tools_json,
             user_message,
             input_message_id,
+            received_at,
             config_snapshot,
         })
     }
@@ -544,9 +547,12 @@ impl TurnExecutor<'_> {
     ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
         self.persistence(prepared)
             .persist_user_input(
-                &prepared.input_message_id,
-                &prepared.user_message,
-                user_input,
+                persistence::UserInput {
+                    message_id: &prepared.input_message_id,
+                    message: &prepared.user_message,
+                    input: user_input,
+                    received_at: &prepared.received_at,
+                },
                 &prepared.channel_llm,
                 prompt_ctx,
                 prepared.config_snapshot.as_ref(),
@@ -749,17 +755,22 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let state_str: String = state
+        let (state_str, scheduled_json): (String, Option<String>) = state
             .db
             .get_conn()
             .expect("conn")
             .query_row(
-                "SELECT state FROM turn_runs WHERE chat_id = ?1",
+                "SELECT state, scheduled_request_json FROM turn_runs WHERE chat_id = ?1",
                 rusqlite::params![chat_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("turn_run state");
         assert_eq!(state_str, "failed");
+        let scheduled: serde_json::Value =
+            serde_json::from_str(&scheduled_json.expect("scheduled request payload"))
+                .expect("scheduled request JSON");
+        assert_eq!(scheduled["input"], "hello");
+        assert!(scheduled["received_at"].is_string());
     }
 
     #[tokio::test]

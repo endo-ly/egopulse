@@ -5,6 +5,7 @@ import {
   initialChatState,
   reduceToolStart,
   reduceToolResult,
+  reduceUserInput,
   type ChatEventPayload,
 } from "../chatReducer";
 
@@ -90,6 +91,39 @@ describe("chatReducer", () => {
       result: "done",
       duration_ms: 120,
       input: { path: "a.txt" },
+    });
+  });
+
+  it("user_input_events_append_the_committed_follow_up_once", () => {
+    let state = initialChatState();
+    state = reduceToolStart(state, {
+      callId: "call-1",
+      name: "read",
+      input: { path: "a.txt" },
+    });
+    state = reduceToolResult(state, {
+      callId: "call-1",
+      name: "read",
+      isError: false,
+      preview: "done",
+      durationMs: 120,
+    });
+
+    const payload = {
+      messageId: "web:follow-up",
+      senderId: "web-user",
+      text: "follow-up",
+      timestamp: "2026-08-28T12:00:00Z",
+    };
+    state = reduceUserInput(state, payload);
+    state = reduceUserInput(state, payload);
+
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages[1]).toMatchObject({
+      id: "web:follow-up",
+      sender_kind: "user",
+      content: "follow-up",
+      timestamp: payload.timestamp,
     });
   });
 });

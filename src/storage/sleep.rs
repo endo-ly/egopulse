@@ -891,6 +891,7 @@ impl Database {
                  AND prospective_checkpoint.source_kind = 'messages'
                  AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
                 WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
+                  AND m.seq IS NOT NULL
                   AND (
                        event_checkpoint.cursor_at IS NULL
                        OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
@@ -918,7 +919,8 @@ impl Database {
                     c.channel,
                     c.external_chat_id,
                     s.updated_at,
-                    (SELECT COUNT(*) FROM messages WHERE chat_id = c.chat_id) AS message_count,
+                    (SELECT COUNT(*) FROM messages
+                     WHERE chat_id = c.chat_id AND seq IS NOT NULL) AS message_count,
                     LENGTH(COALESCE(s.messages_json, '')) / 3 AS estimated_tokens,
                     m.timestamp AS pending_ts,
                     m.id AS pending_id,
@@ -940,6 +942,7 @@ impl Database {
                  AND prospective_checkpoint.source_kind = 'messages'
                  AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
                 WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
+                  AND m.seq IS NOT NULL
                   AND (
                        event_checkpoint.cursor_at IS NULL
                        OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)

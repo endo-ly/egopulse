@@ -150,7 +150,9 @@ impl CoordinatorState {
                 self.log.finish(&call_id, &name, is_error, duration_ms);
                 self.refresh_display().await;
             }
-            AgentEvent::Error { .. } | AgentEvent::FinalResponse { .. } => {}
+            AgentEvent::Error { .. }
+            | AgentEvent::FinalResponse { .. }
+            | AgentEvent::UserInputInjected { .. } => {}
         }
     }
 
