@@ -1,6 +1,6 @@
 [package]
 name = "egopulse"
-version = "2026.8.23"
+version = "2026.8.29"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
