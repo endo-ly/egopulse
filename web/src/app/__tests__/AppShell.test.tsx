@@ -94,18 +94,19 @@ describe("App shell", () => {
     expect(screen.getByText("AGENTS")).toBeTruthy();
     expect(screen.getByText("SESSIONS")).toBeTruthy();
     expect(screen.getByText("Lyre")).toBeTruthy();
-    expect(screen.getByText("Web Chat")).toBeTruthy();
+    // Session label is intentionally not rendered; only the preview is.
+    expect(screen.queryByText("Web Chat")).toBeNull();
     expect(screen.getByRole("button", { name: "Chat" }).className).toContain(
       "active",
     );
 
-    fireEvent.click(screen.getByText("Web Chat"));
+    fireEvent.click(screen.getByText("hi"));
     expect(onSelectSession).toHaveBeenCalledWith("s1");
 
     fireEvent.click(screen.getByRole("button", { name: /open command palette/i }));
     expect(onOpenPalette).toHaveBeenCalledTimes(1);
 
-    fireEvent.click(screen.getByText("New Session"));
+    fireEvent.click(screen.getByRole("button", { name: "New Session" }));
     expect(onNewSession).toHaveBeenCalledTimes(1);
   });
 });

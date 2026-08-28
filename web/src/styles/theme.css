@@ -4,10 +4,10 @@
   --color-panel-2: #0e1830;
   --color-panel-hover: #142244;
 
-  --color-text: #dce4f0;
-  --color-text-strong: #f4f7fc;
-  --color-muted: #6b7fa8;
-  --color-muted-2: #4b5e80;
+  --color-text: #e6edf6;
+  --color-text-strong: #ffffff;
+  --color-muted: #b7c3d6;
+  --color-muted-2: #8b9ab1;
 
   --color-accent: #00d4ff;
   --color-accent-2: #c084fc;
@@ -23,6 +23,9 @@
 
   --color-border: rgba(0, 212, 255, 0.1);
   --color-border-strong: rgba(0, 212, 255, 0.22);
+
+  --color-row-hover: rgba(220, 228, 240, 0.05);
+  --color-row-active: rgba(220, 228, 240, 0.09);
 
   --color-panel-70: rgba(8, 16, 32, 0.7);
   --color-panel-80: rgba(8, 16, 32, 0.8);
@@ -49,9 +52,9 @@
   --space-3xl: 40px;
 
   --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 14px;
-  --radius-xl: 20px;
-  --radius-2xl: 28px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 14px;
+  --radius-2xl: 20px;
   --radius-full: 9999px;
 }

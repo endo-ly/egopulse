@@ -1,7 +1,7 @@
 @layer components {
   .app-shell {
     display: grid;
-    grid-template-columns: 260px 1fr;
+    grid-template-columns: 216px 1fr;
     grid-template-rows: 56px 1fr;
     grid-template-areas:
       "sidebar topbar"
@@ -144,6 +144,12 @@
     min-height: 0;
   }
 
+  .sidebar-top {
+    display: flex;
+    justify-content: flex-end;
+    flex-shrink: 0;
+  }
+
   .sidebar-footer {
     display: flex;
     flex-direction: column;
@@ -154,8 +160,11 @@
   }
 
   .new-session-btn {
-    width: 100%;
-    justify-content: flex-start;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    justify-content: center;
+    border-radius: var(--radius-full);
   }
 
   .sidebar-runtime-status {
@@ -191,12 +200,6 @@
     padding-top: var(--space-sm);
   }
 
-  .sidebar.collapsed .new-session-btn {
-    width: auto;
-    padding: var(--space-sm);
-    justify-content: center;
-  }
-
   .sidebar.collapsed .sidebar-runtime-status {
     justify-content: center;
     padding: 0;
@@ -219,7 +222,7 @@
     padding: var(--space-xs) 0;
     display: flex;
     flex-direction: column;
-    gap: var(--space-xs);
+    gap: 2px;
     min-height: 0;
     overflow-y: auto;
   }
@@ -237,33 +240,24 @@
     align-items: center;
     gap: var(--space-sm);
     width: 100%;
-    padding: var(--space-md) var(--space-base);
-    background: var(--color-panel-70);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-card);
-    backdrop-filter: blur(20px);
+    padding: var(--space-xs) var(--space-sm);
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-sm);
     color: var(--color-text);
-    font-size: 14px;
+    font-size: 13px;
     text-align: left;
     cursor: pointer;
-    transition:
-      transform var(--motion-fast, 120ms) ease,
-      border-color var(--motion-fast, 120ms) ease,
-      box-shadow var(--motion-fast, 120ms) ease;
+    transition: background var(--motion-fast, 120ms) ease;
   }
 
   .agent-row.active {
-    border-color: color-mix(in srgb, var(--color-accent-2) 45%, transparent);
-    background: color-mix(in srgb, var(--color-accent-2) 6%, transparent);
+    background: var(--color-row-active);
     color: var(--color-text-strong);
   }
 
-  /* Hover must follow .active (equal specificity) so the hover border wins
-     even on the active row, matching the session card behaviour. */
-  .agent-row:hover {
-    transform: translateY(-2px);
-    border-color: var(--color-border-strong);
+  .agent-row:not(.active):hover {
+    background: var(--color-row-hover);
   }
 
   .agent-label {
@@ -307,29 +301,50 @@
 
   .session-item {
     display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: var(--space-xs);
-  }
-
-  .session-label {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--color-text-strong);
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-sm);
+    min-width: 0;
   }
 
   .session-preview {
+    flex: 1;
+    min-width: 0;
     font-size: 12px;
     color: var(--color-muted);
-    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .sessions-list .card {
-    padding: var(--space-md) var(--space-base);
-    border-radius: var(--radius-lg);
+    padding: var(--space-xs) var(--space-sm);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    backdrop-filter: none;
+  }
+
+  .sessions-list .card-clickable:hover {
+    transform: none;
+    background: var(--color-row-hover);
+  }
+
+  .sessions-list .card-active {
+    background: var(--color-row-active);
+  }
+
+  .sessions-list .card-active.card-clickable:hover {
+    background: var(--color-row-active);
+  }
+
+  .sessions-list .badge-channel {
+    height: 16px;
+    padding: 0 4px;
+    font-size: 10px;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
   }
 
   .topbar-content {
@@ -467,7 +482,7 @@
       top: 0;
       left: 0;
       bottom: 0;
-      width: 260px;
+      width: 216px;
       max-width: 80vw;
       z-index: 900;
       transform: translateX(-100%);
@@ -561,43 +576,45 @@
   .chat-header {
     display: flex;
     align-items: center;
-    padding: var(--space-sm) var(--space-lg);
-    border-bottom: 1px solid var(--color-border);
-    background: var(--color-panel);
-    gap: var(--space-md);
+    padding: var(--space-xs) var(--space-lg);
+    background: transparent;
+    gap: var(--space-sm);
   }
 
   .chat-header-info {
     display: flex;
     align-items: center;
-    gap: var(--space-md);
-    flex-wrap: wrap;
+    gap: var(--space-sm);
+    min-width: 0;
   }
 
   .chat-header-label {
-    font-size: var(--text-md);
-    font-weight: 600;
-    color: var(--color-text-strong);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--color-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .chat-header-meta {
-    font-size: var(--text-sm);
-    color: var(--color-muted);
+    font-size: 11px;
+    color: var(--color-muted-2);
+    white-space: nowrap;
   }
 
   .chat-search-btn {
-    margin-left: auto;
     flex-shrink: 0;
+    padding: var(--space-xs);
   }
 
   .chat-search {
-    margin-left: auto;
     flex-shrink: 0;
     display: inline-flex;
     align-items: center;
     gap: var(--space-xs);
-    width: min(220px, 50%);
-    height: 32px;
+    width: min(160px, 30%);
+    height: 24px;
     padding: 0 var(--space-sm);
     background: var(--color-panel-2);
     border: 1px solid var(--color-border);
@@ -621,7 +638,7 @@
     outline: none;
     color: var(--color-text);
     font-family: inherit;
-    font-size: var(--text-sm);
+    font-size: 12px;
   }
 
   .chat-search-input::placeholder {
@@ -682,7 +699,7 @@
     padding: var(--space-sm) var(--space-base);
     background: var(--color-panel-hover);
     border: 1px solid var(--color-border-strong);
-    border-radius: var(--radius-full);
+    border-radius: var(--radius-sm);
     color: var(--color-text);
     font-size: var(--text-sm);
     cursor: pointer;
@@ -830,7 +847,7 @@
   /* Assistant messages stay centered with a comfortable reading width. */
   .message-row.bubble-assistant {
     align-self: center;
-    width: min(760px, 100%);
+    width: min(900px, 100%);
   }
 
   .message-row.bubble-system {
@@ -839,10 +856,10 @@
   }
 
   /* Tool outputs share the assistant row width so their left edge aligns,
-     but the inner card/body is capped narrower so they read as metadata. */
+      but the inner card/body is capped narrower so they read as metadata. */
   .message-row.bubble-tool {
     align-self: center;
-    width: min(760px, 100%);
+    width: min(900px, 100%);
   }
 
   .bubble-tool .message-body,
@@ -1300,8 +1317,11 @@
     background: var(--color-accent-2-soft);
   }
 
+  /* Assistant messages render flat (no bubble) for a document-like flow. */
   .bubble-assistant .message-body {
-    background: var(--color-panel-85);
+    background: transparent;
+    padding: 0;
+    border-radius: 0;
   }
 
   .bubble-system .message-body {

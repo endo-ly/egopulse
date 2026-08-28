@@ -1,5 +1,4 @@
-import { useMemo, useState, type KeyboardEvent } from "react";
-import { Badge } from "../../shared/ui/Badge";
+import { useMemo, useState, type FocusEvent, type KeyboardEvent } from "react";
 import { Timeline } from "./Timeline";
 import { MessageBubble } from "./MessageBubble";
 import { ToolCard } from "./ToolCard";
@@ -80,6 +79,12 @@ export function ChatTab({
   };
   const closeSearch = () => setSearchOpen(false);
 
+  // Clicking anywhere outside the search box returns it to the icon form.
+  const handleSearchBlur = (e: FocusEvent<HTMLDivElement>) => {
+    if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+    closeSearch();
+  };
+
   const handleSearchKey = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -100,13 +105,13 @@ export function ChatTab({
       <header className="chat-header">
         <div className="chat-header-info">
           <span className="chat-header-label">{sessionLabel}</span>
-          <Badge kind="channel">{channelLabel(channel)}</Badge>
+          <span className="chat-header-meta">{channelLabel(channel)}</span>
           {readOnly && (
             <span className="chat-header-meta">Read-only</span>
           )}
         </div>
         {searchOpen ? (
-          <div className="chat-search">
+          <div className="chat-search" onBlur={handleSearchBlur}>
             <svg
               className="chat-search-icon"
               width="14"

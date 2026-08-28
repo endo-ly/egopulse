@@ -5,16 +5,16 @@ WebUI の全体レイアウト、Sidebar / Top Bar の構造、レスポンシ�
 ## 1. 全体構造
 
 ```
-┌─ Sidebar (260px) ──┬─ Top Bar (h:56px) ──────────────────────┐
+┌─ Sidebar (216px) ──┬─ Top Bar (h:56px) ──────────────────────┐
 │                    │                                          │
 │ (logo + version)   │ [⌘K] [Chat][Sleep][Pulse][Metrics][⚙]   │
-│                    │                              [Health]    │
-│ AGENTS             ├─ Main ──────────────────────────────────┤
-│ (agent list)       │                                          │
-│                    │   選択タブ + 選択 agent のコンテンツ      │
+│             (+)    │                              [Health]    │
+│                    ├─ Main ──────────────────────────────────┤
+│ AGENTS             │                                          │
+│ (agent list)       │   選択タブ + 選択 agent のコンテンツ      │
+│                    │                                          │
 │ SESSIONS           │                                          │
 │ (filter + list)    │                                          │
-│ + New Session      │                                          │
 │                    │                                          │
 │ Runtime Status     │                                          │
 └────────────────────┴──────────────────────────────────────────┘
@@ -33,6 +33,7 @@ WebUI の全体レイアウト、Sidebar / Top Bar の構造、レスポンシ�
 ```
 ┌─ Sidebar ──────────────┐
 │ ◆ EgoPulse  v0.1.0  [<]│  ← Brand header + collapse button
+│                (+)     │  ← 円形 New Session ボタン（最上部右端）
 │ ──────────────────     │
 │ AGENTS                 │
 │ ● lyre (default)       │
@@ -40,10 +41,9 @@ WebUI の全体レイアウト、Sidebar / Top Bar の構造、レスポンシ�
 │ ○ vega                 │
 │ ──────────────────     │
 │ SESSIONS  [All ▼]      │
-│ ▸ Web Chat    [web] ●  │
-│ ▸ Dev         [dis…]   │
-│ ▸ Notes       [cli]    │
-│ + New Session          │
+│ ▸ [web]   preview…  ●  │
+│ ▸ [dis…]  preview…     │
+│ ▸ [cli]   preview…     │
 │ ──────────────────     │
 │ ◴ ok    ●2 turns live  │
 └────────────────────────┘
@@ -55,7 +55,7 @@ Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の
 
 | 状態 | 幅 | 表示内容 |
 |---|---|---|
-| expanded（デフォルト） | 260px (desktop) / 240px (tablet) | 全要素表示 |
+| expanded（デフォルト） | 216px (desktop / tablet) | 全要素表示 |
 | collapsed | 48px | ロゴ・agent StatusDot（縦並び）・New Session アイコン・Runtime Status StatusDot のみ。ラベル・セッション一覧は非表示 |
 
 - 畳み込み状態は URL query (`?sidebar=collapsed`) で永続化し、リロード後も維持
@@ -73,7 +73,7 @@ Sidebar の第1セクション。必ず表示する。
 
 - Section title（小テキスト・uppercase・muted）
 - agent 一覧：各 agent を1行に並べる。左端に StatusDot、続けて agent name、必要に応じてタグ（`default` 等）
-- 選択中 agent は強調表示（アクセント2色の枠線 + 内側 ring）
+- 行は枠線・背景を持たない。hover で背景ハイライト、選択中 agent はアクセント2色の背景チントで強調表示
 - StatusDot の色：
   - `live`（`active === true`、accent 色 + pulse アニメーション）：active turn 実行中
   - `idle`（`active === false`、muted-2 色）：待機中
@@ -104,20 +104,18 @@ Sidebar の第2セクション。
 
 ```
 SESSIONS  [All ▼]
-  ▸ Web Chat          [web]  ●
-  ▸ Dev Discussion    [discord]
-  ▸ Yesterday notes   [cli]
-  ▸ Quick test        [tui]
-+ New Session
+  ▸ [web]      preview…
+  ▸ [discord]  preview…
+  ▸ [cli]      preview…
+  ▸ [tui]      preview…
 ```
 
 #### Session Item
 
-- panel 背景・大 radius・card 相当の shadow
-- 1行目：label（強調本文）
-- 2行目：channel badge
-- 3行目：preview（最終メッセージの先頭1行、`text-xs` `muted`、ellipsis 付き）
-- 選択中：強調表示
+- 枠線・背景を持たない 1 行構成・細身（縦余白は極小）
+- channel badge（コンパクト表示）+ preview（最終メッセージの先頭1行、小サイズ・muted・ellipsis 付き）
+- hover で背景ハイライト、選択中はアクセント2色の背景チントで強調表示
+- label（session key 等の ID 的表記）は表示しない
 
 #### Channel Filter
 
@@ -143,7 +141,7 @@ SESSIONS ヘッダーに単一選択のドロップダウンを置く：
 
 ### 2.5 New Session
 
-Sidebar 最下部に「+ New Session」ボタンを固定表示。
+Brand header の直下、Sidebar 最上部右端に円形の「+」アイコンボタン（28px・radius full）を固定表示。hover で tooltip（title）表示。
 
 - 選択中 agent を親とする新規 web セッションを作成
 - クリック → 楽観的に `session-{timestamp}` キーを生成し Sidebar 先頭へ挿入 → Chat タブへ遷移 → Composer へフォーカス
@@ -153,7 +151,7 @@ Sidebar 最下部に「+ New Session」ボタンを固定表示。
 
 ### 2.6 Runtime Status Footer
 
-Sidebar 最下部、`+ New Session` の下。
+Sidebar 最下部。
 
 - Health status + active turn 数
 - 小テキスト・muted
@@ -225,13 +223,13 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
 
 ### 4.2 Desktop (`lg`)
 
-- Sidebar：常時表示、260px 固定
+- Sidebar：常時表示、216px 固定
 - Top Bar：全タブ + palette + health badge を1行に表示
 - Chat：timeline / tool cards / composer すべて標準レイアウト
 
 ### 4.3 Tablet (`md`)
 
-- Sidebar：240px に縮小、可能なら常時表示
+- Sidebar：216px、可能なら常時表示
 - Top Bar：tab label を短縮（アイコンのみまたは略称）、label は tooltip で補完
 - Sleep / Pulse diff：unified をデフォルトに（split は選択可能）
 

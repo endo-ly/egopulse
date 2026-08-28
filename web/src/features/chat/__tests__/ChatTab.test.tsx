@@ -47,11 +47,10 @@ describe("ChatTab", () => {
     const label = header?.querySelector(".chat-header-label");
     expect(label?.textContent).toBe("Web Chat");
 
-    const badge = header?.querySelector(".badge-channel");
-    expect(badge).toBeTruthy();
-
-    // Message count is intentionally not shown; no meta for writable sessions.
-    expect(header?.querySelector(".chat-header-meta")).toBeNull();
+    // Channel is plain text next to the label, no badge.
+    const meta = header?.querySelector(".chat-header-meta");
+    expect(meta?.textContent).toBe("Web");
+    expect(header?.querySelector(".badge-channel")).toBeNull();
   });
 
   it("chat_tab_header_shows_read_only_for_non_web_channel", () => {
@@ -63,8 +62,11 @@ describe("ChatTab", () => {
       />,
     );
 
-    const meta = container.querySelector(".chat-header-meta");
-    expect(meta?.textContent).toContain("Read-only");
+    const metas = Array.from(
+      container.querySelectorAll(".chat-header-meta"),
+    ).map((el) => el.textContent);
+    expect(metas).toContain("Discord");
+    expect(metas).toContain("Read-only");
   });
 
   it("chat_tab_search_opens_counts_and_closes", () => {
@@ -87,6 +89,30 @@ describe("ChatTab", () => {
     expect(container.querySelector(".chat-search-count")?.textContent).toBe("1 / 2");
 
     fireEvent.keyDown(input, { key: "Escape" });
+    expect(container.querySelector(".chat-search-input")).toBeFalsy();
+    expect(container.querySelector(".chat-search-btn")).toBeTruthy();
+  });
+
+  it("chat_tab_search_closes_when_focus_leaves_the_box", () => {
+    const { container } = render(
+      <ChatTab
+        sessionLabel="Web Chat"
+        channel="web"
+        readOnly={false}
+        messages={messages}
+      />,
+    );
+
+    fireEvent.click(container.querySelector(".chat-search-btn") as HTMLButtonElement);
+    const input = container.querySelector(".chat-search-input") as HTMLInputElement;
+    expect(input).toBeTruthy();
+
+    // Focus moving back into the box (e.g. the close button) keeps it open.
+    fireEvent.blur(input, { relatedTarget: input.parentElement });
+    expect(container.querySelector(".chat-search-input")).toBeTruthy();
+
+    // Focus moving elsewhere collapses the box back to the icon.
+    fireEvent.blur(input);
     expect(container.querySelector(".chat-search-input")).toBeFalsy();
     expect(container.querySelector(".chat-search-btn")).toBeTruthy();
   });

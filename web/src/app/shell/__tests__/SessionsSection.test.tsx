@@ -42,25 +42,39 @@ describe("SessionsSection", () => {
       />,
     );
 
-    expect(screen.queryByText("Notes")).toBeNull();
+    expect(screen.queryByText("quick note")).toBeNull();
 
-    const items = screen.getAllByText(/Web Chat|Dev/);
+    const items = screen.getAllByText(/hello world|review code/);
     expect(items).toHaveLength(2);
 
     const list = document.querySelector(".sessions-list") as HTMLElement;
-    const labels = within(list)
-      .getAllByText(/Web Chat|Dev/)
+    const previews = within(list)
+      .getAllByText(/hello world|review code/)
       .map((el) => el.textContent);
-    expect(labels).toEqual(["Dev", "Web Chat"]);
+    expect(previews).toEqual(["review code", "hello world"]);
 
     const filter = screen.getByLabelText("Filter sessions by channel");
     fireEvent.change(filter, { target: { value: "web" } });
 
-    expect(screen.queryByText("Dev")).toBeNull();
-    expect(screen.queryByText("Web Chat")).not.toBeNull();
+    expect(screen.queryByText("review code")).toBeNull();
+    expect(screen.queryByText("hello world")).not.toBeNull();
 
-    fireEvent.click(screen.getByText("Web Chat"));
+    fireEvent.click(screen.getByText("hello world"));
     expect(onSelectSession).toHaveBeenCalledWith("s1");
+    cleanup();
+  });
+
+  it("sessions_section_does_not_render_session_label", () => {
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+      />,
+    );
+    expect(screen.queryByText("Web Chat")).toBeNull();
+    expect(screen.queryByText("Dev")).toBeNull();
     cleanup();
   });
 

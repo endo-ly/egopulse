@@ -6,11 +6,7 @@ Chat タブは、選択中 agent との Web セッションでの対話、およ
 
 ```
 ┌─ Chat Tab ──────────────────────────────────────────┐
-│ ┌─ Chat Header ─────────────────────────────────┐   │
-│ │ Web Chat  [web]                                │   │
-│ │ Started 2026-06-29 14:32 · 12 messages         │   │
-│ │                              [Refresh] [⋯]      │   │
-│ └────────────────────────────────────────────────┘   │
+│   session-label · web                    [🔍]        │  ← Chat Header（バーなし・小テキスト）
 │                                                      │
 │ ┌─ Timeline ────────────────────────────────────┐    │
 │ │  [user]    メッセージ…                          │    │
@@ -45,25 +41,25 @@ Chat Tab は3領域で構成される：
 
 ## 2. Chat Header
 
-- session label（左寄せ・強調本文）+ channel badge
-- session metadata：開始時刻・メッセージ数・（read-only の場合）その旨
-- 操作：Refresh（アイコン）、OverflowMenu（rename / delete）
-- read-only セッションでは OverflowMenu を隠し Refresh のみ残す
+バー（背景・枠線）を持たない、小さなテキストのみの帯。
 
-### Channel 別の metadata 表示
+- session label（小サイズ・muted）+ channel 名（テキスト）。badge は使わない
+- 全要素（情報テキスト + 検索）をチャット領域の左端に寄せて 1 行に固める。右側は空け、Timeline の領域を圧迫しない
+- read-only の場合のみ `Read-only` を追加表示
+- 情報テキストの隣に検索ボタン（小アイコン）。開くと小型のインライン検索ボックスに切り替わる（[3.3](#33-メッセージ検索cmdf)）
+
+### Channel 表示
 
 | Channel | 表示 |
 |---|---|
-| `web` | `Started {time} · {n} messages` |
-| `discord` | `Discord · {chat_title or external_chat_id} · {n} messages · read-only` |
-| `telegram` | `Telegram · {chat_title or external_chat_id} · {n} messages · read-only` |
-| `cli` | `CLI session · {n} messages · read-only` |
-| `tui` | `TUI session · {n} messages · read-only` |
-| `voice` | `Voice session · {n} messages · read-only` |
+| `web` | `web` |
+| `discord` | `discord`（+ `Read-only`） |
+| `telegram` | `telegram`（+ `Read-only`） |
+| `cli` | `cli`（+ `Read-only`） |
+| `tui` | `tui`（+ `Read-only`） |
+| `voice` | `voice`（+ `Read-only`） |
 
-`chat_title` が未設定の場合は `external_chat_id`（チャネル ID や DM 相手等）を等幅表示する。Discord のチャネル/スレッド/DM の別は chat_title 側で適切に設定されることを前提とし、UI 側では特別扱いしない。
-
-session label が未設定（自動生成キー `session-...`）の場合は、最初のユーザーメッセージの先頭30字を label として表示する（読み取り専用）。編集は OverflowMenu から。
+`web` 以外は read-only 監査ビューになる。
 
 ---
 
@@ -109,13 +105,13 @@ Timeline 内キーワード検索機能。
 | `sender_kind` | 配置 | 背景 | 備考 |
 |---|---|---|---|
 | `user` | 右寄せ | `accent-2-soft`（パープル系） | ユーザー入力 |
-| `assistant` | 中央 | `panel`（85% opacity） | LLM 応答・Pulse 通知 |
+| `assistant` | 中央 | なし（バブルなし・フラット表示） | LLM 応答・Pulse 通知 |
 | `system` | 中央（幅 60% 程度） | `panel-2` | システムメッセージ |
 
 ツール実行結果は `message_kind: "tool_call"` で判定し、assistant と同じ中央配置で、内側のカード幅のみ短く表示する。左端は assistant と揃える。
 
-- bubble の最大幅：`min(760px, 80%)`
-- panel 相当の radius・shadow
+- bubble の最大幅：`min(900px, 100%)`
+- user / system の bubble は panel 相当の radius・shadow。assistant は padding・背景・radius を持たないドキュメント風の表示
 
 ### 4.2 Avatar
 

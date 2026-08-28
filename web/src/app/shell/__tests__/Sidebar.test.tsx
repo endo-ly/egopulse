@@ -12,8 +12,9 @@ describe("Sidebar", () => {
     expect(screen.getByText("EgoPulse")).toBeTruthy();
     expect(screen.getByText(/v0\.1\.0/)).toBeTruthy();
 
-    expect(screen.queryByText("New Session")).not.toBeNull();
-    fireEvent.click(screen.getByText("New Session"));
+    const newSession = screen.getByRole("button", { name: "New Session" });
+    expect(newSession).toBeTruthy();
+    fireEvent.click(newSession);
     expect(onNewSession).toHaveBeenCalledTimes(1);
 
     const runtime = screen.getByText(/2 turns live/);

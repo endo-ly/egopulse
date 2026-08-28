@@ -15,12 +15,14 @@ WebUI 全体で共有するデザイントークンと、状態を持たない�
 
 ### 1.2 Text
 
+テキストは完全な白と薄めの白の2系統で構成し、視認性を優先する。
+
 | 名称 | 色 | 用途 |
 |---|---|---|
-| `text` | `#dce4f0` | 本文 |
-| `text-strong` | `#f4f7fc` | 強調本文・見出し |
-| `muted` | `#6b7fa8` | 補助情報・metadata |
-| `muted-2` | `#4b5e80` | さらに弱い補助（timestamp 等） |
+| `text` | `#e6edf6` | 本文（薄めの白） |
+| `text-strong` | `#ffffff` | 強調本文・見出し（完全な白） |
+| `muted` | `#b7c3d6` | 補助情報・metadata（薄めの白） |
+| `muted-2` | `#8b9ab1` | さらに弱い補助（timestamp・placeholder 等） |
 
 ### 1.3 Accents
 
@@ -76,14 +78,16 @@ WebUI 全体で共有するデザイントークンと、状態を持たない�
 
 ## 3. Radius
 
+角丸は控えめにする。ふわっとした面（カード・モーダル・バブル）と操作要素（ボタン・入力欄）に小さめの角丸を持ち、バッジやリスト行などの小要素はより締まった値にする。full のみ円形要素に使う。
+
 | サイズ | 値 | 用途 |
 |---|---|---|
-| 小 | 6px | badge・tag |
-| 中 | 10px | input・select・code block |
-| 大 | 14px | button・session item・カード一般 |
-| 特大 | 20px | message bubble・tool card |
-| 2特大 | 28px | modal・large card |
-| full | 9999px | pill badge・status dot・avatar |
+| 小 | 6px | badge・tag・sidebar のリスト行 |
+| 中 | 8px | input・select・code block |
+| 大 | 10px | button・composer |
+| 特大 | 14px | message bubble・tool card・カード一般 |
+| 2特大 | 20px | modal・large card |
+| full | 9999px | status dot・spinner など円形要素 |
 
 ---
 
@@ -117,8 +121,8 @@ Web フォントは読み込まない。OS 標準フォントで一貫した見�
 
 | レベル | 用途 |
 |---|---|
-| flat | 通常の panel（Sidebar 等） |
-| card | session item・tool card・sleep run card 等 |
+| flat | 通常の panel（Sidebar・session item 等） |
+| card | tool card・sleep run card 等 |
 | bubble | message bubble |
 | modal | modal dialog・command palette |
 
@@ -233,9 +237,9 @@ agent の live 状態・runtime health の簡易表示に使う小円（8px 程�
 
 Sleep run / Pulse run / Session 等のリスト項目で使う汎用カード。
 
-- panel 背景・特大 radius・card レベルの shadow
-- hover 時：枠線が強調色へ・わずかに上へ移動
-- 選択中（active）：アクセント2色の枠線 + 内側に薄い ring
+- sidebar のリスト項目（session 等）では枠線・背景・shadow を持たない
+- hover 時：ニュートラルな背景ハイライト（`row-hover`）・位置は動かさない
+- 選択中（active）：ひとつ濃いニュートラル背景（`row-active`）+ 強調テキスト
 
 ### 9.9 Code Block
 

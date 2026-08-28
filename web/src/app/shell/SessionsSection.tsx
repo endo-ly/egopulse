@@ -108,7 +108,6 @@ export function SessionsSection({
                 onClick={() => onSelectSession(s.session_key)}
               >
                 <div className="session-item">
-                  <span className="session-label">{s.label}</span>
                   <Badge kind="channel">{channelLabel(s.channel)}</Badge>
                   <span className="session-preview">{s.last_message_preview}</span>
                 </div>
