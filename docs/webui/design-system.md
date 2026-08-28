@@ -140,11 +140,10 @@ body の背景は、左上を中心とした放射状のアクセント色グラ
 
 ### 7.1 Duration
 
-| レベル | 時間 | 用途 |
+| トークン | 時間 | 用途 |
 |---|---|---|
-| fast | 120ms | hover・focus |
-| base | 160ms | button・item の状態変化 |
-| slow | 240ms | modal・palette の開閉 |
+| `--motion-fast` | 120ms | hover・focus |
+| `--motion-slow` | 240ms | modal・palette の開閉 |
 
 アニメーションは状態遷移の補助に限定し、純装飾的な動きは加えない。
 
