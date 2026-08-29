@@ -7,11 +7,12 @@ pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::PromptContext;
+use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
-use crate::agent_loop::message_format::format_channel_log_message;
+use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
-    TurnAcceptance, TurnLifecycle, resolve_request_key, validate_resume,
+    TurnAcceptance, TurnAcceptanceRequest, TurnLifecycle, resolve_request_key, validate_resume,
+    validate_tools_completed_resume,
 };
 use crate::agent_loop::turn::persistence::TurnPersistence;
 
@@ -21,13 +22,18 @@ use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message, ToolDefinition};
+use crate::runtime::turn::{ScheduledTurn, serialize_scheduled_turn};
 use crate::storage::{TurnRun, call_blocking};
 use crate::tools::ToolExecutionContext;
-use chrono::{Datelike, Utc};
-use chrono_tz::Tz;
+use chrono::Utc;
 use std::sync::Arc;
 use tracing::Instrument;
 use tracing::warn;
+
+enum ResumeMode {
+    InputCommitted,
+    ToolsCompleted { start_iteration: usize },
+}
 
 /// Maximum number of Channel Log events to inject as Shared Room Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
@@ -54,6 +60,7 @@ pub(super) struct PreparedTurn {
     pub(super) tools_json: Option<String>,
     pub(super) user_message: Message,
     pub(super) input_message_id: String,
+    pub(super) received_at: String,
     /// Immutable Config snapshot acquired at Turn start. All downstream
     /// processing must use this snapshot rather than re-reading ConfigManager,
     /// preventing generation-mixing when config changes mid-flight.
@@ -65,6 +72,7 @@ struct TurnExecutor<'a> {
     context: &'a SurfaceContext,
     on_event: EventEmitter,
     config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
+    received_at: Option<String>,
 }
 
 /// Sends a one-shot prompt within a named persistent session.
@@ -108,38 +116,13 @@ pub async fn ask_in_session_with_state(
     }
 }
 
-/// Formats the current time as a human-readable string with weekday and IANA timezone.
-///
-/// Example: `2026-05-25 (Mon) 14:32:19 Asia/Tokyo`
-fn format_current_time(tz: &str) -> String {
-    let tz: Tz = tz.parse().unwrap_or(chrono_tz::UTC);
-    let now = Utc::now().with_timezone(&tz);
-    let weekday = match now.weekday().number_from_monday() {
-        1 => "Mon",
-        2 => "Tue",
-        3 => "Wed",
-        4 => "Thu",
-        5 => "Fri",
-        6 => "Sat",
-        7 => "Sun",
-        _ => "???",
-    };
-    format!(
-        "{} ({}) {} {}",
-        now.format("%Y-%m-%d"),
-        weekday,
-        now.format("%H:%M:%S"),
-        tz,
-    )
-}
-
 /// Processes one user turn against the persisted session state.
 pub(crate) async fn process_turn(
     state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
 ) -> Result<String, EgoPulseError> {
-    process_turn_inner(state, context, user_input, EventEmitter::none(), None).await
+    process_turn_inner(state, context, user_input, EventEmitter::none(), None, None).await
 }
 
 /// Processes one user turn and emits lifecycle events for streaming consumers.
@@ -158,18 +141,18 @@ where
         user_input,
         EventEmitter::new(on_event),
         None,
+        None,
     )
     .await
 }
 
-/// Processes a user turn with a caller-supplied Config snapshot and emits
-/// lifecycle events for streaming consumers.
-pub(crate) async fn process_turn_with_events_and_snapshot<F>(
+pub(crate) async fn process_turn_with_events_and_snapshot_and_received_at<F>(
     state: &TurnDependencies,
     context: &SurfaceContext,
     user_input: &str,
     on_event: F,
     config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+    received_at: Option<String>,
 ) -> Result<String, EgoPulseError>
 where
     F: Fn(AgentEvent) + Send + Sync + 'static,
@@ -180,6 +163,7 @@ where
         user_input,
         EventEmitter::new(on_event),
         Some(config_snapshot),
+        received_at,
     )
     .await
 }
@@ -215,6 +199,7 @@ pub(crate) async fn resume_input_committed_turn(
 
     let snapshot = config_snapshot;
     let persisted = validate_resume(state, scope, turn_id, &run, &snapshot).await?;
+    let received_at = persisted.received_at.clone();
     let context = persisted.context;
 
     let executor = TurnExecutor {
@@ -222,8 +207,69 @@ pub(crate) async fn resume_input_committed_turn(
         context: &context,
         on_event: EventEmitter::none(),
         config_snapshot: Some(Arc::clone(&snapshot)),
+        received_at: None,
     };
-    executor.resume_run(&persisted.input, &snapshot, &run).await
+    executor
+        .resume_run(
+            &persisted.input,
+            received_at.as_deref(),
+            &snapshot,
+            &run,
+            ResumeMode::InputCommitted,
+        )
+        .await
+}
+
+/// Resumes a Turn that reached `tools_completed` before the runtime stopped.
+///
+/// The Tool phase is durable, while staged follow-ups may or may not have been
+/// committed when the process stopped. This path reloads the current session
+/// snapshot, idempotently drains staged follow-ups, and starts only the next
+/// model iteration; it never re-accepts the original input or re-executes
+/// completed Tools.
+pub(crate) async fn resume_tools_completed_turn(
+    state: &TurnDependencies,
+    scope: ConversationScope,
+    turn_id: &str,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+) -> Result<String, EgoPulseError> {
+    let turn_id_owned = turn_id.to_string();
+    let run = call_blocking(state.db_for(scope), move |db| {
+        db.get_turn_run(&turn_id_owned)
+    })
+    .await
+    .map_err(EgoPulseError::from)?;
+
+    let snapshot = config_snapshot;
+    let persisted = validate_tools_completed_resume(state, scope, turn_id, &run, &snapshot).await?;
+    let start_iteration = usize::try_from(run.current_iteration)
+        .ok()
+        .and_then(|iteration| iteration.checked_add(1))
+        .ok_or_else(|| {
+            EgoPulseError::Internal(format!(
+                "tools_completed turn has invalid current iteration: {}",
+                run.current_iteration
+            ))
+        })?;
+    let received_at = persisted.received_at.clone();
+    let context = persisted.context;
+
+    let executor = TurnExecutor {
+        state,
+        context: &context,
+        on_event: EventEmitter::none(),
+        config_snapshot: Some(Arc::clone(&snapshot)),
+        received_at: None,
+    };
+    executor
+        .resume_run(
+            &persisted.input,
+            received_at.as_deref(),
+            &snapshot,
+            &run,
+            ResumeMode::ToolsCompleted { start_iteration },
+        )
+        .await
 }
 
 async fn process_turn_inner(
@@ -232,12 +278,14 @@ async fn process_turn_inner(
     user_input: &str,
     on_event: EventEmitter,
     config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
+    received_at: Option<String>,
 ) -> Result<String, EgoPulseError> {
     let executor = TurnExecutor {
         state,
         context,
         on_event,
         config_snapshot,
+        received_at,
     };
 
     executor.run(user_input).await
@@ -270,16 +318,33 @@ impl TurnExecutor<'_> {
                 .unwrap_or_else(|| self.state.config_manager.current_blocking());
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let request_key = resolve_request_key(self.context);
+            let received_at = self
+                .received_at
+                .clone()
+                .unwrap_or_else(|| Utc::now().to_rfc3339());
+            let mut persisted_context = self.context.clone();
+            persisted_context.request_key = request_key.clone();
+            let scheduled_request_json = serialize_scheduled_turn(&ScheduledTurn {
+                turn_id: String::new(),
+                context: persisted_context,
+                input: user_input.to_string(),
+                origin_id: self.context.origin_id.clone(),
+                received_at: Some(received_at.clone()),
+                config_snapshot: Some(Arc::clone(&snapshot)),
+            })?;
             let payload_hash =
                 crate::runtime::turn::canonical_request_hash(self.context, user_input);
             let acceptance = TurnLifecycle::accept(
                 self.state,
                 self.context.scope,
-                chat_id,
-                &request_key,
-                &payload_hash,
-                &self.context.origin_id,
-                &snapshot,
+                TurnAcceptanceRequest {
+                    chat_id,
+                    request_key: &request_key,
+                    payload_hash: &payload_hash,
+                    origin_id: &self.context.origin_id,
+                    snapshot: &snapshot,
+                    scheduled_request_json: Some(&scheduled_request_json),
+                },
             )
             .await?;
             let turn = match acceptance {
@@ -310,7 +375,7 @@ impl TurnExecutor<'_> {
             let result = async {
                 // 段階1: セッションを変更する前に、このターンで使う依存を解決する。
                 let prepared = self
-                    .prepare_turn(user_input, &turn.turn_id, &snapshot)
+                    .prepare_turn(user_input, &turn.turn_id, &snapshot, Some(&received_at))
                     .await?;
                 let prompt_ctx = PromptContext {
                     system_prompt: &prepared.system_prompt,
@@ -334,6 +399,7 @@ impl TurnExecutor<'_> {
                     channel_context_msg,
                     messages,
                     session_revision,
+                    1,
                 )
                 .await
             }
@@ -353,15 +419,18 @@ impl TurnExecutor<'_> {
         .await
     }
 
-    /// Runs the model loop for a Turn that already reached `input_committed`
-    /// before the runtime stopped. Reloads the persisted session snapshot but
-    /// does **not** re-accept, re-persist the user message, or re-run compaction
-    /// (those are already durable). See [`resume_input_committed_turn`].
+    /// Runs the model loop from a state-specific durable resume boundary.
+    /// `input_committed` resumes the first model iteration, while
+    /// `tools_completed` drains staged follow-ups and resumes the next model
+    /// iteration. Neither mode re-accepts the original input or re-executes
+    /// completed Tools.
     async fn resume_run(
         &self,
         user_input: &str,
+        received_at: Option<&str>,
         snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
         turn_run: &TurnRun,
+        resume_mode: ResumeMode,
     ) -> Result<String, EgoPulseError> {
         self.state.active_turns.begin_turn(&self.context.agent_id);
         crate::runtime::metrics::inc_turns_total(&self.context.agent_id, &self.context.channel);
@@ -374,15 +443,16 @@ impl TurnExecutor<'_> {
         let result = async move {
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let prepared = self
-                .prepare_turn(user_input, &turn_run.turn_id, snapshot)
+                .prepare_turn(user_input, &turn_run.turn_id, snapshot, received_at)
                 .await?;
             let prompt_ctx = PromptContext {
                 system_prompt: &prepared.system_prompt,
                 tools_json: prepared.tools_json.as_deref(),
                 has_tools: !prepared.tool_defs.is_empty(),
             };
-            // Reload the already-committed session snapshot; do NOT re-persist the
-            // user message or re-run compaction.
+            // Reload the persisted session snapshot; do NOT re-persist the user
+            // message. Only the tools_completed boundary re-runs the staged
+            // follow-up commit and post-tool compaction.
             let loaded = load_messages_for_turn_with_limit(
                 self.state,
                 self.context.scope,
@@ -390,13 +460,57 @@ impl TurnExecutor<'_> {
                 snapshot.config.max_history_messages,
             )
             .await?;
+            let (messages, session_revision, start_iteration) = match resume_mode {
+                ResumeMode::InputCommitted => {
+                    (loaded.messages, loaded.session_revision, 1)
+                }
+                ResumeMode::ToolsCompleted { start_iteration } => {
+                    let persistence = TurnPersistence::new(
+                        self.state,
+                        self.context,
+                        chat_id,
+                        &turn_run.turn_id,
+                    );
+                    let persisted = persistence
+                        .commit_staged_user_messages(
+                            loaded.messages,
+                            loaded.session_revision,
+                            snapshot,
+                            &self.on_event,
+                        )
+                        .await?;
+                    let compacted = match maybe_compact_messages(
+                        self.state,
+                        self.context,
+                        chat_id,
+                        &persisted.messages,
+                        &prepared.channel_llm,
+                        &prompt_ctx,
+                        &snapshot.config,
+                    )
+                    .await
+                    {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                turn_id = %turn_run.turn_id,
+                                "message compaction failed during tools_completed recovery; continuing with uncompacted messages"
+                            );
+                            persisted.messages
+                        }
+                    };
+                    (Arc::new(compacted), Some(persisted.revision), start_iteration)
+                }
+            };
             let channel_context_msg = load_channel_context(self.state, self.context).await;
             self.run_agent_loop(
                 &prepared,
                 prompt_ctx,
                 channel_context_msg,
-                loaded.messages,
-                loaded.session_revision,
+                messages,
+                session_revision,
+                start_iteration,
             )
             .await
         }
@@ -460,6 +574,7 @@ impl TurnExecutor<'_> {
         user_input: &str,
         turn_id: &str,
         snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
+        received_at: Option<&str>,
     ) -> Result<PreparedTurn, EgoPulseError> {
         let chat_id = resolve_chat_id(self.state, self.context)
             .await
@@ -505,13 +620,12 @@ impl TurnExecutor<'_> {
                 );
             })?;
 
-        let timestamp_line = format!(
-            "[Current time: {}]\n",
-            format_current_time(&config_snapshot.config.timezone)
-        );
+        let received_at = received_at
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| Utc::now().to_rfc3339());
         let user_message = Message::text(
             "user",
-            format!("<direct-input>\n{timestamp_line}{user_input}\n</direct-input>"),
+            format_direct_input(user_input, &received_at, &config_snapshot.config.timezone),
         );
 
         let tool_defs = self.state.tools.definitions_async().await;
@@ -532,6 +646,7 @@ impl TurnExecutor<'_> {
             tools_json,
             user_message,
             input_message_id,
+            received_at,
             config_snapshot,
         })
     }
@@ -544,9 +659,12 @@ impl TurnExecutor<'_> {
     ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
         self.persistence(prepared)
             .persist_user_input(
-                &prepared.input_message_id,
-                &prepared.user_message,
-                user_input,
+                persistence::UserInput {
+                    message_id: &prepared.input_message_id,
+                    message: &prepared.user_message,
+                    input: user_input,
+                    received_at: &prepared.received_at,
+                },
                 &prepared.channel_llm,
                 prompt_ctx,
                 prepared.config_snapshot.as_ref(),
@@ -561,6 +679,7 @@ impl TurnExecutor<'_> {
         channel_context_msg: Option<Message>,
         messages: Arc<Vec<Message>>,
         session_revision: Option<i64>,
+        start_iteration: usize,
     ) -> Result<String, EgoPulseError> {
         let result = AgentLoop::new(
             self.state,
@@ -570,7 +689,7 @@ impl TurnExecutor<'_> {
             channel_context_msg,
             self.on_event.clone(),
         )
-        .run(messages, session_revision)
+        .run(messages, session_revision, start_iteration)
         .await?;
 
         self.persist_agent_loop_result(prepared, result).await
@@ -644,11 +763,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::agent_loop::event::AgentEvent;
-    use crate::agent_loop::{process_turn, process_turn_with_events};
+    use crate::agent_loop::{process_turn, process_turn_with_events, resolve_chat_id};
     use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
-    use crate::storage::{SenderKind, call_blocking};
+    use crate::runtime::turn::{ScheduledTurn, serialize_scheduled_turn};
+    use crate::storage::{AcceptOutcome, SenderKind, StoredMessage, TurnRunState, call_blocking};
 
     // -----------------------------------------------------------------------
     // Core turn execution
@@ -714,6 +834,249 @@ mod tests {
         );
     }
 
+    async fn recover_tools_completed_turn(
+        commit_followup_before_recovery: bool,
+        current_iteration: i64,
+        response: Option<MessagesResponse>,
+    ) -> (Vec<Vec<crate::llm::Message>>, TurnRunState, i64, usize) {
+        // Arrange: persist a Turn exactly at the crash boundary after Tool
+        // Results and before or after staged follow-ups are committed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = response.into_iter().map(Ok).collect::<Vec<_>>();
+        let response_count = responses.len();
+        let provider = RecordingProvider::new(responses, vec![0; response_count]);
+        let state = Arc::new(build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        ));
+        let mut context = cli_context("tools-completed-recovery");
+        context.request_key = "recovery-request".to_string();
+        context.origin_id = "recovery-origin".to_string();
+        let runtime = state.turn_dependencies();
+        let chat_id = resolve_chat_id(&runtime, &context).await.expect("chat id");
+        let config_snapshot = state.config_manager.current_blocking();
+        let scheduled_json = serialize_scheduled_turn(&ScheduledTurn {
+            turn_id: String::new(),
+            context: context.clone(),
+            input: "original input".to_string(),
+            origin_id: context.origin_id.clone(),
+            received_at: Some("2026-08-29T12:00:00Z".to_string()),
+            config_snapshot: None,
+        })
+        .expect("scheduled payload");
+        let run = match call_blocking(Arc::clone(&state.db), {
+            let scheduled_json = scheduled_json.clone();
+            let fingerprint = config_snapshot.fingerprint.clone();
+            let config_revision = config_snapshot.revision as i64;
+            move |db| {
+                db.accept_or_get_turn(crate::storage::AcceptTurnParams {
+                    chat_id,
+                    request_key: "recovery-request",
+                    config_revision,
+                    config_fingerprint: Some(&fingerprint),
+                    request_payload_hash: "recovery-hash",
+                    origin_id: Some("recovery-origin"),
+                    scheduled_request_json: Some(&scheduled_json),
+                })
+            }
+        })
+        .await
+        .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            AcceptOutcome::Existing(_) => panic!("expected created run"),
+        };
+
+        let mut input_message = StoredMessage::user(
+            chat_id,
+            context.surface_user.clone(),
+            "original input".to_string(),
+        );
+        input_message.id = format!("turn:{}:input", run.turn_id);
+        input_message.turn_id = Some(run.turn_id.clone());
+        input_message.timestamp = "2026-08-29T12:00:00Z".to_string();
+        let assistant_tool = crate::llm::Message {
+            role: "assistant".to_string(),
+            content: crate::llm::MessageContent::text("checking"),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "recovery-tool".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "config"}),
+            }],
+            tool_call_id: None,
+        };
+        let tool_result = crate::llm::Message {
+            role: "tool".to_string(),
+            content: crate::llm::MessageContent::text("tool result already persisted"),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("recovery-tool".to_string()),
+        };
+        let initial_snapshot = crate::agent_loop::session::serialize_snapshot(
+            Arc::clone(&state.assets),
+            vec![
+                crate::llm::Message::text("user", "original input"),
+                assistant_tool.clone(),
+                tool_result.clone(),
+            ],
+        )
+        .await
+        .expect("initial snapshot");
+        call_blocking(Arc::clone(&state.db), {
+            let input_message = input_message.clone();
+            let turn_id = run.turn_id.clone();
+            let fingerprint = config_snapshot.fingerprint.clone();
+            let config_revision = config_snapshot.revision as i64;
+            move |db| {
+                db.commit_turn_input_with_conversation(
+                    &input_message,
+                    &initial_snapshot,
+                    None,
+                    &turn_id,
+                    config_revision,
+                    Some(&fingerprint),
+                )
+            }
+        })
+        .await
+        .expect("commit input");
+        state
+            .db
+            .begin_turn_model_iteration(&run.turn_id, current_iteration, "initial-model")
+            .expect("begin model");
+        state
+            .db
+            .complete_turn_model(&run.turn_id)
+            .expect("complete model");
+        state
+            .db
+            .begin_turn_tools(&run.turn_id)
+            .expect("begin tools");
+        state
+            .db
+            .stage_tool_followup(
+                chat_id,
+                "recovery-follow-up",
+                "follow-up-hash",
+                "user-b",
+                "follow-up input",
+                "2026-08-29T12:01:00Z",
+            )
+            .expect("stage follow-up");
+        state
+            .db
+            .complete_turn_tools(&run.turn_id)
+            .expect("complete tools");
+        state
+            .db
+            .mark_turn_output_published(&run.turn_id)
+            .expect("mark output published");
+        let committed_followup = crate::llm::Message::text(
+            "user",
+            crate::agent_loop::message_format::format_direct_input(
+                "follow-up input",
+                "2026-08-29T12:01:00Z",
+                &config_snapshot.config.timezone,
+            ),
+        );
+        let recovery_snapshot = crate::agent_loop::session::serialize_snapshot(
+            Arc::clone(&state.assets),
+            vec![
+                crate::llm::Message::text("user", "original input"),
+                assistant_tool,
+                tool_result,
+                committed_followup,
+            ],
+        )
+        .await
+        .expect("recovery snapshot");
+        if commit_followup_before_recovery {
+            state
+                .db
+                .commit_staged_user_messages(&run.turn_id, &recovery_snapshot, 1)
+                .expect("commit follow-up");
+        }
+
+        assert_eq!(
+            state.db.recover_interrupted_turns().expect("recover"),
+            Vec::new()
+        );
+        let mut scheduled = crate::runtime::turn::deserialize_scheduled_turn(&scheduled_json)
+            .expect("deserialize scheduled payload");
+        scheduled.turn_id = run.turn_id.clone();
+
+        // Act: the dispatcher path resumes the next model iteration.
+        crate::runtime::execute_scheduled_turn(&state, scheduled).await;
+
+        let seen_messages = provider.seen_messages();
+        let final_run = state.db.get_turn_run(&run.turn_id).expect("turn run");
+        let staged_count = state
+            .db
+            .list_staged_user_messages(&run.turn_id)
+            .expect("staged messages")
+            .len();
+        (
+            seen_messages,
+            final_run.state,
+            final_run.current_iteration,
+            staged_count,
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovered_tools_completed_turn_drains_followup_before_or_after_commit() {
+        for commit_followup_before_recovery in [false, true] {
+            let (seen_messages, state, current_iteration, staged_count) =
+                recover_tools_completed_turn(
+                    commit_followup_before_recovery,
+                    17,
+                    Some(MessagesResponse {
+                        content: "recovered response".to_string(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    }),
+                )
+                .await;
+
+            // Assert: both crash boundaries resume after the completed Tool
+            // phase, consume the follow-up exactly once, and preserve the
+            // durable iteration sequence.
+            assert_eq!(seen_messages.len(), 1);
+            assert!(
+                seen_messages[0]
+                    .iter()
+                    .any(|message| { message.content.as_text_lossy().contains("follow-up input") })
+            );
+            assert_eq!(state, TurnRunState::Completed);
+            assert_eq!(current_iteration, 18);
+            assert_eq!(staged_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tools_completed_recovery_does_not_reset_hard_iteration_cap() {
+        let (seen_messages, state, current_iteration, staged_count) = recover_tools_completed_turn(
+            false,
+            crate::agent_loop::loop_runner::MAX_TOOL_ITERATIONS as i64,
+            None,
+        )
+        .await;
+
+        // Assert: a Turn that already used the final iteration is not given a
+        // fresh loop after restart.
+        assert!(seen_messages.is_empty());
+        assert_eq!(state, TurnRunState::Uncertain);
+        assert_eq!(
+            current_iteration,
+            crate::agent_loop::loop_runner::MAX_TOOL_ITERATIONS as i64
+        );
+        assert_eq!(staged_count, 0);
+    }
+
     #[tokio::test]
     #[serial]
     async fn process_turn_surfaces_llm_failure() {
@@ -749,17 +1112,22 @@ mod tests {
         })
         .await
         .expect("chat id");
-        let state_str: String = state
+        let (state_str, scheduled_json): (String, Option<String>) = state
             .db
             .get_conn()
             .expect("conn")
             .query_row(
-                "SELECT state FROM turn_runs WHERE chat_id = ?1",
+                "SELECT state, scheduled_request_json FROM turn_runs WHERE chat_id = ?1",
                 rusqlite::params![chat_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("turn_run state");
         assert_eq!(state_str, "failed");
+        let scheduled: serde_json::Value =
+            serde_json::from_str(&scheduled_json.expect("scheduled request payload"))
+                .expect("scheduled request JSON");
+        assert_eq!(scheduled["input"], "hello");
+        assert!(scheduled["received_at"].is_string());
     }
 
     #[tokio::test]

@@ -79,7 +79,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 - 認証トークン未設定時は `/api/*` へのアクセスができない
 - WebSocket 最大接続数: 64
 - WebSocket 最大メッセージサイズ: 64KB
-- WebSocket の 1 接続あたり同時 `chat.send` は 1 つまで
+- WebSocket の 1 接続あたり active `chat.send` は 1 つまで。active run と同一 session の ordinary message は Tool 実行中に follow-up として durable queue へ追加できる
 
 ---
 
@@ -314,7 +314,7 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 - **送信**: `RuntimeSupervisor` が所有する turn task で `agent_loop::process_turn_with_events` を実行し、`AgentEvent` を mpsc で TUI へ転送
 - **確定出力**: ユーザー発言、最終応答、確定ツールカード、エラーを `terminal.insert_before()` で一度だけスクロールバックへ出力
 - **再描画**: dirty フラグを 16ms 間隔で coalesce し、高頻度の Delta をまとめて表示
-- **同時実行**: ターンは 1 件。実行中の追加送信は 1 件だけ保留し、完了後に自動送信
+- **同時実行**: ターンは 1 件。Tool 実行中の ordinary prompt は durable staged follow-up として FIFO で保留し、Tool Result 後に同じ Turn の履歴へ commit する。それ以外の busy 状態では既存の pending prompt 制御を使う
 - **端末ライフサイクル**: raw mode と bracketed paste mode を TUI の生成・破棄に合わせて有効化・解除する
 
 ### 起動とセッション
@@ -323,7 +323,7 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 - `--session` 省略時は最終更新セッションを開き、保存済みセッションがなければ新規コンテキストを作る
 - `--session` に未知の名前を指定した場合は、その名前の新規 TUI セッションを作る
 - 起動時の端末高さが 10 行未満の場合はエラー終了する
-- TUI の表示履歴は append-only `messages` を正本とし、`tool_calls` 台帳の入力・結果でツールカードを補完する。`sessions.messages_json` は次ターンの LLM context 用であり、表示履歴の source には使わない
+- TUI の表示履歴は committed な `messages` を正本とし、`tool_calls` 台帳の入力・結果でツールカードを補完する。`sessions.messages_json` は次ターンの LLM context 用であり、表示履歴の source には使わない
 
 ### コンポーザ操作
 

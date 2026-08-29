@@ -5,8 +5,11 @@ use std::sync::Arc;
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
+use crate::agent_loop::message_format::format_direct_input;
 use crate::agent_loop::model_step::AssistantToolPhase;
-use crate::agent_loop::session::{PersistedTurn, persist_phase, persist_phase_messages};
+use crate::agent_loop::session::{
+    PersistedTurn, persist_phase, persist_phase_messages, serialize_snapshot,
+};
 use crate::agent_loop::tool_execution::ToolResultPhase;
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, StorageError};
@@ -19,6 +22,13 @@ pub(crate) struct TurnPersistence<'a> {
     context: &'a SurfaceContext,
     chat_id: i64,
     turn_id: String,
+}
+
+pub(super) struct UserInput<'a> {
+    pub(super) message_id: &'a str,
+    pub(super) message: &'a Message,
+    pub(super) input: &'a str,
+    pub(super) received_at: &'a str,
 }
 
 impl<'a> TurnPersistence<'a> {
@@ -38,11 +48,9 @@ impl<'a> TurnPersistence<'a> {
     }
 
     /// Persists the user input and the resulting session snapshot.
-    pub(crate) async fn persist_user_input(
+    pub(super) async fn persist_user_input(
         &self,
-        input_message_id: &str,
-        user_message: &Message,
-        user_input: &str,
+        input: UserInput<'_>,
         llm: &Arc<dyn LlmProvider>,
         prompt_ctx: &PromptContext<'_>,
         config_snapshot: &crate::config::manager::ConfigSnapshot,
@@ -58,16 +66,17 @@ impl<'a> TurnPersistence<'a> {
         let mut stored_message = StoredMessage::user(
             self.chat_id,
             self.context.surface_user.clone(),
-            user_input.to_string(),
+            input.input.to_string(),
         );
-        stored_message.id = input_message_id.to_string();
+        stored_message.id = input.message_id.to_string();
         stored_message.turn_id = Some(self.turn_id.clone());
+        stored_message.timestamp = input.received_at.to_string();
 
         for attempt in 0..2 {
             let current_messages = std::mem::replace(&mut loaded.messages, Arc::new(Vec::new()));
             let mut candidate_messages =
                 Arc::try_unwrap(current_messages).unwrap_or_else(|arc| (*arc).clone());
-            candidate_messages.push(user_message.clone());
+            candidate_messages.push(input.message.clone());
             let candidate_messages = maybe_compact_messages(
                 self.runtime,
                 self.context,
@@ -223,6 +232,113 @@ impl<'a> TurnPersistence<'a> {
             session_revision,
         )
         .await
+    }
+
+    /// Promotes staged human follow-ups after the Tool phase has completed.
+    ///
+    /// The candidate LLM snapshot is built from the current loop messages and
+    /// the staged rows in FIFO order. Storage then assigns causal sequence
+    /// numbers and writes the snapshot atomically. A concurrent snapshot
+    /// update is handled by reloading the latest committed snapshot once.
+    pub(crate) async fn commit_staged_user_messages(
+        &self,
+        messages: Arc<Vec<Message>>,
+        session_revision: Option<i64>,
+        config_snapshot: &crate::config::manager::ConfigSnapshot,
+        on_event: &EventEmitter,
+    ) -> Result<PersistedTurn, EgoPulseError> {
+        let Some(mut revision) = session_revision else {
+            let turn_id = self.turn_id.clone();
+            let staged =
+                crate::storage::call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                    db.list_staged_user_messages(&turn_id)
+                })
+                .await?;
+            if staged.is_empty() {
+                return Ok(PersistedTurn {
+                    revision: 0,
+                    messages: (*messages).clone(),
+                });
+            }
+            return Err(EgoPulseError::Storage(StorageError::Conflict(
+                "staged follow-up requires an existing session snapshot".to_string(),
+            )));
+        };
+        let mut current_messages = messages;
+
+        for attempt in 0..2 {
+            let turn_id = self.turn_id.clone();
+            let staged =
+                crate::storage::call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                    db.list_staged_user_messages(&turn_id)
+                })
+                .await?;
+            if staged.is_empty() {
+                return Ok(PersistedTurn {
+                    revision,
+                    messages: (*current_messages).clone(),
+                });
+            }
+
+            let mut candidate = (*current_messages).clone();
+            for message in &staged {
+                candidate.push(Message::text(
+                    "user",
+                    format_direct_input(
+                        &message.content,
+                        &message.timestamp,
+                        &config_snapshot.config.timezone,
+                    ),
+                ));
+            }
+            let session_json =
+                serialize_snapshot(Arc::clone(&self.runtime.assets), candidate.clone())
+                    .await
+                    .map_err(|error| match error {
+                        EgoPulseError::Storage(storage) => storage,
+                        other => StorageError::TaskJoin(other.to_string()),
+                    })?;
+            let turn_id = self.turn_id.clone();
+            let committed =
+                crate::storage::call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                    db.commit_staged_user_messages(&turn_id, &session_json, revision)
+                })
+                .await;
+            match committed {
+                Ok(committed) => {
+                    for message in &committed.messages {
+                        on_event.emit(AgentEvent::UserInputInjected {
+                            message_id: message.id.clone(),
+                            sender_id: message.sender_id.clone(),
+                            text: message.content.clone(),
+                            timestamp: message.timestamp.clone(),
+                        });
+                    }
+                    return Ok(PersistedTurn {
+                        revision: committed.revision,
+                        messages: candidate,
+                    });
+                }
+                Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
+                    let loaded = crate::agent_loop::session::load_messages_for_turn_with_limit(
+                        self.runtime,
+                        self.context.scope,
+                        self.chat_id,
+                        config_snapshot.config.max_history_messages,
+                    )
+                    .await?;
+                    current_messages = loaded.messages;
+                    revision = loaded.session_revision.ok_or_else(|| {
+                        EgoPulseError::Storage(StorageError::SessionSnapshotConflict)
+                    })?;
+                }
+                Err(error) => return Err(EgoPulseError::Storage(error)),
+            }
+        }
+
+        Err(EgoPulseError::Storage(
+            StorageError::SessionSnapshotConflict,
+        ))
     }
 }
 

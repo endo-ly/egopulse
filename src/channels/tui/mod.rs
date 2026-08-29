@@ -218,7 +218,7 @@ impl TuiApp {
             UiEvent::Paste(text) => {
                 let effect = self.composer.handle(InputEvent::Paste(text));
                 self.update_completion();
-                self.apply_composer_effect(effect);
+                self.apply_composer_effect(effect).await;
             }
             UiEvent::Key(key) if self.sessions.is_some() => {
                 let action = self
@@ -234,19 +234,19 @@ impl TuiApp {
                 if matches!(effect, Effect::Quit) {
                     return Ok(true);
                 }
-                self.apply_composer_effect(effect);
+                self.apply_composer_effect(effect).await;
             }
         }
         self.insert_pending(terminal)?;
         Ok(false)
     }
 
-    fn apply_composer_effect(&mut self, effect: Effect) {
+    async fn apply_composer_effect(&mut self, effect: Effect) {
         match effect {
             Effect::None => {}
             Effect::Quit => {}
             Effect::Send(prompt) => {
-                if self.submit_prompt(prompt) {
+                if self.submit_prompt(prompt).await {
                     self.composer.accept_submission();
                 }
             }
@@ -269,8 +269,25 @@ impl TuiApp {
         }
     }
 
-    fn submit_prompt(&mut self, prompt: String) -> bool {
+    async fn submit_prompt(&mut self, prompt: String) -> bool {
         if self.busy {
+            if !slash_commands::is_slash_command(&prompt) {
+                let mut context = self.context.clone();
+                context.request_key = format!("tui:{}", uuid::Uuid::new_v4());
+                match crate::runtime::try_stage_tool_followup(&self.state, context, prompt.clone())
+                    .await
+                {
+                    Ok(crate::runtime::ToolFollowupOutcome::Accepted) => {
+                        self.status = "Turn running — follow-up queued".to_string();
+                        return true;
+                    }
+                    Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {}
+                    Err(error) => {
+                        self.status = format!("Follow-up rejected: {error}");
+                        return false;
+                    }
+                }
+            }
             if queue_prompt(&mut self.pending_prompt, prompt) {
                 self.status = "Turn running — queued one prompt".to_string();
                 true
@@ -638,6 +655,7 @@ fn agent_status(event: &AgentEvent) -> String {
         ),
         AgentEvent::FinalResponse { .. } => "Ready".to_string(),
         AgentEvent::Error { .. } => "Turn failed".to_string(),
+        AgentEvent::UserInputInjected { .. } => "Queued input".to_string(),
     }
 }
 

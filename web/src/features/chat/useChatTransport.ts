@@ -2,12 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   initialChatState,
   reduceChatEvent,
+  reduceUserInput,
   reduceToolResult,
   reduceToolStart,
   type ChatEventPayload,
   type ChatState,
   type ToolResultPayload,
   type ToolStartPayload,
+  type UserInputPayload,
 } from "./chatReducer";
 import { AuthRequiredError } from "../../shared/api/auth";
 import { wsUrl } from "../../shared/api/ws";
@@ -156,6 +158,10 @@ export function useChatTransport({
         setState((prev) => reduceToolResult(prev, parsed.payload as ToolResultPayload));
         return;
       }
+
+      if (parsed.type === "event" && parsed.event === "user_input" && parsed.payload) {
+        setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
+      }
     },
     [authToken, onAuthRequired, onDone, onError, clearReconnectTimer],
   );
@@ -248,6 +254,7 @@ export function useChatTransport({
         params: {
           sessionKey,
           message: text,
+          requestId,
         },
       };
       ws.send(JSON.stringify(msg));

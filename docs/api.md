@@ -504,7 +504,7 @@ JSON-RPC 風の双方向メッセージング。
     "server": { "version": "0.1.0", "connId": "uuid" },
     "features": {
       "methods": ["connect", "chat.send"],
-      "events": ["connect.challenge", "chat", "tool_start", "tool_result"]
+      "events": ["connect.challenge", "chat", "tool_start", "tool_result", "user_input"]
     }
   }
 }
@@ -519,7 +519,8 @@ JSON-RPC 風の双方向メッセージング。
   "method": "chat.send",
   "params": {
     "sessionKey": "main",
-    "message": "こんにちは"
+    "message": "こんにちは",
+    "requestId": "client-generated-uuid"
   }
 }
 ```
@@ -537,6 +538,10 @@ JSON-RPC 風の双方向メッセージング。
   }
 }
 ```
+
+同一 WebSocket 接続で active run と同じ `sessionKey` に ordinary message を送った場合、current Turn が Tool 実行中なら `requestId` を message identity として durable staging する。受付 COMMIT 後、active run の `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。Tool 実行中でない、別 session、または slash command の送信は従来通り `busy` または通常の command routing となる。
+
+`user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
 
 #### チャットイベント受信
 

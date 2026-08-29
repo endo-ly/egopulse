@@ -93,6 +93,30 @@ pub(crate) use tool::{ClaimOutcome, ClaimParams, canonical_tool_input, input_has
 pub(crate) use turn::RecoveredOrigin;
 pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun};
 
+/// Result of attempting to stage a human follow-up for the active Tool phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StageToolFollowupOutcome {
+    /// The message is durably present in `messages`.
+    Accepted(StoredMessage),
+    /// There is no unique `tools_pending` Turn for this chat.
+    NoToolPhase,
+}
+
+/// Result of promoting staged human follow-ups into committed conversation history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommittedStagedMessages {
+    pub(crate) revision: i64,
+    pub(crate) messages: Vec<StoredMessage>,
+}
+
+/// A staged human message whose owning Turn is already terminal and therefore
+/// requires promotion into a fresh durable human Turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalStagedMessage {
+    pub(crate) message: StoredMessage,
+    pub(crate) scheduled_request_json: Option<String>,
+}
+
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Connection factory that opens a SQLite database file with connection-local

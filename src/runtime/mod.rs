@@ -13,8 +13,9 @@ pub(crate) mod supervisor;
 pub(crate) mod turn;
 
 pub(crate) use channel_input::{
-    ChannelLogKey, HumanChannelLogMessage, TurnIntake, build_channel_context,
+    ChannelLogKey, HumanChannelLogMessage, ToolFollowupOutcome, TurnIntake, build_channel_context,
     channel_scope_from_secret, store_human_channel_log_message, submit_agent_turn,
+    try_stage_tool_followup,
 };
 pub(crate) use status::ChannelState;
 pub(crate) use status::RuntimeStatus;
@@ -481,7 +482,7 @@ pub async fn build_app_state_with_path(
 // Startup recovery and background services
 // ---------------------------------------------------------------------------
 
-async fn recover_runtime_state(state: &AppState) -> Result<(), EgoPulseError> {
+async fn recover_runtime_state(state: &Arc<AppState>) -> Result<(), EgoPulseError> {
     state.warm_up_calibrator().await;
     recover_durable_state(state).await?;
     rehydrate_origin_tracker(state)?;

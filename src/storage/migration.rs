@@ -2954,7 +2954,19 @@ mod tests {
                 .expect("insert");
             }
         }
-        let before = db.get_all_messages(chat).expect("messages before");
+        let before: Vec<(String, String)> = {
+            let conn = db.get_conn().expect("conn");
+            conn.prepare(
+                "SELECT id, content FROM messages WHERE chat_id = ?1 ORDER BY timestamp, id",
+            )
+            .expect("prepare")
+            .query_map(rusqlite::params![chat], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+        };
 
         // Act
         rollback_schema(&db, 11, "v12");
@@ -2962,13 +2974,10 @@ mod tests {
         // Assert: messages table content/order unchanged (only seq added).
         let after = db.get_all_messages(chat).expect("messages after");
         assert_eq!(
-            before
-                .iter()
-                .map(|m| (&m.id, &m.content))
-                .collect::<Vec<_>>(),
+            before,
             after
                 .iter()
-                .map(|m| (&m.id, &m.content))
+                .map(|m| (m.id.clone(), m.content.clone()))
                 .collect::<Vec<_>>(),
             "web history must be unchanged by migration"
         );

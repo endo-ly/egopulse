@@ -162,6 +162,22 @@ impl Transcript {
                     });
                 }
             }
+            AgentEvent::UserInputInjected { text, .. } => {
+                let (buffer, cards) = {
+                    let active = self.ensure_active();
+                    (
+                        std::mem::take(&mut active.buffer),
+                        std::mem::take(&mut active.tool_cards),
+                    )
+                };
+                if !buffer.trim().is_empty() {
+                    self.commit(Block::Assistant(buffer));
+                }
+                for card in cards {
+                    self.commit(Block::Tool(card));
+                }
+                self.commit(Block::User(text));
+            }
             AgentEvent::FinalResponse { text } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
@@ -368,6 +384,50 @@ mod tests {
             pending.last(),
             Some(&Block::Assistant("**final**".to_string()))
         );
+    }
+
+    #[test]
+    fn injected_user_input_commits_after_tool_cards() {
+        // Arrange
+        let mut transcript = Transcript::new();
+        transcript.begin_turn("hello");
+        transcript.apply_agent_event(AgentEvent::Delta {
+            text: "before".to_string(),
+        });
+        transcript.apply_agent_event(AgentEvent::ToolStart {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            input: json!({"command": "pwd"}),
+        });
+        transcript.apply_agent_event(AgentEvent::ToolResult {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            is_error: false,
+            preview: "/tmp".to_string(),
+            duration_ms: 12,
+        });
+
+        // Act
+        transcript.apply_agent_event(AgentEvent::UserInputInjected {
+            message_id: "tui:follow-up".to_string(),
+            sender_id: "user-b".to_string(),
+            text: "follow-up".to_string(),
+            timestamp: "2026-08-28T12:00:00Z".to_string(),
+        });
+        transcript.apply_agent_event(AgentEvent::Delta {
+            text: "after".to_string(),
+        });
+        transcript.apply_agent_event(AgentEvent::FinalResponse {
+            text: "after".to_string(),
+        });
+
+        // Assert
+        let pending = transcript.drain_pending();
+        assert_eq!(pending.len(), 5);
+        assert_eq!(pending[1], Block::Assistant("before".to_string()));
+        assert!(matches!(pending[2], Block::Tool(_)));
+        assert_eq!(pending[3], Block::User("follow-up".to_string()));
+        assert_eq!(pending[4], Block::Assistant("after".to_string()));
     }
 
     #[test]

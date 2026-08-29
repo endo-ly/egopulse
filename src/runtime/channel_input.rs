@@ -15,7 +15,19 @@ use crate::runtime::metrics;
 use crate::runtime::turn::{RejectReason, ScheduleResult, SubmitOutcome};
 use crate::runtime::turn::{ScheduledTurn, canonical_request_hash, serialize_scheduled_turn};
 use crate::storage::{AcceptOutcome, AcceptTurnParams};
-use crate::storage::{MessageKind, SenderKind, StoredMessage, call_blocking};
+use crate::storage::{
+    MessageKind, SenderKind, StageToolFollowupOutcome, StoredMessage, call_blocking,
+};
+
+/// Outcome of trying to attach ordinary human input to the current Tool phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolFollowupOutcome {
+    /// The follow-up is durable and will be injected after Tool completion.
+    Accepted,
+    /// No unique `tools_pending` Turn exists; the caller should use normal
+    /// input handling for this message.
+    NoToolPhase,
+}
 
 /// Narrow capability for durably accepting and scheduling a target turn.
 ///
@@ -178,9 +190,47 @@ pub(crate) async fn submit_agent_turn(
             context,
             input,
             config_snapshot: None,
+            received_at: Some(chrono::Utc::now().to_rfc3339()),
         },
     )
     .await
+}
+
+/// Attempts to durably stage ordinary human input for the unique Tool phase
+/// of the context's chat.
+pub(crate) async fn try_stage_tool_followup(
+    state: &Arc<AppState>,
+    mut context: SurfaceContext,
+    input: String,
+) -> Result<ToolFollowupOutcome, EgoPulseError> {
+    if !state.supervisor.accepting_inputs() {
+        tracing::info!("tool follow-up rejected: runtime not accepting input (shutdown)");
+        metrics::inc_turn_queue_rejections("shutdown");
+        return Err(EgoPulseError::ShutdownRequested);
+    }
+    if context.request_key.is_empty() {
+        context.request_key = uuid::Uuid::new_v4().to_string();
+    }
+    let chat_id = resolve_chat_id(&state.turn_dependencies(), &context).await?;
+    let request_payload_hash = canonical_request_hash(&context, &input);
+    let request_key = context.request_key;
+    let sender_id = context.surface_user;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let result = call_blocking(state.db_for(context.scope), move |db| {
+        db.stage_tool_followup(
+            chat_id,
+            &request_key,
+            &request_payload_hash,
+            &sender_id,
+            &input,
+            &timestamp,
+        )
+    })
+    .await?;
+    Ok(match result {
+        StageToolFollowupOutcome::Accepted(_) => ToolFollowupOutcome::Accepted,
+        StageToolFollowupOutcome::NoToolPhase => ToolFollowupOutcome::NoToolPhase,
+    })
 }
 
 /// Submits an agent turn and starts execution immediately when the session is idle.
@@ -201,6 +251,9 @@ pub(crate) async fn submit_scheduled_turn(
     state: &Arc<AppState>,
     mut scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
+    if scheduled.received_at.is_none() {
+        scheduled.received_at = Some(chrono::Utc::now().to_rfc3339());
+    }
     if scheduled.config_snapshot.is_none() {
         scheduled.config_snapshot = Some(state.config_manager.current_blocking());
     }
@@ -452,5 +505,27 @@ mod tests {
         assert_eq!(messages[0].sender_kind, SenderKind::User);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("lyre"));
+    }
+
+    #[tokio::test]
+    async fn tool_followup_is_rejected_during_shutdown_before_resolution() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(build_test_state(&dir));
+        state.supervisor.shutdown().await;
+        let context = build_channel_context(
+            "cli",
+            "local_user",
+            "shutdown-follow-up",
+            "cli",
+            "default",
+            ConversationScope::Normal,
+        );
+
+        // Act
+        let result = try_stage_tool_followup(&state, context, "follow-up".to_string()).await;
+
+        // Assert
+        assert!(matches!(result, Err(EgoPulseError::ShutdownRequested)));
     }
 }

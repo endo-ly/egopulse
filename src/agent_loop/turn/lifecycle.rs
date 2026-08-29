@@ -21,6 +21,15 @@ pub(crate) enum TurnAcceptance {
     Terminated(String),
 }
 
+pub(super) struct TurnAcceptanceRequest<'a> {
+    pub(super) chat_id: i64,
+    pub(super) request_key: &'a str,
+    pub(super) payload_hash: &'a str,
+    pub(super) origin_id: &'a str,
+    pub(super) snapshot: &'a crate::config::manager::ConfigSnapshot,
+    pub(super) scheduled_request_json: Option<&'a str>,
+}
+
 /// Resolves the idempotency key used to accept a user request.
 pub(crate) fn resolve_request_key(context: &SurfaceContext) -> String {
     if context.request_key.is_empty() {
@@ -55,20 +64,25 @@ impl<'a> TurnLifecycle<'a> {
     }
 
     /// Accepts a request idempotently or returns the existing Turn outcome.
-    pub(crate) async fn accept(
+    pub(super) async fn accept(
         runtime: &TurnDependencies,
         scope: ConversationScope,
-        chat_id: i64,
-        request_key: &str,
-        payload_hash: &str,
-        origin_id: &str,
-        snapshot: &crate::config::manager::ConfigSnapshot,
+        request: TurnAcceptanceRequest<'_>,
     ) -> Result<TurnAcceptance, EgoPulseError> {
+        let TurnAcceptanceRequest {
+            chat_id,
+            request_key,
+            payload_hash,
+            origin_id,
+            snapshot,
+            scheduled_request_json,
+        } = request;
         let request_key = request_key.to_string();
         let payload_hash = payload_hash.to_string();
         let config_revision = snapshot.revision as i64;
         let config_fingerprint = snapshot.fingerprint.clone();
         let origin_id = origin_id.to_string();
+        let scheduled_request_json = scheduled_request_json.map(ToOwned::to_owned);
         let run = call_blocking(runtime.db_for(scope), move |db| {
             db.accept_or_get_turn(crate::storage::AcceptTurnParams {
                 chat_id,
@@ -77,7 +91,7 @@ impl<'a> TurnLifecycle<'a> {
                 config_fingerprint: Some(&config_fingerprint),
                 request_payload_hash: &payload_hash,
                 origin_id: Some(&origin_id),
-                scheduled_request_json: None,
+                scheduled_request_json: scheduled_request_json.as_deref(),
             })
         })
         .await?;
@@ -261,7 +275,53 @@ pub(crate) async fn validate_resume(
     run: &TurnRun,
     snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> Result<ScheduledTurn, EgoPulseError> {
-    if run.state != TurnRunState::InputCommitted {
+    validate_resume_target(
+        runtime,
+        scope,
+        turn_id,
+        run,
+        snapshot,
+        TurnRunState::InputCommitted,
+        true,
+    )
+    .await
+}
+
+/// Validates and decodes a durable `tools_completed` resume target.
+///
+/// A `tools_completed` Turn has already persisted its Tool Results, while its
+/// staged human follow-ups may still need to be committed. Resuming this state
+/// drains those rows before starting only the next model iteration; it never
+/// accepts the request again or re-runs the completed Tools.
+pub(crate) async fn validate_tools_completed_resume(
+    runtime: &TurnDependencies,
+    scope: ConversationScope,
+    turn_id: &str,
+    run: &TurnRun,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+) -> Result<ScheduledTurn, EgoPulseError> {
+    validate_resume_target(
+        runtime,
+        scope,
+        turn_id,
+        run,
+        snapshot,
+        TurnRunState::ToolsCompleted,
+        false,
+    )
+    .await
+}
+
+async fn validate_resume_target(
+    runtime: &TurnDependencies,
+    scope: ConversationScope,
+    turn_id: &str,
+    run: &TurnRun,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+    expected_state: TurnRunState,
+    reject_published_output: bool,
+) -> Result<ScheduledTurn, EgoPulseError> {
+    if run.state != expected_state {
         return Err(EgoPulseError::TurnConcurrencyConflict);
     }
 
@@ -280,7 +340,7 @@ pub(crate) async fn validate_resume(
             ));
         }
     };
-    if run.output_published {
+    if reject_published_output && run.output_published {
         fail_resume_permanently(
             runtime,
             scope,
@@ -401,6 +461,7 @@ mod tests {
             input: input.to_string(),
             origin_id: context.origin_id.clone(),
             config_snapshot: None,
+            received_at: None,
         })
         .expect("serialize scheduled turn")
     }

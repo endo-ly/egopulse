@@ -113,6 +113,7 @@ impl Database {
                     message_kind, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
+               AND seq IS NOT NULL
                AND (?2 IS NULL OR timestamp >= ?2)
                AND (?3 IS NULL OR timestamp < ?3)
              ORDER BY timestamp ASC",
@@ -135,6 +136,7 @@ impl Database {
                     message_kind, recipient_agent_id
              FROM messages
              WHERE chat_id = ?1
+               AND seq IS NOT NULL
                AND (?2 IS NULL OR (timestamp, id) > (?2, ?3))
                AND (timestamp, id) <= (?4, ?5)
              ORDER BY timestamp ASC, id ASC",
@@ -155,6 +157,7 @@ impl Database {
         conn.query_row(
             "SELECT timestamp, id FROM messages
              WHERE chat_id = ?1
+               AND seq IS NOT NULL
              ORDER BY timestamp DESC, id DESC
              LIMIT 1",
             params![chat_id],
@@ -224,6 +227,7 @@ impl Database {
                AND EXISTS (
                    SELECT 1 FROM messages m
                    WHERE m.chat_id = c.chat_id
+                     AND m.seq IS NOT NULL
                      AND (?2 IS NULL OR m.timestamp >= ?2)
                      AND (?3 IS NULL OR m.timestamp < ?3)
                )

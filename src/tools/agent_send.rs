@@ -232,6 +232,7 @@ impl Tool for AgentSendTool {
             context: target_context,
             input: target_input,
             config_snapshot: context.config_snapshot.clone(),
+            received_at: Some(chrono::Utc::now().to_rfc3339()),
         };
 
         let delivered = match self.intake.submit(scheduled).await {
@@ -381,7 +382,7 @@ mod tests {
     fn accepted_turns(state: &AppState) -> Vec<ScheduledTurn> {
         state
             .db
-            .scan_durable_pending_turns_after("", "", 100)
+            .scan_durable_resumable_turns_after("", "", 100)
             .expect("scan durable turns")
             .into_iter()
             .map(|p| {
@@ -883,7 +884,7 @@ mod integration_tests {
     async fn accepted_turns(state: &AppState) -> Vec<ScheduledTurn> {
         state
             .db
-            .scan_durable_pending_turns_after("", "", 100)
+            .scan_durable_resumable_turns_after("", "", 100)
             .expect("scan durable turns")
             .into_iter()
             .map(|p| {
@@ -966,6 +967,7 @@ mod integration_tests {
             },
             input: "blocker".to_string(),
             config_snapshot: Some(state.config_manager.current_blocking()),
+            received_at: None,
         };
         assert!(matches!(
             state.turn_scheduler.submit(blocker),

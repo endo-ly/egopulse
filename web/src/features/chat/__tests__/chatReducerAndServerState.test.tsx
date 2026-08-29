@@ -5,6 +5,7 @@ import {
   initialChatState,
   reduceToolStart,
   reduceToolResult,
+  reduceUserInput,
   type ChatEventPayload,
 } from "../chatReducer";
 
@@ -91,6 +92,96 @@ describe("chatReducer", () => {
       duration_ms: 120,
       input: { path: "a.txt" },
     });
+  });
+
+  it("user_input_events_append_the_committed_follow_up_once", () => {
+    let state = initialChatState();
+    state = reduceToolStart(state, {
+      callId: "call-1",
+      name: "read",
+      input: { path: "a.txt" },
+    });
+    state = reduceToolResult(state, {
+      callId: "call-1",
+      name: "read",
+      isError: false,
+      preview: "done",
+      durationMs: 120,
+    });
+
+    const payload = {
+      messageId: "web:follow-up",
+      senderId: "web-user",
+      text: "follow-up",
+      timestamp: "2026-08-28T12:00:00Z",
+    };
+    state = reduceUserInput(state, payload);
+    state = reduceUserInput(state, payload);
+
+    expect(state.messages).toHaveLength(2);
+    expect(state.messages[1]).toMatchObject({
+      id: "web:follow-up",
+      sender_kind: "user",
+      content: "follow-up",
+      timestamp: payload.timestamp,
+    });
+  });
+
+  it("separates_assistant_stream_segments_around_injected_user_input", () => {
+    let state = initialChatState();
+    state = reduceChatEvent(state, {
+      runId: "run-segments",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "before" }] },
+    });
+    state = reduceToolStart(state, {
+      callId: "call-segments",
+      name: "read",
+      input: { path: "config" },
+    });
+    state = reduceToolResult(state, {
+      callId: "call-segments",
+      name: "read",
+      isError: false,
+      preview: "done",
+      durationMs: 10,
+    });
+
+    state = reduceUserInput(state, {
+      messageId: "web:segment-follow-up",
+      senderId: "web-user",
+      text: "also check config",
+      timestamp: "2026-08-28T12:00:00Z",
+    });
+    state = reduceChatEvent(state, {
+      runId: "run-segments",
+      sessionKey: "main",
+      seq: 2,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "after" }] },
+    });
+    state = reduceChatEvent(state, {
+      runId: "run-segments",
+      sessionKey: "main",
+      seq: 3,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "after" }] },
+    });
+
+    expect(state.messages.map((message) => message.content)).toEqual([
+      "before",
+      expect.stringContaining('"tool":"read"'),
+      "also check config",
+      "after",
+    ]);
+    expect(state.messages.map((message) => message.sender_kind)).toEqual([
+      "assistant",
+      "tool",
+      "user",
+      "assistant",
+    ]);
   });
 });
 
