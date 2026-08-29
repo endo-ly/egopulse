@@ -289,10 +289,10 @@ pub(crate) async fn validate_resume(
 
 /// Validates and decodes a durable `tools_completed` resume target.
 ///
-/// A `tools_completed` Turn has already persisted its Tool Results and may also
-/// have committed staged human follow-ups into the session snapshot. Resuming
-/// this state therefore starts only the next model iteration; it never accepts
-/// the request again or re-runs the completed Tools.
+/// A `tools_completed` Turn has already persisted its Tool Results, while its
+/// staged human follow-ups may still need to be committed. Resuming this state
+/// drains those rows before starting only the next model iteration; it never
+/// accepts the request again or re-runs the completed Tools.
 pub(crate) async fn validate_tools_completed_resume(
     runtime: &TurnDependencies,
     scope: ConversationScope,

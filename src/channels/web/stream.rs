@@ -17,9 +17,7 @@ use tracing::error;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
-use super::{
-    RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_external_chat_id, web_session_key,
-};
+use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
 use crate::storage::call_blocking;
 
 #[derive(Debug, Serialize)]
@@ -213,21 +211,7 @@ async fn resolve_new_web_session(
     raw_session_key: &str,
     actor: &str,
 ) -> Result<(String, SurfaceContext), (StatusCode, String)> {
-    let default_agent = state
-        .app_state
-        .config_manager
-        .current_blocking()
-        .config
-        .default_agent
-        .to_string();
-    let surface_thread = web_session_key(raw_session_key);
-    let context = SurfaceContext::new(
-        "web".to_string(),
-        actor.to_string(),
-        surface_thread,
-        "web".to_string(),
-        default_agent,
-    );
+    let context = web_context_for_session(state, raw_session_key, actor);
     let chat_id = resolve_chat_id(&state.app_state.turn_dependencies(), &context)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -250,14 +234,9 @@ async fn resolve_existing_web_session(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let default_agent = state
-            .app_state
-            .config_manager
-            .current_blocking()
-            .config
-            .default_agent
-            .to_string();
-        let external_chat_id = web_external_chat_id(raw_session_key);
+        let context = web_context_for_session(state, raw_session_key, actor);
+        let external_chat_id = context.session_key();
+        let default_agent = context.agent_id.clone();
         call_blocking(db, move |db| {
             db.get_chat_by_channel_external_and_agent("web", &external_chat_id, &default_agent)
         })
@@ -269,6 +248,23 @@ async fn resolve_existing_web_session(
         let session_key = format!("chat:{}", info.chat_id);
         (session_key, surface_context_from_chat_info(info, actor))
     }))
+}
+
+fn web_context_for_session(state: &WebState, raw_session_key: &str, actor: &str) -> SurfaceContext {
+    let default_agent = state
+        .app_state
+        .config_manager
+        .current_blocking()
+        .config
+        .default_agent
+        .to_string();
+    SurfaceContext::new(
+        "web".to_string(),
+        actor.to_string(),
+        web_session_key(raw_session_key),
+        "web".to_string(),
+        default_agent,
+    )
 }
 
 /// Resolves a WebSocket follow-up against an existing chat only.

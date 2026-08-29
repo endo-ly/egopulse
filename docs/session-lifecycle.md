@@ -105,7 +105,7 @@ execute_scheduled_turn():
 
 **バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
 
-- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）、`input_committed`（model loop resume）、`tools_completed`（Tool を再実行せず次の model iteration だけ resume）である。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown` / 同一 `request_key` への異なる本文は `internal`）。
+- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）、`input_committed`（model loop resume）、`tools_completed`（未commitの staged follow-upを反映してから、Tool を再実行せず次の model iteration だけ resume）である。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown` / 同一 `request_key` への異なる本文は `internal`）。
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
 - Agent Send (`agent_send`): 非同期のため、拒否時に Channel Log へ SystemEvent を記録する。
 
@@ -126,13 +126,13 @@ execute_scheduled_turn():
 
 ### `messages`
 
-- 役割: 表示用・一覧用の message レコード（**append-only**）
+- 役割: 表示用・一覧用の message レコード
 - 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`, `seq`, `turn_id`
 - `/new` や compaction では削除されない。セッションクリアは `sessions.messages_json` のリセットのみ行う
 
-`seq` は message lifecycle の境界である。`seq IS NOT NULL` の行だけが committed conversation history であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。
+`seq IS NOT NULL` の committed conversation history は append-only かつ immutable であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。staged row は commit 時に `seq` が付与され、terminal Turn への promotion 時には削除される場合がある。
 
-Tool 実行中の human follow-up は staged message として保存され、`turn_id` に `tools_pending` の current Turn を持つ。Tool Result の保存と `complete_tools()` が成功した直後、staged rows を timestamp と message ID の FIFO で committed history と session snapshot へ同一トランザクションで反映する。
+Tool 実行中の human follow-up は staged message として保存され、`turn_id` に current Turn（`tools_pending` または `tools_completed`）を持つ。Tool Result の保存と `complete_tools()` が成功した直後に、staged rows を timestamp と message ID の FIFO で committed history と session snapshot へ同一トランザクションで反映する。プロセス停止でこの反映が中断された場合も、`tools_completed` の recovery が同じ処理を冪等に再実行する。
 
 ### `sessions`
 
@@ -437,11 +437,11 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 | `accepted` / `input_committed`（`scheduled_request_json` あり） | **そのまま残す**。要求が永続化されているため `TurnDispatcher` が再実行する（accepted は受付から、input_committed は model loop から resume） |
 | `accepted`（`scheduled_request_json` なし・旧式直接実行） | `failed`（input 未 commit。再受付で安全に再開可能） |
 | `input_committed`（`scheduled_request_json` なし・旧式直接実行） | `failed`（model 未実行。再受付で安全に再開可能） |
-| `tools_completed`（`scheduled_request_json` あり） | **そのまま残す**。Tool Results と session snapshot が永続化済みのため、Tool を再実行せず次の model iteration だけを `TurnDispatcher` が resume する |
+| `tools_completed`（`scheduled_request_json` あり） | **そのまま残す**。Tool Results は永続化済みで、未commitの staged follow-up があれば先に同じTurnへ反映し、Tool を再実行せず次の model iteration だけを `TurnDispatcher` が resume する |
 | `model_pending` / `model_completed` / `tools_pending` / `tools_completed`（`scheduled_request_json` なし） | `uncertain`（外部出力や Tool 副作用が及んでいる可能性があり、再開の安全性を証明できない） |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
-起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` / `tools_completed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため `failed` とする。`tools_completed` の resume は元の input を再保存せず、完了済み Tool を再実行しない。
+起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` / `tools_completed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため `failed` とする。`tools_completed` の resume は未commitの staged follow-upを先にsession snapshotへ反映し、元の input を再保存せず、完了済み Tool を再実行しない。
 
 同時に `Database::recover_running_tools()` が `running` の Tool をすべて `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
 
@@ -457,12 +457,12 @@ Dispatcher が保存済み `scheduled_request_json` の JSON 構文、必須フ�
 
 再開条件を証明できない場合は、推測して処理を続けず `failed` または `uncertain` で停止する。
 
-- partial output をすでに公開済み（`output_published = true`）。ただし `tools_completed` は Tool Results と session snapshot が揃っているため、次の model iteration だけを再開できる
+- partial output をすでに公開済み（`output_published = true`）。ただし `tools_completed` は Tool Results が揃っており、未commitの staged follow-upも先に反映できるため、次の model iteration だけを再開できる
 - 同じ Tool Call ID に異なる input が渡された
 - Tool 実行結果が不明（`running` のまま停止）
 - 同一 `request_key` へ異なる本文が再受付された
 
-これらは人手による確認を促す安全弁として機能する。`accepted` / `input_committed` は外部出力が一切発生していないことが前提のため、要求が永続化されていれば再実行（§10.3）、そうでなければ `failed` として再受付による安全な再実行を許す。`tools_completed` は完了済み Tool の再実行を伴わず、永続化済みの session snapshot から次の model iteration だけを再開できる。それ以外の状態は出力または副作用が及んでいる可能性があるため `uncertain` とする。
+これらは人手による確認を促す安全弁として機能する。`accepted` / `input_committed` は外部出力が一切発生していないことが前提のため、要求が永続化されていれば再実行（§10.3）、そうでなければ `failed` として再受付による安全な再実行を許す。`tools_completed` は未commitの staged follow-upをsession snapshotへ反映したうえで、完了済み Tool の再実行を伴わず、次の model iteration だけを再開できる。それ以外の状態は出力または副作用が及んでいる可能性があるため `uncertain` とする。
 
 ---
 

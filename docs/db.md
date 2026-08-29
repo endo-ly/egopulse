@@ -228,7 +228,7 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 
 NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未割当行が複数存在しても衝突しない。
 
-`seq IS NOT NULL` が committed conversation history の境界である。`seq IS NULL` の user/message 行は Tool phase 中に durable staging された未消費の follow-up であり、履歴・session preview・Sleep source には含めない。staged row は `turn_id` に current `tools_pending` Turn を持ち、Tool phase 完了後に FIFO で seq を割り当て、session snapshot、`chats.revision`、`chats.next_message_seq` と同一トランザクションで commit する。
+`seq IS NOT NULL` が committed conversation history の境界である。`seq IS NULL` の user/message 行は Tool phase 中に durable staging された未消費の follow-up であり、履歴・session preview・Sleep source には含めない。staged row は `turn_id` に current `tools_pending` または `tools_completed` Turn を持ち、Tool phase 完了後に FIFO で seq を割り当て、session snapshot、`chats.revision`、`chats.next_message_seq` と同一トランザクションで commit する。`tools_completed` recovery は、このcommitが中断された場合も同じ操作を再実行する。
 
 **操作**:
 - `store_message(msg)` — `INSERT OR REPLACE`
@@ -604,7 +604,7 @@ Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実�
 | `model_pending` | model 呼出し中。外部出力・Tool 実行がなく request hash 一致なら retry 可能 |
 | `model_completed` | model 応答受信済み。保存済み response/Tool Call から続行 |
 | `tools_pending` | Tool 実行中。`tool_calls` 状態を確認 |
-| `tools_completed` | Tool 実行完了。次 iteration または finalize へ。`scheduled_request_json` があれば crash 後も Tool を再実行せず次の model iteration を resume |
+| `tools_completed` | Tool 実行完了。未commitの staged follow-upがあれば先に反映し、次 iteration または finalize へ。`scheduled_request_json` があれば crash 後も Tool を再実行せず次の model iteration を resume |
 | `completed` | 完了。保存済み結果を返し新規実行しない |
 | `failed` | 失敗。明示的再実行がない限り自動再開しない |
 | `cancelled` | キャンセル。自動再開しない |
@@ -612,7 +612,7 @@ Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実�
 
 **設計ポイント**:
 - 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する（`Database`（turn.rs））
-- `output_published` が真の Turn は原則自動 retry しない。ただし `tools_completed` は Tool Results と session snapshot が durable なので、完了済み Tool を再実行せず次の model iteration だけを resume する
+- `output_published` が真の Turn は原則自動 retry しない。ただし `tools_completed` は Tool Results が durable で、未commitの staged follow-upも先に反映できるため、完了済み Tool を再実行せず次の model iteration だけを resume する
 - `UNIQUE(chat_id, request_key)` により同一受付の重複を防止する。再受付時は既存 Turn を返し、`completed` なら保存済み結果を再利用する
 - `accepted` / `input_committed` / `tools_completed` の `scheduled_request_json` を復元できない場合は、`error_kind = durable_payload_invalid` で終端化する。`accepted` / `input_committed` は `failed`、`tools_completed` は `output_published` の状態に応じて `failed` または `uncertain` とする。`error_message` は固定の sanitized 文言とし、保存済み payload は調査用に変更しない。`origin_id` がある場合は Turn の失敗と origin の終了理由を同一 transaction で記録する
 - crash recovery は起動時に `recover_interrupted()` が未端末 Turn を処理する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state)

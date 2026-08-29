@@ -323,7 +323,7 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 - `--session` 省略時は最終更新セッションを開き、保存済みセッションがなければ新規コンテキストを作る
 - `--session` に未知の名前を指定した場合は、その名前の新規 TUI セッションを作る
 - 起動時の端末高さが 10 行未満の場合はエラー終了する
-- TUI の表示履歴は append-only `messages` を正本とし、`tool_calls` 台帳の入力・結果でツールカードを補完する。`sessions.messages_json` は次ターンの LLM context 用であり、表示履歴の source には使わない
+- TUI の表示履歴は committed な `messages` を正本とし、`tool_calls` 台帳の入力・結果でツールカードを補完する。`sessions.messages_json` は次ターンの LLM context 用であり、表示履歴の source には使わない
 
 ### コンポーザ操作
 

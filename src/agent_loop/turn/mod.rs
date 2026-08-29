@@ -7,7 +7,7 @@ pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::PromptContext;
+use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
@@ -29,6 +29,11 @@ use chrono::Utc;
 use std::sync::Arc;
 use tracing::Instrument;
 use tracing::warn;
+
+enum ResumeMode {
+    InputCommitted,
+    ToolsCompleted { start_iteration: usize },
+}
 
 /// Maximum number of Channel Log events to inject as Shared Room Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
@@ -205,16 +210,23 @@ pub(crate) async fn resume_input_committed_turn(
         received_at: None,
     };
     executor
-        .resume_run(&persisted.input, received_at.as_deref(), &snapshot, &run)
+        .resume_run(
+            &persisted.input,
+            received_at.as_deref(),
+            &snapshot,
+            &run,
+            ResumeMode::InputCommitted,
+        )
         .await
 }
 
 /// Resumes a Turn that reached `tools_completed` before the runtime stopped.
 ///
-/// The Tool phase and any staged follow-ups that were committed before the
-/// crash are already durable. This path reloads the current session snapshot
-/// and starts only the next model iteration; it never re-accepts the original
-/// input or re-executes completed Tools.
+/// The Tool phase is durable, while staged follow-ups may or may not have been
+/// committed when the process stopped. This path reloads the current session
+/// snapshot, idempotently drains staged follow-ups, and starts only the next
+/// model iteration; it never re-accepts the original input or re-executes
+/// completed Tools.
 pub(crate) async fn resume_tools_completed_turn(
     state: &TurnDependencies,
     scope: ConversationScope,
@@ -230,6 +242,15 @@ pub(crate) async fn resume_tools_completed_turn(
 
     let snapshot = config_snapshot;
     let persisted = validate_tools_completed_resume(state, scope, turn_id, &run, &snapshot).await?;
+    let start_iteration = usize::try_from(run.current_iteration)
+        .ok()
+        .and_then(|iteration| iteration.checked_add(1))
+        .ok_or_else(|| {
+            EgoPulseError::Internal(format!(
+                "tools_completed turn has invalid current iteration: {}",
+                run.current_iteration
+            ))
+        })?;
     let received_at = persisted.received_at.clone();
     let context = persisted.context;
 
@@ -241,7 +262,13 @@ pub(crate) async fn resume_tools_completed_turn(
         received_at: None,
     };
     executor
-        .resume_run(&persisted.input, received_at.as_deref(), &snapshot, &run)
+        .resume_run(
+            &persisted.input,
+            received_at.as_deref(),
+            &snapshot,
+            &run,
+            ResumeMode::ToolsCompleted { start_iteration },
+        )
         .await
 }
 
@@ -372,6 +399,7 @@ impl TurnExecutor<'_> {
                     channel_context_msg,
                     messages,
                     session_revision,
+                    1,
                 )
                 .await
             }
@@ -391,16 +419,18 @@ impl TurnExecutor<'_> {
         .await
     }
 
-    /// Runs the model loop for a Turn that already reached `input_committed`
-    /// before the runtime stopped. Reloads the persisted session snapshot but
-    /// does **not** re-accept, re-persist the user message, or re-run compaction
-    /// (those are already durable). See [`resume_input_committed_turn`].
+    /// Runs the model loop from a state-specific durable resume boundary.
+    /// `input_committed` resumes the first model iteration, while
+    /// `tools_completed` drains staged follow-ups and resumes the next model
+    /// iteration. Neither mode re-accepts the original input or re-executes
+    /// completed Tools.
     async fn resume_run(
         &self,
         user_input: &str,
         received_at: Option<&str>,
         snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
         turn_run: &TurnRun,
+        resume_mode: ResumeMode,
     ) -> Result<String, EgoPulseError> {
         self.state.active_turns.begin_turn(&self.context.agent_id);
         crate::runtime::metrics::inc_turns_total(&self.context.agent_id, &self.context.channel);
@@ -420,8 +450,9 @@ impl TurnExecutor<'_> {
                 tools_json: prepared.tools_json.as_deref(),
                 has_tools: !prepared.tool_defs.is_empty(),
             };
-            // Reload the already-committed session snapshot; do NOT re-persist the
-            // user message or re-run compaction.
+            // Reload the persisted session snapshot; do NOT re-persist the user
+            // message. Only the tools_completed boundary re-runs the staged
+            // follow-up commit and post-tool compaction.
             let loaded = load_messages_for_turn_with_limit(
                 self.state,
                 self.context.scope,
@@ -429,13 +460,57 @@ impl TurnExecutor<'_> {
                 snapshot.config.max_history_messages,
             )
             .await?;
+            let (messages, session_revision, start_iteration) = match resume_mode {
+                ResumeMode::InputCommitted => {
+                    (loaded.messages, loaded.session_revision, 1)
+                }
+                ResumeMode::ToolsCompleted { start_iteration } => {
+                    let persistence = TurnPersistence::new(
+                        self.state,
+                        self.context,
+                        chat_id,
+                        &turn_run.turn_id,
+                    );
+                    let persisted = persistence
+                        .commit_staged_user_messages(
+                            loaded.messages,
+                            loaded.session_revision,
+                            snapshot,
+                            &self.on_event,
+                        )
+                        .await?;
+                    let compacted = match maybe_compact_messages(
+                        self.state,
+                        self.context,
+                        chat_id,
+                        &persisted.messages,
+                        &prepared.channel_llm,
+                        &prompt_ctx,
+                        &snapshot.config,
+                    )
+                    .await
+                    {
+                        Ok(messages) => messages,
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                turn_id = %turn_run.turn_id,
+                                "message compaction failed during tools_completed recovery; continuing with uncompacted messages"
+                            );
+                            persisted.messages
+                        }
+                    };
+                    (Arc::new(compacted), Some(persisted.revision), start_iteration)
+                }
+            };
             let channel_context_msg = load_channel_context(self.state, self.context).await;
             self.run_agent_loop(
                 &prepared,
                 prompt_ctx,
                 channel_context_msg,
-                loaded.messages,
-                loaded.session_revision,
+                messages,
+                session_revision,
+                start_iteration,
             )
             .await
         }
@@ -604,6 +679,7 @@ impl TurnExecutor<'_> {
         channel_context_msg: Option<Message>,
         messages: Arc<Vec<Message>>,
         session_revision: Option<i64>,
+        start_iteration: usize,
     ) -> Result<String, EgoPulseError> {
         let result = AgentLoop::new(
             self.state,
@@ -613,7 +689,7 @@ impl TurnExecutor<'_> {
             channel_context_msg,
             self.on_event.clone(),
         )
-        .run(messages, session_revision)
+        .run(messages, session_revision, start_iteration)
         .await?;
 
         self.persist_agent_loop_result(prepared, result).await
@@ -758,21 +834,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn recovered_tools_completed_turn_resumes_without_rerunning_tools() {
+    async fn recover_tools_completed_turn(
+        commit_followup_before_recovery: bool,
+        current_iteration: i64,
+        response: Option<MessagesResponse>,
+    ) -> (Vec<Vec<crate::llm::Message>>, TurnRunState, i64, usize) {
         // Arrange: persist a Turn exactly at the crash boundary after Tool
-        // Results and staged follow-ups have been committed.
+        // Results and before or after staged follow-ups are committed.
         let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![Ok(MessagesResponse {
-                content: "recovered response".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })],
-            vec![0],
-        );
+        let responses = response.into_iter().map(Ok).collect::<Vec<_>>();
+        let response_count = responses.len();
+        let provider = RecordingProvider::new(responses, vec![0; response_count]);
         let state = Arc::new(build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider.clone()),
@@ -871,7 +943,7 @@ mod tests {
         .expect("commit input");
         state
             .db
-            .begin_turn_model_iteration(&run.turn_id, 1, "initial-model")
+            .begin_turn_model_iteration(&run.turn_id, current_iteration, "initial-model")
             .expect("begin model");
         state
             .db
@@ -896,6 +968,10 @@ mod tests {
             .db
             .complete_turn_tools(&run.turn_id)
             .expect("complete tools");
+        state
+            .db
+            .mark_turn_output_published(&run.turn_id)
+            .expect("mark output published");
         let committed_followup = crate::llm::Message::text(
             "user",
             crate::agent_loop::message_format::format_direct_input(
@@ -915,10 +991,12 @@ mod tests {
         )
         .await
         .expect("recovery snapshot");
-        state
-            .db
-            .commit_staged_user_messages(&run.turn_id, &recovery_snapshot, 1)
-            .expect("commit follow-up");
+        if commit_followup_before_recovery {
+            state
+                .db
+                .commit_staged_user_messages(&run.turn_id, &recovery_snapshot, 1)
+                .expect("commit follow-up");
+        }
 
         assert_eq!(
             state.db.recover_interrupted_turns().expect("recover"),
@@ -931,18 +1009,72 @@ mod tests {
         // Act: the dispatcher path resumes the next model iteration.
         crate::runtime::execute_scheduled_turn(&state, scheduled).await;
 
-        // Assert: the completed Tool phase is not replayed and the committed
-        // follow-up is visible to exactly one resumed model request.
-        assert_eq!(provider.seen_messages().len(), 1);
-        assert!(
-            provider.seen_messages()[0]
-                .iter()
-                .any(|message| { message.content.as_text_lossy().contains("follow-up input") })
-        );
+        let seen_messages = provider.seen_messages();
+        let final_run = state.db.get_turn_run(&run.turn_id).expect("turn run");
+        let staged_count = state
+            .db
+            .list_staged_user_messages(&run.turn_id)
+            .expect("staged messages")
+            .len();
+        (
+            seen_messages,
+            final_run.state,
+            final_run.current_iteration,
+            staged_count,
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovered_tools_completed_turn_drains_followup_before_or_after_commit() {
+        for commit_followup_before_recovery in [false, true] {
+            let (seen_messages, state, current_iteration, staged_count) =
+                recover_tools_completed_turn(
+                    commit_followup_before_recovery,
+                    17,
+                    Some(MessagesResponse {
+                        content: "recovered response".to_string(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    }),
+                )
+                .await;
+
+            // Assert: both crash boundaries resume after the completed Tool
+            // phase, consume the follow-up exactly once, and preserve the
+            // durable iteration sequence.
+            assert_eq!(seen_messages.len(), 1);
+            assert!(
+                seen_messages[0]
+                    .iter()
+                    .any(|message| { message.content.as_text_lossy().contains("follow-up input") })
+            );
+            assert_eq!(state, TurnRunState::Completed);
+            assert_eq!(current_iteration, 18);
+            assert_eq!(staged_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tools_completed_recovery_does_not_reset_hard_iteration_cap() {
+        let (seen_messages, state, current_iteration, staged_count) = recover_tools_completed_turn(
+            false,
+            crate::agent_loop::loop_runner::MAX_TOOL_ITERATIONS as i64,
+            None,
+        )
+        .await;
+
+        // Assert: a Turn that already used the final iteration is not given a
+        // fresh loop after restart.
+        assert!(seen_messages.is_empty());
+        assert_eq!(state, TurnRunState::Uncertain);
         assert_eq!(
-            state.db.get_turn_run(&run.turn_id).expect("turn run").state,
-            TurnRunState::Completed
+            current_iteration,
+            crate::agent_loop::loop_runner::MAX_TOOL_ITERATIONS as i64
         );
+        assert_eq!(staged_count, 0);
     }
 
     #[tokio::test]

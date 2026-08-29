@@ -374,8 +374,9 @@ impl Database {
     /// Returns durable Turns that can be dispatched or resumed after startup.
     ///
     /// In addition to queued `accepted` / `input_committed` Turns, this includes
-    /// `tools_completed` Turns with a persisted request. The latter resume only
-    /// their next model iteration; their completed Tool phase is never replayed.
+    /// `tools_completed` Turns with a persisted request. The latter drain any
+    /// staged follow-ups before resuming only their next model iteration; their
+    /// completed Tool phase is never replayed.
     /// Only returns rows whose `(accepted_at, turn_id)` is strictly greater than
     /// the supplied cursor. The dispatcher uses this for in-tick pagination:
     /// each tick scans from the head (`("", "")`) and pages through the full
@@ -1026,9 +1027,10 @@ impl Database {
             // full request is persisted) is left for the turn dispatcher to
             // resume after startup. Accepted turns can be re-executed,
             // input_committed turns can restart their first model iteration,
-            // and tools_completed turns can restart only their next model
-            // iteration without re-running tools. Legacy turns without a
-            // persisted request still fall through to the fail-stop branch.
+            // and tools_completed turns can drain staged follow-ups before
+            // restarting only their next model iteration without re-running
+            // tools. Legacy turns without a persisted request still fall
+            // through to the fail-stop branch.
             if row.scheduled_request_json.is_some()
                 && matches!(
                     from,

@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_chat_send_stages_same_session_follow_up_and_acks_active_run() {
+    async fn ws_chat_send_stages_same_session_follow_up_with_raw_session_key() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
@@ -1129,7 +1129,7 @@ mod tests {
         let resolved = resolve_send_request(
             &state,
             &SendRequest {
-                session_key: Some(format!("chat:{chat_id}")),
+                session_key: Some("active-follow-up".to_string()),
                 message: "follow-up".to_string(),
                 request_id: Some("follow-up-request".to_string()),
             },
@@ -1145,7 +1145,7 @@ mod tests {
             context,
             "req-follow-up",
             serde_json::json!({
-                "sessionKey": format!("chat:{chat_id}"),
+                "sessionKey": "active-follow-up",
                 "message": "follow-up",
                 "requestId": "follow-up-request"
             }),

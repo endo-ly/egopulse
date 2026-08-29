@@ -115,10 +115,11 @@ impl<'a> AgentLoop<'a> {
         &self,
         messages: Arc<Vec<Message>>,
         session_revision: Option<i64>,
+        start_iteration: usize,
     ) -> Result<AgentLoopResult, EgoPulseError> {
         let mut loop_state = LoopState::new(messages, session_revision);
 
-        for iteration in 1..=MAX_TOOL_ITERATIONS {
+        for iteration in start_iteration..=MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
             let request_messages = request_messages_for_iteration(
                 &mut loop_state,
