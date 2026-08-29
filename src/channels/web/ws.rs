@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::auth;
-use super::stream::{SendRequest, resolve_send_request, start_stream_run};
+use super::stream::{SendRequest, resolve_existing_send_request, start_stream_run};
 use super::{RunEvent, WEB_ACTOR, WebState};
 
 #[derive(Deserialize)]
@@ -404,8 +404,9 @@ async fn handle_chat_send(
     };
 
     if let Some(active) = context.active_chat_send.lock().await.clone() {
-        let resolved = match resolve_send_request(state, &request, WEB_ACTOR).await {
-            Ok(resolved) => resolved,
+        let resolved = match resolve_existing_send_request(state, &request, WEB_ACTOR).await {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => return send_busy(context.tx, id),
             Err((status, message)) => {
                 return send_error(
                     context.tx,
@@ -789,6 +790,7 @@ mod tests {
     use axum::extract::ws::Message;
 
     use crate::channels::web::RunHub;
+    use crate::channels::web::stream::resolve_send_request;
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message as LlmMessage, MessagesResponse};
     use crate::test_util::build_state_with_provider;
@@ -1166,6 +1168,69 @@ mod tests {
         assert_eq!(staged.len(), 1);
         assert_eq!(staged[0].id, "web:follow-up-request");
         assert_eq!(staged[0].content, "follow-up");
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_rejects_unknown_session_without_creating_chat() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let active_chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id(
+                "web",
+                "web:active-session:agent:default",
+                None,
+                "web",
+                "default",
+            )
+            .expect("create active chat");
+        let chat_count = |state: &WebState| {
+            state
+                .app_state
+                .db
+                .get_conn()
+                .expect("connection")
+                .query_row("SELECT COUNT(*) FROM chats", [], |row| row.get::<_, i64>(0))
+                .expect("count chats")
+        };
+        let before = chat_count(&state);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let in_flight = Arc::new(AtomicUsize::new(1));
+        let active_chat_send = Arc::new(Mutex::new(Some(ActiveChatSend {
+            run_id: "active-run".to_string(),
+            session_key: format!("chat:{active_chat_id}"),
+        })));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            in_flight_chat_sends: &in_flight,
+            active_chat_send: &active_chat_send,
+            conn_id: "test-conn",
+        };
+
+        // Act
+        let stopped = handle_chat_send(
+            &state,
+            context,
+            "req-unknown-session",
+            serde_json::json!({
+                "sessionKey": "not-yet-created",
+                "message": "follow-up"
+            }),
+        )
+        .await;
+
+        // Assert
+        assert!(!stopped);
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "busy");
+        assert_eq!(chat_count(&state), before);
     }
 
     #[test]

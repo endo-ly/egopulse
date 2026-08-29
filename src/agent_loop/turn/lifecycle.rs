@@ -275,7 +275,53 @@ pub(crate) async fn validate_resume(
     run: &TurnRun,
     snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> Result<ScheduledTurn, EgoPulseError> {
-    if run.state != TurnRunState::InputCommitted {
+    validate_resume_target(
+        runtime,
+        scope,
+        turn_id,
+        run,
+        snapshot,
+        TurnRunState::InputCommitted,
+        true,
+    )
+    .await
+}
+
+/// Validates and decodes a durable `tools_completed` resume target.
+///
+/// A `tools_completed` Turn has already persisted its Tool Results and may also
+/// have committed staged human follow-ups into the session snapshot. Resuming
+/// this state therefore starts only the next model iteration; it never accepts
+/// the request again or re-runs the completed Tools.
+pub(crate) async fn validate_tools_completed_resume(
+    runtime: &TurnDependencies,
+    scope: ConversationScope,
+    turn_id: &str,
+    run: &TurnRun,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+) -> Result<ScheduledTurn, EgoPulseError> {
+    validate_resume_target(
+        runtime,
+        scope,
+        turn_id,
+        run,
+        snapshot,
+        TurnRunState::ToolsCompleted,
+        false,
+    )
+    .await
+}
+
+async fn validate_resume_target(
+    runtime: &TurnDependencies,
+    scope: ConversationScope,
+    turn_id: &str,
+    run: &TurnRun,
+    snapshot: &crate::config::manager::ConfigSnapshot,
+    expected_state: TurnRunState,
+    reject_published_output: bool,
+) -> Result<ScheduledTurn, EgoPulseError> {
+    if run.state != expected_state {
         return Err(EgoPulseError::TurnConcurrencyConflict);
     }
 
@@ -294,7 +340,7 @@ pub(crate) async fn validate_resume(
             ));
         }
     };
-    if run.output_published {
+    if reject_published_output && run.output_published {
         fail_resume_permanently(
             runtime,
             scope,

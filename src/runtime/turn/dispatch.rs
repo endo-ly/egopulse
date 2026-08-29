@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::scheduler;
 use super::{ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
-use crate::agent_loop::resume_input_committed_turn;
+use crate::agent_loop::{resume_input_committed_turn, resume_tools_completed_turn};
 use crate::config::manager::ConfigSnapshot;
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
@@ -57,14 +57,14 @@ pub(in crate::runtime) fn spawn_turn_dispatcher(state: Arc<AppState>, shutdown: 
     );
 }
 
-/// Re-enqueues durably accepted turns found in the databases. Each is rebuilt
-/// from its persisted request and re-submitted in acceptance order; the
-/// scheduler deduplicates by `turn_id`, so re-scanning a turn that is already
-/// running or queued is an idempotent no-op and no per-process dedup set is
-/// needed. A database failure leaves the row pending so the next scan retries.
-/// An invalid persisted payload is terminalized as `failed`, while turns the
-/// scheduler cannot accept yet (capacity) stay `accepted`/`input_committed` in
-/// the DB and are retried as capacity frees.
+/// Re-enqueues durably accepted or safely resumable turns found in the
+/// databases. Each is rebuilt from its persisted request and re-submitted in
+/// acceptance order; the scheduler deduplicates by `turn_id`, so re-scanning a
+/// turn that is already running or queued is an idempotent no-op and no
+/// per-process dedup set is needed. A database failure leaves the row pending
+/// so the next scan retries. An invalid persisted payload is terminalized as
+/// `failed`, while turns the scheduler cannot accept yet (capacity) stay in
+/// their durable state and are retried as capacity frees.
 ///
 /// Each tick scans from the head (`("", "")`) with in-tick cursor pagination.
 /// Because the scheduler deduplicates already-owned turns (a cheap HashMap
@@ -185,7 +185,7 @@ async fn dispatch_durable_turns_for_scope(
             let after_at = after_at.clone();
             let after_id = after_id.clone();
             move |db| {
-                db.scan_durable_pending_turns_after(&after_at, &after_id, DISPATCHER_BATCH_LIMIT)
+                db.scan_durable_resumable_turns_after(&after_at, &after_id, DISPATCHER_BATCH_LIMIT)
             }
         })
         .await
@@ -213,7 +213,7 @@ async fn dispatch_durable_turns_for_scope(
             turn.turn_id = turn_id;
             // Re-enqueue. The scheduler deduplicates by `turn_id`, so a turn
             // already running or queued is an idempotent no-op; a turn rejected
-            // by capacity stays in the DB for the next tick.
+            // by capacity stays in its durable state for the next tick.
             let _ = channel_input::enqueue_durable_turn(state, turn);
         }
 
@@ -309,29 +309,29 @@ where
     }
 }
 
-/// Persists the durable cancellation of a turn, retrying across transient
-/// storage failures so a momentary DB hiccup does not leave the runnable row in
-/// `accepted`/`input_committed`. A row left accepted would be re-delivered by
-/// the turn dispatcher after a restart, re-running a turn a stop condition had
-/// already rejected.
+/// Persists the durable rejection of a turn, retrying across transient storage
+/// failures so a momentary DB hiccup does not leave a rejected turn runnable.
+/// Queued turns are cancelled; turns that already started execution are moved
+/// to `uncertain` because their external output or side effects cannot be
+/// discarded safely.
 ///
 /// The synchronous SQLite write is performed on a blocking thread via
 /// [`call_blocking`] so it never stalls the async executor. The call sites are
-/// fail-closed: a returned `Err` means the turn could not be durably cancelled,
+/// fail-closed: a returned `Err` means the turn could not be durably stopped,
 /// and the caller must NOT mark the turn complete or start the next queued turn
 /// for the same session (see [`execute_scheduled_turn`]).
 ///
 /// Retries indefinitely with exponential backoff (capped at 5 s) so a transient
 /// DB outage does not wedge the session permanently — once the DB recovers the
-/// cancellation lands and the session advances. A `Conflict` (the turn already
-/// moved past the cancellable point, e.g. another executor raced ahead) is
-/// treated as success: the turn is past cancellation and retrying cannot help.
+/// rejection lands and the session advances. A `Conflict` (the turn already
+/// moved past the stoppable point, e.g. another executor raced ahead) is
+/// treated as success: the turn is no longer owned by this rejection path.
 /// The loop aborts only on shutdown, returning `Err` so the caller can exit.
 ///
 /// # Errors
 ///
 /// Returns [`EgoPulseError`] only when shutdown begins mid-retry.
-async fn persist_turn_cancellation(
+async fn persist_turn_rejection(
     state: &AppState,
     scope: crate::conversation::ConversationScope,
     turn_id: &str,
@@ -347,13 +347,24 @@ async fn persist_turn_cancellation(
     retry_durable_storage_write(
         state,
         &identifier,
-        "cancel_turn",
+        "reject_turn",
         move || {
             let db = Arc::clone(&db);
             let turn_id = turn_id.clone();
             let reason = reason.clone();
             let note = note.clone();
-            call_blocking(db, move |db| db.cancel_turn(&turn_id, &reason, &note))
+            call_blocking(db, move |db| {
+                let run = db.get_turn_run(&turn_id)?;
+                if run.state.is_terminal() {
+                    return Ok(());
+                }
+                match run.state {
+                    TurnRunState::Accepted | TurnRunState::InputCommitted => {
+                        db.cancel_turn(&turn_id, &reason, &note)
+                    }
+                    _ => db.fail_turn(&turn_id, TurnRunState::Uncertain, &reason, &note),
+                }
+            })
         },
         |error| {
             matches!(
@@ -509,7 +520,7 @@ pub(crate) fn execute_scheduled_turn(
             .clone()
             .unwrap_or_else(|| state.config_manager.current_blocking());
 
-        if !begin_scheduled_turn(state, &prepared, &config_snapshot).await {
+        if !begin_scheduled_turn(state, &prepared, current_state, &config_snapshot).await {
             return;
         }
 
@@ -555,7 +566,7 @@ async fn prepare_scheduled_turn(
         );
 
         let reason_text = reason.to_string();
-        match persist_turn_cancellation(
+        match persist_turn_rejection(
             state,
             turn.context.scope,
             &turn.turn_id,
@@ -572,7 +583,7 @@ async fn prepare_scheduled_turn(
                 tracing::error!(
                     error = %error,
                     turn_id = %turn.turn_id,
-                    "durable cancellation failed; leaving turn blocked until DB recovers"
+                    "durable rejection failed; leaving turn blocked until DB recovers"
                 );
             }
         }
@@ -632,6 +643,7 @@ async fn load_durable_turn_state(state: &AppState, turn: &ScheduledTurn) -> Dura
 async fn begin_scheduled_turn(
     state: &AppState,
     prepared: &PreparedScheduledTurn,
+    current_state: Option<TurnRunState>,
     config_snapshot: &ConfigSnapshot,
 ) -> bool {
     let turn = &prepared.turn;
@@ -644,12 +656,16 @@ async fn begin_scheduled_turn(
     let chain_depth = turn.context.chain_depth;
     let agent_id = &turn.context.agent_id;
 
-    match state.turn_tracker.try_begin_execution(
-        &prepared.origin_id,
-        chain_depth,
-        agent_id,
-        &valid_ids,
-    ) {
+    let execution = if current_state == Some(TurnRunState::ToolsCompleted) {
+        state.turn_tracker.try_resume_execution(&prepared.origin_id)
+    } else {
+        state
+            .turn_tracker
+            .try_begin_execution(&prepared.origin_id, chain_depth, agent_id, &valid_ids)
+            .map(|_| ())
+    };
+
+    match execution {
         Ok(_) => true,
         Err(reason) => {
             tracing::warn!(
@@ -674,7 +690,7 @@ async fn begin_scheduled_turn(
                 );
                 return false;
             }
-            if let Err(error) = persist_turn_cancellation(
+            if let Err(error) = persist_turn_rejection(
                 state,
                 turn.context.scope,
                 &turn.turn_id,
@@ -686,7 +702,7 @@ async fn begin_scheduled_turn(
                 tracing::error!(
                     error = %error,
                     turn_id = %turn.turn_id,
-                    "durable stop cancellation failed; leaving turn blocked"
+                    "durable stop rejection failed; leaving turn blocked"
                 );
                 return false;
             }
@@ -755,8 +771,17 @@ async fn execute_and_publish_scheduled_turn(
             )
             .await
         }
+        Some(TurnRunState::ToolsCompleted) => {
+            resume_tools_completed_turn(
+                &runtime,
+                turn.context.scope,
+                &turn.turn_id,
+                Arc::clone(&config_snapshot),
+            )
+            .await
+        }
         _ => {
-            execute_turn_with_progress_and_snapshot_and_received_at(
+            execute_turn_with_progress_and_snapshot(
                 state,
                 &turn.context,
                 &turn.input,
@@ -952,24 +977,7 @@ pub(crate) async fn execute_observed_turn(
     result
 }
 
-#[cfg(test)]
 async fn execute_turn_with_progress_and_snapshot(
-    state: &AppState,
-    context: &SurfaceContext,
-    input: &str,
-    config_snapshot: Arc<ConfigSnapshot>,
-) -> Result<String, EgoPulseError> {
-    execute_turn_with_progress_and_snapshot_and_received_at(
-        state,
-        context,
-        input,
-        config_snapshot,
-        None,
-    )
-    .await
-}
-
-async fn execute_turn_with_progress_and_snapshot_and_received_at(
     state: &AppState,
     context: &SurfaceContext,
     input: &str,
@@ -1280,6 +1288,7 @@ mod tests {
                 &success_context,
                 "hello",
                 success_state.config_manager.current_blocking(),
+                None,
             ),
         )
         .await;
@@ -1305,6 +1314,7 @@ mod tests {
                 &failure_context,
                 "hello",
                 failure_state.config_manager.current_blocking(),
+                None,
             ),
         )
         .await;
@@ -1342,6 +1352,7 @@ mod tests {
             &context,
             "hello",
             state.config_manager.current_blocking(),
+            None,
         )
         .await;
 
@@ -1460,7 +1471,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_turn_cancellation_retries_until_db_recovers() {
+    async fn persist_turn_rejection_retries_until_db_recovers() {
         use crate::conversation::ConversationScope;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1473,7 +1484,7 @@ mod tests {
         state
             .db_for(ConversationScope::Normal)
             .fault_inject_next_get_conn(2);
-        let result = persist_turn_cancellation(
+        let result = persist_turn_rejection(
             &state,
             ConversationScope::Normal,
             "turn-fix3",

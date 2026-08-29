@@ -396,6 +396,30 @@ impl TurnTracker {
         Ok(state.executed_turn_count)
     }
 
+    /// Reclaims an execution slot for a Turn that already began before a
+    /// process restart and reached a safely resumable boundary.
+    ///
+    /// The Turn has already been counted in `executed_turn_count`, so this only
+    /// refreshes the origin and checks that another Turn has not terminated the
+    /// chain while the process was down. It deliberately does not increment the
+    /// count a second time.
+    pub(crate) fn try_resume_execution(&self, origin_id: &str) -> Result<(), StopReason> {
+        let mut origins = self.origins.lock().expect("turn_tracker lock");
+        self.prune_stale_locked(&mut origins);
+        let now = self.clock.now();
+        let state = origins.entry(origin_id.to_string()).or_insert(OriginState {
+            executed_turn_count: 0,
+            pending_reservations: 0,
+            terminal_reason: None,
+            last_touched: now,
+        });
+        state.last_touched = now;
+        if let Some(reason) = state.terminal_reason.clone() {
+            return Err(reason);
+        }
+        Ok(())
+    }
+
     /// Returns the number of turns that have actually begun execution for
     /// `origin_id`, or `0` if the origin is not tracked.
     #[cfg(test)]
@@ -463,7 +487,10 @@ impl TurnTracker {
     /// silently resume it. `accepted` / `input_committed` turns are not included
     /// in the counts (see [`crate::storage::Database::recover_origin_tracker`]);
     /// the dispatcher re-executes them after startup and they increment the
-    /// count live via [`TurnTracker::try_begin_execution`].
+    /// count live via [`TurnTracker::try_begin_execution`]. A `tools_completed`
+    /// turn is already included because its Tool phase consumed an execution
+    /// slot; [`TurnTracker::try_resume_execution`] therefore only reclaims it
+    /// without incrementing the count again.
     pub(crate) fn rehydrate_executed(&self, origins: &[RecoveredOrigin]) {
         if origins.is_empty() {
             return;
@@ -1040,6 +1067,24 @@ mod tests {
             tracker.try_begin_execution("orig-2", 0, "agent_a", &["agent_a"]),
             Err(StopReason::TurnCountExceeded)
         );
+    }
+
+    #[test]
+    fn turn_tracker_resume_does_not_increment_executed_count() {
+        // Arrange
+        let tracker = TurnTracker::new();
+        tracker.reserve("orig-1").unwrap();
+        assert_eq!(
+            tracker.try_begin_execution("orig-1", 0, "agent_a", &["agent_a"]),
+            Ok(1)
+        );
+
+        // Act
+        let result = tracker.try_resume_execution("orig-1");
+
+        // Assert
+        assert_eq!(result, Ok(()));
+        assert_eq!(tracker.executed_count("orig-1"), 1);
     }
 
     #[test]

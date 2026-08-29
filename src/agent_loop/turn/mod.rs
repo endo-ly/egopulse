@@ -12,6 +12,7 @@ use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
     TurnAcceptance, TurnAcceptanceRequest, TurnLifecycle, resolve_request_key, validate_resume,
+    validate_tools_completed_resume,
 };
 use crate::agent_loop::turn::persistence::TurnPersistence;
 
@@ -193,6 +194,42 @@ pub(crate) async fn resume_input_committed_turn(
 
     let snapshot = config_snapshot;
     let persisted = validate_resume(state, scope, turn_id, &run, &snapshot).await?;
+    let received_at = persisted.received_at.clone();
+    let context = persisted.context;
+
+    let executor = TurnExecutor {
+        state,
+        context: &context,
+        on_event: EventEmitter::none(),
+        config_snapshot: Some(Arc::clone(&snapshot)),
+        received_at: None,
+    };
+    executor
+        .resume_run(&persisted.input, received_at.as_deref(), &snapshot, &run)
+        .await
+}
+
+/// Resumes a Turn that reached `tools_completed` before the runtime stopped.
+///
+/// The Tool phase and any staged follow-ups that were committed before the
+/// crash are already durable. This path reloads the current session snapshot
+/// and starts only the next model iteration; it never re-accepts the original
+/// input or re-executes completed Tools.
+pub(crate) async fn resume_tools_completed_turn(
+    state: &TurnDependencies,
+    scope: ConversationScope,
+    turn_id: &str,
+    config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
+) -> Result<String, EgoPulseError> {
+    let turn_id_owned = turn_id.to_string();
+    let run = call_blocking(state.db_for(scope), move |db| {
+        db.get_turn_run(&turn_id_owned)
+    })
+    .await
+    .map_err(EgoPulseError::from)?;
+
+    let snapshot = config_snapshot;
+    let persisted = validate_tools_completed_resume(state, scope, turn_id, &run, &snapshot).await?;
     let received_at = persisted.received_at.clone();
     let context = persisted.context;
 
@@ -650,11 +687,12 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::agent_loop::event::AgentEvent;
-    use crate::agent_loop::{process_turn, process_turn_with_events};
+    use crate::agent_loop::{process_turn, process_turn_with_events, resolve_chat_id};
     use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::EgoPulseError;
     use crate::llm::{MessagesResponse, ToolCall};
-    use crate::storage::{SenderKind, call_blocking};
+    use crate::runtime::turn::{ScheduledTurn, serialize_scheduled_turn};
+    use crate::storage::{AcceptOutcome, SenderKind, StoredMessage, TurnRunState, call_blocking};
 
     // -----------------------------------------------------------------------
     // Core turn execution
@@ -717,6 +755,193 @@ mod tests {
                 .content
                 .as_text_lossy()
                 .contains("<thinking>")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recovered_tools_completed_turn_resumes_without_rerunning_tools() {
+        // Arrange: persist a Turn exactly at the crash boundary after Tool
+        // Results and staged follow-ups have been committed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![Ok(MessagesResponse {
+                content: "recovered response".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })],
+            vec![0],
+        );
+        let state = Arc::new(build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider.clone()),
+        ));
+        let mut context = cli_context("tools-completed-recovery");
+        context.request_key = "recovery-request".to_string();
+        context.origin_id = "recovery-origin".to_string();
+        let runtime = state.turn_dependencies();
+        let chat_id = resolve_chat_id(&runtime, &context).await.expect("chat id");
+        let config_snapshot = state.config_manager.current_blocking();
+        let scheduled_json = serialize_scheduled_turn(&ScheduledTurn {
+            turn_id: String::new(),
+            context: context.clone(),
+            input: "original input".to_string(),
+            origin_id: context.origin_id.clone(),
+            received_at: Some("2026-08-29T12:00:00Z".to_string()),
+            config_snapshot: None,
+        })
+        .expect("scheduled payload");
+        let run = match call_blocking(Arc::clone(&state.db), {
+            let scheduled_json = scheduled_json.clone();
+            let fingerprint = config_snapshot.fingerprint.clone();
+            let config_revision = config_snapshot.revision as i64;
+            move |db| {
+                db.accept_or_get_turn(crate::storage::AcceptTurnParams {
+                    chat_id,
+                    request_key: "recovery-request",
+                    config_revision,
+                    config_fingerprint: Some(&fingerprint),
+                    request_payload_hash: "recovery-hash",
+                    origin_id: Some("recovery-origin"),
+                    scheduled_request_json: Some(&scheduled_json),
+                })
+            }
+        })
+        .await
+        .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            AcceptOutcome::Existing(_) => panic!("expected created run"),
+        };
+
+        let mut input_message = StoredMessage::user(
+            chat_id,
+            context.surface_user.clone(),
+            "original input".to_string(),
+        );
+        input_message.id = format!("turn:{}:input", run.turn_id);
+        input_message.turn_id = Some(run.turn_id.clone());
+        input_message.timestamp = "2026-08-29T12:00:00Z".to_string();
+        let assistant_tool = crate::llm::Message {
+            role: "assistant".to_string(),
+            content: crate::llm::MessageContent::text("checking"),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "recovery-tool".to_string(),
+                name: "read".to_string(),
+                arguments: serde_json::json!({"path": "config"}),
+            }],
+            tool_call_id: None,
+        };
+        let tool_result = crate::llm::Message {
+            role: "tool".to_string(),
+            content: crate::llm::MessageContent::text("tool result already persisted"),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some("recovery-tool".to_string()),
+        };
+        let initial_snapshot = crate::agent_loop::session::serialize_snapshot(
+            Arc::clone(&state.assets),
+            vec![
+                crate::llm::Message::text("user", "original input"),
+                assistant_tool.clone(),
+                tool_result.clone(),
+            ],
+        )
+        .await
+        .expect("initial snapshot");
+        call_blocking(Arc::clone(&state.db), {
+            let input_message = input_message.clone();
+            let turn_id = run.turn_id.clone();
+            let fingerprint = config_snapshot.fingerprint.clone();
+            let config_revision = config_snapshot.revision as i64;
+            move |db| {
+                db.commit_turn_input_with_conversation(
+                    &input_message,
+                    &initial_snapshot,
+                    None,
+                    &turn_id,
+                    config_revision,
+                    Some(&fingerprint),
+                )
+            }
+        })
+        .await
+        .expect("commit input");
+        state
+            .db
+            .begin_turn_model_iteration(&run.turn_id, 1, "initial-model")
+            .expect("begin model");
+        state
+            .db
+            .complete_turn_model(&run.turn_id)
+            .expect("complete model");
+        state
+            .db
+            .begin_turn_tools(&run.turn_id)
+            .expect("begin tools");
+        state
+            .db
+            .stage_tool_followup(
+                chat_id,
+                "recovery-follow-up",
+                "follow-up-hash",
+                "user-b",
+                "follow-up input",
+                "2026-08-29T12:01:00Z",
+            )
+            .expect("stage follow-up");
+        state
+            .db
+            .complete_turn_tools(&run.turn_id)
+            .expect("complete tools");
+        let committed_followup = crate::llm::Message::text(
+            "user",
+            crate::agent_loop::message_format::format_direct_input(
+                "follow-up input",
+                "2026-08-29T12:01:00Z",
+                &config_snapshot.config.timezone,
+            ),
+        );
+        let recovery_snapshot = crate::agent_loop::session::serialize_snapshot(
+            Arc::clone(&state.assets),
+            vec![
+                crate::llm::Message::text("user", "original input"),
+                assistant_tool,
+                tool_result,
+                committed_followup,
+            ],
+        )
+        .await
+        .expect("recovery snapshot");
+        state
+            .db
+            .commit_staged_user_messages(&run.turn_id, &recovery_snapshot, 1)
+            .expect("commit follow-up");
+
+        assert_eq!(
+            state.db.recover_interrupted_turns().expect("recover"),
+            Vec::new()
+        );
+        let mut scheduled = crate::runtime::turn::deserialize_scheduled_turn(&scheduled_json)
+            .expect("deserialize scheduled payload");
+        scheduled.turn_id = run.turn_id.clone();
+
+        // Act: the dispatcher path resumes the next model iteration.
+        crate::runtime::execute_scheduled_turn(&state, scheduled).await;
+
+        // Assert: the completed Tool phase is not replayed and the committed
+        // follow-up is visible to exactly one resumed model request.
+        assert_eq!(provider.seen_messages().len(), 1);
+        assert!(
+            provider.seen_messages()[0]
+                .iter()
+                .any(|message| { message.content.as_text_lossy().contains("follow-up input") })
+        );
+        assert_eq!(
+            state.db.get_turn_run(&run.turn_id).expect("turn run").state,
+            TurnRunState::Completed
         );
     }
 

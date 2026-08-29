@@ -203,6 +203,11 @@ pub(crate) async fn try_stage_tool_followup(
     mut context: SurfaceContext,
     input: String,
 ) -> Result<ToolFollowupOutcome, EgoPulseError> {
+    if !state.supervisor.accepting_inputs() {
+        tracing::info!("tool follow-up rejected: runtime not accepting input (shutdown)");
+        metrics::inc_turn_queue_rejections("shutdown");
+        return Err(EgoPulseError::ShutdownRequested);
+    }
     if context.request_key.is_empty() {
         context.request_key = uuid::Uuid::new_v4().to_string();
     }
@@ -500,5 +505,27 @@ mod tests {
         assert_eq!(messages[0].sender_kind, SenderKind::User);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[0].recipient_agent_id.as_deref(), Some("lyre"));
+    }
+
+    #[tokio::test]
+    async fn tool_followup_is_rejected_during_shutdown_before_resolution() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(build_test_state(&dir));
+        state.supervisor.shutdown().await;
+        let context = build_channel_context(
+            "cli",
+            "local_user",
+            "shutdown-follow-up",
+            "cli",
+            "default",
+            ConversationScope::Normal,
+        );
+
+        // Act
+        let result = try_stage_tool_followup(&state, context, "follow-up".to_string()).await;
+
+        // Assert
+        assert!(matches!(result, Err(EgoPulseError::ShutdownRequested)));
     }
 }

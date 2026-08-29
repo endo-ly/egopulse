@@ -24,5 +24,5 @@ pub(crate) use turn::process_turn;
 pub use turn::{ask_in_session, ask_in_session_with_state};
 pub(crate) use turn::{
     process_turn_with_events, process_turn_with_events_and_snapshot_and_received_at,
-    resume_input_committed_turn,
+    resume_input_committed_turn, resume_tools_completed_turn,
 };

@@ -10,8 +10,8 @@
 //!   updates,
 //! * a `completed` Turn returns its saved final result without re-invoking
 //!   the LLM,
-//! * interrupted Turns are recovered to a safe stop (`uncertain`/`failed`)
-//!   on startup rather than auto-resumed.
+//! * interrupted Turns are either recovered to a safe stop (`uncertain`/`failed`)
+//!   or resumed from a state-specific durable boundary on startup.
 //!
 //! Config revision / fingerprint are stored as given by the caller. A `NULL`
 //! `config_fingerprint` means the Config identity was not captured at
@@ -371,29 +371,22 @@ impl Database {
         .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))
     }
 
-    /// Returns the IDs of durably pending Turns whose full request is
-    /// persisted in `scheduled_request_json` but never started execution.
+    /// Returns durable Turns that can be dispatched or resumed after startup.
     ///
-    /// Covers both `accepted` (never started) and `input_committed`
-    /// (model loop not yet started) turns. A single query ordered by
-    /// `accepted_at` (then `turn_id`) preserves the original acceptance order
-    /// across both states, so a restart cannot reverse the turn order of a
-    /// session (an `input_committed` turn accepted before an `accepted` turn
-    /// is still dispatched first). The dispatcher re-submits freely; the
-    /// scheduler deduplicates by `turn_id`, so no grace window is needed.
-    ///
+    /// In addition to queued `accepted` / `input_committed` Turns, this includes
+    /// `tools_completed` Turns with a persisted request. The latter resume only
+    /// their next model iteration; their completed Tool phase is never replayed.
     /// Only returns rows whose `(accepted_at, turn_id)` is strictly greater than
     /// the supplied cursor. The dispatcher uses this for in-tick pagination:
     /// each tick scans from the head (`("", "")`) and pages through the full
-    /// backlog, so every durable-pending turn is reached every tick. Turns
-    /// already owned by the in-memory scheduler are deduplicated cheaply on
-    /// re-submit, and capacity-rejected turns are retried from the head on the
-    /// next tick — no turn is ever permanently skipped.
+    /// backlog, so every resumable Turn is reached every tick. Turns already
+    /// owned by the in-memory scheduler are deduplicated on re-submit, and
+    /// capacity-rejected turns are retried from the head on the next tick.
     ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the underlying SQLite read fails.
-    pub(crate) fn scan_durable_pending_turns_after(
+    pub(crate) fn scan_durable_resumable_turns_after(
         &self,
         after_accepted_at: &str,
         after_turn_id: &str,
@@ -402,12 +395,12 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
             "SELECT turn_id, accepted_at, scheduled_request_json
-              FROM turn_runs
-              WHERE (accepted_at, turn_id) > (?1, ?2)
-                AND state IN ('accepted', 'input_committed')
-                AND scheduled_request_json IS NOT NULL
-              ORDER BY accepted_at ASC, turn_id ASC
-              LIMIT ?3",
+             FROM turn_runs
+             WHERE (accepted_at, turn_id) > (?1, ?2)
+               AND state IN ('accepted', 'input_committed', 'tools_completed')
+               AND scheduled_request_json IS NOT NULL
+             ORDER BY accepted_at ASC, turn_id ASC
+             LIMIT ?3",
         )?;
         let rows = stmt
             .query_map(params![after_accepted_at, after_turn_id, limit], |row| {
@@ -423,7 +416,7 @@ impl Database {
 
     /// Total durable-pending turn count (`accepted`/`input_committed`), for
     /// backlog observability. Uses `idx_turn_runs_state`, so it stays cheap
-    /// regardless of table size. Unlike [`Self::scan_durable_pending_turns_after`]
+    /// regardless of table size. Unlike [`Self::scan_durable_resumable_turns_after`]
     /// this is not batch-limited, so it reflects the true backlog even when it
     /// exceeds the dispatcher batch.
     pub(crate) fn count_durable_pending(&self) -> Result<i64, StorageError> {
@@ -831,19 +824,21 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically terminates a queued durable Turn whose persisted request
-    /// cannot be reconstructed by the running binary.
+    /// Atomically terminates a durable Turn whose persisted request cannot be
+    /// reconstructed by the running binary.
     ///
-    /// Only `accepted` and `input_committed` are eligible because neither state
-    /// has started model execution. The stored payload is deliberately left
-    /// untouched for investigation. When the Turn has an origin, its terminal
-    /// stop reason is recorded in the same transaction so the origin cannot be
-    /// resumed without also observing this terminal failure.
+    /// `accepted` and `input_committed` become `failed`; a `tools_completed`
+    /// Turn becomes `uncertain` when output was already published because its
+    /// Tool side effects and external output cannot be safely replayed. The
+    /// stored payload is deliberately left untouched for investigation. When
+    /// the Turn has an origin, its terminal stop reason is recorded in the same
+    /// transaction so the origin cannot be resumed without also observing this
+    /// terminal failure.
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::Conflict`] when the Turn is missing from the
-    /// eligible queued states or has already become terminal. Returns
+    /// Returns [`StorageError::Conflict`] when the Turn is missing from an
+    /// eligible state or has already become terminal. Returns
     /// [`StorageError`] when the database transaction fails.
     pub(crate) fn fail_invalid_durable_turn(&self, turn_id: &str) -> Result<(), StorageError> {
         let mut conn = self.get_conn()?;
@@ -851,35 +846,40 @@ impl Database {
         let current = read_state_locked(&tx, turn_id)?;
         if !matches!(
             current,
-            TurnRunState::Accepted | TurnRunState::InputCommitted
-        ) || !TurnRunState::can_transition(current, TurnRunState::Failed)
-        {
+            TurnRunState::Accepted | TurnRunState::InputCommitted | TurnRunState::ToolsCompleted
+        ) {
             return Err(StorageError::Conflict(format!(
                 "invalid durable turn payload failure rejected from state {current}"
             )));
         }
-        let (origin_id, has_payload): (Option<String>, i64) = tx.query_row(
-            "SELECT origin_id, scheduled_request_json IS NOT NULL
+        let (origin_id, has_payload, output_published): (Option<String>, i64, i64) = tx.query_row(
+            "SELECT origin_id, scheduled_request_json IS NOT NULL, output_published
              FROM turn_runs WHERE turn_id = ?1",
             params![turn_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         if has_payload == 0 {
             return Err(StorageError::Conflict(
                 "invalid durable turn payload failure requires a persisted payload".to_string(),
             ));
         }
+        let target = if current == TurnRunState::ToolsCompleted && output_published != 0 {
+            TurnRunState::Uncertain
+        } else {
+            TurnRunState::Failed
+        };
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
             "UPDATE turn_runs
-             SET state = 'failed',
-                 error_kind = ?2,
-                 error_message = ?3,
-                 finished_at = ?4,
-                 updated_at = ?4
+             SET state = ?2,
+                 error_kind = ?3,
+                 error_message = ?4,
+                 finished_at = ?5,
+                 updated_at = ?5
              WHERE turn_id = ?1",
             params![
                 turn_id,
+                target.to_string(),
                 DURABLE_PAYLOAD_INVALID_ERROR_KIND,
                 DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE,
                 &now
@@ -953,10 +953,11 @@ impl Database {
 
     /// Recovers Turns interrupted by a process crash.
     ///
-    /// Crashed turns are moved to a terminal state so they are never silently
-    /// resumed by a re-delivered request. A re-sent request whose turn is
-    /// already `InProgress` (still owned by the original executor that crashed)
-    /// would otherwise be accepted as `TurnAcceptance::InProgress` by a fresh
+    /// Crashed turns are either resumed from a state-specific durable boundary
+    /// or moved to a terminal state so they are never silently resumed by a
+    /// re-delivered request. A re-sent request whose turn is already
+    /// `InProgress` (still owned by the original executor that crashed) would
+    /// otherwise be accepted as `TurnAcceptance::InProgress` by a fresh
     /// executor and produce an empty response, leaving the turn stuck forever.
     ///
     /// State-specific recovery rules:
@@ -970,7 +971,8 @@ impl Database {
     /// | `model_pending`   | `uncertain` — output may have been published externally. |
     /// | `model_completed` | `uncertain` — output may have been published externally. |
     /// | `tools_pending`   | `uncertain` — tool side effects may have run.            |
-    /// | `tools_completed` | `uncertain` — tool side effects may have run.            |
+    /// | `tools_completed` | left for the dispatcher when a durable request exists; |
+    /// |                  | otherwise `uncertain` — the next model step cannot be rebuilt. |
     ///
     /// Returns the transitioned rows so the caller can log them. This does
     /// **not** touch `tool_calls`; [`Database::recover_running_tools`] handles
@@ -1020,25 +1022,30 @@ impl Database {
                 .parse()
                 .map_err(|e| StorageError::Conflict(format!("invalid turn_runs.state: {e}")))?;
 
-            // A durably accepted or input_committed turn (its full request is
-            // persisted) is left for the turn dispatcher to resume after startup
-            // instead of being failed here: the request can be rebuilt and the
-            // turn re-executed (accepted) or its model loop restarted
-            // (input_committed) safely. Legacy turns without
-            // a persisted request (direct-execution paths) still fall through to
-            // the fail-stop branch below.
+            // A durably accepted, input_committed, or tools_completed turn (its
+            // full request is persisted) is left for the turn dispatcher to
+            // resume after startup. Accepted turns can be re-executed,
+            // input_committed turns can restart their first model iteration,
+            // and tools_completed turns can restart only their next model
+            // iteration without re-running tools. Legacy turns without a
+            // persisted request still fall through to the fail-stop branch.
             if row.scheduled_request_json.is_some()
-                && matches!(from, TurnRunState::Accepted | TurnRunState::InputCommitted)
+                && matches!(
+                    from,
+                    TurnRunState::Accepted
+                        | TurnRunState::InputCommitted
+                        | TurnRunState::ToolsCompleted
+                )
             {
                 continue;
             }
 
-            // Fail-stop recovery: every non-terminal turn is terminated on
-            // startup. `accepted` / `input_committed` never published any
-            // model output, so failing them is safe and lets the user retry.
-            // The remaining states may have emitted output (or tool side
-            // effects) that the process failed to durably record before
-            // crashing, so they go to `uncertain` to avoid re-sending.
+            // Fail-stop recovery applies to states whose next action cannot be
+            // proven safe. `accepted` / `input_committed` without a payload
+            // never published model output, so failing them is safe and lets
+            // the user retry. `tools_completed` without a payload cannot rebuild
+            // its routing context, so it is uncertain like the other states
+            // that may have published output or tool side effects.
             let (to, error_kind, error_message): (TurnRunState, Option<&str>, Option<String>) =
                 match from {
                     TurnRunState::Accepted => (
@@ -1743,7 +1750,7 @@ mod tests {
         assert!(failed.finished_at.is_some());
         assert_eq!(failed.scheduled_request_json.as_deref(), Some(payload));
         assert!(
-            db.scan_durable_pending_turns_after("", "", 100)
+            db.scan_durable_resumable_turns_after("", "", 100)
                 .expect("scan")
                 .is_empty()
         );
@@ -1778,10 +1785,55 @@ mod tests {
         // Assert
         assert_eq!(state(&db, &run.turn_id), TurnRunState::Failed);
         assert!(
-            db.scan_durable_pending_turns_after("", "", 100)
+            db.scan_durable_resumable_turns_after("", "", 100)
                 .expect("scan")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn fail_invalid_durable_turn_stops_tools_completed_after_output() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "invalid-tools-completed",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: Some("not-json"),
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        let mut revision = None;
+        commit_input(&db, &run.turn_id, &mut revision);
+        db.begin_turn_model_iteration(&run.turn_id, 1, "model-hash")
+            .expect("begin model");
+        db.complete_turn_model(&run.turn_id)
+            .expect("complete model");
+        db.begin_turn_tools(&run.turn_id).expect("begin tools");
+        db.complete_turn_tools(&run.turn_id)
+            .expect("complete tools");
+        db.mark_turn_output_published(&run.turn_id)
+            .expect("mark published");
+
+        // Act
+        db.fail_invalid_durable_turn(&run.turn_id)
+            .expect("stop invalid payload");
+
+        // Assert
+        let stopped = db.get_turn_run(&run.turn_id).expect("get stopped turn");
+        assert_eq!(stopped.state, TurnRunState::Uncertain);
+        assert_eq!(
+            stopped.error_kind.as_deref(),
+            Some("durable_payload_invalid")
+        );
+        assert_eq!(stopped.scheduled_request_json.as_deref(), Some("not-json"));
     }
 
     #[test]
@@ -1969,6 +2021,53 @@ mod tests {
     }
 
     #[test]
+    fn recover_keeps_durable_tools_completed_turn_for_safe_resume() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "tools-completed-resume",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: Some("resume-origin"),
+                scheduled_request_json: Some("durable-payload"),
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) => run,
+            _ => panic!("expected created"),
+        };
+        let mut revision = None;
+        commit_input(&db, &run.turn_id, &mut revision);
+        db.begin_turn_model_iteration(&run.turn_id, 1, "model-hash")
+            .expect("begin model");
+        db.complete_turn_model(&run.turn_id)
+            .expect("complete model");
+        db.begin_turn_tools(&run.turn_id).expect("begin tools");
+        db.complete_turn_tools(&run.turn_id)
+            .expect("complete tools");
+
+        // Act
+        let recovered = db.recover_interrupted_turns().expect("recover");
+        let resumable = db
+            .scan_durable_resumable_turns_after("", "", 100)
+            .expect("scan resumable");
+
+        // Assert
+        assert!(recovered.is_empty(), "safe resume must not be terminalized");
+        assert_eq!(state(&db, &run.turn_id), TurnRunState::ToolsCompleted);
+        assert_eq!(
+            resumable
+                .iter()
+                .map(|turn| &turn.turn_id)
+                .collect::<Vec<_>>(),
+            vec![&run.turn_id]
+        );
+    }
+
+    #[test]
     fn cancel_turn_moves_accepted_to_cancelled_with_reason() {
         // Arrange
         let (db, _dir) = test_db();
@@ -2121,7 +2220,7 @@ mod tests {
 
         // Act
         let ids = db
-            .scan_durable_pending_turns_after("", "", 100)
+            .scan_durable_resumable_turns_after("", "", 100)
             .expect("scan")
             .into_iter()
             .map(|p| p.turn_id)
@@ -2226,7 +2325,7 @@ mod tests {
 
         // Act
         let ids = db
-            .scan_durable_pending_turns_after("", "", 100)
+            .scan_durable_resumable_turns_after("", "", 100)
             .expect("scan")
             .into_iter()
             .map(|p| p.turn_id)
@@ -2282,7 +2381,7 @@ mod tests {
 
         // Act
         let ids = db
-            .scan_durable_pending_turns_after("", "", 100)
+            .scan_durable_resumable_turns_after("", "", 100)
             .expect("scan")
             .into_iter()
             .map(|p| p.turn_id)
@@ -2409,7 +2508,7 @@ mod tests {
     // --- Fix 4: the dispatcher scan must reach turns beyond the batch prefix ---
 
     #[test]
-    fn scan_durable_pending_turns_after_reaches_past_batch_prefix() {
+    fn scan_durable_resumable_turns_after_reaches_past_batch_prefix() {
         let (db, _dir) = test_db();
         // Insert 300 durable-pending turns (well above the 256-batch limit).
         for i in 0..300i64 {
@@ -2428,18 +2527,18 @@ mod tests {
         // A single uncursored scan is capped at the batch limit and cannot see
         // the 257th+ turn — the starvation the cursor pagination fixes.
         let single = db
-            .scan_durable_pending_turns_after("", "", 256)
+            .scan_durable_resumable_turns_after("", "", 256)
             .expect("single scan");
         assert_eq!(single.len(), 256, "uncursored scan sees only the prefix");
 
         // Cursor pagination: first batch, then continue from its last row.
         let first = db
-            .scan_durable_pending_turns_after("", "", 256)
+            .scan_durable_resumable_turns_after("", "", 256)
             .expect("first page");
         assert_eq!(first.len(), 256);
         let last = first.last().expect("last of first page");
         let second = db
-            .scan_durable_pending_turns_after(&last.accepted_at, &last.turn_id, 256)
+            .scan_durable_resumable_turns_after(&last.accepted_at, &last.turn_id, 256)
             .expect("second page");
         assert_eq!(second.len(), 44, "second page reaches the 257th+ turns");
 

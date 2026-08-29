@@ -17,7 +17,9 @@ use tracing::error;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
-use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
+use super::{
+    RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_external_chat_id, web_session_key,
+};
 use crate::storage::call_blocking;
 
 #[derive(Debug, Serialize)]
@@ -230,6 +232,76 @@ async fn resolve_new_web_session(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((format!("chat:{chat_id}"), context))
+}
+
+/// Resolves an existing web chat without creating a row for an unknown session.
+///
+/// Active WebSocket runs use this resolver before deciding whether a second
+/// request belongs to the active session. A rejected request must not create an
+/// empty chat as a side effect.
+async fn resolve_existing_web_session(
+    state: &WebState,
+    raw_session_key: &str,
+    actor: &str,
+) -> Result<Option<(String, SurfaceContext)>, (StatusCode, String)> {
+    let db = Arc::clone(&state.app_state.db);
+    let chat_info = if let Some(chat_id) = parse_chat_id_from_session_key(raw_session_key) {
+        call_blocking(db, move |db| db.get_chat_by_id(chat_id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    } else {
+        let default_agent = state
+            .app_state
+            .config_manager
+            .current_blocking()
+            .config
+            .default_agent
+            .to_string();
+        let external_chat_id = web_external_chat_id(raw_session_key);
+        call_blocking(db, move |db| {
+            db.get_chat_by_channel_external_and_agent("web", &external_chat_id, &default_agent)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    };
+
+    Ok(chat_info.map(|info| {
+        let session_key = format!("chat:{}", info.chat_id);
+        (session_key, surface_context_from_chat_info(info, actor))
+    }))
+}
+
+/// Resolves a WebSocket follow-up against an existing chat only.
+pub(super) async fn resolve_existing_send_request(
+    state: &WebState,
+    request: &SendRequest,
+    actor: &str,
+) -> Result<Option<ResolvedSend>, (StatusCode, String)> {
+    let message = request.message.trim().to_string();
+    if message.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message is required".to_string()));
+    }
+
+    let raw_session_key = request.session_key.as_deref().unwrap_or("main");
+    let Some((session_key, mut context)) =
+        resolve_existing_web_session(state, raw_session_key, actor).await?
+    else {
+        return Ok(None);
+    };
+
+    if let Some(id) = request
+        .request_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        context.request_key = format!("web:{id}");
+    }
+
+    Ok(Some(ResolvedSend {
+        message,
+        session_key,
+        context,
+    }))
 }
 
 pub(super) async fn resolve_send_request(

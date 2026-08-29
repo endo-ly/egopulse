@@ -34,7 +34,9 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
       const existing = messages.find((m) => m.id === draftId);
       if (existing) {
         messages = messages.map((m) =>
-          m.id === draftId ? { ...m, content: m.content + chunk } : m,
+          m.id === draftId
+            ? { ...m, content: m.content + chunk }
+            : m,
         );
       } else {
         messages = [
@@ -57,16 +59,18 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
       let messages = state.messages;
       const existing = messages.find((m) => m.id === draftId);
       if (existing) {
+        const sealedId = sealedAssistantDraftId(messages, draftId);
         messages = messages.map((m) =>
           m.id === draftId
-            ? { ...m, id: `${draftId}:done`, content: finalText || m.content }
+            ? { ...m, id: sealedId, content: finalText || m.content }
             : m,
         );
       } else if (finalText) {
+        const sealedId = sealedAssistantDraftId(messages, draftId);
         messages = [
           ...messages,
           {
-            id: `${draftId}:done`,
+            id: sealedId,
             sender_id: "assistant",
             sender_kind: "assistant" as const,
             content: finalText,
@@ -90,6 +94,17 @@ function extractText(event: ChatEventPayload): string {
     .filter((c) => c.type === "text")
     .map((c) => c.text)
     .join("");
+}
+
+function sealedAssistantDraftId(messages: ChatMessage[], draftId: string): string {
+  const firstId = `${draftId}:done`;
+  if (!messages.some((message) => message.id === firstId)) return firstId;
+
+  let segment = 2;
+  while (messages.some((message) => message.id === `${draftId}:segment:${segment}:done`)) {
+    segment += 1;
+  }
+  return `${draftId}:segment:${segment}:done`;
 }
 
 export interface StatusEventPayload {
@@ -130,10 +145,19 @@ export function reduceUserInput(
     return state;
   }
 
+  const draftId = state.runId ? `draft:${state.runId}` : null;
+  const messages = draftId && state.messages.some((message) => message.id === draftId)
+    ? state.messages.map((message) =>
+        message.id === draftId
+          ? { ...message, id: sealedAssistantDraftId(state.messages, draftId) }
+          : message,
+      )
+    : state.messages;
+
   return {
     ...state,
     messages: [
-      ...state.messages,
+      ...messages,
       {
         id: payload.messageId,
         sender_id: payload.senderId,
