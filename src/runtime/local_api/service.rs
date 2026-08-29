@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
 use crate::agent_loop;
 use crate::agent_loop::event::AgentEvent;
@@ -13,9 +12,10 @@ use crate::agent_loop::message_format::{is_tool_error_message, tool_result_body}
 use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
-use crate::runtime::channel_input::ToolFollowupOutcome;
+use crate::runtime::channel_input::{ToolFollowupOutcome, submit_observed_agent_turn};
 use crate::slash_commands::SlashCommandOutcome;
 use crate::storage::{SessionSummary as StoredSessionSummary, call_blocking};
+use tokio_util::sync::CancellationToken;
 
 use super::PROTOCOL_VERSION;
 use super::protocol::{
@@ -26,14 +26,16 @@ use super::protocol::{
 pub(crate) async fn handle_connection(
     stream: UnixStream,
     state: Arc<AppState>,
+    shutdown: CancellationToken,
 ) -> Result<(), EgoPulseError> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
-    let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|error| EgoPulseError::RuntimeLocalApi(error.to_string()))?
-    else {
+    let line = tokio::select! {
+        _ = shutdown.cancelled() => return Ok(()),
+        line = lines.next_line() => line
+            .map_err(|error| EgoPulseError::RuntimeLocalApi(error.to_string()))?,
+    };
+    let Some(line) = line else {
         return Ok(());
     };
 
@@ -60,6 +62,10 @@ pub(crate) async fn handle_connection(
             },
         )
         .await?;
+        return Ok(());
+    }
+
+    if shutdown.is_cancelled() {
         return Ok(());
     }
 
@@ -111,7 +117,7 @@ pub(crate) async fn handle_connection(
             }
         }
         Request::ExecuteTurn { session, prompt } => {
-            execute_turn(&state, &mut write_half, session, prompt).await?;
+            execute_turn(&state, &mut write_half, &shutdown, session, prompt).await?;
         }
     }
     Ok(())
@@ -181,25 +187,18 @@ async fn stage_followup(
 }
 
 async fn execute_turn(
-    state: &AppState,
+    state: &Arc<AppState>,
     writer: &mut WriteHalf<UnixStream>,
+    shutdown: &CancellationToken,
     reference: SessionReference,
     prompt: String,
 ) -> Result<(), EgoPulseError> {
-    ensure_runtime_accepting(state)?;
     let resolved = resolve_session(state, reference).await?;
-    let (events_tx, mut events_rx) = unbounded_channel();
-    let (completion_tx, mut completion_rx) = oneshot::channel();
-    let dependencies = state.turn_dependencies();
-    let context = resolved.context;
-    state.supervisor.spawn_turn(async move {
-        let result =
-            agent_loop::process_turn_with_events(&dependencies, &context, &prompt, move |event| {
-                let _ = events_tx.send(event);
-            })
-            .await;
-        let _ = completion_tx.send(result);
-    });
+    let observer = submit_observed_agent_turn(state, resolved.context, prompt)
+        .await
+        .map_err(|reason| EgoPulseError::RuntimeLocalApi(reason.message().to_string()))?;
+    let mut events_rx = observer.events;
+    let mut completion_rx = observer.completion;
 
     loop {
         tokio::select! {
@@ -212,11 +211,12 @@ async fn execute_turn(
                 }
                 match result {
                     Ok(Ok(response)) => write_response(writer, Response::TurnFinished { response }).await?,
-                    Ok(Err(error)) => write_response(writer, Response::Error { message: error.user_message() }).await?,
+                    Ok(Err(message)) => write_response(writer, Response::Error { message }).await?,
                     Err(_) => write_response(writer, Response::Error { message: "runtime turn ended unexpectedly".to_string() }).await?,
                 }
                 return Ok(());
             }
+            _ = shutdown.cancelled() => return Ok(()),
         }
     }
 }
@@ -456,10 +456,14 @@ async fn write_error(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::{handle_connection, map_agent_event, messages_to_entries};
     use crate::agent_loop::event::AgentEvent;
+    use crate::channels::adapter::{ChannelAdapter, ChannelRegistry, ConversationKind};
     use crate::config::{AgentConfig, AgentId, AgentProfileConfig};
+    use crate::llm::{LlmProvider, MessagesResponse};
     use crate::llm::{Message, MessageContent, ToolCall};
     use crate::runtime::local_api::LocalRuntimeClient;
     use crate::runtime::local_api::protocol::{
@@ -471,7 +475,117 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    fn runtime_state(dir: &tempfile::TempDir) -> Arc<crate::runtime::AppState> {
+    struct ProviderStats {
+        calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        first_started: tokio::sync::Notify,
+        completed: tokio::sync::Notify,
+    }
+
+    struct CountingProvider {
+        delays: std::sync::Mutex<Vec<Duration>>,
+        stats: Arc<ProviderStats>,
+    }
+
+    impl CountingProvider {
+        fn new(delays: Vec<Duration>) -> (Self, Arc<ProviderStats>) {
+            let stats = Arc::new(ProviderStats {
+                calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                first_started: tokio::sync::Notify::new(),
+                completed: tokio::sync::Notify::new(),
+            });
+            (
+                Self {
+                    delays: std::sync::Mutex::new(delays),
+                    stats: Arc::clone(&stats),
+                },
+                stats,
+            )
+        }
+
+        async fn respond(&self) -> Result<MessagesResponse, crate::error::LlmError> {
+            let call = self.stats.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let active = self.stats.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.stats.max_active.fetch_max(active, Ordering::SeqCst);
+            if call == 1 {
+                self.stats.first_started.notify_one();
+            }
+            let delay = {
+                let mut delays = self.delays.lock().expect("provider delays");
+                if delays.is_empty() {
+                    Duration::ZERO
+                } else {
+                    delays.remove(0)
+                }
+            };
+            tokio::time::sleep(delay).await;
+            self.stats.active.fetch_sub(1, Ordering::SeqCst);
+            self.stats.completed.notify_one();
+            Ok(MessagesResponse {
+                content: "ok".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            self.respond().await
+        }
+
+        async fn send_message_streaming(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let response = self.respond().await?;
+            on_delta(response.content.clone());
+            Ok(response)
+        }
+
+        fn provider_name(&self) -> &str {
+            "counting"
+        }
+
+        fn model_name(&self) -> &str {
+            "counting-model"
+        }
+    }
+
+    struct RecordingAdapter {
+        sends: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelAdapter for RecordingAdapter {
+        fn name(&self) -> &str {
+            "discord"
+        }
+
+        fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
+            Vec::new()
+        }
+
+        async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn runtime_config(dir: &tempfile::TempDir) -> crate::config::Config {
         let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
         config.channels.clear();
         config.agents.insert(
@@ -487,9 +601,29 @@ mod tests {
                 ..Default::default()
             },
         );
+        config
+    }
+
+    fn runtime_state(dir: &tempfile::TempDir) -> Arc<crate::runtime::AppState> {
+        let config = runtime_config(dir);
         Arc::new(crate::test_util::build_state_with_config(
             config, None, None, None, None,
         ))
+    }
+
+    async fn wait_for_provider_idle(stats: &ProviderStats) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if stats.calls.load(Ordering::SeqCst) >= 2
+                    && stats.active.load(Ordering::SeqCst) == 0
+                {
+                    return;
+                }
+                stats.completed.notified().await;
+            }
+        })
+        .await
+        .expect("provider did not finish queued turns");
     }
 
     async fn start_runtime(
@@ -652,6 +786,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_local_api_turn_is_drained_by_runtime_shutdown() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, stats) = CountingProvider::new(vec![Duration::from_millis(100)]);
+        let state = Arc::new(crate::test_util::build_state_with_config(
+            runtime_config(&dir),
+            Some(Arc::new(provider)),
+            None,
+            None,
+            None,
+        ));
+        server::start(&state).expect("start local API");
+        let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
+        let client = LocalRuntimeClient::connect(path)
+            .await
+            .expect("connect client");
+
+        // Act
+        let turn = tokio::spawn(async move {
+            client
+                .execute_turn(
+                    SessionReference::Named {
+                        name: "shutdown-session".to_string(),
+                    },
+                    "hello".to_string(),
+                    |_| {},
+                )
+                .await
+        });
+        stats.first_started.notified().await;
+        let shutdown =
+            tokio::time::timeout(Duration::from_secs(1), state.supervisor.shutdown()).await;
+        let turn_result = tokio::time::timeout(Duration::from_secs(1), turn)
+            .await
+            .expect("local API connection timeout")
+            .expect("local API task");
+
+        // Assert
+        assert!(shutdown.is_ok(), "active turn must be drained");
+        assert!(
+            turn_result.is_err(),
+            "shutdown must close the local connection"
+        );
+        assert_eq!(stats.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn runtime_api_streams_turn_events() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -701,12 +882,295 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_local_clients_are_serialized_by_the_shared_session_scheduler() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, stats) =
+            CountingProvider::new(vec![Duration::from_millis(80), Duration::from_millis(20)]);
+        let config = runtime_config(&dir);
+        let state = Arc::new(crate::test_util::build_state_with_config(
+            config,
+            Some(Arc::new(provider)),
+            None,
+            None,
+            None,
+        ));
+        server::start(&state).expect("start local API");
+        let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
+        let client_a = LocalRuntimeClient::connect(path.clone())
+            .await
+            .expect("connect client A");
+        let client_b = LocalRuntimeClient::connect(path)
+            .await
+            .expect("connect client B");
+        let session = SessionReference::Named {
+            name: "shared-session".to_string(),
+        };
+
+        // Act
+        let first = tokio::spawn({
+            let client = client_a.clone();
+            let session = session.clone();
+            async move {
+                client
+                    .execute_turn(session, "first".to_string(), |_| {})
+                    .await
+            }
+        });
+        stats.first_started.notified().await;
+        let second = client_b
+            .execute_turn(session, "second".to_string(), |_| {})
+            .await
+            .expect("second turn");
+        let first = first.await.expect("first task").expect("first turn");
+
+        // Assert
+        assert_eq!(first, "ok");
+        assert_eq!(second, "ok");
+        assert_eq!(stats.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(stats.max_active.load(Ordering::SeqCst), 1);
+        let sessions = client_a.list_sessions().await.expect("list sessions");
+        let transcript = client_a
+            .open_session(SessionReference::Existing {
+                chat_id: sessions[0].chat_id,
+            })
+            .await
+            .expect("open session")
+            .transcript;
+        let inputs: Vec<_> = transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec!["first", "second"]);
+        state.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_api_and_channel_input_share_session_ownership() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, stats) =
+            CountingProvider::new(vec![Duration::from_millis(80), Duration::from_millis(20)]);
+        let state = Arc::new(crate::test_util::build_state_with_config(
+            runtime_config(&dir),
+            Some(Arc::new(provider)),
+            None,
+            None,
+            None,
+        ));
+        server::start(&state).expect("start local API");
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "discord",
+                "discord:42:agent:default",
+                Some("work"),
+                "dm",
+                "default",
+            )
+            .expect("create Discord session");
+        let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
+        let client = LocalRuntimeClient::connect(path)
+            .await
+            .expect("connect client");
+        let session = SessionReference::Existing { chat_id };
+
+        // Act
+        let tui_turn = tokio::spawn({
+            let client = client.clone();
+            let session = session.clone();
+            async move {
+                client
+                    .execute_turn(session, "from tui".to_string(), |_| {})
+                    .await
+            }
+        });
+        stats.first_started.notified().await;
+        let channel_outcome = crate::runtime::submit_agent_turn(
+            &state,
+            crate::conversation::SurfaceContext::new(
+                "discord".to_string(),
+                "discord-user".to_string(),
+                "42".to_string(),
+                "dm".to_string(),
+                "default".to_string(),
+            ),
+            "from discord".to_string(),
+        )
+        .await;
+        let tui_result = tui_turn.await.expect("TUI task").expect("TUI turn");
+
+        // Assert
+        assert_eq!(tui_result, "ok");
+        assert!(matches!(
+            channel_outcome,
+            crate::runtime::turn::SubmitOutcome::Queued
+                | crate::runtime::turn::SubmitOutcome::Started
+        ));
+        assert_eq!(stats.max_active.load(Ordering::SeqCst), 1);
+        wait_for_provider_idle(&stats).await;
+        assert_eq!(stats.calls.load(Ordering::SeqCst), 2);
+        let transcript = client
+            .open_session(session)
+            .await
+            .expect("open session")
+            .transcript;
+        let inputs: Vec<_> = transcript
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::User { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(inputs, vec!["from tui", "from discord"]);
+        state.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cross_channel_observer_does_not_send_to_the_original_channel() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, _stats) = CountingProvider::new(vec![Duration::from_millis(20)]);
+        let sends = Arc::new(AtomicUsize::new(0));
+        let mut channels = ChannelRegistry::new();
+        channels.register(Arc::new(RecordingAdapter {
+            sends: Arc::clone(&sends),
+        }));
+        let state = Arc::new(crate::test_util::build_state_with_config(
+            runtime_config(&dir),
+            Some(Arc::new(provider)),
+            None,
+            None,
+            Some(Arc::new(channels)),
+        ));
+        server::start(&state).expect("start local API");
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                "discord",
+                "discord:42:agent:special",
+                Some("work"),
+                "dm",
+                "special",
+            )
+            .expect("create Discord session");
+        let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
+        let client = LocalRuntimeClient::connect(path)
+            .await
+            .expect("connect client");
+
+        // Act
+        let response = client
+            .execute_turn(
+                SessionReference::Existing { chat_id },
+                "from tui".to_string(),
+                |_| {},
+            )
+            .await
+            .expect("execute cross-channel turn");
+
+        // Assert
+        assert_eq!(response, "ok");
+        assert_eq!(sends.load(Ordering::SeqCst), 0);
+        let session = client
+            .open_session(SessionReference::Existing { chat_id })
+            .await
+            .expect("open original session");
+        assert_eq!(session.channel, "discord");
+        assert_eq!(session.agent_id, "special");
+        assert_eq!(session.effective_provider, "openai");
+        assert_eq!(session.effective_model, "discord-model");
+        assert!(session.transcript.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::User { text } if text == "from tui"
+        )));
+        state.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatcher_rescan_does_not_duplicate_queued_observer_turn() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (provider, stats) =
+            CountingProvider::new(vec![Duration::from_secs(6), Duration::from_millis(20)]);
+        let state = Arc::new(crate::test_util::build_state_with_config(
+            runtime_config(&dir),
+            Some(Arc::new(provider)),
+            None,
+            None,
+            None,
+        ));
+        server::start(&state).expect("start local API");
+        crate::runtime::turn::spawn_turn_dispatcher(
+            Arc::clone(&state),
+            state.supervisor.shutdown_token(),
+        );
+        let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
+        let client = LocalRuntimeClient::connect(path)
+            .await
+            .expect("connect client");
+        let session = SessionReference::Named {
+            name: "dispatcher-session".to_string(),
+        };
+
+        // Act
+        let first = tokio::spawn({
+            let client = client.clone();
+            let session = session.clone();
+            async move {
+                client
+                    .execute_turn(session, "first".to_string(), |_| {})
+                    .await
+            }
+        });
+        stats.first_started.notified().await;
+        let second = tokio::spawn({
+            let client = client.clone();
+            async move {
+                client
+                    .execute_turn(
+                        SessionReference::Named {
+                            name: "dispatcher-session".to_string(),
+                        },
+                        "second".to_string(),
+                        |_| {},
+                    )
+                    .await
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(15), first)
+            .await
+            .expect("first timeout")
+            .expect("first task")
+            .expect("first turn");
+        let second = tokio::time::timeout(Duration::from_secs(15), second)
+            .await
+            .expect("second timeout")
+            .expect("second task")
+            .expect("second turn");
+
+        // Assert
+        assert_eq!(first, "ok");
+        assert_eq!(second, "ok");
+        assert_eq!(stats.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(stats.max_active.load(Ordering::SeqCst), 1);
+        state.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn malformed_request_returns_error_response() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let state = runtime_state(&dir);
         let (client_stream, server_stream) = UnixStream::pair().expect("unix pair");
-        let server_task = tokio::spawn(handle_connection(server_stream, state));
+        let server_task = tokio::spawn(handle_connection(
+            server_stream,
+            state,
+            tokio_util::sync::CancellationToken::new(),
+        ));
         let (read_half, mut write_half) = tokio::io::split(client_stream);
         let mut lines = BufReader::new(read_half).lines();
 

@@ -20,41 +20,35 @@
 EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントランタイム。Runtime のコアコンポーネントは単一プロセス内で動作し、TUI Client は Local API 経由で接続する。
 
 ```text
+┌──────────────────────────────┐
+│ TUI process                  │
+│ channels/tui/                │
+│   Local Runtime API Client   │
+└──────────────┬───────────────┘
+               │ Unix Domain Socket
+               ▼
 ┌──────────────────────────────────────────────────────────┐
-│                        main.rs                           │
-│   CLI エントリポイント (ask/chat/run/setup/gateway/update/sleep/events)  │
-└────────────┬──────────────────────────┬──────────────────┘
-             │                          │
-    ┌────────▼────────┐        ┌────────▼────────┐
-    │  ローカルモード  │        │  サーバーモード   │
-    │  (TUI / CLI)    │        │  (egopulse run)  │
-    └────────┬────────┘        └────────┬────────┘
-             │                          │
-             │    ┌─────────────────────┼─────────────────────┐
-             │    │                     │                     │
-             │    │              runtime/                     │
-             │    │          (AppState 構築・管理)             │
-             │    └─────────────────────┬─────────────────────┘
-             │                          │
-             │    ┌─────────────────────┼─────────────────────┐
-             │    │         channel 群 (tokio task)            │
-             │    │   Web Server  │  Discord  │  Telegram     │
-             │    └─────────────────────┬─────────────────────┘
-             │                          │
-             └──────────┬───────────────┘
-                        │
-             ┌──────────▼──────────┐
-             │    agent_loop       │
-             │  (process_turn)    │
-             └──────────┬──────────┘
-                        │
-        ┌───────────────┼───────────────┐
-        │               │               │
-  ┌─────▼─────┐  ┌──────▼──────┐  ┌─────▼─────┐
-  │  storage  │  │     llm     │  │   tools   │
-  │ (SQLite)  │  │  (Provider) │  │ (built-in │
-  │           │  │             │  │  + MCP)   │
-  └───────────┘  └─────────────┘  └───────────┘
+│ Runtime process                                           │
+│   AppState / InstanceGuard / DB                           │
+│   Discord task ─────┐                                    │
+│   Telegram task ────┤                                    │
+│   Web task ─────────┤                                    │
+│   Local API adapter ┘                                    │
+│                    │                                      │
+│              Runtime Turn Core                           │
+│                    │                                      │
+│              TurnScheduler                               │
+│                    │                                      │
+│                Agent Loop                                │
+└─────────────────────────┼────────────────────────────────┘
+                          │
+                 ┌────────┴────────┐
+                 │                 │
+           ┌─────▼─────┐     ┌─────▼─────┐
+           │  storage  │     │  llm/tools │
+           │  (SQLite) │     │  (Provider │
+           │           │     │   + MCP)   │
+           └───────────┘     └────────────┘
 ```
 
 ---
@@ -93,6 +87,7 @@ src/
 │   │   ├── scheduled.rs # durable ScheduledTurn の表現・hash・serialization
 │   │   ├── scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
 │   │   ├── dispatch.rs  # durable turn の復旧・dispatch・scheduled turn 実行
+│   │   ├── observer.rs  # transport adapter向けTurn event/completion配信
 │   │   └── progress.rs  # ツール進捗表示コーディネータ
 │   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
 │   ├── backup_scheduler.rs # 定期 SQLite backup スケジューラ
@@ -131,7 +126,7 @@ src/
 │   ├── cli.rs           # CLI チャネル
 │   ├── discord.rs       # Discord ボット
 │   ├── telegram.rs      # Telegram ボット
-│   ├── tui.rs           # TUI チャネル
+│   ├── tui/              # TUI チャネル
 │   ├── voice.rs         # Voice チャネル (Bearer 認証 REST)
 │   ├── web/             # Web サーバー (Axum, SSE, WebSocket)
 │   └── utils/           # チャネル共通ユーティリティ
@@ -332,16 +327,16 @@ TurnExecutor
 ## 5. リクエストフロー
 
 ```text
-1. チャネルがメッセージを受信
+1. チャネルがメッセージを受信、または TUI Client が Local API へ送信
       │
-2. チャネルが受信イベントを内部メタデータへ正規化
+2. チャネルまたは Local API adapter が入力を内部メタデータへ正規化
       │  (channel, surface_user, surface_thread, agent_id)
       │
 3. runtime/channel_input.rs が SurfaceContext を生成し、必要に応じて Channel Log へ保存
       │
-4. ScheduledTurn を TurnScheduler に投入
+4. ScheduledTurn を durable accept し、TurnScheduler に投入
       │
-5. agent_loop::process_turn(state, ctx, message, attachments)
+5. Runtime の共通 Turn 実行境界が Agent Loop へ委譲
       │
       ├─ 5a. chat_id を解決 (chats テーブルを upsert)
       ├─ 5b. session snapshot をロード (sessions テーブル)
@@ -367,7 +362,9 @@ TurnExecutor
       │      ├ sessions テーブルを UPDATE (楽観ロック)
       │      └ llm_usage_logs テーブルに INSERT
       │
-      └─ 5g. 応答を channel adapter 経由で返送
+      └─ 5g. 応答を宛先へ返送
+             ├─ channel turn → channel adapter
+             └─ Local API turn → observer → Unix socket client
 ```
 
 ---
@@ -420,7 +417,8 @@ deadline 付きで停止する。
       │
 2. accepting_inputs = false / shutdown_started = true
    ├─ 新規 Turn 受付拒否 (submit gate)
-   └─ queue 済み Turn は次ターンを開始しない
+   ├─ queue 済み Turn は次ターンを開始しない
+   └─ Local API listener / connection は新規operationを開始しない
       │
 3. 実行中 Turn を deadline (default 30s) まで待って drain
    ├─ Turn は安全地点で自然完了
@@ -445,6 +443,7 @@ deadline 付きで停止する。
 |---------|---------|------|
 | **Channel Adapter** | `channels/adapter.rs` | 全チャネルを統一インターフェースで扱う |
 | **Channel Input Boundary** | `runtime/channel_input.rs` | チャネルが正規化した入力を `SurfaceContext`、Channel Log、`ScheduledTurn` に変換する |
+| **Turn Output Observer** | `runtime/turn/observer.rs` | Local APIなどのtransport adapterへTurn eventとcompletionを配送する |
 | **Dependency Injection** | `runtime/` AppState | 全コンポーネントの依存を明示的に注入 |
 | **Optimistic Concurrency** | `storage/` sessions | セッション書き込みの競合を `updated_at` で解決 |
 | **Tool Registry** | `tools/mod.rs` | built-in / MCP の区別なくツールを動的登録 |

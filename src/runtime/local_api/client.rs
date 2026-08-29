@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines, ReadHalf};
 use tokio::net::UnixStream;
+use tokio::time::{Duration, timeout};
 
 use crate::error::EgoPulseError;
 
@@ -12,6 +13,8 @@ use super::protocol::{
     CommandOutcome, Request, RequestEnvelope, Response, ResponseEnvelope, SessionReference,
     SessionSummary, SessionView,
 };
+
+const RUNTIME_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalRuntimeClient {
@@ -36,6 +39,14 @@ impl LocalRuntimeClient {
     }
 
     pub(crate) async fn runtime_info(&self) -> Result<RuntimeInfo, EgoPulseError> {
+        timeout(RUNTIME_INFO_TIMEOUT, self.runtime_info_inner())
+            .await
+            .map_err(|_| {
+                EgoPulseError::RuntimeLocalApi("runtime info request timed out".to_string())
+            })?
+    }
+
+    async fn runtime_info_inner(&self) -> Result<RuntimeInfo, EgoPulseError> {
         let mut lines = self.request(Request::RuntimeInfo).await?;
         match read_response(&mut lines).await? {
             Response::RuntimeInfo {

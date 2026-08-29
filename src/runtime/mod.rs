@@ -125,6 +125,8 @@ pub struct AppState {
     pub(crate) turn_scheduler: Arc<turn::TurnScheduler>,
     /// Per-origin turn counter for runaway prevention.
     pub(crate) turn_tracker: Arc<turn::TurnTracker>,
+    /// Live client observers for turns submitted through a transport adapter.
+    pub(crate) turn_observers: Arc<turn::TurnObserverRegistry>,
     /// In-memory runtime health summary for observability.
     pub(crate) runtime_status: Arc<RuntimeStatus>,
     /// Owns long-lived tasks and in-flight turns; orchestrates shutdown.
@@ -199,6 +201,7 @@ impl AppState {
             active_turns: Arc::new(ActiveTurnTracker::new()),
             turn_scheduler: Arc::new(turn::TurnScheduler::new()),
             turn_tracker: Arc::new(turn::TurnTracker::new()),
+            turn_observers: Arc::new(turn::TurnObserverRegistry::new()),
             runtime_status: parts.runtime_status.clone(),
             supervisor: Arc::new(RuntimeSupervisor::with_instance_guard(
                 parts.runtime_status,

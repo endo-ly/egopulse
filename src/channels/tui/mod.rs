@@ -101,6 +101,7 @@ impl Drop for TuiSession {
 enum RuntimeEvent {
     Agent(TurnEvent),
     TurnFinished(Result<String, EgoPulseError>),
+    RuntimeHealth(Result<(), EgoPulseError>),
     SlashFinished {
         prompt: String,
         result: Result<CommandResult, EgoPulseError>,
@@ -381,6 +382,7 @@ impl TuiApp {
         terminal: &mut TuiSession,
     ) -> Result<(), EgoPulseError> {
         match event {
+            RuntimeEvent::RuntimeHealth(_) => {}
             RuntimeEvent::Agent(event) => {
                 self.status = agent_status(&event);
                 self.transcript.apply_turn_event(event);
@@ -508,7 +510,7 @@ pub(crate) async fn run(
 
     let mut event_stream = crossterm::event::EventStream::new();
     let mut redraw_tick = tokio::time::interval(MAX_FRAME_INTERVAL);
-    let mut health_tick = tokio::time::interval(Duration::from_secs(1));
+    let health_task = spawn_health_check(app.client.clone(), app.runtime_tx.clone());
     let mut dirty = true;
     let mut disconnect_error = None;
 
@@ -518,12 +520,6 @@ pub(crate) async fn run(
                 if dirty {
                     app.draw(&mut terminal)?;
                     dirty = false;
-                }
-            }
-            _ = health_tick.tick() => {
-                if let Err(error) = app.client.runtime_info().await {
-                    disconnect_error = Some(error);
-                    break;
                 }
             }
             maybe_event = event_stream.next() => {
@@ -537,13 +533,39 @@ pub(crate) async fn run(
                 dirty = true;
             }
             Some(event) = app.runtime_rx.recv() => {
-                app.handle_runtime(event, &mut terminal).await?;
-                dirty = true;
+                if let RuntimeEvent::RuntimeHealth(result) = event {
+                    if let Err(error) = result {
+                        disconnect_error = Some(error);
+                        break;
+                    }
+                } else {
+                    app.handle_runtime(event, &mut terminal).await?;
+                    dirty = true;
+                }
             }
         }
     }
 
+    health_task.abort();
+    let _ = health_task.await;
     disconnect_error.map_or(Ok(()), Err)
+}
+
+fn spawn_health_check(
+    client: LocalRuntimeClient,
+    tx: UnboundedSender<RuntimeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let result = client.runtime_info().await.map(|_| ());
+            let failed = result.is_err();
+            if tx.send(RuntimeEvent::RuntimeHealth(result)).is_err() || failed {
+                return;
+            }
+        }
+    })
 }
 
 const TUI_ONLY_COMMANDS: &[&str] = &["/sessions"];

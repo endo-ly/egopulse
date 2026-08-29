@@ -224,6 +224,8 @@ pub enum ConfigError {
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,
+    #[error("state_root_must_be_absolute: {path}")]
+    StateRootMustBeAbsolute { path: String },
     /// SecretRef の解決に失敗した（環境変数が見つからない等）。
     #[error("secret_ref_unresolved: {reference}")]
     SecretRefUnresolved { reference: String },

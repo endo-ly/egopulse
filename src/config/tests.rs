@@ -11,6 +11,8 @@ use secrecy::ExposeSecret;
 use serial_test::serial;
 
 use super::{Config, default_state_root};
+use crate::error::ConfigError;
+use crate::test_env::EnvVarGuard;
 
 #[test]
 fn runtime_endpoint_resolution_reads_only_state_root() {
@@ -41,8 +43,38 @@ fn runtime_endpoint_resolution_uses_default_state_root_when_omitted() {
 
     assert_eq!(resolved, default_state_root().expect("default state root"));
 }
-use crate::error::ConfigError;
-use crate::test_env::EnvVarGuard;
+
+#[test]
+fn runtime_endpoint_resolution_rejects_relative_state_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("egopulse.config.yaml");
+    std::fs::write(&config_path, "state_root: ./state\n").expect("write config");
+
+    let error = super::resolve_state_root(Some(&config_path)).expect_err("relative root");
+
+    assert!(matches!(
+        error,
+        crate::error::ConfigError::StateRootMustBeAbsolute { .. }
+    ));
+}
+
+#[test]
+#[serial]
+fn full_config_loader_rejects_relative_state_root() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        &format!("state_root: ./state\n{}", sample_config()),
+    );
+
+    let error = Config::load(Some(&file_path)).expect_err("relative root");
+
+    assert!(matches!(
+        error,
+        crate::error::ConfigError::StateRootMustBeAbsolute { .. }
+    ));
+}
 
 fn write_config(temp_dir: &tempfile::TempDir, body: &str) -> PathBuf {
     let file_path = temp_dir.path().join("egopulse.config.yaml");

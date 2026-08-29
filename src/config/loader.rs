@@ -282,11 +282,7 @@ pub(super) fn build_config(
 
     let default_model = normalize_string(file_default_model);
 
-    let state_root = normalize_string(file_state_root).unwrap_or(
-        super::resolve::default_state_root()?
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let state_root = normalize_state_root(file_state_root)?;
 
     let log_level = first_non_empty([env_var("LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
@@ -405,16 +401,24 @@ pub(crate) fn resolve_state_root(config_path: Option<&Path>) -> Result<PathBuf, 
             path: resolved_config_path,
             detail: source.to_string(),
         })?;
-    Ok(file_config
-        .state_root
-        .and_then(|value| normalize_string(Some(value)))
-        .map(PathBuf::from)
-        .unwrap_or(super::resolve::default_state_root()?))
+    Ok(PathBuf::from(normalize_state_root(file_config.state_root)?))
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct MinimalFileConfig {
     state_root: Option<String>,
+}
+
+fn normalize_state_root(value: Option<String>) -> Result<String, ConfigError> {
+    let state_root = normalize_string(value).unwrap_or(
+        super::resolve::default_state_root()?
+            .to_string_lossy()
+            .into_owned(),
+    );
+    if !Path::new(&state_root).is_absolute() {
+        return Err(ConfigError::StateRootMustBeAbsolute { path: state_root });
+    }
+    Ok(state_root)
 }
 
 /// Validates an already-normalized candidate produced by an in-process

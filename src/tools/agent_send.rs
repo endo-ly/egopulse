@@ -13,8 +13,8 @@ use crate::config::{AgentConfig, AgentId};
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::llm::ToolDefinition;
 use crate::runtime::TurnIntake;
-use crate::runtime::turn::ScheduledTurn;
 use crate::runtime::turn::SubmitOutcome;
+use crate::runtime::turn::{ResponseDelivery, ScheduledTurn};
 use crate::runtime::turn::{StopReason, evaluate_stop_conditions};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
@@ -233,6 +233,7 @@ impl Tool for AgentSendTool {
             input: target_input,
             config_snapshot: context.config_snapshot.clone(),
             received_at: Some(chrono::Utc::now().to_rfc3339()),
+            response_delivery: ResponseDelivery::Channel,
         };
 
         let delivered = match self.intake.submit(scheduled).await {
@@ -968,6 +969,7 @@ mod integration_tests {
             input: "blocker".to_string(),
             config_snapshot: Some(state.config_manager.current_blocking()),
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         assert!(matches!(
             state.turn_scheduler.submit(blocker),

@@ -13,7 +13,9 @@ use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::runtime::metrics;
 use crate::runtime::turn::{RejectReason, ScheduleResult, SubmitOutcome};
-use crate::runtime::turn::{ScheduledTurn, canonical_request_hash, serialize_scheduled_turn};
+use crate::runtime::turn::{
+    ResponseDelivery, ScheduledTurn, TurnObserver, canonical_request_hash, serialize_scheduled_turn,
+};
 use crate::storage::{AcceptOutcome, AcceptTurnParams};
 use crate::storage::{
     MessageKind, SenderKind, StageToolFollowupOutcome, StoredMessage, call_blocking,
@@ -191,9 +193,36 @@ pub(crate) async fn submit_agent_turn(
             input,
             config_snapshot: None,
             received_at: Some(chrono::Utc::now().to_rfc3339()),
+            response_delivery: ResponseDelivery::Channel,
         },
     )
     .await
+}
+
+/// Submits a turn through the shared durable scheduler and observes its output.
+pub(crate) async fn submit_observed_agent_turn(
+    state: &Arc<AppState>,
+    context: SurfaceContext,
+    input: String,
+) -> Result<TurnObserver, RejectReason> {
+    let observer_id = uuid::Uuid::new_v4().to_string();
+    let (response_delivery, observer) = state.turn_observers.register(observer_id.clone());
+    let scheduled = ScheduledTurn {
+        turn_id: uuid::Uuid::new_v4().to_string(),
+        origin_id: context.origin_id.clone(),
+        context,
+        input,
+        config_snapshot: None,
+        received_at: Some(chrono::Utc::now().to_rfc3339()),
+        response_delivery,
+    };
+    match submit_scheduled_turn(state, scheduled).await {
+        SubmitOutcome::Started | SubmitOutcome::Queued => Ok(observer),
+        SubmitOutcome::Rejected(reason) => {
+            state.turn_observers.unregister(&observer_id);
+            Err(reason)
+        }
+    }
 }
 
 /// Attempts to durably stage ordinary human input for the unique Tool phase

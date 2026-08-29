@@ -311,7 +311,7 @@ Ratatui + crossterm の Inline viewport で動作する。TUI は Runtime が提
 ### データフロー
 
 - **入力**: crossterm `EventStream` から key / paste / resize を受信
-- **送信**: TUI が Local Runtime API の `ExecuteTurn` を呼び出し、Runtime が `process_turn_with_events` を実行して Local Turn Event を逐次返す
+- **送信**: TUI が Local Runtime API の `ExecuteTurn` を呼び出し、Runtime が共通の durable Turn intake と `TurnScheduler` を経由して Agent Loop を実行し、Turn Event を逐次返す
 - **確定出力**: ユーザー発言、最終応答、確定ツールカード、エラーを `terminal.insert_before()` で一度だけスクロールバックへ出力
 - **再描画**: dirty フラグを 16ms 間隔で coalesce し、高頻度の Delta をまとめて表示
 - **同時実行**: ターンは 1 件。Tool 実行中の ordinary prompt は durable staged follow-up として FIFO で保留し、Tool Result 後に同じ Turn の履歴へ commit する。それ以外の busy 状態では既存の pending prompt 制御を使う

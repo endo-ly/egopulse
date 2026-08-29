@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::scheduler;
-use super::{ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
+use super::{ResponseDelivery, ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
 use crate::agent_loop::{resume_input_committed_turn, resume_tools_completed_turn};
 use crate::config::manager::ConfigSnapshot;
 use crate::conversation::{ConversationScope, SurfaceContext};
@@ -511,8 +511,28 @@ pub(crate) fn execute_scheduled_turn(
 
         let current_state = match load_durable_turn_state(state, &prepared.turn).await {
             DurableTurnStateLookup::Found(state) => Some(state),
-            DurableTurnStateLookup::Missing => None,
-            DurableTurnStateLookup::Shutdown => return,
+            DurableTurnStateLookup::Missing => {
+                if matches!(
+                    &prepared.turn.response_delivery,
+                    ResponseDelivery::Observer { .. }
+                ) {
+                    finish_observer(
+                        state,
+                        &prepared.turn.response_delivery,
+                        Err("durable turn was not found".to_string()),
+                    );
+                    return;
+                }
+                None
+            }
+            DurableTurnStateLookup::Shutdown => {
+                finish_observer(
+                    state,
+                    &prepared.turn.response_delivery,
+                    Err(EgoPulseError::ShutdownRequested.user_message()),
+                );
+                return;
+            }
         };
         let config_snapshot = prepared
             .turn
@@ -521,6 +541,11 @@ pub(crate) fn execute_scheduled_turn(
             .unwrap_or_else(|| state.config_manager.current_blocking());
 
         if !begin_scheduled_turn(state, &prepared, current_state, &config_snapshot).await {
+            finish_observer(
+                state,
+                &prepared.turn.response_delivery,
+                Err("turn rejected by runtime stop condition".to_string()),
+            );
             return;
         }
 
@@ -554,6 +579,11 @@ async fn prepare_scheduled_turn(
             "shutdown in progress: not starting submitted turn"
         );
         state.turn_tracker.release(&origin_id);
+        finish_observer(
+            state,
+            &turn.response_delivery,
+            Err(EgoPulseError::ShutdownRequested.user_message()),
+        );
         return None;
     }
 
@@ -577,6 +607,11 @@ async fn prepare_scheduled_turn(
         {
             Ok(()) => {
                 state.turn_tracker.release(&origin_id);
+                finish_observer(
+                    state,
+                    &turn.response_delivery,
+                    Err("turn chain already terminated".to_string()),
+                );
                 drain_next_queued_turn(state, &session_key).await;
             }
             Err(error) => {
@@ -741,7 +776,15 @@ async fn execute_and_publish_scheduled_turn(
     let turn = &prepared.turn;
     let origin_id = &prepared.origin_id;
     let session_key = &prepared.session_key;
-    let adapter = state.channels.get(&turn.context.channel).cloned();
+    let observer_id = match &turn.response_delivery {
+        ResponseDelivery::Observer { observer_id } => Some(observer_id.as_str()),
+        ResponseDelivery::Channel => None,
+    };
+    let adapter = if observer_id.is_none() {
+        state.channels.get(&turn.context.channel).cloned()
+    } else {
+        None
+    };
     let external_chat_id = turn.context.session_key();
     let _activity = match adapter.as_ref() {
         Some(adapter) => match adapter.begin_turn_activity(&external_chat_id).await {
@@ -787,6 +830,7 @@ async fn execute_and_publish_scheduled_turn(
                 &turn.input,
                 config_snapshot,
                 turn.received_at.clone(),
+                observer_id,
             )
             .await
         }
@@ -808,7 +852,11 @@ async fn execute_and_publish_scheduled_turn(
 
     match turn_result {
         Ok(response) => {
-            if let Some(adapter) = adapter.as_ref() {
+            if let Some(observer_id) = observer_id {
+                state
+                    .turn_observers
+                    .finish(observer_id, Ok(response.clone()));
+            } else if let Some(adapter) = adapter.as_ref() {
                 if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                     tracing::warn!(
                         agent_id = %turn.context.agent_id,
@@ -866,7 +914,13 @@ async fn execute_and_publish_scheduled_turn(
                     tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                 }
             }
-            send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
+            if let Some(observer_id) = observer_id {
+                state
+                    .turn_observers
+                    .finish(observer_id, Err(error.user_message()));
+            } else {
+                send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
+            }
         }
     }
 
@@ -983,8 +1037,12 @@ async fn execute_turn_with_progress_and_snapshot(
     input: &str,
     config_snapshot: Arc<ConfigSnapshot>,
     received_at: Option<String>,
+    observer_id: Option<&str>,
 ) -> Result<String, EgoPulseError> {
-    let adapter = state.channels.get(&context.channel);
+    let adapter = observer_id
+        .is_none()
+        .then(|| state.channels.get(&context.channel))
+        .flatten();
     let external_chat_id = context.session_key();
     let sink = adapter
         .and_then(|adapter| adapter.tool_progress_sink())
@@ -998,13 +1056,18 @@ async fn execute_turn_with_progress_and_snapshot(
     let coordinator_abort = coordinator_handle.abort_handle();
 
     let event_sender = evt_tx.clone();
+    let observer_registry = Arc::clone(&state.turn_observers);
+    let observer_id = observer_id.map(str::to_owned);
     let runtime = state.turn_dependencies();
     let result = crate::agent_loop::process_turn_with_events_and_snapshot_and_received_at(
         &runtime,
         context,
         input,
         move |event| {
-            let _ = event_sender.send(event);
+            let _ = event_sender.send(event.clone());
+            if let Some(observer_id) = observer_id.as_deref() {
+                observer_registry.emit(observer_id, event);
+            }
         },
         config_snapshot,
         received_at,
@@ -1037,6 +1100,12 @@ async fn execute_turn_with_progress_and_snapshot(
         }
     }
     result
+}
+
+fn finish_observer(state: &AppState, delivery: &ResponseDelivery, result: Result<String, String>) {
+    if let ResponseDelivery::Observer { observer_id } = delivery {
+        state.turn_observers.finish(observer_id, result);
+    }
 }
 
 /// 当該チャネルで進捗表示が有効かを設定からルックアップする。
@@ -1191,6 +1260,7 @@ mod tests {
             origin_id: uuid::Uuid::new_v4().to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
 
         // Act
@@ -1289,6 +1359,7 @@ mod tests {
                 "hello",
                 success_state.config_manager.current_blocking(),
                 None,
+                None,
             ),
         )
         .await;
@@ -1314,6 +1385,7 @@ mod tests {
                 &failure_context,
                 "hello",
                 failure_state.config_manager.current_blocking(),
+                None,
                 None,
             ),
         )
@@ -1352,6 +1424,7 @@ mod tests {
             &context,
             "hello",
             state.config_manager.current_blocking(),
+            None,
             None,
         )
         .await;
@@ -1415,6 +1488,7 @@ mod tests {
             origin_id: uuid::Uuid::new_v4().to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
 
         // Act: execute the scheduled turn
@@ -1539,6 +1613,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
@@ -1547,6 +1622,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         assert!(
             matches!(
@@ -1613,6 +1689,7 @@ mod tests {
                 origin_id: format!("fill-{i}"),
                 config_snapshot: None,
                 received_at: None,
+                response_delivery: ResponseDelivery::Channel,
             };
             let _ = state.turn_scheduler.submit(turn);
         }
@@ -1633,6 +1710,7 @@ mod tests {
             origin_id: "origin-blk1".to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let outcome = channel_input::submit_scheduled_turn(&state, turn_a).await;
         assert!(
@@ -1739,6 +1817,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
@@ -1747,6 +1826,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         assert!(matches!(
             state.turn_scheduler.submit(turn_a.clone()),
@@ -1891,6 +1971,7 @@ mod tests {
             origin_id: "original-origin".to_string(),
             config_snapshot: None,
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
+            response_delivery: ResponseDelivery::Channel,
         };
         let scheduled_json =
             crate::runtime::turn::serialize_scheduled_turn(&scheduled).expect("serialize route");
@@ -2077,6 +2158,7 @@ mod tests {
             origin_id: uuid::Uuid::new_v4().to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let scheduled_json = serialize_scheduled_turn(&scheduled).expect("serialize");
 

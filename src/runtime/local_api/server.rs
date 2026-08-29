@@ -16,7 +16,7 @@ use super::socket_path;
 pub(crate) fn start(state: &Arc<AppState>) -> Result<(), EgoPulseError> {
     let path = socket_path(std::path::Path::new(&state.config.state_root));
     let listener = bind_listener(&path)?;
-    let shutdown = state.supervisor.shutdown_token();
+    let shutdown = state.supervisor.shutdown_started_token();
     let supervisor = Arc::clone(&state.supervisor);
     let runtime = Arc::clone(state);
     supervisor.spawn_long_lived(
@@ -82,9 +82,11 @@ async fn serve(
                     EgoPulseError::RuntimeLocalApi(format!("runtime socket accept failed: {error}"))
                 })?;
                 let connection_state = Arc::clone(&state);
-                let connection_supervisor = Arc::clone(&state.supervisor);
-                connection_supervisor.spawn_turn(async move {
-                    if let Err(error) = service::handle_connection(stream, connection_state).await {
+                let connection_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    if let Err(error) =
+                        service::handle_connection(stream, connection_state, connection_shutdown).await
+                    {
                         tracing::debug!(error = %error, "local runtime API connection ended with an error");
                     }
                 });
@@ -115,7 +117,12 @@ fn cleanup_socket(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::bind_listener;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::net::UnixStream;
+
+    use super::{bind_listener, socket_path, start};
 
     #[test]
     fn regular_file_at_socket_path_is_not_removed() {
@@ -186,5 +193,31 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    #[tokio::test]
+    async fn idle_connection_does_not_delay_runtime_shutdown() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        config.channels.clear();
+        let state = Arc::new(crate::test_util::build_state_with_config(
+            config, None, None, None, None,
+        ));
+        start(&state).expect("start local API");
+        let path = socket_path(std::path::Path::new(&state.config.state_root));
+        let _connection = UnixStream::connect(&path).await.expect("connect socket");
+
+        // Act
+        let shutdown =
+            tokio::time::timeout(Duration::from_secs(1), state.supervisor.shutdown()).await;
+
+        // Assert
+        assert!(shutdown.is_ok(), "idle connection must not block shutdown");
+        assert!(!path.exists(), "runtime socket must be cleaned up");
+        assert!(
+            UnixStream::connect(&path).await.is_err(),
+            "shutdown must reject new local API connections"
+        );
     }
 }
