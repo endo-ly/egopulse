@@ -43,6 +43,7 @@
 │
 ├── runtime/
 │   ├── egopulse.db
+│   ├── egopulse.sock      # 稼働中 Runtime の Local API Unix socket
 │   ├── assets/
 │   ├── groups/
 │   │   ├── telegram/
@@ -76,7 +77,7 @@
 
 ### 2.1 リポジトリの TUI 実装
 
-TUI は `src/channels/tui/` に責務別に分割されている。Inline viewport のライフサイクルとイベントループを `mod.rs`、crossterm イベント変換を `event.rs`、入力状態機械を `composer.rs`、会話とストリーミング状態を `transcript.rs`、Markdown 表示を `markdown.rs`、セッション選択を `sessions.rs`、ratatui 描画を `draw.rs` が担当する。確定済みブロックは端末スクロールバックへ出力し、viewport はアクティブターンと入力欄を描画する。
+TUI は `src/channels/tui/` に責務別に分割されている。Inline viewport のライフサイクルとイベントループを `mod.rs`、crossterm イベント変換を `event.rs`、入力状態機械を `composer.rs`、会話とストリーミング状態を `transcript.rs`、Markdown 表示を `markdown.rs`、セッション選択を `sessions.rs`、ratatui 描画を `draw.rs` が担当する。Runtime 接続と Session / Turn 操作は `src/runtime/local_api/` の Client / Protocol を利用する。確定済みブロックは端末スクロールバックへ出力し、viewport はアクティブターンと入力欄を描画する。
 
 ### 2.2 直下 — 設定・人格・ルール・MCP
 

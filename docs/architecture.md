@@ -17,7 +17,7 @@
 
 ## 1. 全体像
 
-EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントランタイム。全コンポーネントが単一プロセス内で動作する。
+EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントランタイム。Runtime のコアコンポーネントは単一プロセス内で動作し、TUI Client は Local API 経由で接続する。
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
@@ -86,6 +86,7 @@ src/
 │
 ├── runtime/             # AppState 構築、チャネル起動・監視
 │   ├── mod.rs           # AppState, InstanceGuard, build_app_state(), start_channels()
+│   ├── local_api/       # TUI向けUnix socket API (protocol / client / server / service)
 │   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
 │   ├── turn/            # Scheduled Turn subsystem
 │   │   ├── mod.rs       # Runtime Turn facade
@@ -397,6 +398,7 @@ TurnExecutor
       │
 4. start_channels()
        │
+       ├─ Local API Unix socket bind (`<state_root>/runtime/egopulse.sock`, supervisor 経由)
        ├─ Web server 起動 (supervisor 経由)
        ├─ Discord bot 起動 (supervisor 経由 × bot 数)
        ├─ Telegram bot 起動 (supervisor 経由)

@@ -7,6 +7,7 @@ pub(crate) mod types;
 pub(crate) mod web_fetch;
 
 pub(crate) use loader::is_valid_base_url;
+pub(crate) use loader::resolve_state_root;
 pub(crate) use manager::ConfigManager;
 pub use resolve::default_config_path;
 pub(crate) use resolve::default_state_root;

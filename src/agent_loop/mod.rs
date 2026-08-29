@@ -17,7 +17,7 @@ pub(crate) mod test_support;
 pub(crate) mod tool_execution;
 pub(crate) mod turn;
 
-pub(crate) use session::{list_sessions, load_transcript_history, resolve_chat_id};
+pub(crate) use session::{load_transcript_history, resolve_chat_id};
 pub(crate) use turn::dependencies::TurnDependencies;
 #[cfg(test)]
 pub(crate) use turn::process_turn;

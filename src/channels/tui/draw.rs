@@ -6,15 +6,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::conversation::SurfaceContext;
-
 use super::composer::Composer;
 use super::markdown::render_markdown;
 use super::sessions::SessionsOverlay;
 use super::transcript::{Block as TranscriptBlock, ToolBlock, ToolStatus, Transcript};
 
 pub(super) struct DrawState<'a> {
-    pub(super) context: &'a SurfaceContext,
+    pub(super) surface_thread: &'a str,
+    pub(super) agent_id: &'a str,
     pub(super) transcript: &'a Transcript,
     pub(super) composer: &'a Composer,
     pub(super) status: &'a str,
@@ -44,7 +43,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, state: DrawState<'_>) {
 
     draw_active_turn(frame, conversation_area, state.transcript);
     draw_composer(frame, composer_area, state.composer);
-    draw_status(frame, status_area, state.context, state.status, state.model);
+    draw_status(
+        frame,
+        status_area,
+        state.surface_thread,
+        state.agent_id,
+        state.status,
+        state.model,
+    );
 
     if let Some(completion) = state.composer.completion() {
         let popup_height = completion.candidates().len().min(6) as u16 + 2;
@@ -257,17 +263,18 @@ fn line_width_until(line: &str, column: usize) -> usize {
 fn draw_status(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    context: &SurfaceContext,
+    surface_thread: &str,
+    agent_id: &str,
     status: &str,
     model: &str,
 ) {
     let line = Line::from(vec![
         Span::styled(
-            format!(" {} ", context.surface_thread),
+            format!(" {} ", surface_thread),
             Style::default().fg(Color::Cyan),
         ),
         Span::styled(
-            format!("agent={} model={} ", context.agent_id, model),
+            format!("agent={} model={} ", agent_id, model),
             Style::default().fg(Color::DarkGray),
         ),
         Span::raw(status),
@@ -349,22 +356,11 @@ fn draw_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, sessions: &Sessions
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::event::AgentEvent;
     use crate::channels::tui::composer::InputEvent;
-    use crate::conversation::SurfaceContext;
+    use crate::runtime::local_api::protocol::TurnEvent;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
-
-    fn context() -> SurfaceContext {
-        SurfaceContext::new(
-            "tui".to_string(),
-            "local_user".to_string(),
-            "session".to_string(),
-            "tui".to_string(),
-            "default".to_string(),
-        )
-    }
 
     fn rendered(terminal: &Terminal<TestBackend>) -> String {
         terminal
@@ -408,7 +404,6 @@ mod tests {
     #[test]
     fn test_backend_contains_composer_and_status() {
         // Arrange
-        let context = context();
         let transcript = Transcript::new();
         let composer = Composer::new();
         let mut terminal = Terminal::new(TestBackend::new(60, 10)).expect("test terminal");
@@ -419,7 +414,8 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
-                        context: &context,
+                        surface_thread: "session",
+                        agent_id: "default",
                         transcript: &transcript,
                         composer: &composer,
                         status: "Ready",
@@ -440,7 +436,6 @@ mod tests {
     #[test]
     fn completion_popup_lists_candidates() {
         // Arrange
-        let context = context();
         let transcript = Transcript::new();
         let mut composer = Composer::new();
         composer.set_completion_candidates(["/model", "/models"]);
@@ -452,7 +447,8 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
-                        context: &context,
+                        surface_thread: "session",
+                        agent_id: "default",
                         transcript: &transcript,
                         composer: &composer,
                         status: "Ready",
@@ -473,10 +469,9 @@ mod tests {
     #[test]
     fn tool_card_shows_pending_and_result_states() {
         // Arrange
-        let context = context();
         let mut transcript = Transcript::new();
         transcript.begin_turn("run");
-        transcript.apply_agent_event(AgentEvent::ToolStart {
+        transcript.apply_turn_event(TurnEvent::ToolStart {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             input: json!({"command": "pwd"}),
@@ -490,7 +485,8 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
-                        context: &context,
+                        surface_thread: "session",
+                        agent_id: "default",
                         transcript: &transcript,
                         composer: &composer,
                         status: "Working…",
@@ -506,7 +502,7 @@ mod tests {
         assert!(pending.contains("… shell"));
 
         // Act
-        transcript.apply_agent_event(AgentEvent::ToolResult {
+        transcript.apply_turn_event(TurnEvent::ToolResult {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             is_error: false,
@@ -518,7 +514,8 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
-                        context: &context,
+                        surface_thread: "session",
+                        agent_id: "default",
                         transcript: &transcript,
                         composer: &composer,
                         status: "Working…",
@@ -538,7 +535,6 @@ mod tests {
     #[test]
     fn long_line_keeps_cursor_inside_composer() {
         // Arrange
-        let context = context();
         let transcript = Transcript::new();
         let mut composer = Composer::new();
         composer.handle(InputEvent::Paste("01234567890123456789".to_string()));
@@ -550,7 +546,8 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
-                        context: &context,
+                        surface_thread: "session",
+                        agent_id: "default",
                         transcript: &transcript,
                         composer: &composer,
                         status: "Ready",

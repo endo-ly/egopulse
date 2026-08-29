@@ -840,29 +840,37 @@ body
     }
 
     #[tokio::test]
-    async fn runtime_requires_channel_even_when_pulse_scheduler_enabled() {
+    async fn runtime_starts_with_local_api_when_external_channels_are_disabled() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
         config.pulse = enabled_pulse_config();
         config.channels.clear();
+        let socket_path =
+            crate::runtime::local_api::socket_path(std::path::Path::new(&config.state_root));
 
         let state = crate::runtime::build_app_state(config)
             .await
             .expect("build state");
 
         // Act
-        let result = crate::runtime::start_channels(state).await;
+        let runtime = tokio::spawn(crate::runtime::start_channels(state.clone()));
+        for _ in 0..20 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         // Assert
+        assert!(socket_path.exists(), "runtime should expose the local API");
+
+        state.supervisor.shutdown().await;
+        runtime.abort();
+        let _ = runtime.await;
         assert!(
-            result.is_err(),
-            "start_channels should fail with NoActiveChannels"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("no enabled channel") || msg.contains("no active channel"),
-            "error should mention no active channels, got: {msg}"
+            !socket_path.exists(),
+            "runtime shutdown should remove socket"
         );
     }
 

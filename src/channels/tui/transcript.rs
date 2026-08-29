@@ -1,8 +1,6 @@
 //! Conversation transcript and active-turn state.
 
-use crate::agent_loop::event::AgentEvent;
-use crate::agent_loop::message_format::{is_tool_error_message, tool_result_body};
-use crate::llm::Message;
+use crate::runtime::local_api::protocol::{TranscriptEntry, TurnEvent};
 
 /// A committed conversation block that can be sent to terminal scrollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,34 +52,39 @@ impl Transcript {
         Self::default()
     }
 
-    /// Builds a transcript from messages already persisted for a session.
-    pub(crate) fn from_messages(messages: &[Message]) -> Self {
+    /// Builds a transcript from frontend entries returned by the runtime.
+    pub(crate) fn from_entries(entries: &[TranscriptEntry]) -> Self {
         let mut transcript = Self::new();
-        let mut blocks = Vec::new();
-        for message in messages {
-            let content = message.content.as_text_lossy();
-            match message.role.as_str() {
-                "user" => blocks.push(Block::User(content)),
-                "assistant" => {
-                    if !content.trim().is_empty() {
-                        blocks.push(Block::Assistant(content));
-                    }
-                    blocks.extend(message.tool_calls.iter().map(|tool_call| {
-                        Block::Tool(ToolBlock {
-                            call_id: tool_call.id.clone(),
-                            name: tool_call.name.clone(),
-                            input: summarize_json(&tool_call.arguments),
-                            status: ToolStatus::Running,
-                        })
-                    }));
+        for entry in entries {
+            match entry {
+                TranscriptEntry::User { text } => transcript.commit(Block::User(text.clone())),
+                TranscriptEntry::Assistant { text } | TranscriptEntry::System { text } => {
+                    transcript.commit(Block::Assistant(text.clone()));
                 }
-                "tool" => restore_tool_result(&mut blocks, message),
-                "system" => blocks.push(Block::Assistant(content)),
-                _ => blocks.push(Block::Assistant(content)),
+                TranscriptEntry::ToolStarted {
+                    call_id,
+                    name,
+                    input,
+                } => transcript.commit(Block::Tool(ToolBlock {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    input: summarize_json(input),
+                    status: ToolStatus::Running,
+                })),
+                TranscriptEntry::ToolFinished {
+                    call_id,
+                    name,
+                    is_error,
+                    preview,
+                    duration_ms,
+                } => transcript.complete_history_tool(
+                    call_id,
+                    name,
+                    *is_error,
+                    preview.clone(),
+                    *duration_ms,
+                ),
             }
-        }
-        for block in blocks {
-            transcript.commit(block);
         }
         transcript
     }
@@ -111,15 +114,15 @@ impl Transcript {
     }
 
     /// Applies one agent lifecycle event to the pure UI state.
-    pub(crate) fn apply_agent_event(&mut self, event: AgentEvent) {
+    pub(crate) fn apply_turn_event(&mut self, event: TurnEvent) {
         match event {
-            AgentEvent::Iteration { iteration } => {
+            TurnEvent::Iteration { iteration } => {
                 self.ensure_active().iteration = Some(iteration);
             }
-            AgentEvent::Delta { text } => {
+            TurnEvent::Delta { text } => {
                 self.ensure_active().buffer.push_str(&text);
             }
-            AgentEvent::ToolStart {
+            TurnEvent::ToolStart {
                 call_id,
                 name,
                 input,
@@ -131,38 +134,16 @@ impl Transcript {
                     status: ToolStatus::Running,
                 });
             }
-            AgentEvent::ToolResult {
+            TurnEvent::ToolResult {
                 call_id,
                 name,
                 is_error,
                 preview,
                 duration_ms,
             } => {
-                let active = self.ensure_active();
-                if let Some(card) = active
-                    .tool_cards
-                    .iter_mut()
-                    .find(|card| card.call_id == call_id)
-                {
-                    card.status = ToolStatus::Completed {
-                        is_error,
-                        preview,
-                        duration_ms: Some(duration_ms),
-                    };
-                } else {
-                    active.tool_cards.push(ToolBlock {
-                        call_id,
-                        name,
-                        input: String::new(),
-                        status: ToolStatus::Completed {
-                            is_error,
-                            preview,
-                            duration_ms: Some(duration_ms),
-                        },
-                    });
-                }
+                self.apply_tool_result(&call_id, &name, is_error, preview, Some(duration_ms));
             }
-            AgentEvent::UserInputInjected { text, .. } => {
+            TurnEvent::UserInputInjected { text, .. } => {
                 let (buffer, cards) = {
                     let active = self.ensure_active();
                     (
@@ -178,14 +159,14 @@ impl Transcript {
                 }
                 self.commit(Block::User(text));
             }
-            AgentEvent::FinalResponse { text } => {
+            TurnEvent::FinalResponse { text } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
                     self.commit(Block::Tool(card));
                 }
                 self.commit(Block::Assistant(text));
             }
-            AgentEvent::Error { message } => {
+            TurnEvent::Error { message } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
                     self.commit(Block::Tool(card));
@@ -193,6 +174,73 @@ impl Transcript {
                 self.commit(Block::Error(message));
             }
         }
+    }
+
+    fn apply_tool_result(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        is_error: bool,
+        preview: String,
+        duration_ms: Option<u128>,
+    ) {
+        let active = self.ensure_active();
+        if let Some(card) = active
+            .tool_cards
+            .iter_mut()
+            .find(|card| card.call_id == call_id)
+        {
+            card.status = ToolStatus::Completed {
+                is_error,
+                preview,
+                duration_ms,
+            };
+        } else {
+            active.tool_cards.push(ToolBlock {
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                input: String::new(),
+                status: ToolStatus::Completed {
+                    is_error,
+                    preview,
+                    duration_ms,
+                },
+            });
+        }
+    }
+
+    fn complete_history_tool(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        is_error: bool,
+        preview: String,
+        duration_ms: Option<u128>,
+    ) {
+        let status = ToolStatus::Completed {
+            is_error,
+            preview,
+            duration_ms,
+        };
+        if let Some(index) = self
+            .committed
+            .iter()
+            .rposition(|block| matches!(block, Block::Tool(tool) if tool.call_id == call_id))
+        {
+            if let Block::Tool(tool) = &mut self.committed[index] {
+                tool.status = status.clone();
+            }
+            if let Some(Block::Tool(tool)) = self.pending_commit.get_mut(index) {
+                tool.status = status;
+            }
+            return;
+        }
+        self.commit(Block::Tool(ToolBlock {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            input: String::new(),
+            status,
+        }));
     }
 
     fn ensure_active(&mut self) -> &mut ActiveTurn {
@@ -209,35 +257,6 @@ impl Transcript {
     }
 }
 
-fn restore_tool_result(blocks: &mut Vec<Block>, message: &Message) {
-    let preview = crate::channels::utils::text::truncate_by_chars(
-        &tool_result_body(&message.content.as_text_lossy()),
-        120,
-    );
-    let status = ToolStatus::Completed {
-        is_error: is_tool_error_message(message),
-        preview,
-        duration_ms: None,
-    };
-
-    if let Some(tool_call_id) = message.tool_call_id.as_deref()
-        && let Some(Block::Tool(tool)) = blocks
-            .iter_mut()
-            .rev()
-            .find(|block| matches!(block, Block::Tool(tool) if tool.call_id == tool_call_id))
-    {
-        tool.status = status;
-        return;
-    }
-
-    blocks.push(Block::Tool(ToolBlock {
-        call_id: message.tool_call_id.clone().unwrap_or_default(),
-        name: "tool".to_string(),
-        input: String::new(),
-        status,
-    }));
-}
-
 fn summarize_json(value: &serde_json::Value) -> String {
     let text = value.to_string().replace(['\n', '\r'], " ");
     crate::channels::utils::text::truncate_by_chars(&text, 120)
@@ -246,7 +265,7 @@ fn summarize_json(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{Message, MessageContent, ToolCall};
+    use crate::runtime::local_api::protocol::TurnEvent;
     use serde_json::json;
 
     #[test]
@@ -256,10 +275,10 @@ mod tests {
         transcript.begin_turn("hello");
 
         // Act
-        transcript.apply_agent_event(AgentEvent::Delta {
+        transcript.apply_turn_event(TurnEvent::Delta {
             text: "one".to_string(),
         });
-        transcript.apply_agent_event(AgentEvent::Delta {
+        transcript.apply_turn_event(TurnEvent::Delta {
             text: " two".to_string(),
         });
 
@@ -275,14 +294,14 @@ mod tests {
         // Arrange
         let mut transcript = Transcript::new();
         transcript.begin_turn("run");
-        transcript.apply_agent_event(AgentEvent::ToolStart {
+        transcript.apply_turn_event(TurnEvent::ToolStart {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             input: json!({"command": "pwd"}),
         });
 
         // Act
-        transcript.apply_agent_event(AgentEvent::ToolResult {
+        transcript.apply_turn_event(TurnEvent::ToolResult {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             is_error: false,
@@ -309,35 +328,31 @@ mod tests {
     }
 
     #[test]
-    fn persisted_tool_messages_restore_as_tool_cards() {
+    fn persisted_entries_restore_tool_cards() {
         // Arrange
-        let messages = vec![
-            Message::text("user", "inspect"),
-            Message {
-                role: "assistant".to_string(),
-                content: MessageContent::text(""),
-                reasoning_content: None,
-                tool_calls: vec![ToolCall {
-                    id: "call-1".to_string(),
-                    name: "shell".to_string(),
-                    arguments: json!({"command": "pwd"}),
-                }],
-                tool_call_id: None,
+        let entries = vec![
+            TranscriptEntry::User {
+                text: "inspect".to_string(),
             },
-            Message {
-                role: "tool".to_string(),
-                content: MessageContent::text(
-                    r#"{"tool":"shell","status":"success","result":"/tmp"}"#,
-                ),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: Some("call-1".to_string()),
+            TranscriptEntry::ToolStarted {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                input: json!({"command": "pwd"}),
             },
-            Message::text("assistant", "The working directory is /tmp."),
+            TranscriptEntry::ToolFinished {
+                call_id: "call-1".to_string(),
+                name: "shell".to_string(),
+                is_error: false,
+                preview: "/tmp".to_string(),
+                duration_ms: None,
+            },
+            TranscriptEntry::Assistant {
+                text: "The working directory is /tmp.".to_string(),
+            },
         ];
 
         // Act
-        let mut transcript = Transcript::from_messages(&messages);
+        let mut transcript = Transcript::from_entries(&entries);
         let pending = transcript.drain_pending();
 
         // Assert
@@ -367,12 +382,12 @@ mod tests {
         // Arrange
         let mut transcript = Transcript::new();
         transcript.begin_turn("hello");
-        transcript.apply_agent_event(AgentEvent::Delta {
+        transcript.apply_turn_event(TurnEvent::Delta {
             text: "partial".to_string(),
         });
 
         // Act
-        transcript.apply_agent_event(AgentEvent::FinalResponse {
+        transcript.apply_turn_event(TurnEvent::FinalResponse {
             text: "**final**".to_string(),
         });
 
@@ -391,15 +406,15 @@ mod tests {
         // Arrange
         let mut transcript = Transcript::new();
         transcript.begin_turn("hello");
-        transcript.apply_agent_event(AgentEvent::Delta {
+        transcript.apply_turn_event(TurnEvent::Delta {
             text: "before".to_string(),
         });
-        transcript.apply_agent_event(AgentEvent::ToolStart {
+        transcript.apply_turn_event(TurnEvent::ToolStart {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             input: json!({"command": "pwd"}),
         });
-        transcript.apply_agent_event(AgentEvent::ToolResult {
+        transcript.apply_turn_event(TurnEvent::ToolResult {
             call_id: "call-1".to_string(),
             name: "shell".to_string(),
             is_error: false,
@@ -408,16 +423,16 @@ mod tests {
         });
 
         // Act
-        transcript.apply_agent_event(AgentEvent::UserInputInjected {
+        transcript.apply_turn_event(TurnEvent::UserInputInjected {
             message_id: "tui:follow-up".to_string(),
             sender_id: "user-b".to_string(),
             text: "follow-up".to_string(),
             timestamp: "2026-08-28T12:00:00Z".to_string(),
         });
-        transcript.apply_agent_event(AgentEvent::Delta {
+        transcript.apply_turn_event(TurnEvent::Delta {
             text: "after".to_string(),
         });
-        transcript.apply_agent_event(AgentEvent::FinalResponse {
+        transcript.apply_turn_event(TurnEvent::FinalResponse {
             text: "after".to_string(),
         });
 
@@ -437,7 +452,7 @@ mod tests {
         transcript.begin_turn("hello");
 
         // Act
-        transcript.apply_agent_event(AgentEvent::Error {
+        transcript.apply_turn_event(TurnEvent::Error {
             message: "failed".to_string(),
         });
 

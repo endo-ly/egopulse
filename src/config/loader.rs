@@ -381,6 +381,42 @@ pub(super) fn build_config(
     Ok(config)
 }
 
+/// Resolves only the state root needed by a local runtime client.
+pub(crate) fn resolve_state_root(config_path: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let resolved_config_path = match config_path {
+        Some(path) => PathBuf::from(path),
+        None => match Config::resolve_config_path()? {
+            Some(path) => path,
+            None => {
+                return Err(ConfigError::AutoConfigNotFound {
+                    searched_paths: vec![super::resolve::default_config_path()?],
+                });
+            }
+        },
+    };
+    let contents = fs::read_to_string(&resolved_config_path).map_err(|source| {
+        ConfigError::ConfigReadFailed {
+            path: resolved_config_path.clone(),
+            source,
+        }
+    })?;
+    let file_config: MinimalFileConfig =
+        yaml_serde::from_str(&contents).map_err(|source| ConfigError::ConfigParseFailed {
+            path: resolved_config_path,
+            detail: source.to_string(),
+        })?;
+    Ok(file_config
+        .state_root
+        .and_then(|value| normalize_string(Some(value)))
+        .map(PathBuf::from)
+        .unwrap_or(super::resolve::default_state_root()?))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MinimalFileConfig {
+    state_root: Option<String>,
+}
+
 /// Validates an already-normalized candidate produced by an in-process
 /// update. File loading performs the same checks while normalizing YAML, but
 /// API and slash-command updates mutate the normalized representation directly.

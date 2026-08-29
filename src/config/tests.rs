@@ -11,6 +11,36 @@ use secrecy::ExposeSecret;
 use serial_test::serial;
 
 use super::{Config, default_state_root};
+
+#[test]
+fn runtime_endpoint_resolution_reads_only_state_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state_root = dir.path().join("state");
+    let config_path = dir.path().join("egopulse.config.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "state_root: {}\nproviders: invalid\napi_key: dotenv:DO_NOT_READ\n",
+            state_root.display()
+        ),
+    )
+    .expect("write config");
+
+    let resolved = super::resolve_state_root(Some(&config_path)).expect("resolve endpoint");
+
+    assert_eq!(resolved, state_root);
+}
+
+#[test]
+fn runtime_endpoint_resolution_uses_default_state_root_when_omitted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("egopulse.config.yaml");
+    std::fs::write(&config_path, "default_provider: missing\n").expect("write config");
+
+    let resolved = super::resolve_state_root(Some(&config_path)).expect("resolve endpoint");
+
+    assert_eq!(resolved, default_state_root().expect("default state root"));
+}
 use crate::error::ConfigError;
 use crate::test_env::EnvVarGuard;
 

@@ -6,6 +6,7 @@ pub(crate) mod backup_scheduler;
 pub(crate) mod channel_input;
 pub(crate) mod config_reload;
 pub mod gateway;
+pub(crate) mod local_api;
 pub mod logging;
 pub(crate) mod metrics;
 pub(crate) mod status;
@@ -37,7 +38,6 @@ use tracing::{info, warn};
 
 use crate::agent_loop::prompt::SoulAgentsLoader;
 use crate::assets::AssetStore;
-use crate::channels;
 use crate::channels::adapter::ChannelRegistry;
 use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
@@ -642,19 +642,16 @@ pub async fn list_session_names(state: &AppState) -> Result<Vec<String>, EgoPuls
         .collect())
 }
 
-/// Starts the local TUI channel with a fully built application state.
-pub async fn run_tui(
-    config: Config,
-    config_path: Option<PathBuf>,
-    session: Option<&str>,
-) -> Result<(), EgoPulseError> {
-    let state = build_app_state_with_path(config, config_path).await?;
-    channels::tui::run(state, session).await
+/// Resolves the local runtime socket without loading the full configuration.
+pub fn resolve_runtime_socket_path(
+    config_path: Option<&Path>,
+) -> Result<PathBuf, crate::error::ConfigError> {
+    local_api::resolve_socket_path(config_path)
 }
 
-fn spawn_web_channel(state: &Arc<AppState>) -> bool {
+fn spawn_web_channel(state: &Arc<AppState>) {
     if !state.config.web_enabled() {
-        return false;
+        return;
     }
 
     state
@@ -669,11 +666,10 @@ fn spawn_web_channel(state: &Arc<AppState>) -> bool {
         TaskSpec::new(TaskKind::Channel, "web", Criticality::Critical),
         async move { crate::channels::web::run_server(web_state, &host, port, token).await },
     );
-    true
 }
 
 #[cfg(feature = "channel-discord")]
-fn spawn_discord_channels(state: &Arc<AppState>) -> bool {
+fn spawn_discord_channels(state: &Arc<AppState>) {
     let bot_configs: Vec<_> = state
         .config
         .discord_bots()
@@ -686,7 +682,7 @@ fn spawn_discord_channels(state: &Arc<AppState>) -> bool {
             "Discord channel is enabled but no bots have a token configured. \
              Set channels.discord.bots.<id>.token in egopulse.config.yaml."
         );
-        return false;
+        return;
     }
 
     state
@@ -717,11 +713,10 @@ fn spawn_discord_channels(state: &Arc<AppState>) -> bool {
             },
         );
     }
-    true
 }
 
 #[cfg(feature = "channel-telegram")]
-fn spawn_telegram_channels(state: &Arc<AppState>) -> bool {
+fn spawn_telegram_channels(state: &Arc<AppState>) {
     let bot_configs: Vec<_> = state
         .config
         .telegram_bots()
@@ -736,7 +731,7 @@ fn spawn_telegram_channels(state: &Arc<AppState>) -> bool {
                  Set channels.telegram.bots.<id>.token in egopulse.config.yaml."
             );
         }
-        return false;
+        return;
     }
 
     state
@@ -767,7 +762,6 @@ fn spawn_telegram_channels(state: &Arc<AppState>) -> bool {
             },
         );
     }
-    true
 }
 
 async fn spawn_runtime_services(state: &Arc<AppState>) {
@@ -870,21 +864,17 @@ async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
 /// stops accepting input, drains in-flight turns, then drains long-lived tasks
 /// within bounded deadlines.
 pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
-    let mut has_active_channels = spawn_web_channel(&state);
+    local_api::start(&state)?;
+
+    spawn_web_channel(&state);
 
     #[cfg(feature = "channel-discord")]
     {
-        has_active_channels |= spawn_discord_channels(&state);
+        spawn_discord_channels(&state);
     }
     #[cfg(feature = "channel-telegram")]
     {
-        has_active_channels |= spawn_telegram_channels(&state);
-    }
-
-    if !has_active_channels {
-        return Err(EgoPulseError::Config(
-            crate::error::ConfigError::NoActiveChannels,
-        ));
+        spawn_telegram_channels(&state);
     }
 
     spawn_runtime_services(&state).await;

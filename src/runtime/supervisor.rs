@@ -58,6 +58,7 @@ const DEFAULT_TASK_DRAIN_SECS: u64 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskKind {
     Channel,
+    LocalApi,
     TurnDispatcher,
     McpReconnect,
     ConfigReload,
@@ -70,6 +71,7 @@ impl TaskKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Channel => "channel",
+            Self::LocalApi => "local_api",
             Self::TurnDispatcher => "turn_dispatcher",
             Self::McpReconnect => "mcp_reconnect",
             Self::ConfigReload => "config_reload",

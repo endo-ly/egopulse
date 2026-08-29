@@ -299,7 +299,7 @@ session identity の概念と正本は [session-lifecycle.md §1](./session-life
 
 ### 接続方式
 
-Ratatui + crossterm の Inline viewport で動作する。代替スクリーンは使用せず、確定済みの会話を端末本来のスクロールバックへ流し、画面下端の viewport だけを再描画する。
+Ratatui + crossterm の Inline viewport で動作する。TUI は Runtime が提供する Unix socket (`<state_root>/runtime/egopulse.sock`) の Client であり、Runtime が保持する Session、Agent Turn、Slash Command、Tool follow-up を利用する。代替スクリーンは使用せず、確定済みの会話を端末本来のスクロールバックへ流し、画面下端の viewport だけを再描画する。
 
 ### 画面構成
 
@@ -311,11 +311,12 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 ### データフロー
 
 - **入力**: crossterm `EventStream` から key / paste / resize を受信
-- **送信**: `RuntimeSupervisor` が所有する turn task で `agent_loop::process_turn_with_events` を実行し、`AgentEvent` を mpsc で TUI へ転送
+- **送信**: TUI が Local Runtime API の `ExecuteTurn` を呼び出し、Runtime が `process_turn_with_events` を実行して Local Turn Event を逐次返す
 - **確定出力**: ユーザー発言、最終応答、確定ツールカード、エラーを `terminal.insert_before()` で一度だけスクロールバックへ出力
 - **再描画**: dirty フラグを 16ms 間隔で coalesce し、高頻度の Delta をまとめて表示
 - **同時実行**: ターンは 1 件。Tool 実行中の ordinary prompt は durable staged follow-up として FIFO で保留し、Tool Result 後に同じ Turn の履歴へ commit する。それ以外の busy 状態では既存の pending prompt 制御を使う
 - **端末ライフサイクル**: raw mode と bracketed paste mode を TUI の生成・破棄に合わせて有効化・解除する
+- **Runtime 接続**: 起動時に Protocol version を確認し、Runtime が停止した場合は接続エラーとして終了する。TUI の終了や接続切断で Runtime は停止しない
 
 ### 起動とセッション
 
@@ -324,6 +325,7 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 - `--session` に未知の名前を指定した場合は、その名前の新規 TUI セッションを作る
 - 起動時の端末高さが 10 行未満の場合はエラー終了する
 - TUI の表示履歴は committed な `messages` を正本とし、`tool_calls` 台帳の入力・結果でツールカードを補完する。`sessions.messages_json` は次ターンの LLM context 用であり、表示履歴の source には使わない
+- Runtime が起動していない場合は自動起動せず、`egopulse gateway start` または `egopulse run` の案内を表示する
 
 ### コンポーザ操作
 
@@ -341,7 +343,7 @@ Ratatui + crossterm の Inline viewport で動作する。代替スクリーン�
 
 ### 接続方式
 
-標準入出力。引数なしの `egopulse` は TUI を起動し、`egopulse -p [PROMPT]` は非対話モードで応答を stdout に出力する。`--session <name>` で永続セッションを指定でき、`--continue` で最終更新セッションを再開できる。
+標準入出力。`egopulse -p [PROMPT]` は Runtime を直接構築する非対話モードで応答を stdout に出力する。引数なしの `egopulse` は起動済み Runtime の Local API に接続して TUI を起動する。`--session <name>` で永続セッションを指定でき、`--continue` で最終更新セッションを再開できる。
 
 ### データフロー
 
