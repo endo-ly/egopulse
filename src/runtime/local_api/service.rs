@@ -199,19 +199,25 @@ async fn execute_turn(
         .map_err(|reason| EgoPulseError::RuntimeLocalApi(reason.message().to_string()))?;
     let mut events_rx = observer.events;
     let mut completion_rx = observer.completion;
+    let mut last_response = String::new();
 
     loop {
         tokio::select! {
             Some(event) = events_rx.recv() => {
+                if let AgentEvent::FinalResponse { text } = &event {
+                    last_response.clone_from(text);
+                }
                 write_response(writer, Response::TurnEvent { event: map_agent_event(event) }).await?;
             }
             result = &mut completion_rx => {
                 while let Ok(event) = events_rx.try_recv() {
+                    if let AgentEvent::FinalResponse { text } = &event {
+                        last_response.clone_from(text);
+                    }
                     write_response(writer, Response::TurnEvent { event: map_agent_event(event) }).await?;
                 }
                 match result {
-                    Ok(Ok(response)) => write_response(writer, Response::TurnFinished { response }).await?,
-                    Ok(Err(message)) => write_response(writer, Response::Error { message }).await?,
+                    Ok(()) => write_response(writer, Response::TurnFinished { response: last_response }).await?,
                     Err(_) => write_response(writer, Response::Error { message: "runtime turn ended unexpectedly".to_string() }).await?,
                 }
                 return Ok(());

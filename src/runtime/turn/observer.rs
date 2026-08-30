@@ -7,10 +7,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::agent_loop::event::AgentEvent;
 
-/// Receives lifecycle events and the terminal result of a client interaction.
+/// Receives lifecycle events and the completion signal of a client interaction.
 pub(crate) struct TurnObserver {
     pub(crate) events: mpsc::UnboundedReceiver<AgentEvent>,
-    pub(crate) completion: oneshot::Receiver<Result<String, String>>,
+    pub(crate) completion: oneshot::Receiver<()>,
 }
 
 struct ObserverSink {
@@ -20,10 +20,8 @@ struct ObserverSink {
 }
 
 struct ObserverState {
-    completion: Option<oneshot::Sender<Result<String, String>>>,
+    completion: Option<oneshot::Sender<()>>,
     pending_turns: usize,
-    failure: Option<String>,
-    last_response: Option<String>,
 }
 
 /// Routes runtime-owned turn output to a client without owning the turn.
@@ -48,8 +46,6 @@ impl TurnObserverRegistry {
                 state: Mutex::new(ObserverState {
                     completion: Some(completion_tx),
                     pending_turns: 1,
-                    failure: None,
-                    last_response: None,
                 }),
                 initial_events: Mutex::new(HashMap::new()),
             }),
@@ -58,10 +54,17 @@ impl TurnObserverRegistry {
     }
 
     pub(crate) fn unregister(&self, request_key: &str) {
-        self.sinks
+        let sink = self
+            .sinks
             .lock()
             .expect("turn observer lock")
             .remove(request_key);
+        if let Some(sink) = sink {
+            sink.initial_events
+                .lock()
+                .expect("turn observer initial event lock")
+                .remove(request_key);
+        }
     }
 
     pub(crate) fn has_live_observer(&self, request_key: &str) -> bool {
@@ -85,7 +88,8 @@ impl TurnObserverRegistry {
     }
 
     /// Assigns one live client observer to several staged follow-up root
-    /// turns. The observer completes only after every assigned turn finishes.
+    /// turns. The observer completes only after every assigned turn finishes;
+    /// each turn's result remains an event in the shared stream.
     /// Returns `false` when the source observer is absent, closed, or any
     /// destination is already occupied.
     pub(crate) fn transfer_many(&self, from_request_key: &str, to_request_keys: &[String]) -> bool {
@@ -182,7 +186,7 @@ impl TurnObserverRegistry {
         }
     }
 
-    pub(crate) fn finish(&self, request_key: &str, result: Result<String, String>) {
+    pub(crate) fn finish(&self, request_key: &str, result: Result<(), String>) {
         let Some(sink) = self
             .sinks
             .lock()
@@ -191,32 +195,33 @@ impl TurnObserverRegistry {
         else {
             return;
         };
+        sink.initial_events
+            .lock()
+            .expect("turn observer initial event lock")
+            .remove(request_key);
+        if let Err(message) = &result {
+            // A shared observer represents one client interaction, but each
+            // assigned turn still has its own terminal event. Completion is
+            // only an interaction-level signal, so an intermediate failure
+            // must be sent before the remaining turns finish.
+            let _ = sink.events.send(AgentEvent::Error {
+                message: message.clone(),
+            });
+        }
         let completion = {
             let mut state = sink.state.lock().expect("turn observer state lock");
-            match result {
-                Ok(response) => state.last_response = Some(response),
-                Err(message) => {
-                    if state.failure.is_none() {
-                        state.failure = Some(message);
-                    }
-                }
-            }
             state.pending_turns = state
                 .pending_turns
                 .checked_sub(1)
                 .expect("turn observer finished more times than assigned");
             if state.pending_turns == 0 {
-                let result = match state.failure.take() {
-                    Some(message) => Err(message),
-                    None => Ok(state.last_response.take().unwrap_or_default()),
-                };
-                state.completion.take().map(|sender| (sender, result))
+                state.completion.take()
             } else {
                 None
             }
         };
-        if let Some((sender, result)) = completion {
-            let _ = sender.send(result);
+        if let Some(sender) = completion {
+            let _ = sender.send(());
         }
     }
 }
@@ -260,18 +265,15 @@ mod tests {
             ]
         ));
         registry.emit("promoted-request-1", AgentEvent::Iteration { iteration: 1 });
-        registry.finish("promoted-request-1", Ok("first".to_string()));
-        registry.finish("promoted-request-2", Ok("second".to_string()));
+        registry.finish("promoted-request-1", Ok(()));
+        registry.finish("promoted-request-2", Ok(()));
 
         // Assert
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::Iteration { iteration: 1 })
         ));
-        assert_eq!(
-            completion.await.expect("completion sender"),
-            Ok("second".to_string())
-        );
+        completion.await.expect("completion sender");
         assert!(!registry.has_live_observer("promoted-request-1"));
         assert!(!registry.has_live_observer("promoted-request-2"));
     }
