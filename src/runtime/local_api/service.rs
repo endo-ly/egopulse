@@ -453,8 +453,8 @@ async fn write_error(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::{handle_connection, map_agent_event, messages_to_entries};
@@ -1060,18 +1060,33 @@ mod tests {
         let client = LocalRuntimeClient::connect(path)
             .await
             .expect("connect client");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let received_events = Arc::clone(&events);
 
         // Act
         client
             .execute_turn(
                 SessionReference::Existing { chat_id },
                 "from tui".to_string(),
-                |_| {},
+                move |event| {
+                    received_events.lock().expect("event mutex").push(event);
+                },
             )
             .await
             .expect("execute cross-channel turn");
 
         // Assert
+        assert!(
+            events
+                .lock()
+                .expect("event mutex")
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    TurnEvent::FinalResponse { text } if text == "ok"
+                )),
+            "cross-channel observer did not receive the final response"
+        );
         assert_eq!(sends.load(Ordering::SeqCst), 0);
         let session = client
             .open_session(SessionReference::Existing { chat_id })

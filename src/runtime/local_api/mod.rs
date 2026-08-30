@@ -12,7 +12,7 @@ use crate::error::{ConfigError, EgoPulseError};
 pub(crate) use client::LocalRuntimeClient;
 
 /// Stable protocol version used by the runtime and its local clients.
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 1;
 const SOCKET_FILE_NAME: &str = "egopulse.sock";
 
 /// Returns the local runtime socket path for a state root.
