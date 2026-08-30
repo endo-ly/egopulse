@@ -170,6 +170,7 @@ async fn promote_terminal_staged_messages(
                 false
             };
 
+        let mut accepted_turns = Vec::new();
         for message in messages {
             let mut turn = template.clone();
             turn.turn_id = uuid::Uuid::new_v4().to_string();
@@ -183,27 +184,34 @@ async fn promote_terminal_staged_messages(
             turn.context.trace_id.clear();
             turn.context.scope = scope;
 
-            let observer_attached = observer_transferred
-                || (matches!(&template.response_delivery, ResponseDelivery::ClientOwned)
-                    && state.turn_observers.has_live_observer(&message.id));
-            if observer_attached {
-                // Register the initial event before submission can start the
-                // turn. A `Started` submission spawns execution immediately,
-                // so queueing it afterwards would allow the worker to miss
-                // the event on a multi-threaded runtime.
-                state.turn_observers.queue_initial_event(
-                    message.id.clone(),
-                    crate::agent_loop::event::AgentEvent::UserInputInjected {
-                        message_id: message.id.clone(),
-                        sender_id: message.sender_id.clone(),
-                        text: message.content.clone(),
-                        timestamp: message.timestamp.clone(),
-                    },
-                );
-            }
-            match channel_input::submit_scheduled_turn(state, turn).await {
-                crate::runtime::turn::SubmitOutcome::Started
-                | crate::runtime::turn::SubmitOutcome::Queued => {
+            match channel_input::accept_scheduled_turn(state, turn).await {
+                Ok(channel_input::AcceptedScheduledTurn::Created(turn)) => {
+                    let observer_attached = observer_transferred
+                        || (matches!(&template.response_delivery, ResponseDelivery::ClientOwned)
+                            && state.turn_observers.has_live_observer(&message.id));
+                    if observer_attached {
+                        // Register the initial event before scheduling can
+                        // start the turn. All staged-row cleanup is complete
+                        // before the accepted child is handed to the scheduler.
+                        state.turn_observers.queue_initial_event(
+                            message.id.clone(),
+                            crate::agent_loop::event::AgentEvent::UserInputInjected {
+                                message_id: message.id.clone(),
+                                sender_id: message.sender_id.clone(),
+                                text: message.content.clone(),
+                                timestamp: message.timestamp.clone(),
+                            },
+                        );
+                    }
+                    let chat_id = message.chat_id;
+                    let message_id = message.id;
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.delete_staged_user_message_after_promotion(chat_id, &message_id)
+                    })
+                    .await?;
+                    accepted_turns.push(*turn);
+                }
+                Ok(channel_input::AcceptedScheduledTurn::Existing) => {
                     let chat_id = message.chat_id;
                     let message_id = message.id;
                     call_blocking(Arc::clone(&db), move |db| {
@@ -211,7 +219,7 @@ async fn promote_terminal_staged_messages(
                     })
                     .await?;
                 }
-                crate::runtime::turn::SubmitOutcome::Rejected(reason) => {
+                Err(reason) => {
                     tracing::warn!(
                         scope = %scope,
                         message_id = %message.id,
@@ -220,6 +228,9 @@ async fn promote_terminal_staged_messages(
                     );
                 }
             }
+        }
+        for turn in accepted_turns {
+            channel_input::schedule_accepted_turn(state, turn);
         }
     }
     Ok(())
@@ -1437,7 +1448,11 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(provider_observer.seen_messages().len(), 2);
+        assert_eq!(
+            provider_observer.seen_messages().len(),
+            2,
+            "first_succeeds={first_succeeds}, second_succeeds={second_succeeds}, events={delivered:?}"
+        );
         delivered
     }
 
