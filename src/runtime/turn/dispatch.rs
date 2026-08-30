@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::scheduler;
-use super::{ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
+use super::{ResponseDelivery, ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
 use crate::agent_loop::{resume_input_committed_turn, resume_tools_completed_turn};
 use crate::config::manager::ConfigSnapshot;
 use crate::conversation::{ConversationScope, SurfaceContext};
@@ -103,57 +103,134 @@ async fn promote_terminal_staged_messages(
     })
     .await?;
 
+    let mut groups: Vec<(String, Option<String>)> = Vec::new();
     for terminal in staged {
-        let Some(payload) = terminal.scheduled_request_json else {
+        let Some(parent_turn_id) = terminal.message.turn_id.clone() else {
             tracing::warn!(
                 scope = %scope,
                 message_id = %terminal.message.id,
+                "cannot promote staged follow-up: message has no owning turn"
+            );
+            continue;
+        };
+        if let Some((_, payload)) = groups
+            .iter_mut()
+            .find(|(turn_id, _)| turn_id == &parent_turn_id)
+        {
+            if payload.is_none() {
+                *payload = terminal.scheduled_request_json;
+            }
+        } else {
+            groups.push((parent_turn_id, terminal.scheduled_request_json));
+        }
+    }
+
+    for (parent_turn_id, payload) in groups {
+        let Some(payload) = payload else {
+            tracing::warn!(
+                scope = %scope,
+                turn_id = %parent_turn_id,
                 "cannot promote staged follow-up: terminal turn has no routing payload"
             );
             continue;
         };
-        let mut turn = match deserialize_scheduled_turn(&payload) {
+        let messages = call_blocking(Arc::clone(&db), {
+            let parent_turn_id = parent_turn_id.clone();
+            move |db| db.list_staged_user_messages(&parent_turn_id)
+        })
+        .await?;
+        if messages.is_empty() {
+            continue;
+        }
+
+        let template = match deserialize_scheduled_turn(&payload) {
             Ok(turn) => turn,
             Err(error) => {
                 tracing::warn!(
                     scope = %scope,
-                    message_id = %terminal.message.id,
+                    turn_id = %parent_turn_id,
                     error = %error,
                     "cannot promote staged follow-up: routing payload is invalid"
                 );
                 continue;
             }
         };
+        let parent_request_key = template.context.request_key.clone();
+        let child_request_keys: Vec<String> =
+            messages.iter().map(|message| message.id.clone()).collect();
+        let observer_transferred =
+            if matches!(&template.response_delivery, ResponseDelivery::ClientOwned) {
+                state
+                    .turn_observers
+                    .transfer_many(&parent_request_key, &child_request_keys)
+                    || child_request_keys
+                        .iter()
+                        .all(|request_key| state.turn_observers.has_live_observer(request_key))
+            } else {
+                false
+            };
 
-        turn.turn_id = uuid::Uuid::new_v4().to_string();
-        turn.input = terminal.message.content.clone();
-        turn.origin_id.clear();
-        turn.received_at = Some(terminal.message.timestamp.clone());
-        turn.context.surface_user = terminal.message.sender_id.clone();
-        turn.context.request_key = terminal.message.id.clone();
-        turn.context.chain_depth = 0;
-        turn.context.origin_id.clear();
-        turn.context.trace_id.clear();
-        turn.context.scope = scope;
+        let mut accepted_turns = Vec::new();
+        for message in messages {
+            let mut turn = template.clone();
+            turn.turn_id = uuid::Uuid::new_v4().to_string();
+            turn.input = message.content.clone();
+            turn.origin_id.clear();
+            turn.received_at = Some(message.timestamp.clone());
+            turn.context.surface_user = message.sender_id.clone();
+            turn.context.request_key = message.id.clone();
+            turn.context.chain_depth = 0;
+            turn.context.origin_id.clear();
+            turn.context.trace_id.clear();
+            turn.context.scope = scope;
 
-        match channel_input::submit_scheduled_turn(state, turn).await {
-            crate::runtime::turn::SubmitOutcome::Started
-            | crate::runtime::turn::SubmitOutcome::Queued => {
-                let chat_id = terminal.message.chat_id;
-                let message_id = terminal.message.id;
-                call_blocking(Arc::clone(&db), move |db| {
-                    db.delete_staged_user_message_after_promotion(chat_id, &message_id)
-                })
-                .await?;
+            match channel_input::accept_scheduled_turn(state, turn).await {
+                Ok(channel_input::AcceptedScheduledTurn::Created(turn)) => {
+                    let observer_attached = observer_transferred
+                        || (matches!(&template.response_delivery, ResponseDelivery::ClientOwned)
+                            && state.turn_observers.has_live_observer(&message.id));
+                    if observer_attached {
+                        // Register the initial event before scheduling can
+                        // start the turn. All staged-row cleanup is complete
+                        // before the accepted child is handed to the scheduler.
+                        state.turn_observers.queue_initial_event(
+                            message.id.clone(),
+                            crate::agent_loop::event::AgentEvent::UserInputInjected {
+                                message_id: message.id.clone(),
+                                sender_id: message.sender_id.clone(),
+                                text: message.content.clone(),
+                                timestamp: message.timestamp.clone(),
+                            },
+                        );
+                    }
+                    let chat_id = message.chat_id;
+                    let message_id = message.id;
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.delete_staged_user_message_after_promotion(chat_id, &message_id)
+                    })
+                    .await?;
+                    accepted_turns.push(*turn);
+                }
+                Ok(channel_input::AcceptedScheduledTurn::Existing) => {
+                    let chat_id = message.chat_id;
+                    let message_id = message.id;
+                    call_blocking(Arc::clone(&db), move |db| {
+                        db.delete_staged_user_message_after_promotion(chat_id, &message_id)
+                    })
+                    .await?;
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        scope = %scope,
+                        message_id = %message.id,
+                        reason = %reason,
+                        "staged follow-up promotion deferred after Turn rejection"
+                    );
+                }
             }
-            crate::runtime::turn::SubmitOutcome::Rejected(reason) => {
-                tracing::warn!(
-                    scope = %scope,
-                    message_id = %terminal.message.id,
-                    reason = %reason,
-                    "staged follow-up promotion deferred after Turn rejection"
-                );
-            }
+        }
+        for turn in accepted_turns {
+            channel_input::schedule_accepted_turn(state, turn);
         }
     }
     Ok(())
@@ -511,8 +588,28 @@ pub(crate) fn execute_scheduled_turn(
 
         let current_state = match load_durable_turn_state(state, &prepared.turn).await {
             DurableTurnStateLookup::Found(state) => Some(state),
-            DurableTurnStateLookup::Missing => None,
-            DurableTurnStateLookup::Shutdown => return,
+            DurableTurnStateLookup::Missing => {
+                if matches!(
+                    &prepared.turn.response_delivery,
+                    ResponseDelivery::ClientOwned
+                ) {
+                    finish_observer(
+                        state,
+                        &prepared.turn,
+                        Err("durable turn was not found".to_string()),
+                    );
+                    return;
+                }
+                None
+            }
+            DurableTurnStateLookup::Shutdown => {
+                finish_observer(
+                    state,
+                    &prepared.turn,
+                    Err(EgoPulseError::ShutdownRequested.user_message()),
+                );
+                return;
+            }
         };
         let config_snapshot = prepared
             .turn
@@ -521,6 +618,11 @@ pub(crate) fn execute_scheduled_turn(
             .unwrap_or_else(|| state.config_manager.current_blocking());
 
         if !begin_scheduled_turn(state, &prepared, current_state, &config_snapshot).await {
+            finish_observer(
+                state,
+                &prepared.turn,
+                Err("turn rejected by runtime stop condition".to_string()),
+            );
             return;
         }
 
@@ -554,6 +656,11 @@ async fn prepare_scheduled_turn(
             "shutdown in progress: not starting submitted turn"
         );
         state.turn_tracker.release(&origin_id);
+        finish_observer(
+            state,
+            &turn,
+            Err(EgoPulseError::ShutdownRequested.user_message()),
+        );
         return None;
     }
 
@@ -577,6 +684,11 @@ async fn prepare_scheduled_turn(
         {
             Ok(()) => {
                 state.turn_tracker.release(&origin_id);
+                finish_observer(
+                    state,
+                    &turn,
+                    Err("turn chain already terminated".to_string()),
+                );
                 drain_next_queued_turn(state, &session_key).await;
             }
             Err(error) => {
@@ -732,6 +844,31 @@ async fn begin_scheduled_turn(
     }
 }
 
+fn observer_key(turn: &ScheduledTurn) -> Option<&str> {
+    matches!(&turn.response_delivery, ResponseDelivery::ClientOwned)
+        .then_some(turn.context.request_key.as_str())
+        .filter(|request_key| !request_key.is_empty())
+}
+
+async fn retain_observer_for_staged_follow_up(
+    state: &AppState,
+    turn: &ScheduledTurn,
+) -> Result<bool, EgoPulseError> {
+    let Some(request_key) = observer_key(turn) else {
+        return Ok(false);
+    };
+    if !state.turn_observers.has_live_observer(request_key) {
+        return Ok(false);
+    }
+
+    let turn_id = turn.turn_id.clone();
+    let messages = call_blocking(state.db_for(turn.context.scope), move |db| {
+        db.list_staged_user_messages(&turn_id)
+    })
+    .await?;
+    Ok(!messages.is_empty())
+}
+
 async fn execute_and_publish_scheduled_turn(
     state: &AppState,
     prepared: &PreparedScheduledTurn,
@@ -741,7 +878,12 @@ async fn execute_and_publish_scheduled_turn(
     let turn = &prepared.turn;
     let origin_id = &prepared.origin_id;
     let session_key = &prepared.session_key;
-    let adapter = state.channels.get(&turn.context.channel).cloned();
+    let observer_key = observer_key(turn);
+    let adapter = if observer_key.is_none() {
+        state.channels.get(&turn.context.channel).cloned()
+    } else {
+        None
+    };
     let external_chat_id = turn.context.session_key();
     let _activity = match adapter.as_ref() {
         Some(adapter) => match adapter.begin_turn_activity(&external_chat_id).await {
@@ -757,6 +899,9 @@ async fn execute_and_publish_scheduled_turn(
         },
         None => None,
     };
+    if let Some(observer_key) = observer_key {
+        state.turn_observers.emit_initial_event(observer_key);
+    }
 
     let started_at = chrono::Utc::now().to_rfc3339();
     let started = std::time::Instant::now();
@@ -787,6 +932,7 @@ async fn execute_and_publish_scheduled_turn(
                 &turn.input,
                 config_snapshot,
                 turn.received_at.clone(),
+                observer_key,
             )
             .await
         }
@@ -808,7 +954,9 @@ async fn execute_and_publish_scheduled_turn(
 
     match turn_result {
         Ok(response) => {
-            if let Some(adapter) = adapter.as_ref() {
+            if let Some(observer_key) = observer_key {
+                state.turn_observers.finish(observer_key, Ok(()));
+            } else if let Some(adapter) = adapter.as_ref() {
                 if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                     tracing::warn!(
                         agent_id = %turn.context.agent_id,
@@ -866,7 +1014,40 @@ async fn execute_and_publish_scheduled_turn(
                     tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                 }
             }
-            send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
+            if observer_key.is_some() {
+                let error_message = error.user_message();
+                let retain_observer = match retain_observer_for_staged_follow_up(state, turn).await
+                {
+                    Ok(retain_observer) => retain_observer,
+                    Err(db_error) => {
+                        tracing::warn!(
+                            error = %db_error,
+                            turn_id = %turn.turn_id,
+                            "failed to inspect staged follow-up; keeping client observer for retry"
+                        );
+                        true
+                    }
+                };
+                if retain_observer {
+                    tracing::info!(
+                        turn_id = %turn.turn_id,
+                        request_key = %turn.context.request_key,
+                        "keeping client observer for terminal staged follow-up"
+                    );
+                    if let Some(observer_key) = observer_key {
+                        state.turn_observers.emit(
+                            observer_key,
+                            crate::agent_loop::event::AgentEvent::Error {
+                                message: error_message,
+                            },
+                        );
+                    }
+                } else {
+                    finish_observer(state, turn, Err(error_message));
+                }
+            } else {
+                send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
+            }
         }
     }
 
@@ -983,8 +1164,12 @@ async fn execute_turn_with_progress_and_snapshot(
     input: &str,
     config_snapshot: Arc<ConfigSnapshot>,
     received_at: Option<String>,
+    observer_key: Option<&str>,
 ) -> Result<String, EgoPulseError> {
-    let adapter = state.channels.get(&context.channel);
+    let adapter = observer_key
+        .is_none()
+        .then(|| state.channels.get(&context.channel))
+        .flatten();
     let external_chat_id = context.session_key();
     let sink = adapter
         .and_then(|adapter| adapter.tool_progress_sink())
@@ -998,13 +1183,18 @@ async fn execute_turn_with_progress_and_snapshot(
     let coordinator_abort = coordinator_handle.abort_handle();
 
     let event_sender = evt_tx.clone();
+    let observer_registry = Arc::clone(&state.turn_observers);
+    let observer_key = observer_key.map(str::to_owned);
     let runtime = state.turn_dependencies();
     let result = crate::agent_loop::process_turn_with_events_and_snapshot_and_received_at(
         &runtime,
         context,
         input,
         move |event| {
-            let _ = event_sender.send(event);
+            let _ = event_sender.send(event.clone());
+            if let Some(observer_key) = observer_key.as_deref() {
+                observer_registry.emit(observer_key, event);
+            }
         },
         config_snapshot,
         received_at,
@@ -1037,6 +1227,12 @@ async fn execute_turn_with_progress_and_snapshot(
         }
     }
     result
+}
+
+fn finish_observer(state: &AppState, turn: &ScheduledTurn, result: Result<(), String>) {
+    if let Some(request_key) = observer_key(turn) {
+        state.turn_observers.finish(request_key, result);
+    }
 }
 
 /// 当該チャネルで進捗表示が有効かを設定からルックアップする。
@@ -1092,15 +1288,172 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     fn final_provider() -> RecordingProvider {
+        final_provider_for(1)
+    }
+
+    fn final_provider_for(count: usize) -> RecordingProvider {
         RecordingProvider::new(
-            vec![Ok(crate::llm::MessagesResponse {
-                content: "ok".to_string(),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                usage: None,
-            })],
-            vec![0],
+            (0..count)
+                .map(|_| {
+                    Ok(crate::llm::MessagesResponse {
+                        content: "ok".to_string(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    })
+                })
+                .collect(),
+            vec![0; count],
         )
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum DeliveredEvent {
+        Input(String),
+        Response(String),
+        Error(String),
+    }
+
+    async fn run_terminal_staged_follow_up_case(
+        first_succeeds: bool,
+        second_succeeds: bool,
+    ) -> Vec<DeliveredEvent> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = [first_succeeds, second_succeeds]
+            .into_iter()
+            .enumerate()
+            .map(|(index, succeeds)| {
+                if succeeds {
+                    Ok(crate::llm::MessagesResponse {
+                        content: "ok".to_string(),
+                        reasoning_content: None,
+                        tool_calls: Vec::new(),
+                        usage: None,
+                    })
+                } else {
+                    Err(crate::error::LlmError::InvalidResponse(format!(
+                        "follow-up {index} failed"
+                    )))
+                }
+            })
+            .collect();
+        let provider = RecordingProvider::new(responses, vec![0, 0]);
+        let provider_observer = provider.clone();
+        let state = Arc::new(crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        ));
+        let mut context = crate::test_util::cli_context("terminal-follow-up-events");
+        context.request_key = "terminal-follow-up-client".to_string();
+        let chat_id = crate::agent_loop::resolve_chat_id(&state.turn_dependencies(), &context)
+            .await
+            .expect("resolve chat");
+        let scheduled = ScheduledTurn {
+            turn_id: String::new(),
+            context: context.clone(),
+            input: "original input".to_string(),
+            origin_id: "original-origin".to_string(),
+            config_snapshot: None,
+            received_at: Some("2026-08-28T12:00:00Z".to_string()),
+            response_delivery: ResponseDelivery::ClientOwned,
+        };
+        let observer = state.turn_observers.register(context.request_key.clone());
+        let mut events = observer.events;
+        let completion = observer.completion;
+        let scheduled_json =
+            crate::runtime::turn::serialize_scheduled_turn(&scheduled).expect("serialize route");
+        let target_turn_id = call_blocking(Arc::clone(&state.db), {
+            let scheduled_json = scheduled_json.clone();
+            move |db| match db.accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "original-request",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: "original-payload",
+                origin_id: Some("original-origin"),
+                scheduled_request_json: Some(&scheduled_json),
+            })? {
+                crate::storage::AcceptOutcome::Created(run) => Ok(run.turn_id),
+                crate::storage::AcceptOutcome::Existing(_) => {
+                    Err(crate::error::StorageError::Conflict(
+                        "expected target Turn to be new".to_string(),
+                    ))
+                }
+            }
+        })
+        .await
+        .expect("accept target turn");
+        call_blocking(Arc::clone(&state.db), {
+            let target_turn_id = target_turn_id.clone();
+            move |db| {
+                db.get_conn()?.execute(
+                    "UPDATE turn_runs SET state = 'tools_pending' WHERE turn_id = ?1",
+                    rusqlite::params![&target_turn_id],
+                )?;
+                db.stage_tool_followup(
+                    chat_id,
+                    "staged-follow-up-1",
+                    "staged-follow-up-hash-1",
+                    "user-b",
+                    "recovered follow-up 1",
+                    "2026-08-28T12:34:56Z",
+                )?;
+                db.stage_tool_followup(
+                    chat_id,
+                    "staged-follow-up-2",
+                    "staged-follow-up-hash-2",
+                    "user-c",
+                    "recovered follow-up 2",
+                    "2026-08-28T12:34:57Z",
+                )?;
+                db.get_conn()?.execute(
+                    "UPDATE turn_runs SET state = 'failed' WHERE turn_id = ?1",
+                    rusqlite::params![&target_turn_id],
+                )?;
+                Ok::<(), crate::error::StorageError>(())
+            }
+        })
+        .await
+        .expect("seed terminal staged rows");
+
+        let mut terminal_turn =
+            crate::runtime::turn::deserialize_scheduled_turn(&scheduled_json).expect("decode");
+        terminal_turn.turn_id = target_turn_id;
+        assert!(
+            retain_observer_for_staged_follow_up(&state, &terminal_turn)
+                .await
+                .expect("inspect staged follow-ups")
+        );
+
+        promote_terminal_staged_messages(&state, ConversationScope::Normal, Arc::clone(&state.db))
+            .await
+            .expect("promote staged rows");
+        tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .expect("promoted follow-up completion timeout")
+            .expect("promoted follow-up observer completion");
+
+        let mut delivered = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                crate::agent_loop::event::AgentEvent::UserInputInjected { text, .. } => {
+                    delivered.push(DeliveredEvent::Input(text));
+                }
+                crate::agent_loop::event::AgentEvent::FinalResponse { text } => {
+                    delivered.push(DeliveredEvent::Response(text));
+                }
+                crate::agent_loop::event::AgentEvent::Error { message } => {
+                    delivered.push(DeliveredEvent::Error(message));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            provider_observer.seen_messages().len(),
+            2,
+            "first_succeeds={first_succeeds}, second_succeeds={second_succeeds}, events={delivered:?}"
+        );
+        delivered
     }
 
     #[derive(Clone)]
@@ -1191,6 +1544,7 @@ mod tests {
             origin_id: uuid::Uuid::new_v4().to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
 
         // Act
@@ -1289,6 +1643,7 @@ mod tests {
                 "hello",
                 success_state.config_manager.current_blocking(),
                 None,
+                None,
             ),
         )
         .await;
@@ -1314,6 +1669,7 @@ mod tests {
                 &failure_context,
                 "hello",
                 failure_state.config_manager.current_blocking(),
+                None,
                 None,
             ),
         )
@@ -1352,6 +1708,7 @@ mod tests {
             &context,
             "hello",
             state.config_manager.current_blocking(),
+            None,
             None,
         )
         .await;
@@ -1415,6 +1772,7 @@ mod tests {
             origin_id: uuid::Uuid::new_v4().to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
 
         // Act: execute the scheduled turn
@@ -1539,6 +1897,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
@@ -1547,6 +1906,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         assert!(
             matches!(
@@ -1613,6 +1973,7 @@ mod tests {
                 origin_id: format!("fill-{i}"),
                 config_snapshot: None,
                 received_at: None,
+                response_delivery: ResponseDelivery::Channel,
             };
             let _ = state.turn_scheduler.submit(turn);
         }
@@ -1633,6 +1994,7 @@ mod tests {
             origin_id: "origin-blk1".to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let outcome = channel_input::submit_scheduled_turn(&state, turn_a).await;
         assert!(
@@ -1739,6 +2101,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let turn_b = ScheduledTurn {
             turn_id: "B".to_string(),
@@ -1747,6 +2110,7 @@ mod tests {
             origin_id: ctx.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         assert!(matches!(
             state.turn_scheduler.submit(turn_a.clone()),
@@ -1876,11 +2240,14 @@ mod tests {
     async fn terminal_staged_follow_up_is_promoted_with_original_timestamp() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
+        let provider = final_provider_for(2);
+        let provider_observer = provider.clone();
         let state = Arc::new(crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            Box::new(final_provider()),
+            Box::new(provider),
         ));
-        let context = crate::test_util::cli_context("terminal-follow-up");
+        let mut context = crate::test_util::cli_context("terminal-follow-up");
+        context.request_key = "original-client-request".to_string();
         let chat_id = crate::agent_loop::resolve_chat_id(&state.turn_dependencies(), &context)
             .await
             .expect("resolve chat");
@@ -1891,7 +2258,11 @@ mod tests {
             origin_id: "original-origin".to_string(),
             config_snapshot: None,
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
+            response_delivery: ResponseDelivery::ClientOwned,
         };
+        let observer = state.turn_observers.register(context.request_key.clone());
+        let mut events = observer.events;
+        let completion = observer.completion;
         let scheduled_json =
             crate::runtime::turn::serialize_scheduled_turn(&scheduled).expect("serialize route");
         let target_turn_id = call_blocking(Arc::clone(&state.db), {
@@ -1924,11 +2295,19 @@ mod tests {
                 )?;
                 db.stage_tool_followup(
                     chat_id,
-                    "staged-after-crash",
-                    "staged-after-crash-hash",
+                    "staged-after-crash-1",
+                    "staged-after-crash-hash-1",
                     "user-b",
-                    "recovered follow-up",
+                    "recovered follow-up 1",
                     "2026-08-28T12:34:56Z",
+                )?;
+                db.stage_tool_followup(
+                    chat_id,
+                    "staged-after-crash-2",
+                    "staged-after-crash-hash-2",
+                    "user-c",
+                    "recovered follow-up 2",
+                    "2026-08-28T12:34:57Z",
                 )?;
                 db.get_conn()?.execute(
                     "UPDATE turn_runs SET state = 'failed' WHERE turn_id = ?1",
@@ -1940,37 +2319,194 @@ mod tests {
         .await
         .expect("seed terminal staged row");
 
+        let mut terminal_turn =
+            crate::runtime::turn::deserialize_scheduled_turn(&scheduled_json).expect("decode");
+        terminal_turn.turn_id = target_turn_id.clone();
+        assert!(
+            retain_observer_for_staged_follow_up(&state, &terminal_turn)
+                .await
+                .expect("inspect staged follow-ups"),
+            "a live client observer must stay open while a staged follow-up is promoted"
+        );
+
         // Act
         promote_terminal_staged_messages(&state, ConversationScope::Normal, Arc::clone(&state.db))
             .await
             .expect("promote staged row");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .expect("promoted follow-up completion timeout")
+            .expect("promoted follow-up observer completion");
 
         // Assert
+        let mut injected = Vec::new();
+        let mut turn_boundaries = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                crate::agent_loop::event::AgentEvent::UserInputInjected {
+                    sender_id, text, ..
+                } => {
+                    injected.push((sender_id, text));
+                    turn_boundaries.push("input");
+                }
+                crate::agent_loop::event::AgentEvent::FinalResponse { .. } => {
+                    turn_boundaries.push("response");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            injected,
+            vec![
+                ("user-b".to_string(), "recovered follow-up 1".to_string()),
+                ("user-c".to_string(), "recovered follow-up 2".to_string()),
+            ]
+        );
+        assert_eq!(turn_boundaries, ["input", "response", "input", "response"]);
+        assert_eq!(provider_observer.seen_messages().len(), 2);
         let promoted = call_blocking(Arc::clone(&state.db), move |db| {
             let conn = db.get_conn()?;
-            let row: (String, String, String, String) = conn.query_row(
-                "SELECT t.turn_id, t.request_key, m.sender_id, m.timestamp
+            let mut statement = conn.prepare(
+                "SELECT t.turn_id, t.request_key, m.content, m.sender_id, m.timestamp
                  FROM turn_runs t
                  JOIN messages m ON m.turn_id = t.turn_id
-                 WHERE t.request_key = 'staged-after-crash' AND m.content = 'recovered follow-up'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                 WHERE t.request_key LIKE 'staged-after-crash-%'
+                   AND m.content LIKE 'recovered follow-up %'
+                 ORDER BY t.request_key",
             )?;
-            Ok::<(String, String, String, String), crate::error::StorageError>(row)
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<(String, String, String, String, String)>, _>>()?;
+            Ok::<Vec<(String, String, String, String, String)>, crate::error::StorageError>(rows)
         })
         .await
-        .expect("promoted Turn and message");
-        assert_ne!(promoted.0, target_turn_id);
-        assert_eq!(promoted.1, "staged-after-crash");
-        assert_eq!(promoted.2, "user-b");
-        assert_eq!(promoted.3, "2026-08-28T12:34:56Z");
+        .expect("promoted Turns and messages");
+        assert_eq!(promoted.len(), 2);
+        assert!(promoted.iter().all(|row| row.0 != target_turn_id));
+        assert_eq!(
+            promoted
+                .iter()
+                .map(|row| (
+                    row.1.as_str(),
+                    row.2.as_str(),
+                    row.3.as_str(),
+                    row.4.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "staged-after-crash-1",
+                    "recovered follow-up 1",
+                    "user-b",
+                    "2026-08-28T12:34:56Z",
+                ),
+                (
+                    "staged-after-crash-2",
+                    "recovered follow-up 2",
+                    "user-c",
+                    "2026-08-28T12:34:57Z",
+                ),
+            ]
+        );
+        assert!(
+            !state
+                .turn_observers
+                .has_live_observer("staged-after-crash-1")
+        );
+        assert!(
+            !state
+                .turn_observers
+                .has_live_observer("staged-after-crash-2")
+        );
         let remaining = call_blocking(Arc::clone(&state.db), |db| {
             db.list_terminal_staged_user_messages(10)
         })
         .await
         .expect("staged rows");
         assert!(remaining.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn promoted_follow_up_outcomes_are_delivered_per_turn() {
+        for (first_succeeds, second_succeeds) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            // Arrange / Act
+            let events = run_terminal_staged_follow_up_case(first_succeeds, second_succeeds).await;
+
+            // Assert
+            assert_eq!(events.len(), 4, "events={events:?}");
+            assert_eq!(
+                events[0],
+                DeliveredEvent::Input("recovered follow-up 1".to_string())
+            );
+            assert_eq!(
+                events[2],
+                DeliveredEvent::Input("recovered follow-up 2".to_string())
+            );
+            match (first_succeeds, &events[1]) {
+                (true, DeliveredEvent::Response(text)) => assert_eq!(text, "ok"),
+                (false, DeliveredEvent::Error(message)) => {
+                    assert!(message.contains("follow-up 0 failed"));
+                }
+                (succeeds, event) => {
+                    panic!("unexpected first child outcome: succeeds={succeeds}, event={event:?}")
+                }
+            }
+            match (second_succeeds, &events[3]) {
+                (true, DeliveredEvent::Response(text)) => assert_eq!(text, "ok"),
+                (false, DeliveredEvent::Error(message)) => {
+                    assert!(message.contains("follow-up 1 failed"));
+                }
+                (succeeds, event) => {
+                    panic!("unexpected second child outcome: succeeds={succeeds}, event={event:?}")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn staged_follow_up_read_failure_keeps_client_observer_for_retry() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(final_provider()),
+        ));
+        let mut context = crate::test_util::cli_context("staged-read-failure");
+        context.request_key = "staged-read-failure-client".to_string();
+        let _observer = state.turn_observers.register(context.request_key.clone());
+        let turn = ScheduledTurn {
+            turn_id: "staged-read-failure-turn".to_string(),
+            context,
+            input: "input".to_string(),
+            origin_id: "origin".to_string(),
+            received_at: None,
+            config_snapshot: None,
+            response_delivery: ResponseDelivery::ClientOwned,
+        };
+        state.db.fault_inject_next_get_conn(1);
+
+        // Act
+        let result = retain_observer_for_staged_follow_up(&state, &turn).await;
+
+        // Assert
+        assert!(result.is_err(), "the staged-message state is unknown");
+        assert!(
+            state
+                .turn_observers
+                .has_live_observer("staged-read-failure-client")
+        );
     }
 
     #[tokio::test]
@@ -2077,6 +2613,7 @@ mod tests {
             origin_id: uuid::Uuid::new_v4().to_string(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: ResponseDelivery::Channel,
         };
         let scheduled_json = serialize_scheduled_turn(&scheduled).expect("serialize");
 

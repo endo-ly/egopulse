@@ -462,6 +462,7 @@ mod tests {
             origin_id: context.origin_id.clone(),
             config_snapshot: None,
             received_at: None,
+            response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
         })
         .expect("serialize scheduled turn")
     }

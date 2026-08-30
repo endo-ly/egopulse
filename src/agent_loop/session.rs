@@ -15,8 +15,8 @@ use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent, ToolCall};
 use crate::storage::{
-    SenderKind, SessionSnapshot, SessionSummary, StoredMessage, ToolCall as StoredToolCall,
-    ToolState, call_blocking,
+    SenderKind, SessionSnapshot, StoredMessage, ToolCall as StoredToolCall, ToolState,
+    call_blocking,
 };
 
 #[derive(Debug, Clone)]
@@ -56,15 +56,6 @@ pub(crate) async fn resolve_chat_id(
     })
     .await
     .map_err(EgoPulseError::from)
-}
-
-/// Lists all persisted sessions available in the local database.
-pub(crate) async fn list_sessions(
-    state: &TurnDependencies,
-) -> Result<Vec<SessionSummary>, EgoPulseError> {
-    call_blocking(Arc::clone(&state.db), move |db| db.list_sessions())
-        .await
-        .map_err(EgoPulseError::from)
 }
 
 /// Loads the append-only conversation history used by the TUI transcript.

@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use std::ops::Range;
 
-use crate::storage::SessionSummary;
+use crate::runtime::local_api::protocol::{SessionReference, SessionSummary};
 
 /// A local action emitted by the session overlay.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +87,20 @@ pub(crate) enum StartupSession {
     New,
 }
 
+impl StartupSession {
+    pub(crate) fn into_reference(self) -> SessionReference {
+        match self {
+            Self::Existing(summary) => SessionReference::Existing {
+                chat_id: summary.chat_id,
+            },
+            Self::Named(name) => SessionReference::Named { name },
+            Self::New => SessionReference::Named {
+                name: format!("local-{}", uuid::Uuid::new_v4()),
+            },
+        }
+    }
+}
+
 /// Chooses the explicit session, latest session, or a new context.
 pub(crate) fn choose_startup_session(
     requested: Option<&str>,
@@ -115,7 +129,6 @@ mod tests {
         SessionSummary {
             chat_id: 1,
             channel: "tui".to_string(),
-            external_chat_id: format!("tui:{thread}"),
             surface_thread: thread.to_string(),
             chat_title: None,
             last_message_time: "2026-01-01T00:00:00Z".to_string(),

@@ -49,7 +49,7 @@ tar = "0.4"
 teloxide = { version = "0.17", optional = true, default-features = false, features = ["rustls", "macros", "ctrlc_handler"] }
 tempfile = "3.27"
 thiserror = "2.0"
-tokio = { version = "1.52", features = ["macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.52", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }

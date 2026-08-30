@@ -11,7 +11,7 @@ mod sessions;
 mod transcript;
 
 use std::io::{self, Stdout};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use crossterm::cursor::MoveToColumn;
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
@@ -26,15 +26,11 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::time::Duration;
 
-use crate::agent_loop;
-use crate::agent_loop::event::AgentEvent;
-use crate::config::AgentId;
-use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, TuiError};
-use crate::llm::Message;
-use crate::runtime::AppState;
-use crate::slash_commands::{self, SlashCommandOutcome};
-use crate::storage::{SessionSummary, call_blocking};
+use crate::runtime::local_api::LocalRuntimeClient;
+use crate::runtime::local_api::client::CommandResult;
+use crate::runtime::local_api::protocol::{CommandOutcome, SessionSummary, SessionView, TurnEvent};
+use crate::slash_commands;
 
 use self::composer::{Composer, Effect, InputEvent};
 use self::event::UiEvent;
@@ -103,24 +99,20 @@ impl Drop for TuiSession {
 }
 
 enum RuntimeEvent {
-    Agent(AgentEvent),
-    TurnFinished(Result<String, EgoPulseError>),
+    Agent(TurnEvent),
+    TurnFinished(Result<(), EgoPulseError>),
+    RuntimeHealth(Result<(), EgoPulseError>),
     SlashFinished {
         prompt: String,
-        outcome: SlashCommandOutcome,
+        result: Result<CommandResult, EgoPulseError>,
     },
     SessionsLoaded(Result<Vec<SessionSummary>, EgoPulseError>),
-    SessionLoaded(Result<LoadedContext, EgoPulseError>),
-}
-
-struct LoadedContext {
-    context: SurfaceContext,
-    messages: Vec<Message>,
+    SessionLoaded(Result<SessionView, EgoPulseError>),
 }
 
 struct TuiApp {
-    state: Arc<AppState>,
-    context: SurfaceContext,
+    client: LocalRuntimeClient,
+    session: SessionView,
     transcript: Transcript,
     composer: Composer,
     status: String,
@@ -134,16 +126,16 @@ struct TuiApp {
 
 impl TuiApp {
     fn new(
-        state: Arc<AppState>,
-        loaded: LoadedContext,
+        client: LocalRuntimeClient,
+        session: SessionView,
         runtime_tx: UnboundedSender<RuntimeEvent>,
         runtime_rx: UnboundedReceiver<RuntimeEvent>,
     ) -> Self {
-        let model = model_for(&state, &loaded.context);
+        let model = session.effective_model.clone();
         Self {
-            state,
-            context: loaded.context,
-            transcript: Transcript::from_messages(&loaded.messages),
+            client,
+            transcript: Transcript::from_entries(&session.transcript),
+            session,
             composer: Composer::new(),
             status: "Ready".to_string(),
             model,
@@ -156,7 +148,8 @@ impl TuiApp {
     }
 
     fn draw(&self, terminal: &mut TuiSession) -> Result<(), EgoPulseError> {
-        let context = self.context.clone();
+        let surface_thread = self.session.surface_thread.clone();
+        let agent_id = self.session.agent_id.clone();
         let status = self.status.clone();
         let model = self.model.clone();
         terminal
@@ -165,7 +158,8 @@ impl TuiApp {
                 draw::draw(
                     frame,
                     draw::DrawState {
-                        context: &context,
+                        surface_thread: &surface_thread,
+                        agent_id: &agent_id,
                         transcript: &self.transcript,
                         composer: &self.composer,
                         status: &status,
@@ -272,16 +266,16 @@ impl TuiApp {
     async fn submit_prompt(&mut self, prompt: String) -> bool {
         if self.busy {
             if !slash_commands::is_slash_command(&prompt) {
-                let mut context = self.context.clone();
-                context.request_key = format!("tui:{}", uuid::Uuid::new_v4());
-                match crate::runtime::try_stage_tool_followup(&self.state, context, prompt.clone())
+                match self
+                    .client
+                    .stage_followup(self.session.reference.clone(), prompt.clone())
                     .await
                 {
-                    Ok(crate::runtime::ToolFollowupOutcome::Accepted) => {
+                    Ok(crate::runtime::local_api::protocol::FollowupOutcome::Accepted) => {
                         self.status = "Turn running — follow-up queued".to_string();
                         return true;
                     }
-                    Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {}
+                    Ok(crate::runtime::local_api::protocol::FollowupOutcome::NoToolPhase) => {}
                     Err(error) => {
                         self.status = format!("Follow-up rejected: {error}");
                         return false;
@@ -314,13 +308,12 @@ impl TuiApp {
 
         self.busy = true;
         self.status = "Processing…".to_string();
-        let state = Arc::clone(&self.state);
-        let context = self.context.clone();
+        let client = self.client.clone();
+        let session = self.session.reference.clone();
         let tx = self.runtime_tx.clone();
-        self.state.supervisor.spawn_turn(async move {
-            let outcome =
-                slash_commands::process_slash_command(&state, &context, &prompt, None).await;
-            let _ = tx.send(RuntimeEvent::SlashFinished { prompt, outcome });
+        tokio::spawn(async move {
+            let result = client.execute_command(session, prompt.clone()).await;
+            let _ = tx.send(RuntimeEvent::SlashFinished { prompt, result });
         });
     }
 
@@ -328,21 +321,16 @@ impl TuiApp {
         self.transcript.begin_turn(prompt.clone());
         self.busy = true;
         self.status = "Working…".to_string();
-        let state = Arc::clone(&self.state);
-        let dependencies = state.turn_dependencies();
-        let context = self.context.clone();
+        let client = self.client.clone();
+        let session = self.session.reference.clone();
         let event_tx = self.runtime_tx.clone();
         let completion_tx = self.runtime_tx.clone();
-        self.state.supervisor.spawn_turn(async move {
-            let result = agent_loop::process_turn_with_events(
-                &dependencies,
-                &context,
-                &prompt,
-                move |event| {
+        tokio::spawn(async move {
+            let result = client
+                .execute_turn(session, prompt, move |event| {
                     let _ = event_tx.send(RuntimeEvent::Agent(event));
-                },
-            )
-            .await;
+                })
+                .await;
             let _ = completion_tx.send(RuntimeEvent::TurnFinished(result));
         });
     }
@@ -350,10 +338,10 @@ impl TuiApp {
     fn open_sessions(&mut self) {
         self.busy = true;
         self.status = "Loading sessions…".to_string();
-        let state = Arc::clone(&self.state);
+        let client = self.client.clone();
         let tx = self.runtime_tx.clone();
-        self.state.supervisor.spawn_turn(async move {
-            let result = agent_loop::list_sessions(&state.turn_dependencies()).await;
+        tokio::spawn(async move {
+            let result = client.list_sessions().await;
             let _ = tx.send(RuntimeEvent::SessionsLoaded(result));
         });
     }
@@ -371,7 +359,7 @@ impl TuiApp {
             }
             SessionAction::New => {
                 self.sessions = None;
-                self.request_session_load(StartupSession::Named(new_session_name()));
+                self.request_session_load(StartupSession::New);
             }
             SessionAction::None => {}
         }
@@ -380,10 +368,10 @@ impl TuiApp {
     fn request_session_load(&mut self, startup: StartupSession) {
         self.busy = true;
         self.status = "Loading session…".to_string();
-        let state = Arc::clone(&self.state);
+        let client = self.client.clone();
         let tx = self.runtime_tx.clone();
-        self.state.supervisor.spawn_turn(async move {
-            let result = load_context(&state, startup).await;
+        tokio::spawn(async move {
+            let result = client.open_session(startup.into_reference()).await;
             let _ = tx.send(RuntimeEvent::SessionLoaded(result));
         });
     }
@@ -394,49 +382,56 @@ impl TuiApp {
         terminal: &mut TuiSession,
     ) -> Result<(), EgoPulseError> {
         match event {
+            RuntimeEvent::RuntimeHealth(_) => {}
             RuntimeEvent::Agent(event) => {
                 self.status = agent_status(&event);
-                self.transcript.apply_agent_event(event);
+                self.transcript.apply_turn_event(event);
             }
             RuntimeEvent::TurnFinished(result) => {
-                match result {
-                    Ok(response) if self.transcript.active().is_some() => {
-                        self.transcript
-                            .apply_agent_event(AgentEvent::FinalResponse { text: response });
-                    }
-                    Err(error) if self.transcript.active().is_some() => {
-                        self.transcript.apply_agent_event(AgentEvent::Error {
+                if let Err(error) = result {
+                    if self.transcript.active().is_some() {
+                        self.transcript.apply_turn_event(TurnEvent::Error {
                             message: error.user_message(),
                         });
                     }
-                    _ => {}
                 }
                 self.busy = false;
                 self.status = "Ready".to_string();
                 self.insert_pending(terminal)?;
                 self.dispatch_queued_prompt();
             }
-            RuntimeEvent::SlashFinished { prompt, outcome } => {
-                let handled = !matches!(&outcome, SlashCommandOutcome::NotHandled);
-                match outcome {
-                    SlashCommandOutcome::Respond(response) => {
+            RuntimeEvent::SlashFinished { prompt, result } => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.busy = false;
+                        self.status = error.user_message();
+                        self.insert_pending(terminal)?;
+                        self.dispatch_queued_prompt();
+                        return Ok(());
+                    }
+                };
+                self.session.effective_provider = result.effective_provider.clone();
+                self.model = result.effective_model.clone();
+                let handled = !matches!(&result.outcome, CommandOutcome::NotHandled);
+                match result.outcome {
+                    CommandOutcome::Respond { text: response } => {
                         if is_new_command(&prompt) {
                             self.transcript.clear();
                         }
                         self.transcript.begin_turn(prompt);
                         self.transcript
-                            .apply_agent_event(AgentEvent::FinalResponse { text: response });
+                            .apply_turn_event(TurnEvent::FinalResponse { text: response });
                     }
-                    SlashCommandOutcome::Error(message) => {
+                    CommandOutcome::Error { message } => {
                         self.transcript.begin_turn(prompt);
                         self.transcript
-                            .apply_agent_event(AgentEvent::Error { message });
+                            .apply_turn_event(TurnEvent::Error { message });
                     }
-                    SlashCommandOutcome::NotHandled => self.start_agent_turn(prompt),
+                    CommandOutcome::NotHandled => self.start_agent_turn(prompt),
                 }
                 if handled {
                     self.busy = false;
-                    self.model = model_for(&self.state, &self.context);
                     self.status = "Ready".to_string();
                     self.insert_pending(terminal)?;
                     self.dispatch_queued_prompt();
@@ -459,9 +454,9 @@ impl TuiApp {
                 self.busy = false;
                 match result {
                     Ok(loaded) => {
-                        self.context = loaded.context;
-                        self.model = model_for(&self.state, &self.context);
-                        self.transcript = Transcript::from_messages(&loaded.messages);
+                        self.model = loaded.effective_model.clone();
+                        self.session = loaded.clone();
+                        self.transcript = Transcript::from_entries(&loaded.transcript);
                         self.status = "Ready".to_string();
                         self.insert_pending(terminal)?;
                         self.dispatch_queued_prompt();
@@ -494,35 +489,29 @@ fn queue_prompt(pending_prompt: &mut Option<String>, prompt: String) -> bool {
     true
 }
 
-/// Starts the inline TUI.
+/// Starts the inline TUI as a client of the already-running runtime.
 pub(crate) async fn run(
-    state: Arc<AppState>,
+    socket_path: PathBuf,
     requested_session: Option<&str>,
 ) -> Result<(), EgoPulseError> {
-    let sessions = agent_loop::list_sessions(&state.turn_dependencies()).await?;
+    let client = LocalRuntimeClient::connect(socket_path).await?;
+    let sessions = client.list_sessions().await?;
     let startup = choose_startup_session(requested_session, &sessions);
-    let loaded = load_context(&state, startup).await?;
+    let loaded = client.open_session(startup.into_reference()).await?;
     let mut terminal = TuiSession::new()?;
     let (runtime_tx, runtime_rx) = unbounded_channel();
-    let mut app = TuiApp::new(state.clone(), loaded, runtime_tx, runtime_rx);
+    let mut app = TuiApp::new(client, loaded, runtime_tx, runtime_rx);
     app.insert_pending(&mut terminal)?;
 
     let mut event_stream = crossterm::event::EventStream::new();
-    let shutdown = state.supervisor.shutdown_token();
     let mut redraw_tick = tokio::time::interval(MAX_FRAME_INTERVAL);
+    let health_task = spawn_health_check(app.client.clone(), app.runtime_tx.clone());
     let mut dirty = true;
-    let mut critical_failure = None;
+    let mut disconnect_error = None;
 
     loop {
         tokio::select! {
             _ = redraw_tick.tick() => {
-                if let Some(outcome) = state.supervisor.poll_long_lived() {
-                    let summary = outcome.failure_summary();
-                    state.runtime_status.record_critical_task_failure(&summary);
-                    tracing::warn!(task = %outcome.name(), result = ?outcome.result(), %summary, "critical task exited; initiating TUI shutdown");
-                    critical_failure = Some(summary);
-                    break;
-                }
                 if dirty {
                     app.draw(&mut terminal)?;
                     dirty = false;
@@ -539,65 +528,39 @@ pub(crate) async fn run(
                 dirty = true;
             }
             Some(event) = app.runtime_rx.recv() => {
-                app.handle_runtime(event, &mut terminal).await?;
-                dirty = true;
+                if let RuntimeEvent::RuntimeHealth(result) = event {
+                    if let Err(error) = result {
+                        disconnect_error = Some(error);
+                        break;
+                    }
+                } else {
+                    app.handle_runtime(event, &mut terminal).await?;
+                    dirty = true;
+                }
             }
-            _ = shutdown.cancelled() => break,
         }
     }
 
-    state.supervisor.shutdown().await;
-    if let Some(message) = critical_failure {
-        return Err(EgoPulseError::Internal(message));
-    }
-    Ok(())
+    health_task.abort();
+    let _ = health_task.await;
+    disconnect_error.map_or(Ok(()), Err)
 }
 
-async fn load_context(
-    state: &AppState,
-    startup: StartupSession,
-) -> Result<LoadedContext, EgoPulseError> {
-    let context = match startup {
-        StartupSession::Existing(summary) => {
-            let chat_info = call_blocking(Arc::clone(&state.db), {
-                let chat_id = summary.chat_id;
-                move |db| db.get_chat_by_id(chat_id)
-            })
-            .await?
-            .ok_or_else(|| EgoPulseError::Internal("session chat was not found".to_string()))?;
-            let agent_id = if summary.agent_id.is_empty() {
-                state.current_config().default_agent.to_string()
-            } else {
-                summary.agent_id.clone()
-            };
-            SurfaceContext::new(
-                chat_info.channel,
-                "local_user".to_string(),
-                persisted_thread(&summary),
-                chat_info.chat_type,
-                agent_id,
-            )
+fn spawn_health_check(
+    client: LocalRuntimeClient,
+    tx: UnboundedSender<RuntimeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            let result = client.runtime_info().await.map(|_| ());
+            let failed = result.is_err();
+            if tx.send(RuntimeEvent::RuntimeHealth(result)).is_err() || failed {
+                return;
+            }
         }
-        StartupSession::Named(name) => new_context(state, name),
-        StartupSession::New => new_context(state, new_session_name()),
-    };
-    let messages =
-        agent_loop::load_transcript_history(&state.turn_dependencies(), &context).await?;
-    Ok(LoadedContext { context, messages })
-}
-
-fn new_context(state: &AppState, session: String) -> SurfaceContext {
-    SurfaceContext::new(
-        "tui".to_string(),
-        "local_user".to_string(),
-        session,
-        "tui".to_string(),
-        state.current_config().default_agent.to_string(),
-    )
-}
-
-fn persisted_thread(summary: &SessionSummary) -> String {
-    summary.surface_thread.clone()
+    })
 }
 
 const TUI_ONLY_COMMANDS: &[&str] = &["/sessions"];
@@ -619,28 +582,16 @@ fn completion_candidates(prefix: &str) -> Vec<String> {
     candidates
 }
 
-fn model_for(state: &AppState, context: &SurfaceContext) -> String {
-    let config = state.current_config();
-    config
-        .resolve_llm_for_agent_channel(&AgentId::new(&context.agent_id), &context.channel)
-        .map(|resolved| resolved.model)
-        .unwrap_or_else(|_| config.resolve_global_llm().model)
-}
-
-fn new_session_name() -> String {
-    format!("local-{}", uuid::Uuid::new_v4())
-}
-
 fn is_new_command(prompt: &str) -> bool {
     prompt.split_whitespace().next() == Some("/new")
 }
 
-fn agent_status(event: &AgentEvent) -> String {
+fn agent_status(event: &TurnEvent) -> String {
     match event {
-        AgentEvent::Iteration { iteration } => format!("Iteration {iteration}"),
-        AgentEvent::Delta { .. } => "Streaming response…".to_string(),
-        AgentEvent::ToolStart { name, .. } => format!("Running {name}…"),
-        AgentEvent::ToolResult {
+        TurnEvent::Iteration { iteration } => format!("Iteration {iteration}"),
+        TurnEvent::Delta { .. } => "Streaming response…".to_string(),
+        TurnEvent::ToolStart { name, .. } => format!("Running {name}…"),
+        TurnEvent::ToolResult {
             name,
             is_error,
             duration_ms,
@@ -653,9 +604,9 @@ fn agent_status(event: &AgentEvent) -> String {
                 "Tool completed:"
             }
         ),
-        AgentEvent::FinalResponse { .. } => "Ready".to_string(),
-        AgentEvent::Error { .. } => "Turn failed".to_string(),
-        AgentEvent::UserInputInjected { .. } => "Queued input".to_string(),
+        TurnEvent::FinalResponse { .. } => "Ready".to_string(),
+        TurnEvent::Error { .. } => "Turn failed".to_string(),
+        TurnEvent::UserInputInjected { .. } => "Queued input".to_string(),
     }
 }
 

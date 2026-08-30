@@ -12,3 +12,11 @@ pub(crate) mod tui;
 pub(crate) mod utils;
 pub(crate) mod voice;
 pub(crate) mod web;
+
+/// Runs the local TUI as a client of the shared runtime.
+pub async fn run_tui(
+    socket_path: std::path::PathBuf,
+    session: Option<&str>,
+) -> Result<(), crate::error::EgoPulseError> {
+    tui::run(socket_path, session).await
+}

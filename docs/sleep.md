@@ -527,7 +527,7 @@ config.agents = [a,b]  → 指定 agent のみ
 
 ### Scheduler と channel の関係
 
-- scheduler 単独では runtime active condition を満たさない（channel が0個なら `NoActiveChannels` エラー）
+- scheduler は外部チャネルがなくても Local Runtime API とともに起動する
 - Ctrl-C / channel failure 時に scheduler も既存 task shutdown 経路で停止する
 
 ---
@@ -642,5 +642,4 @@ redaction 後の内容だけを DB と記憶ファイルに保存する。
 | 設定（`sleep_batch` セクション含む） | [config.md §3.7](./config.md#37-sleep-batch-設定sleep_batch) |
 | REST API（Sleep エンドポイント含む） | [api.md §2.9](./api.md#29-sleep-batch) |
 | Web UI コンポーネント設計 | [webui/sleep-batch.md](./webui/sleep-batch.md) |
-
 

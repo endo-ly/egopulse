@@ -13,7 +13,9 @@ use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::runtime::metrics;
 use crate::runtime::turn::{RejectReason, ScheduleResult, SubmitOutcome};
-use crate::runtime::turn::{ScheduledTurn, canonical_request_hash, serialize_scheduled_turn};
+use crate::runtime::turn::{
+    ResponseDelivery, ScheduledTurn, TurnObserver, canonical_request_hash, serialize_scheduled_turn,
+};
 use crate::storage::{AcceptOutcome, AcceptTurnParams};
 use crate::storage::{
     MessageKind, SenderKind, StageToolFollowupOutcome, StoredMessage, call_blocking,
@@ -191,9 +193,39 @@ pub(crate) async fn submit_agent_turn(
             input,
             config_snapshot: None,
             received_at: Some(chrono::Utc::now().to_rfc3339()),
+            response_delivery: ResponseDelivery::Channel,
         },
     )
     .await
+}
+
+/// Submits a turn through the shared durable scheduler and observes its output.
+pub(crate) async fn submit_observed_agent_turn(
+    state: &Arc<AppState>,
+    mut context: SurfaceContext,
+    input: String,
+) -> Result<TurnObserver, RejectReason> {
+    if context.request_key.is_empty() {
+        context.request_key = format!("tui:{}", uuid::Uuid::new_v4());
+    }
+    let request_key = context.request_key.clone();
+    let observer = state.turn_observers.register(request_key.clone());
+    let scheduled = ScheduledTurn {
+        turn_id: uuid::Uuid::new_v4().to_string(),
+        origin_id: context.origin_id.clone(),
+        context,
+        input,
+        config_snapshot: None,
+        received_at: Some(chrono::Utc::now().to_rfc3339()),
+        response_delivery: ResponseDelivery::ClientOwned,
+    };
+    match submit_scheduled_turn(state, scheduled).await {
+        SubmitOutcome::Started | SubmitOutcome::Queued => Ok(observer),
+        SubmitOutcome::Rejected(reason) => {
+            state.turn_observers.unregister(&request_key);
+            Err(reason)
+        }
+    }
 }
 
 /// Attempts to durably stage ordinary human input for the unique Tool phase
@@ -249,8 +281,23 @@ pub(crate) async fn try_stage_tool_followup(
 /// frees.
 pub(crate) async fn submit_scheduled_turn(
     state: &Arc<AppState>,
-    mut scheduled: ScheduledTurn,
+    scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
+    match accept_scheduled_turn(state, scheduled).await {
+        Ok(AcceptedScheduledTurn::Created(scheduled)) => schedule_and_spawn(state, *scheduled),
+        Ok(AcceptedScheduledTurn::Existing) => SubmitOutcome::Queued,
+        Err(reason) => SubmitOutcome::Rejected(reason),
+    }
+}
+
+/// Durably accepts a scheduled turn without handing it to the in-memory
+/// scheduler. Promotion of staged follow-ups uses this boundary to finish its
+/// staged-row cleanup before any child turn can start writing conversation
+/// state.
+pub(crate) async fn accept_scheduled_turn(
+    state: &Arc<AppState>,
+    mut scheduled: ScheduledTurn,
+) -> Result<AcceptedScheduledTurn, RejectReason> {
     if scheduled.received_at.is_none() {
         scheduled.received_at = Some(chrono::Utc::now().to_rfc3339());
     }
@@ -277,7 +324,7 @@ pub(crate) async fn submit_scheduled_turn(
     if !state.supervisor.accepting_inputs() {
         tracing::info!("turn rejected: runtime not accepting inputs (shutdown)");
         metrics::inc_turn_queue_rejections("shutdown");
-        return SubmitOutcome::Rejected(RejectReason::Shutdown);
+        return Err(RejectReason::Shutdown);
     }
 
     // Acceptance-time origin checks BEFORE the commit so a rejected turn leaves
@@ -285,7 +332,7 @@ pub(crate) async fn submit_scheduled_turn(
     if let Err(reason) = state.turn_tracker.reserve(&origin_id) {
         tracing::warn!(reason = %reason, "turn rejected at acceptance: origin tracker");
         metrics::inc_turn_queue_rejections(reason.as_str());
-        return SubmitOutcome::Rejected(reason);
+        return Err(reason);
     }
 
     // Durably accept the turn. On failure release the reservation so tracker
@@ -322,7 +369,7 @@ pub(crate) async fn submit_scheduled_turn(
                     RejectReason::Internal
                 }
             };
-            return SubmitOutcome::Rejected(reason);
+            return Err(reason);
         }
     };
 
@@ -332,7 +379,7 @@ pub(crate) async fn submit_scheduled_turn(
         // execution. Release this reservation; the existing owner holds its own.
         crate::storage::AcceptOutcome::Existing(_) => {
             state.turn_tracker.release(&origin_id);
-            return SubmitOutcome::Queued;
+            return Ok(AcceptedScheduledTurn::Existing);
         }
     };
     // Stamp authoritative ids from the DB row; it is the source of truth for
@@ -343,10 +390,12 @@ pub(crate) async fn submit_scheduled_turn(
         scheduled.context.origin_id = canonical_origin.to_string();
     }
 
-    // Post-commit: the turn is durably accepted. In-memory scheduler capacity
-    // is a wait, not a rejection — defer to the dispatcher if it cannot run
-    // now. A reservation is held until execution converts it.
-    schedule_and_spawn(state, scheduled)
+    Ok(AcceptedScheduledTurn::Created(Box::new(scheduled)))
+}
+
+pub(crate) enum AcceptedScheduledTurn {
+    Created(Box<ScheduledTurn>),
+    Existing,
 }
 
 /// Re-enqueues an already-durably-accepted turn (used by the turn dispatcher
@@ -359,6 +408,11 @@ pub(super) fn enqueue_durable_turn(
     scheduled: ScheduledTurn,
 ) -> SubmitOutcome {
     schedule_and_spawn(state, scheduled)
+}
+
+/// Schedules a turn that has already crossed the durable acceptance boundary.
+pub(crate) fn schedule_accepted_turn(state: &Arc<AppState>, scheduled: ScheduledTurn) {
+    let _ = schedule_and_spawn(state, scheduled);
 }
 
 /// Hands the turn to the in-memory scheduler, spawning execution immediately

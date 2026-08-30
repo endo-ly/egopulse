@@ -15,10 +15,10 @@
 //! ## Shutdown
 //!
 //! [`RuntimeSupervisor::shutdown`] flips `accepting_inputs` off, cancels the
-//! root [`CancellationToken`] (so cancellation-aware tasks stop gracefully),
-//! then drains in-flight turns and long-lived tasks in that order, each under a
-//! deadline. Anything still alive after the deadline is aborted so shutdown can
-//! never hang on a single stuck task.
+//! shutdown-started token so listeners stop accepting work, drains in-flight
+//! turns, then cancels the root [`CancellationToken`] and drains long-lived
+//! tasks. Each drain has a deadline, and anything still alive after it is
+//! aborted so shutdown can never hang on a single stuck task.
 //!
 //! New turns are not started once shutdown has begun: the intake path refuses
 //! submissions and a completing turn does not start the next queued turn.
@@ -58,6 +58,7 @@ const DEFAULT_TASK_DRAIN_SECS: u64 = 15;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskKind {
     Channel,
+    LocalApi,
     TurnDispatcher,
     McpReconnect,
     ConfigReload,
@@ -70,6 +71,7 @@ impl TaskKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Channel => "channel",
+            Self::LocalApi => "local_api",
             Self::TurnDispatcher => "turn_dispatcher",
             Self::McpReconnect => "mcp_reconnect",
             Self::ConfigReload => "config_reload",
@@ -153,6 +155,7 @@ impl TaskOutcome {
 /// Owns runtime tasks and orchestrates graceful shutdown.
 pub(crate) struct RuntimeSupervisor {
     root_token: CancellationToken,
+    shutdown_started_token: CancellationToken,
     long_lived: Mutex<JoinSet<TaskOutcome>>,
     turns: Mutex<JoinSet<()>>,
     accepting_inputs: AtomicBool,
@@ -193,6 +196,7 @@ impl RuntimeSupervisor {
     ) -> Self {
         Self {
             root_token: CancellationToken::new(),
+            shutdown_started_token: CancellationToken::new(),
             long_lived: Mutex::new(JoinSet::new()),
             turns: Mutex::new(JoinSet::new()),
             accepting_inputs: AtomicBool::new(true),
@@ -210,6 +214,11 @@ impl RuntimeSupervisor {
     /// begins.
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
         self.root_token.clone()
+    }
+
+    /// Returns a token cancelled as soon as graceful shutdown begins.
+    pub(crate) fn shutdown_started_token(&self) -> CancellationToken {
+        self.shutdown_started_token.clone()
     }
 
     /// Whether the runtime is currently accepting new external input.
@@ -334,6 +343,7 @@ impl RuntimeSupervisor {
         self.accepting_inputs.store(false, Ordering::Release);
         self.runtime_status.set_accepting_inputs(false);
         self.runtime_status.set_shutdown_started(true);
+        self.shutdown_started_token.cancel();
         info!("runtime supervisor: shutdown begun");
 
         // Drain in-flight turns first, while workers/channels are still up to

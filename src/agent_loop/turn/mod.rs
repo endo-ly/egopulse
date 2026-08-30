@@ -331,6 +331,7 @@ impl TurnExecutor<'_> {
                 origin_id: self.context.origin_id.clone(),
                 received_at: Some(received_at.clone()),
                 config_snapshot: Some(Arc::clone(&snapshot)),
+                response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
             })?;
             let payload_hash =
                 crate::runtime::turn::canonical_request_hash(self.context, user_input);
@@ -862,6 +863,7 @@ mod tests {
             origin_id: context.origin_id.clone(),
             received_at: Some("2026-08-29T12:00:00Z".to_string()),
             config_snapshot: None,
+            response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
         })
         .expect("scheduled payload");
         let run = match call_blocking(Arc::clone(&state.db), {

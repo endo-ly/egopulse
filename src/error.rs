@@ -40,6 +40,14 @@ pub enum EgoPulseError {
         "another EgoPulse process already holds the runtime instance lock for this state root: {0}"
     )]
     RuntimeAlreadyRunning(String),
+    #[error(
+        "EgoPulse runtime is not running\n\nStart it with:\n  egopulse gateway start\nor:\n  egopulse run"
+    )]
+    RuntimeUnavailable,
+    #[error("runtime_protocol_mismatch: expected={expected} actual={actual}")]
+    RuntimeProtocolMismatch { expected: u32, actual: u32 },
+    #[error("runtime_local_api: {0}")]
+    RuntimeLocalApi(String),
     #[error("internal_error: {0}")]
     Internal(String),
     /// A turn was already being executed by another executor when this one
@@ -65,6 +73,9 @@ impl EgoPulseError {
             Self::SetupWizard(_) => "setup",
             Self::ShutdownRequested => "shutdown",
             Self::RuntimeAlreadyRunning(_) => "instance_lock",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::RuntimeProtocolMismatch { .. } => "runtime_protocol",
+            Self::RuntimeLocalApi(_) => "runtime_local_api",
             Self::TurnConcurrencyConflict => "concurrency",
             Self::Internal(_) => "internal",
         }
@@ -185,8 +196,6 @@ pub enum ConfigError {
     MissingProviderApiKey { provider: String },
     #[error("invalid_compaction_config: {0}")]
     InvalidCompactionConfig(String),
-    #[error("no_active_channels: no enabled channel has a valid bot_token configured")]
-    NoActiveChannels,
     #[error("invalid_agent_id: {id}")]
     InvalidAgentId { id: String },
     #[error("default_agent_not_found: {agent_id}")]
@@ -215,6 +224,8 @@ pub enum ConfigError {
     /// OS のホームディレクトリが解決できなかった。
     #[error("home_directory_unresolved: OS home directory could not be resolved")]
     HomeDirectoryUnresolved,
+    #[error("state_root_must_be_absolute: {path}")]
+    StateRootMustBeAbsolute { path: String },
     /// SecretRef の解決に失敗した（環境変数が見つからない等）。
     #[error("secret_ref_unresolved: {reference}")]
     SecretRefUnresolved { reference: String },

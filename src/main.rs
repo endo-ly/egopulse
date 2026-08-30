@@ -228,6 +228,15 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
             Err(e) => return Err(EgoPulseError::Config(e).into()),
         },
     };
+
+    if prompt.is_none() && cli.command.is_none() {
+        let socket_path = runtime::resolve_runtime_socket_path(resolved_config_path.as_deref())
+            .map_err(|error| CliError::Runtime(EgoPulseError::Config(error)))?;
+        return egopulse::channels::run_tui(socket_path, cli.session.as_deref())
+            .await
+            .map_err(Into::into);
+    }
+
     let config = Config::load(resolved_config_path.as_deref())
         .map_err(|error| CliError::Runtime(EgoPulseError::Config(error)))?;
     init_logging(config.log_level())
@@ -291,9 +300,7 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
         Some(Command::Gateway { .. }) | Some(Command::Update) => {
             unreachable!("handled without config")
         }
-        None => runtime::run_tui(config, resolved_config_path, cli.session.as_deref())
-            .await
-            .map_err(Into::into),
+        None => unreachable!("interactive TUI is handled before full config loading"),
     }
 }
 
