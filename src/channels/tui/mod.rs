@@ -100,7 +100,7 @@ impl Drop for TuiSession {
 
 enum RuntimeEvent {
     Agent(TurnEvent),
-    TurnFinished(Result<String, EgoPulseError>),
+    TurnFinished(Result<(), EgoPulseError>),
     RuntimeHealth(Result<(), EgoPulseError>),
     SlashFinished {
         prompt: String,
@@ -359,7 +359,7 @@ impl TuiApp {
             }
             SessionAction::New => {
                 self.sessions = None;
-                self.request_session_load(StartupSession::Named(new_session_name()));
+                self.request_session_load(StartupSession::New);
             }
             SessionAction::None => {}
         }
@@ -388,17 +388,12 @@ impl TuiApp {
                 self.transcript.apply_turn_event(event);
             }
             RuntimeEvent::TurnFinished(result) => {
-                match result {
-                    Ok(response) if self.transcript.active().is_some() => {
-                        self.transcript
-                            .apply_turn_event(TurnEvent::FinalResponse { text: response });
-                    }
-                    Err(error) if self.transcript.active().is_some() => {
+                if let Err(error) = result {
+                    if self.transcript.active().is_some() {
                         self.transcript.apply_turn_event(TurnEvent::Error {
                             message: error.user_message(),
                         });
                     }
-                    _ => {}
                 }
                 self.busy = false;
                 self.status = "Ready".to_string();
@@ -585,10 +580,6 @@ fn completion_candidates(prefix: &str) -> Vec<String> {
             .map(|command| (*command).to_string()),
     );
     candidates
-}
-
-fn new_session_name() -> String {
-    format!("local-{}", uuid::Uuid::new_v4())
 }
 
 fn is_new_command(prompt: &str) -> bool {

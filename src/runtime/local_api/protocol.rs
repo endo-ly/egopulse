@@ -43,7 +43,6 @@ pub(crate) struct ResponseEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum Response {
     RuntimeInfo {
-        protocol_version: u32,
         egopulse_version: String,
     },
     Sessions {
@@ -55,9 +54,7 @@ pub(crate) enum Response {
     TurnEvent {
         event: TurnEvent,
     },
-    TurnFinished {
-        response: String,
-    },
+    TurnFinished,
     CommandFinished {
         outcome: CommandOutcome,
         effective_provider: String,

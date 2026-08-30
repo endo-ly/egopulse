@@ -25,12 +25,6 @@ impl LocalRuntimeClient {
     pub(crate) async fn connect(socket_path: PathBuf) -> Result<Self, EgoPulseError> {
         let client = Self { socket_path };
         let info = client.runtime_info().await?;
-        if info.protocol_version != PROTOCOL_VERSION {
-            return Err(EgoPulseError::RuntimeProtocolMismatch {
-                expected: PROTOCOL_VERSION,
-                actual: info.protocol_version,
-            });
-        }
         tracing::debug!(
             version = %info.egopulse_version,
             "connected to local EgoPulse runtime"
@@ -49,13 +43,7 @@ impl LocalRuntimeClient {
     async fn runtime_info_inner(&self) -> Result<RuntimeInfo, EgoPulseError> {
         let mut lines = self.request(Request::RuntimeInfo).await?;
         match read_response(&mut lines).await? {
-            Response::RuntimeInfo {
-                protocol_version,
-                egopulse_version,
-            } => Ok(RuntimeInfo {
-                protocol_version,
-                egopulse_version,
-            }),
+            Response::RuntimeInfo { egopulse_version } => Ok(RuntimeInfo { egopulse_version }),
             other => Err(unexpected_response("runtime_info", other)),
         }
     }
@@ -124,7 +112,7 @@ impl LocalRuntimeClient {
         session: SessionReference,
         prompt: String,
         on_event: F,
-    ) -> Result<String, EgoPulseError>
+    ) -> Result<(), EgoPulseError>
     where
         F: Fn(super::protocol::TurnEvent) + Send + Sync + 'static,
     {
@@ -134,7 +122,7 @@ impl LocalRuntimeClient {
         loop {
             match read_response(&mut lines).await? {
                 Response::TurnEvent { event } => on_event(event),
-                Response::TurnFinished { response } => return Ok(response),
+                Response::TurnFinished => return Ok(()),
                 other => return Err(unexpected_response("execute_turn", other)),
             }
         }
@@ -168,7 +156,6 @@ impl LocalRuntimeClient {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeInfo {
-    pub(crate) protocol_version: u32,
     pub(crate) egopulse_version: String,
 }
 

@@ -74,7 +74,6 @@ pub(crate) async fn handle_connection(
             write_response(
                 &mut write_half,
                 Response::RuntimeInfo {
-                    protocol_version: PROTOCOL_VERSION,
                     egopulse_version: env!("CARGO_PKG_VERSION").to_string(),
                 },
             )
@@ -199,25 +198,18 @@ async fn execute_turn(
         .map_err(|reason| EgoPulseError::RuntimeLocalApi(reason.message().to_string()))?;
     let mut events_rx = observer.events;
     let mut completion_rx = observer.completion;
-    let mut last_response = String::new();
 
     loop {
         tokio::select! {
             Some(event) = events_rx.recv() => {
-                if let AgentEvent::FinalResponse { text } = &event {
-                    last_response.clone_from(text);
-                }
                 write_response(writer, Response::TurnEvent { event: map_agent_event(event) }).await?;
             }
             result = &mut completion_rx => {
                 while let Ok(event) = events_rx.try_recv() {
-                    if let AgentEvent::FinalResponse { text } = &event {
-                        last_response.clone_from(text);
-                    }
                     write_response(writer, Response::TurnEvent { event: map_agent_event(event) }).await?;
                 }
                 match result {
-                    Ok(()) => write_response(writer, Response::TurnFinished { response: last_response }).await?,
+                    Ok(()) => write_response(writer, Response::TurnFinished).await?,
                     Err(_) => write_response(writer, Response::Error { message: "runtime turn ended unexpectedly".to_string() }).await?,
                 }
                 return Ok(());
@@ -864,7 +856,7 @@ mod tests {
         let received_events = Arc::clone(&events);
 
         // Act
-        let response = client
+        client
             .execute_turn(
                 SessionReference::Named {
                     name: "turn-session".to_string(),
@@ -876,13 +868,17 @@ mod tests {
             .expect("execute turn");
 
         // Assert
-        assert_eq!(response, "one two");
         assert!(
             events
                 .lock()
                 .expect("events")
                 .iter()
                 .any(|event| matches!(event, TurnEvent::Delta { text } if text == "one"))
+        );
+        assert!(
+            events.lock().expect("events").iter().any(
+                |event| matches!(event, TurnEvent::FinalResponse { text } if text == "one two")
+            )
         );
         state.supervisor.shutdown().await;
     }
@@ -924,15 +920,13 @@ mod tests {
             }
         });
         stats.first_started.notified().await;
-        let second = client_b
+        client_b
             .execute_turn(session, "second".to_string(), |_| {})
             .await
             .expect("second turn");
-        let first = first.await.expect("first task").expect("first turn");
+        first.await.expect("first task").expect("first turn");
 
         // Assert
-        assert_eq!(first, "ok");
-        assert_eq!(second, "ok");
         assert_eq!(stats.calls.load(Ordering::SeqCst), 2);
         assert_eq!(stats.max_active.load(Ordering::SeqCst), 1);
         let sessions = client_a.list_sessions().await.expect("list sessions");
@@ -1007,10 +1001,9 @@ mod tests {
             "from discord".to_string(),
         )
         .await;
-        let tui_result = tui_turn.await.expect("TUI task").expect("TUI turn");
+        tui_turn.await.expect("TUI task").expect("TUI turn");
 
         // Assert
-        assert_eq!(tui_result, "ok");
         assert!(matches!(
             channel_outcome,
             crate::runtime::turn::SubmitOutcome::Queued
@@ -1069,7 +1062,7 @@ mod tests {
             .expect("connect client");
 
         // Act
-        let response = client
+        client
             .execute_turn(
                 SessionReference::Existing { chat_id },
                 "from tui".to_string(),
@@ -1079,7 +1072,6 @@ mod tests {
             .expect("execute cross-channel turn");
 
         // Assert
-        assert_eq!(response, "ok");
         assert_eq!(sends.load(Ordering::SeqCst), 0);
         let session = client
             .open_session(SessionReference::Existing { chat_id })
@@ -1147,20 +1139,18 @@ mod tests {
                     .await
             }
         });
-        let first = tokio::time::timeout(Duration::from_secs(15), first)
+        tokio::time::timeout(Duration::from_secs(15), first)
             .await
             .expect("first timeout")
             .expect("first task")
             .expect("first turn");
-        let second = tokio::time::timeout(Duration::from_secs(15), second)
+        tokio::time::timeout(Duration::from_secs(15), second)
             .await
             .expect("second timeout")
             .expect("second task")
             .expect("second turn");
 
         // Assert
-        assert_eq!(first, "ok");
-        assert_eq!(second, "ok");
         assert_eq!(stats.calls.load(Ordering::SeqCst), 2);
         assert_eq!(stats.max_active.load(Ordering::SeqCst), 1);
         state.supervisor.shutdown().await;
