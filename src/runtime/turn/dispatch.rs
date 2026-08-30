@@ -158,7 +158,7 @@ async fn promote_terminal_staged_messages(
         let parent_request_key = template.context.request_key.clone();
         let child_request_keys: Vec<String> =
             messages.iter().map(|message| message.id.clone()).collect();
-        let observer_attached =
+        let observer_transferred =
             if matches!(&template.response_delivery, ResponseDelivery::ClientOwned) {
                 state
                     .turn_observers
@@ -183,6 +183,9 @@ async fn promote_terminal_staged_messages(
             turn.context.trace_id.clear();
             turn.context.scope = scope;
 
+            let observer_attached = observer_transferred
+                || (matches!(&template.response_delivery, ResponseDelivery::ClientOwned)
+                    && state.turn_observers.has_live_observer(&message.id));
             match channel_input::submit_scheduled_turn(state, turn).await {
                 crate::runtime::turn::SubmitOutcome::Started
                 | crate::runtime::turn::SubmitOutcome::Queued => {
