@@ -9,6 +9,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 3. [事後処理](#3-事後処理)
 4. [制約事項](#4-制約事項)
 5. [Secret Mode 隔離戦略](#5-secret-mode-隔離戦略)
+6. [Local API の trust boundary](#6-local-api-の-trust-boundary)
 
 ---
 
@@ -217,3 +218,18 @@ Secret スコープの turn では `tracing` の span に内容フィールド�
 - Tool 実行（`write`/`edit`/`bash`）による `secret.db` 外への書き出しは防げない
 - `secret.db` の暗号化（SQLCipher）には未対応
 - WebUI / TUI での秘密チャット表示には未対応
+
+---
+
+## 6. Local API の trust boundary
+
+Runtime と TUI の間の Local API は、`<state_root>/runtime/egopulse.sock` の Unix Domain Socket で提供する。ソケットは Runtime 起動時に作成し、ファイルパーミッションを `0600` に設定する。
+
+この API は同じ OS ユーザーのプロセスから利用できる Runtime 操作面であり、ネットワーク越しの認証境界ではない。ソケットへアクセスできるユーザーは、次の操作を実行できる。
+
+- Session 一覧・履歴の読み取り
+- Session に対する Agent Turn の実行
+- Slash Command の実行
+- Tool 実行中の follow-up 入力の登録
+
+Local API の Turn は Session の Channel identity を維持するが、TUI Client が所有する応答は接続中の Client へ配送し、元の Channel Adapter へ自動送信しない。`state_root` は絶対パスで指定し、Runtime と TUI の endpoint 解決基準を一致させる。

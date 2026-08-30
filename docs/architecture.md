@@ -443,7 +443,7 @@ deadline 付きで停止する。
 |---------|---------|------|
 | **Channel Adapter** | `channels/adapter.rs` | 全チャネルを統一インターフェースで扱う |
 | **Channel Input Boundary** | `runtime/channel_input.rs` | チャネルが正規化した入力を `SurfaceContext`、Channel Log、`ScheduledTurn` に変換する |
-| **Turn Output Observer** | `runtime/turn/observer.rs` | Local APIなどのtransport adapterへTurn eventとcompletionを配送する |
+| **Turn Output Observer** | `runtime/turn/observer.rs` | Local APIなどのtransport adapterへTurn eventとcompletionを配送する。live observerはメモリに保持し、durable TurnにはClient-ownedという配送ポリシーだけを保存する |
 | **Dependency Injection** | `runtime/` AppState | 全コンポーネントの依存を明示的に注入 |
 | **Optimistic Concurrency** | `storage/` sessions | セッション書き込みの競合を `updated_at` で解決 |
 | **Tool Registry** | `tools/mod.rs` | built-in / MCP の区別なくツールを動的登録 |

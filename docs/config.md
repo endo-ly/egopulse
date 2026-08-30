@@ -248,6 +248,7 @@ web_fetch:
 | `default_provider` | `string` | **必須** | なし | `providers` マップ内のキーを参照。起動時に使用するプロバイダーを決定 |
 | `default_model` | `string \| null` | 任意 | `null` | プロバイダーの `default_model` をグローバルに上書き。`null` の場合プロバイダー定義に従う |
 | `default_agent` | `string` | 任意 | `"default"` | 使用するエージェントの ID。`agents` マップ内のキーを参照 |
+| `state_root` | `string` | 任意 | `~/.egopulse` | Runtime の状態ディレクトリ。絶対パスのみ指定でき、Runtime と TUI は同じディレクトリから Local API endpoint を解決する |
 | `timezone` | `string` | 任意 | `"UTC"` | IANA タイムゾーン（例: `Asia/Tokyo`）。全サブシステム（sleep batch、pulse、会話タイムスタンプ）で使用 |
 | `log_level` | `"info" \| "debug" \| "warn" \| "error"` | 任意 | `"info"` | ログ出力レベル |
 | `compaction_timeout_secs` | `u64` | 任意 | `180` | 履歴圧縮（compaction）時の LLM 呼び出しタイムアウト秒数 |

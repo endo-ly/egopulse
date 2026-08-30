@@ -30,9 +30,9 @@ pub(crate) struct ScheduledTurn {
     /// through the in-memory scheduler so a queued turn does not switch to a
     /// newer configuration generation before execution.
     pub config_snapshot: Option<Arc<crate::config::manager::ConfigSnapshot>>,
-    /// Runtime response destination. Observer routes are also persisted so a
-    /// dispatcher re-scan in the same process retains the client delivery
-    /// contract; after a restart the missing observer suppresses channel send.
+    /// Runtime response destination. Client-owned output is delivered to a
+    /// live transport observer when one exists and is never sent to the
+    /// session's channel adapter.
     pub response_delivery: ResponseDelivery,
 }
 
@@ -44,13 +44,42 @@ impl ScheduledTurn {
 }
 
 /// Selects where a scheduled turn's output is delivered.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum ResponseDelivery {
     /// Send the response through the session's channel adapter.
     #[default]
     Channel,
-    /// Publish events and completion to a live runtime observer.
-    Observer { observer_id: String },
+    /// Keep output owned by the submitting client instead of the session's
+    /// channel. The live observer is process-local and is not durable.
+    ClientOwned,
+}
+
+/// Durable encoding for a scheduled turn's response policy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+enum PersistedResponseDelivery {
+    #[serde(rename = "Channel")]
+    #[default]
+    Channel,
+    #[serde(rename = "ClientOwned")]
+    ClientOwned,
+}
+
+impl From<&ResponseDelivery> for PersistedResponseDelivery {
+    fn from(delivery: &ResponseDelivery) -> Self {
+        match delivery {
+            ResponseDelivery::Channel => Self::Channel,
+            ResponseDelivery::ClientOwned => Self::ClientOwned,
+        }
+    }
+}
+
+impl From<PersistedResponseDelivery> for ResponseDelivery {
+    fn from(delivery: PersistedResponseDelivery) -> Self {
+        match delivery {
+            PersistedResponseDelivery::Channel => Self::Channel,
+            PersistedResponseDelivery::ClientOwned => Self::ClientOwned,
+        }
+    }
 }
 
 /// Canonical (order-independent) serialization of a turn request. Fields are
@@ -102,7 +131,7 @@ pub(crate) fn canonical_request_hash(context: &SurfaceContext, input: &str) -> S
 /// field lets a future schema change distinguish and migrate older payloads
 /// instead of silently misreading them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PersistedScheduledTurnV1 {
+struct PersistedScheduledTurnV1 {
     /// Envelope version, always [`SCHEDULED_TURN_VERSION`].
     pub version: u32,
     /// Surface context identifying the agent session.
@@ -114,7 +143,7 @@ pub(crate) struct PersistedScheduledTurnV1 {
     pub received_at: Option<String>,
     /// Response routing contract. Old payloads default to the channel route.
     #[serde(default)]
-    pub response_delivery: ResponseDelivery,
+    response_delivery: PersistedResponseDelivery,
 }
 
 /// Current durable scheduled-turn payload version.
@@ -131,7 +160,7 @@ pub(crate) fn serialize_scheduled_turn(turn: &ScheduledTurn) -> Result<String, E
         context: turn.context.clone(),
         input: turn.input.clone(),
         received_at: turn.received_at.clone(),
-        response_delivery: turn.response_delivery.clone(),
+        response_delivery: (&turn.response_delivery).into(),
     };
     serde_json::to_string(&payload)
         .map_err(|e| EgoPulseError::Internal(format!("serialize scheduled turn: {e}")))
@@ -166,7 +195,7 @@ pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, Eg
         origin_id: payload.context.origin_id.clone(),
         received_at: payload.received_at,
         config_snapshot: None,
-        response_delivery: payload.response_delivery,
+        response_delivery: payload.response_delivery.into(),
     })
 }
 
@@ -267,9 +296,7 @@ mod tests {
             origin_id: "origin-1".to_string(),
             config_snapshot: None,
             received_at: Some("2026-01-02T03:04:05Z".to_string()),
-            response_delivery: ResponseDelivery::Observer {
-                observer_id: "observer-1".to_string(),
-            },
+            response_delivery: ResponseDelivery::ClientOwned,
         };
 
         // Act
@@ -281,12 +308,9 @@ mod tests {
         assert_eq!(back.origin_id, "origin-1");
         assert_eq!(back.context.channel, "discord");
         assert_eq!(back.context.agent_id, "dev");
-        assert_eq!(
-            back.response_delivery,
-            ResponseDelivery::Observer {
-                observer_id: "observer-1".to_string()
-            }
-        );
+        assert_eq!(back.response_delivery, ResponseDelivery::ClientOwned);
+        assert!(!json.contains("observer_id"));
+        assert!(!json.contains("Observer"));
     }
 
     #[test]

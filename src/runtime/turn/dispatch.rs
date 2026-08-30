@@ -125,6 +125,8 @@ async fn promote_terminal_staged_messages(
             }
         };
 
+        let parent_request_key = turn.context.request_key.clone();
+
         turn.turn_id = uuid::Uuid::new_v4().to_string();
         turn.input = terminal.message.content.clone();
         turn.origin_id.clear();
@@ -135,6 +137,12 @@ async fn promote_terminal_staged_messages(
         turn.context.origin_id.clear();
         turn.context.trace_id.clear();
         turn.context.scope = scope;
+
+        if matches!(&turn.response_delivery, ResponseDelivery::ClientOwned) {
+            state
+                .turn_observers
+                .transfer(&parent_request_key, &terminal.message.id);
+        }
 
         match channel_input::submit_scheduled_turn(state, turn).await {
             crate::runtime::turn::SubmitOutcome::Started
@@ -514,11 +522,11 @@ pub(crate) fn execute_scheduled_turn(
             DurableTurnStateLookup::Missing => {
                 if matches!(
                     &prepared.turn.response_delivery,
-                    ResponseDelivery::Observer { .. }
+                    ResponseDelivery::ClientOwned
                 ) {
                     finish_observer(
                         state,
-                        &prepared.turn.response_delivery,
+                        &prepared.turn,
                         Err("durable turn was not found".to_string()),
                     );
                     return;
@@ -528,7 +536,7 @@ pub(crate) fn execute_scheduled_turn(
             DurableTurnStateLookup::Shutdown => {
                 finish_observer(
                     state,
-                    &prepared.turn.response_delivery,
+                    &prepared.turn,
                     Err(EgoPulseError::ShutdownRequested.user_message()),
                 );
                 return;
@@ -543,7 +551,7 @@ pub(crate) fn execute_scheduled_turn(
         if !begin_scheduled_turn(state, &prepared, current_state, &config_snapshot).await {
             finish_observer(
                 state,
-                &prepared.turn.response_delivery,
+                &prepared.turn,
                 Err("turn rejected by runtime stop condition".to_string()),
             );
             return;
@@ -581,7 +589,7 @@ async fn prepare_scheduled_turn(
         state.turn_tracker.release(&origin_id);
         finish_observer(
             state,
-            &turn.response_delivery,
+            &turn,
             Err(EgoPulseError::ShutdownRequested.user_message()),
         );
         return None;
@@ -609,7 +617,7 @@ async fn prepare_scheduled_turn(
                 state.turn_tracker.release(&origin_id);
                 finish_observer(
                     state,
-                    &turn.response_delivery,
+                    &turn,
                     Err("turn chain already terminated".to_string()),
                 );
                 drain_next_queued_turn(state, &session_key).await;
@@ -767,6 +775,38 @@ async fn begin_scheduled_turn(
     }
 }
 
+fn observer_key(turn: &ScheduledTurn) -> Option<&str> {
+    matches!(&turn.response_delivery, ResponseDelivery::ClientOwned)
+        .then_some(turn.context.request_key.as_str())
+        .filter(|request_key| !request_key.is_empty())
+}
+
+async fn retain_observer_for_staged_follow_up(state: &AppState, turn: &ScheduledTurn) -> bool {
+    let Some(request_key) = observer_key(turn) else {
+        return false;
+    };
+    if !state.turn_observers.has_live_observer(request_key) {
+        return false;
+    }
+
+    let turn_id = turn.turn_id.clone();
+    match call_blocking(state.db_for(turn.context.scope), move |db| {
+        db.list_staged_user_messages(&turn_id)
+    })
+    .await
+    {
+        Ok(messages) => !messages.is_empty(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                turn_id = %turn.turn_id,
+                "failed to inspect staged follow-up before finishing client observer"
+            );
+            false
+        }
+    }
+}
+
 async fn execute_and_publish_scheduled_turn(
     state: &AppState,
     prepared: &PreparedScheduledTurn,
@@ -776,11 +816,8 @@ async fn execute_and_publish_scheduled_turn(
     let turn = &prepared.turn;
     let origin_id = &prepared.origin_id;
     let session_key = &prepared.session_key;
-    let observer_id = match &turn.response_delivery {
-        ResponseDelivery::Observer { observer_id } => Some(observer_id.as_str()),
-        ResponseDelivery::Channel => None,
-    };
-    let adapter = if observer_id.is_none() {
+    let observer_key = observer_key(turn);
+    let adapter = if observer_key.is_none() {
         state.channels.get(&turn.context.channel).cloned()
     } else {
         None
@@ -830,7 +867,7 @@ async fn execute_and_publish_scheduled_turn(
                 &turn.input,
                 config_snapshot,
                 turn.received_at.clone(),
-                observer_id,
+                observer_key,
             )
             .await
         }
@@ -852,10 +889,10 @@ async fn execute_and_publish_scheduled_turn(
 
     match turn_result {
         Ok(response) => {
-            if let Some(observer_id) = observer_id {
+            if let Some(observer_key) = observer_key {
                 state
                     .turn_observers
-                    .finish(observer_id, Ok(response.clone()));
+                    .finish(observer_key, Ok(response.clone()));
             } else if let Some(adapter) = adapter.as_ref() {
                 if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                     tracing::warn!(
@@ -914,10 +951,25 @@ async fn execute_and_publish_scheduled_turn(
                     tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                 }
             }
-            if let Some(observer_id) = observer_id {
-                state
-                    .turn_observers
-                    .finish(observer_id, Err(error.user_message()));
+            if observer_key.is_some() {
+                let error_message = error.user_message();
+                if retain_observer_for_staged_follow_up(state, turn).await {
+                    tracing::info!(
+                        turn_id = %turn.turn_id,
+                        request_key = %turn.context.request_key,
+                        "keeping client observer for terminal staged follow-up"
+                    );
+                    if let Some(observer_key) = observer_key {
+                        state.turn_observers.emit(
+                            observer_key,
+                            crate::agent_loop::event::AgentEvent::Error {
+                                message: error_message,
+                            },
+                        );
+                    }
+                } else {
+                    finish_observer(state, turn, Err(error_message));
+                }
             } else {
                 send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
             }
@@ -1037,9 +1089,9 @@ async fn execute_turn_with_progress_and_snapshot(
     input: &str,
     config_snapshot: Arc<ConfigSnapshot>,
     received_at: Option<String>,
-    observer_id: Option<&str>,
+    observer_key: Option<&str>,
 ) -> Result<String, EgoPulseError> {
-    let adapter = observer_id
+    let adapter = observer_key
         .is_none()
         .then(|| state.channels.get(&context.channel))
         .flatten();
@@ -1057,7 +1109,7 @@ async fn execute_turn_with_progress_and_snapshot(
 
     let event_sender = evt_tx.clone();
     let observer_registry = Arc::clone(&state.turn_observers);
-    let observer_id = observer_id.map(str::to_owned);
+    let observer_key = observer_key.map(str::to_owned);
     let runtime = state.turn_dependencies();
     let result = crate::agent_loop::process_turn_with_events_and_snapshot_and_received_at(
         &runtime,
@@ -1065,8 +1117,8 @@ async fn execute_turn_with_progress_and_snapshot(
         input,
         move |event| {
             let _ = event_sender.send(event.clone());
-            if let Some(observer_id) = observer_id.as_deref() {
-                observer_registry.emit(observer_id, event);
+            if let Some(observer_key) = observer_key.as_deref() {
+                observer_registry.emit(observer_key, event);
             }
         },
         config_snapshot,
@@ -1102,9 +1154,9 @@ async fn execute_turn_with_progress_and_snapshot(
     result
 }
 
-fn finish_observer(state: &AppState, delivery: &ResponseDelivery, result: Result<String, String>) {
-    if let ResponseDelivery::Observer { observer_id } = delivery {
-        state.turn_observers.finish(observer_id, result);
+fn finish_observer(state: &AppState, turn: &ScheduledTurn, result: Result<String, String>) {
+    if let Some(request_key) = observer_key(turn) {
+        state.turn_observers.finish(request_key, result);
     }
 }
 
@@ -1960,7 +2012,8 @@ mod tests {
             dir.path().to_str().expect("utf8"),
             Box::new(final_provider()),
         ));
-        let context = crate::test_util::cli_context("terminal-follow-up");
+        let mut context = crate::test_util::cli_context("terminal-follow-up");
+        context.request_key = "original-client-request".to_string();
         let chat_id = crate::agent_loop::resolve_chat_id(&state.turn_dependencies(), &context)
             .await
             .expect("resolve chat");
@@ -1971,8 +2024,10 @@ mod tests {
             origin_id: "original-origin".to_string(),
             config_snapshot: None,
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
-            response_delivery: ResponseDelivery::Channel,
+            response_delivery: ResponseDelivery::ClientOwned,
         };
+        let observer = state.turn_observers.register(context.request_key.clone());
+        let completion = observer.completion;
         let scheduled_json =
             crate::runtime::turn::serialize_scheduled_turn(&scheduled).expect("serialize route");
         let target_turn_id = call_blocking(Arc::clone(&state.db), {
@@ -2021,13 +2076,26 @@ mod tests {
         .await
         .expect("seed terminal staged row");
 
+        let mut terminal_turn =
+            crate::runtime::turn::deserialize_scheduled_turn(&scheduled_json).expect("decode");
+        terminal_turn.turn_id = target_turn_id.clone();
+        assert!(
+            retain_observer_for_staged_follow_up(&state, &terminal_turn).await,
+            "a live client observer must stay open while a staged follow-up is promoted"
+        );
+
         // Act
         promote_terminal_staged_messages(&state, ConversationScope::Normal, Arc::clone(&state.db))
             .await
             .expect("promote staged row");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let response = tokio::time::timeout(Duration::from_secs(5), completion)
+            .await
+            .expect("promoted follow-up completion timeout")
+            .expect("promoted follow-up observer completion")
+            .expect("promoted follow-up response");
 
         // Assert
+        assert_eq!(response, "ok");
         let promoted = call_blocking(Arc::clone(&state.db), move |db| {
             let conn = db.get_conn()?;
             let row: (String, String, String, String) = conn.query_row(
