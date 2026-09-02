@@ -395,6 +395,51 @@ agents:
 
 #[test]
 #[serial]
+fn loader_normalizes_agent_reasoning_effort() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+default_agent: reviewer
+agents:
+  reviewer:
+    label: Reviewer
+    reasoning_effort: " high "
+  lightweight:
+    label: Lightweight
+    reasoning_effort: '   '"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    assert_eq!(
+        config
+            .agents
+            .get(&super::AgentId::new("reviewer"))
+            .expect("reviewer")
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    assert!(
+        config
+            .agents
+            .get(&super::AgentId::new("lightweight"))
+            .expect("lightweight")
+            .reasoning_effort
+            .is_none()
+    );
+}
+
+#[test]
+#[serial]
 fn save_load_round_trip_preserves_agent_profiles() {
     use crate::config::persist::save_config_with_secrets;
     use crate::config::secret_ref::env_resolved_value;
@@ -410,6 +455,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
             label: "Alice".to_string(),
             provider: Some("openai".to_string()),
             model: Some("gpt-5".to_string()),
+            reasoning_effort: Some("high".to_string()),
             profiles: HashMap::from([(
                 "voice".to_string(),
                 super::AgentProfileConfig {
@@ -482,6 +528,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
     let voice = alice.profiles.get("voice").expect("voice profile");
     assert_eq!(voice.provider.as_deref(), Some("local"));
     assert_eq!(voice.model.as_deref(), Some("qwen2.5"));
+    assert_eq!(alice.reasoning_effort.as_deref(), Some("high"));
 }
 
 #[test]
@@ -945,6 +992,43 @@ fn resolve_llm_for_agent_channel_agent_provider_takes_priority() {
     assert_eq!(resolved.provider, "openai");
     assert_eq!(resolved.model, "gpt-5-mini");
     assert_eq!(resolved.base_url, "https://api.openai.com/v1");
+}
+
+#[test]
+fn resolve_llm_for_agent_channel_uses_agent_reasoning_effort() {
+    let config = profile_config(vec![
+        (
+            super::AgentId::new("assistant"),
+            super::AgentConfig {
+                label: "Assistant".to_string(),
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5".to_string()),
+                reasoning_effort: Some("medium".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            super::AgentId::new("reviewer"),
+            super::AgentConfig {
+                label: "Reviewer".to_string(),
+                provider: Some("openai".to_string()),
+                model: Some("gpt-5".to_string()),
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    let assistant = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("assistant"), "web")
+        .expect("assistant resolve");
+    let reviewer = config
+        .resolve_llm_for_agent_channel(&super::AgentId::new("reviewer"), "web")
+        .expect("reviewer resolve");
+
+    assert_eq!(assistant.model, reviewer.model);
+    assert_eq!(assistant.reasoning_effort.as_deref(), Some("medium"));
+    assert_eq!(reviewer.reasoning_effort.as_deref(), Some("high"));
 }
 
 #[test]

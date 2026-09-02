@@ -28,6 +28,7 @@ impl Config {
                 .default_model
                 .clone()
                 .unwrap_or_else(|| provider.default_model.clone()),
+            reasoning_effort: None,
         }
     }
 
@@ -88,6 +89,7 @@ impl Config {
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
+            reasoning_effort: agent.reasoning_effort.clone(),
         })
     }
 
@@ -129,6 +131,7 @@ impl Config {
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
+            reasoning_effort: None,
         })
     }
 

@@ -13,6 +13,7 @@ pub(crate) struct OpenAiProvider {
     http: reqwest::Client,
     api_key: Option<String>,
     model: String,
+    reasoning_effort: Option<String>,
     base_url: String,
     provider: String,
     account_id: Option<String>,
@@ -53,6 +54,7 @@ impl OpenAiProvider {
             http,
             api_key,
             model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
             base_url: config.base_url.clone(),
             provider: config.provider.clone(),
             account_id,
@@ -72,6 +74,7 @@ impl OpenAiProvider {
             system,
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
+            self.reasoning_effort.as_deref(),
         );
         if self.is_codex {
             body["store"] = serde_json::Value::Bool(false);
@@ -219,6 +222,7 @@ impl OpenAiProvider {
             system,
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
+            self.reasoning_effort.as_deref(),
         );
         body["stream"] = serde_json::Value::Bool(true);
 
@@ -257,6 +261,7 @@ impl OpenAiProvider {
             system,
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
+            self.reasoning_effort.as_deref(),
         );
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
@@ -316,6 +321,7 @@ impl LlmProvider for OpenAiProvider {
                 &messages,
                 tools.as_deref().map(|arc| arc.as_slice()),
                 None,
+                self.reasoning_effort.as_deref(),
                 should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
             ))
             .send()
@@ -361,6 +367,7 @@ impl LlmProvider for OpenAiProvider {
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
             Some(true),
+            self.reasoning_effort.as_deref(),
             should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
         );
 
@@ -575,7 +582,7 @@ async fn consume_responses_stream(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::config::ResolvedLlmConfig;
@@ -596,6 +603,7 @@ mod tests {
             api_key: api_key
                 .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             model: model.to_string(),
+            reasoning_effort: None,
         }
     }
 
@@ -849,6 +857,11 @@ mod tests {
         );
         Mock::given(method("POST"))
             .and(path("/v1/responses"))
+            .and(body_partial_json(serde_json::json!({
+                "reasoning": {"effort": "high"},
+                "stream": true,
+                "store": false
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
             .mount(&server)
             .await;
@@ -859,6 +872,7 @@ mod tests {
             base_url: format!("{}/v1", server.uri()),
             api_key: None,
             model: "gpt-5.3-codex".to_string(),
+            reasoning_effort: Some("high".to_string()),
         };
         let provider = OpenAiProvider::new(&codex_config).expect("provider");
 

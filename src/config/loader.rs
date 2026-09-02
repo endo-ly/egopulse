@@ -113,6 +113,7 @@ struct FileAgentConfig {
     label: Option<String>,
     provider: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
     discord_bot: Option<String>,
     telegram_bot: Option<String>,
     profiles: Option<HashMap<String, FileAgentProfileConfig>>,
@@ -803,6 +804,7 @@ fn normalize_agents(
             label: normalize_string(fa.label).unwrap_or_else(|| key.to_string()),
             provider: normalize_string(fa.provider),
             model: normalize_string(fa.model),
+            reasoning_effort: normalize_string(fa.reasoning_effort),
             discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
             telegram_bot: normalize_string(fa.telegram_bot).map(|s| BotId::new(&s)),
             profiles: fa

@@ -205,6 +205,7 @@ mod tests {
             api_key: api_key
                 .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             model: model.to_string(),
+            reasoning_effort: None,
         }
     }
 
@@ -216,7 +217,8 @@ mod tests {
             .and(header("authorization", "Bearer sk-test"))
             .and(body_partial_json(serde_json::json!({
                 "model": "gpt-4o-mini",
-                "messages": [{"role": "user", "content": "hello"}]
+                "messages": [{"role": "user", "content": "hello"}],
+                "reasoning_effort": "high"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "choices": [{
@@ -228,12 +230,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = create_provider(&config(
+        let mut llm_config = config(
             "gpt-4o-mini",
             format!("{}/v1", server.uri()),
             Some("sk-test"),
-        ))
-        .expect("provider");
+        );
+        llm_config.reasoning_effort = Some("high".to_string());
+        let provider = create_provider(&llm_config).expect("provider");
 
         let response = provider
             .send_message("", message("hello"), None)
