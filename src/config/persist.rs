@@ -91,6 +91,8 @@ struct SerializableAgent {
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     discord_bot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     telegram_bot: Option<String>,
@@ -443,6 +445,7 @@ impl From<&Config> for SerializableConfig {
                         label: a.label.clone(),
                         provider: a.provider.clone(),
                         model: a.model.clone(),
+                        reasoning_effort: a.reasoning_effort.clone(),
                         discord_bot: a.discord_bot.as_ref().map(|b| b.to_string()),
                         telegram_bot: a.telegram_bot.as_ref().map(|b| b.to_string()),
                         profiles: a

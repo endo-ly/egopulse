@@ -955,6 +955,7 @@ mod tests {
                 "sk-test".to_string().into_boxed_str(),
             )),
             model: model.to_string(),
+            reasoning_effort: None,
         }
     }
 
@@ -982,6 +983,13 @@ mod tests {
         assert_eq!(
             base.cache_key_with_revision(0),
             identical.cache_key_with_revision(0)
+        );
+
+        let mut different_reasoning_effort = base.clone();
+        different_reasoning_effort.reasoning_effort = Some("high".to_string());
+        assert_ne!(
+            base.cache_key_with_revision(0),
+            different_reasoning_effort.cache_key_with_revision(0)
         );
     }
 

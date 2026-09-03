@@ -1078,6 +1078,7 @@ mod tests {
                 "sk-test".to_string().into_boxed_str(),
             )),
             model: "gpt-4o-mini".to_string(),
+            reasoning_effort: None,
         })
         .expect("provider");
 

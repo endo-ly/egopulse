@@ -7,6 +7,7 @@ pub(crate) fn build_request_body(
     messages: &[Message],
     tools: Option<&[ToolDefinition]>,
     stream: Option<bool>,
+    reasoning_effort: Option<&str>,
     include_reasoning_content: bool,
 ) -> serde_json::Value {
     let mut translated = Vec::new();
@@ -29,6 +30,9 @@ pub(crate) fn build_request_body(
     if let Some(stream) = stream {
         body["stream"] = serde_json::Value::Bool(stream);
     }
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
+    }
     append_chat_tools(&mut body, tools);
     body
 }
@@ -38,6 +42,7 @@ pub(crate) fn build_responses_request_body(
     system: &str,
     messages: &[Message],
     tools: Option<&[ToolDefinition]>,
+    reasoning_effort: Option<&str>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -45,6 +50,9 @@ pub(crate) fn build_responses_request_body(
     });
     if !system.trim().is_empty() {
         body["instructions"] = serde_json::Value::String(system.to_string());
+    }
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = serde_json::json!({"effort": effort});
     }
     append_responses_tools(&mut body, tools);
     body
@@ -339,12 +347,42 @@ mod tests {
             "system",
             &[Message::text("user", "hello")],
             None,
+            None,
         );
 
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"], "hello");
+        assert!(body["reasoning"].is_null());
+    }
+
+    #[test]
+    fn chat_completions_request_includes_reasoning_effort() {
+        let body = build_request_body(
+            "gpt-5.3-codex",
+            "",
+            &[Message::text("user", "hello")],
+            None,
+            None,
+            Some("high"),
+            false,
+        );
+
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn responses_request_includes_reasoning_effort() {
+        let body = build_responses_request_body(
+            "gpt-5.3-codex",
+            "",
+            &[Message::text("user", "hello")],
+            None,
+            Some("high"),
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "high");
     }
 
     #[test]
@@ -368,6 +406,7 @@ mod tests {
                 tool_call_id: None,
             }],
             None,
+            None,
         );
 
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
@@ -385,6 +424,7 @@ mod tests {
                 description: "Read a file".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
             }]),
+            None,
         );
 
         assert_eq!(body["tool_choice"], "auto");
@@ -397,10 +437,11 @@ mod tests {
         let mut message = Message::text("assistant", "visible");
         message.reasoning_content = Some("hidden reasoning".to_string());
 
-        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, false);
+        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, None, false);
 
         assert_eq!(body["messages"][0]["content"], "visible");
         assert!(body["messages"][0]["reasoning_content"].is_null());
+        assert!(body["reasoning_effort"].is_null());
     }
 
     #[test]
@@ -408,7 +449,7 @@ mod tests {
         let mut message = Message::text("assistant", "visible");
         message.reasoning_content = Some("hidden reasoning".to_string());
 
-        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, true);
+        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, None, true);
 
         assert_eq!(body["messages"][0]["content"], "visible");
         assert_eq!(body["messages"][0]["reasoning_content"], "hidden reasoning");
@@ -440,6 +481,7 @@ mod tests {
                 },
             ],
             None,
+            None,
         );
 
         assert_eq!(body["input"][0]["type"], "function_call");
@@ -459,6 +501,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_missing".to_string()),
             }],
+            None,
             None,
         );
 

@@ -232,6 +232,7 @@ pub(crate) struct ResolvedLlmConfig {
     pub base_url: String,
     pub api_key: Option<SecretString>,
     pub model: String,
+    pub reasoning_effort: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedLlmConfig {
@@ -242,6 +243,7 @@ impl std::fmt::Debug for ResolvedLlmConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &debug_secret(self.api_key.as_ref()))
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish()
     }
 }
@@ -252,6 +254,7 @@ impl PartialEq for ResolvedLlmConfig {
             && self.label == other.label
             && self.base_url == other.base_url
             && self.model == other.model
+            && self.reasoning_effort == other.reasoning_effort
     }
 }
 
@@ -273,6 +276,7 @@ impl ResolvedLlmConfig {
         self.label.hash(&mut hasher);
         self.base_url.hash(&mut hasher);
         self.model.hash(&mut hasher);
+        self.reasoning_effort.hash(&mut hasher);
         if let Some(key) = &self.api_key {
             secrecy::ExposeSecret::expose_secret(key).hash(&mut hasher);
         }
@@ -433,6 +437,7 @@ pub(crate) struct AgentConfig {
     pub label: String,
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub discord_bot: Option<BotId>,
     pub telegram_bot: Option<BotId>,
     pub profiles: HashMap<String, AgentProfileConfig>,
@@ -444,6 +449,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("label", &self.label)
             .field("provider", &self.provider)
             .field("model", &self.model)
+            .field("reasoning_effort", &self.reasoning_effort)
             .field("discord_bot", &self.discord_bot)
             .field("telegram_bot", &self.telegram_bot)
             .field("profiles", &self.profiles)

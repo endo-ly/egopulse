@@ -33,10 +33,15 @@ Codex provider の基本形:
       "content": "hello"
     }
   ],
+  "reasoning": {
+    "effort": "high"
+  },
   "stream": true,
   "store": false
 }
 ```
+
+Agent に `reasoning_effort` を設定すると、Codex Responses request の `reasoning.effort` に反映される。設定を省略した場合は `reasoning` を送信せず、Codex backend の既定動作を利用する。
 
 tools がある場合:
 

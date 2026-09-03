@@ -77,10 +77,12 @@ agents:
     label: Default Agent
     provider: null
     model: null
+    reasoning_effort: medium
   alice:
     label: Alice
     provider: openrouter
     model: anthropic/claude-sonnet-4
+    reasoning_effort: high
     discord_bot: main
   reviewer:
     label: Reviewer
@@ -432,6 +434,7 @@ SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md
 | `label` | `string` | 任意 | エージェント ID | UI 上の表示名 |
 | `provider` | `string \| null` | 任意 | `null` | エージェント固有のプロバイダー ID。`null` なら `default_provider` |
 | `model` | `string \| null` | 任意 | `null` | エージェント固有のモデル名。`null` ならモデル解決チェーンに従う |
+| `reasoning_effort` | `string \| null` | 任意 | `null` | エージェント固有の推論量。設定時は Chat Completions の `reasoning_effort`、Responses API の `reasoning.effort` へそのまま渡す |
 | `discord_bot` | `string \| null` | 任意 | `null` | このエージェントが紐づく Discord Bot ID。`channels.discord.bots` のキーを参照 |
 | `telegram_bot` | `string \| null` | 任意 | `null` | このエージェントが紐づく Telegram Bot ID。`channels.telegram.telegram_bots` のキーを参照 |
 | `profiles` | `map` | 任意 | `{}` | チャネル別オーバーライド。キーがチャネル名（例: `voice`） |
@@ -456,6 +459,22 @@ agents:
       voice:
         provider: openrouter
         model: gpt-4.1-mini
+```
+
+`reasoning_effort` は Agent 単位の設定であり、`profiles` のプロバイダー・モデル切り替えには影響されない。同じモデルを利用する Agent ごとに異なる推論量を指定できる。
+
+```yaml
+agents:
+  general:
+    label: General
+    provider: openai-codex
+    model: gpt-5.3-codex
+    reasoning_effort: medium
+  reviewer:
+    label: Reviewer
+    provider: openai-codex
+    model: gpt-5.3-codex
+    reasoning_effort: high
 ```
 
 ---
@@ -528,6 +547,8 @@ provider.default_model（プロバイダーのデフォルトモデル）
 > **Note**: `agent.provider` と `agent.model` は独立して解決される。`agent.provider` だけを設定しても、そのプロバイダーの `default_model` は自動適用されない。モデル解決は上記チェーンに従い、プロバイダーが解決された後にモデル解決が独立して走る。プロファイルの `provider` / `model` も同様に独立して解決される。
 
 `/provider` / `/model` のデフォルト更新対象は現在の `agent_id`（`agents.<id>.provider` / `agents.<id>.model`）。チャネル設定を変更したい場合は `--scope discord` のように明示する。
+
+`reasoning_effort` はモデル解決チェーンとは独立して Agent から解決される。`/model` で Agent のモデルを変更しても、Agent に設定した `reasoning_effort` は保持される。省略時は API の既定動作を利用する。
 
 プロバイダー解決も同様のチェーン:
 
