@@ -202,7 +202,7 @@ Desktop では Top Bar はレンダリングされない。
 | タブ | URL | agent スコープ |
 |---|---|---|
 | Chat | `/agents/:agentId/chat` （セッション選択時は `/agents/:agentId/chat/s/:sessionKey`） | agent scoped |
-| Sleep | `/agents/:agentId/sleep` （run 詳細は `/agents/:agentId/sleep/r/:runId`） | agent scoped |
+| Sleep | `/agents/:agentId/sleep` （run 選択時は `/agents/:agentId/sleep/runs/:runId`、Memory ビューは `/agents/:agentId/sleep/memory`） | agent scoped |
 | Pulse | `/agents/:agentId/pulse` （run 詳細は `/agents/:agentId/pulse/r/:runId`） | agent scoped |
 | Metrics | `/metrics` | global（agent フィルタは query で表現） |
 | Config | `/config` | global |

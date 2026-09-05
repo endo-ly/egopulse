@@ -11,7 +11,7 @@ import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
 import { createSessionKey, fetchSessions } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
-import { buildRoutePath, parseRoute, type AppRoute } from "./router";
+import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
 import type { TabId } from "./navigation";
 
 const DEFAULT_SESSION_KEY = "main";
@@ -52,6 +52,12 @@ export function WebUI() {
   // otherwise a freshly created session is instantly replaced by the first
   // session of the active agent.
   const [sessionExplicit, setSessionExplicit] = useState(false);
+  const [sleepView, setSleepView] = useState<SleepView>(
+    bootRoute?.tab === "sleep" ? bootRoute.sleepView : "runs",
+  );
+  const [sleepRunId, setSleepRunId] = useState<string | null>(
+    bootRoute?.tab === "sleep" ? bootRoute.runId : null,
+  );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [messageJump, setMessageJump] = useState<{
     index: number;
@@ -130,9 +136,11 @@ export function WebUI() {
         (sessionExplicit || selectedSession !== DEFAULT_SESSION_KEY)
           ? selectedSession
           : null,
+      sleepView,
+      runId: sleepRunId,
     });
     if (path !== null) navigatePath(path, true);
-  }, [activeTab, selectedAgent, selectedSession, sessionExplicit]);
+  }, [activeTab, selectedAgent, selectedSession, sessionExplicit, sleepView, sleepRunId]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -141,6 +149,10 @@ export function WebUI() {
       if (!route) return;
       setActiveTab(route.tab);
       if (route.agentId) setSelectedAgent(route.agentId);
+      if (route.tab === "sleep") {
+        setSleepView(route.sleepView);
+        setSleepRunId(route.runId);
+      }
       if (route.tab === "chat" && route.sessionKey) {
         setSelectedSession(route.sessionKey);
         setSessionExplicit(true);
@@ -156,24 +168,33 @@ export function WebUI() {
     (key: string) => {
       setSelectedSession(key);
       setSessionExplicit(true);
-      const path = buildRoutePath({
-        tab: activeTab,
-        agentId: selectedAgent,
-        sessionKey: key,
-      });
-      if (path !== null) navigatePath(path, false);
-    },
-    [activeTab, selectedAgent],
+    const path = buildRoutePath({
+      tab: activeTab,
+      agentId: selectedAgent,
+      sessionKey: key,
+      sleepView,
+      runId: null,
+    });
+    if (path !== null) navigatePath(path, false);
+  },
+  [activeTab, selectedAgent],
   );
 
   const handleSelectAgent = useCallback(
     (id: string) => {
       setSelectedAgent(id);
       setSessionExplicit(false);
-      const path = buildRoutePath({ tab: activeTab, agentId: id, sessionKey: null });
+      setSleepRunId(null);
+      const path = buildRoutePath({
+        tab: activeTab,
+        agentId: id,
+        sessionKey: null,
+        sleepView,
+        runId: null,
+      });
       if (path !== null) navigatePath(path, false);
     },
-    [activeTab],
+    [activeTab, sleepView],
   );
 
   const handleTabChange = useCallback(
@@ -187,11 +208,56 @@ export function WebUI() {
           (sessionExplicit || selectedSession !== DEFAULT_SESSION_KEY)
             ? selectedSession
             : null,
+        sleepView,
+        runId: sleepRunId,
       });
       if (path !== null) navigatePath(path, false);
     },
-    [selectedAgent, selectedSession, sessionExplicit],
+    [selectedAgent, selectedSession, sessionExplicit, sleepView, sleepRunId],
   );
+
+  const handleSleepViewChange = useCallback(
+    (view: SleepView) => {
+      setSleepView(view);
+      setSleepRunId(null);
+      const path = buildRoutePath({
+        tab: "sleep",
+        agentId: selectedAgent,
+        sessionKey: null,
+        sleepView: view,
+        runId: null,
+      });
+      if (path !== null) navigatePath(path, false);
+    },
+    [selectedAgent],
+  );
+
+  const handleSelectRun = useCallback(
+    (runId: string) => {
+      setSleepRunId(runId);
+      const path = buildRoutePath({
+        tab: "sleep",
+        agentId: selectedAgent,
+        sessionKey: null,
+        sleepView: "runs",
+        runId,
+      });
+      if (path !== null) navigatePath(path, false);
+    },
+    [selectedAgent],
+  );
+
+  const handleBackFromRun = useCallback(() => {
+    setSleepRunId(null);
+    const path = buildRoutePath({
+      tab: "sleep",
+      agentId: selectedAgent,
+      sessionKey: null,
+      sleepView: "runs",
+      runId: null,
+    });
+    if (path !== null) navigatePath(path, false);
+  }, [selectedAgent]);
 
   const handleSessionResolved = useCallback((key: string) => {
     setSelectedSession(key);
@@ -209,6 +275,8 @@ export function WebUI() {
       tab: "chat",
       agentId: selectedAgent,
       sessionKey: key,
+      sleepView,
+      runId: null,
     });
     if (path !== null) navigatePath(path, false);
   };
@@ -321,8 +389,18 @@ export function WebUI() {
               {transportError && <div className="run-error">{transportError}</div>}
               {chatMain}
             </>
-          ) : activeTab === "sleep" ? (
-            <SleepBatchPanel authToken={authToken} />
+          ) : activeTab === "sleep" && selectedAgent ? (
+            <SleepBatchPanel
+              agents={agents}
+              agentId={selectedAgent}
+              authToken={authToken}
+              view={sleepView}
+              runId={sleepRunId}
+              onViewChange={handleSleepViewChange}
+              onSelectRun={handleSelectRun}
+              onBack={handleBackFromRun}
+              onRefresh={() => invalidateQueries("sleep")}
+            />
           ) : null
         }
       />
