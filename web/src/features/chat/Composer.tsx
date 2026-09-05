@@ -26,6 +26,15 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
     saveDraft(storageKey, text);
   }, [text, storageKey]);
 
+  // Auto-grow the textarea with its content (up to the CSS max-height,
+  // beyond which it scrolls internally).
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [text]);
+
   const submit = () => {
     const trimmed = text.trim();
     if (!trimmed) return;
@@ -111,8 +120,23 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
         className="btn-primary composer-send"
         disabled={disabled || !text.trim()}
         onClick={submit}
+        aria-label="Send message"
+        title="Send message"
       >
-        Send
+        <svg
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <line x1="12" y1="19" x2="12" y2="5" />
+          <polyline points="5 12 12 5 19 12" />
+        </svg>
       </button>
     </div>
   );

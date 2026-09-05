@@ -38,6 +38,8 @@ Chat Tab は2領域で構成される：
 
 ヘッダー行は持たない。セッション情報は Sidebar の SESSIONS 選択表示に集約され、チャットは Composer を除く縦領域をすべて使う。
 
+Composer は幅 640px の中央カラムに収め、Timeline 上にオーバーレイ表示するフローティングカード（角丸＋影）として浮かべる。メッセージ列の配置は変えない（全幅のまま）。Timeline 末尾には Composer との重なりを避けるクリアランスを確保する。
+
 ---
 
 ## 2. Channel と read-only
@@ -91,7 +93,7 @@ Command Palette（`Cmd/Ctrl+K`）の Messages セクションから行う。
 
 | `sender_kind` | 配置 | 背景 | 備考 |
 |---|---|---|---|
-| `user` | 右寄せ | `accent-2-soft`（パープル系） | ユーザー入力 |
+| `user` | 右寄せ | 濃シアンソリッド | ユーザー入力 |
 | `assistant` | 中央 | なし（バブルなし・フラット表示） | LLM 応答・Pulse 通知 |
 | `system` | 中央（幅 60% 程度） | `panel-2` | システムメッセージ |
 
@@ -216,12 +218,14 @@ LLM がツールを呼び出したとき、応答メッセージの下（同一�
 
 ### 6.3 Send Button の状態
 
-| 状態 | label | disabled |
-|---|---|---|
-| 入力空 | `Send` | true |
-| 入力あり・待機中 | `Send` | false |
-| 送信中 | 小 spinner + `Sending…` | true |
-| read-only | (button 無し) | — |
+円形（32px）の上矢印アイコンボタン。
+
+| 状態 | disabled |
+|---|---|
+| 入力空 | true |
+| 入力あり・待機中 | false |
+| 送信中 | true |
+| read-only | (button 無し) |
 
 ### 6.4 Placeholder
 
