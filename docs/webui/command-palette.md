@@ -9,7 +9,8 @@
 | トリガ | 動作 |
 |---|---|
 | `Cmd+K` / `Ctrl+K` | パレット開く（フォーカスが入力フィールド以外でも有効） |
-| Top Bar の `[⌘K] Search or jump…` button click | 同上 |
+| Sidebarブランド行の検索アイコン click | 同上 |
+| Mobile Top Bar の `[🔍]` button click | 同上 |
 
 ### 1.2 終了トリガ
 
@@ -76,8 +77,9 @@
 | 3 | Navigation | タブ遷移 |
 | 4 | Agents | agent 切替 |
 | 5 | Sessions | セッション検索結果 |
-| 6 | Sleep Runs | Sleep run 検索結果 |
-| 7 | Pulse Runs | Pulse run 検索結果 |
+| 6 | Messages | アクティブセッションのメッセージ検索結果 |
+| 7 | Sleep Runs | Sleep run 検索結果 |
+| 8 | Pulse Runs | Pulse run 検索結果 |
 
 クエリ入力時は、全セクションからマッチする項目を抽出し、マッチしないセクションは非表示にする。マッチが0件の場合は `"No results for '{query}'"` を表示。
 
@@ -128,7 +130,19 @@ agent 一覧から選択して切り替え。
 
 検索対象は選択中 agent のセッションのみ。
 
-### 4.5 Sleep Runs
+### 4.5 Messages
+
+アクティブセッションのメッセージ本文検索。クエリが空の場合は表示しない。クエリでメッセージ `content` の部分一致（case-insensitive）でフィルタし、tool call メッセージは対象外。Chat タブ外で実行した場合は Chat タブへ切り替えてからジャンプする。
+
+| label | 動作 |
+|---|---|
+| {message content} | 当該メッセージへスクロールし、ハイライト表示（表示は ellipsis で省略） |
+
+- 結果上限：20件
+- description には sender kind（`user` / `assistant` / `system`）を表示する
+- ジャンプ実行は Recent 履歴に記録しない
+
+### 4.6 Sleep Runs
 
 Sleep run 検索。クエリが `"sleep"` を含むか、時刻フォーマット（`2026-06-29` 等）にマッチする場合に優先表示。
 
@@ -136,7 +150,7 @@ Sleep run 検索。クエリが `"sleep"` を含むか、時刻フォーマッ�
 |---|---|
 | Sleep run {date} {time} · {status} | 当該 run の Detail を開く |
 
-### 4.6 Pulse Runs
+### 4.7 Pulse Runs
 
 Pulse run 検索。同上。
 

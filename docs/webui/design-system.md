@@ -214,7 +214,7 @@ agent の live 状態・runtime health の簡易表示に使う小円（8px 程�
 
 画面右上に固定する通知。自動消去付き。
 
-- 配置：Top Bar の下、画面右上
+- 配置：画面右上（Top Bar がある mobile ではその下）
 - 表示時間：info/success は4秒、error は8秒、warning は6秒
 - 自動消去までの進行バーを下部に表示
 - 手動で閉じるボタンを常時表示

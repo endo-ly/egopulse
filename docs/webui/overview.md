@@ -24,27 +24,28 @@ LLM の応答・ツール実行・Pulse 発火など、ランタイムで進行�
 
 ## 2. 情報設計
 
-### 2.1 3 領域の構成
+### 2.1 2 領域の構成
 
-WebUI は Sidebar / Top Bar / Main の3領域で構成される。
+Desktop の WebUI は Sidebar / Main の2領域で構成される。
 
 ```
-┌─ Sidebar ────────┬─ Top Bar ──────────────────────────────────┐
-│ EgoPulse         │ [⌘K]  Tabs…                  Health Badge  │
-│ ─────────        ├─ Main ─────────────────────────────────────┤
-│ AGENTS           │                                            │
-│ Sessions         │   選択タブ + 選択 agent のコンテンツ        │
-│ + New Session    │                                            │
+┌─ Sidebar ────────┬─ Main ─────────────────────────────────────┐
+│ EgoPulse      [🔍]   │                                            │
+│ [💬][🌙][◌][◔]   │   選択タブ + 選択 agent のコンテンツ        │
 │ ─────────        │                                            │
-│ Runtime Status   │                                            │
+│ AGENTS           │                                            │
+│ SESSIONS [▼] (+) │                                            │
+│ ─────────        │                                            │
+│ Runtime Status [⚙]│                                           │
 └──────────────────┴────────────────────────────────────────────┘
 ```
 
 | 領域 | 役割 |
 |---|---|
-| **Sidebar** | agent の選択・セッションの選択・新規セッション作成・ランタイム状態の簡易表示 |
-| **Top Bar** | タブ切り替え・コマンドパレット起動・ヘルス状態の簡易表示 |
+| **Sidebar** | タブ切り替え・agent の選択・セッションの選択・新規セッション作成・コマンドパレット起動・ランタイム状態の簡易表示 |
 | **Main** | 選択中タブ・選択中 agent に従属するコンテンツ |
+
+Mobile では Sidebar に加えて hamburger・タブ選択・パレット起動を持つスリムな Top Bar を表示する（[layout.md §3](./layout.md)）。
 
 詳細は [layout.md](./layout.md)。
 
@@ -158,7 +159,7 @@ WS 上で配信される事象と UI 側の関心事の対応を以下に示す�
 | トピック | ファイル |
 |---|---|
 | デザイントークン・共通コンポーネント | [design-system.md](./design-system.md) |
-| 全体レイアウト（Sidebar / Top Bar / レスポンシブ） | [layout.md](./layout.md) |
+| 全体レイアウト（Sidebar / Mobile Top Bar / レスポンシブ） | [layout.md](./layout.md) |
 | Chat タブ | [chat.md](./chat.md) |
 | Sleep Batch タブ | [sleep-batch.md](./sleep-batch.md) |
 | Pulse タブ | [pulse.md](./pulse.md) |

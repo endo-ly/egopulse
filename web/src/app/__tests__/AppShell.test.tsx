@@ -24,23 +24,22 @@ afterEach(() => {
 });
 
 describe("App shell", () => {
-  it("app_shell_renders_three_regions_on_desktop", () => {
+  it("desktop_renders_sidebar_and_main_without_topbar", () => {
     mockViewport(false);
     const { container } = render(<App />);
 
     expect(container.querySelector(".app-shell")).not.toBeNull();
     expect(container.querySelector(".sidebar")).not.toBeNull();
-    expect(container.querySelector(".topbar")).not.toBeNull();
     expect(container.querySelector(".main")).not.toBeNull();
+    expect(container.querySelector(".topbar")).toBeNull();
     expect(container.querySelector(".sidebar")?.className).toContain("open");
   });
 
-  it("app_shell_renders_three_regions_and_mobile_overlay", () => {
+  it("mobile_renders_slim_topbar_and_sidebar_overlay", () => {
     mockViewport(true);
     const { container } = render(<App />);
 
     expect(container.querySelector(".app-shell")).not.toBeNull();
-    expect(container.querySelector(".sidebar")).not.toBeNull();
     expect(container.querySelector(".topbar")).not.toBeNull();
     expect(container.querySelector(".main")).not.toBeNull();
 
@@ -59,7 +58,7 @@ describe("App shell", () => {
     expect(container.querySelector(".sidebar")?.className).toContain("closed");
   });
 
-  it("app_wires_sidebar_topbar_and_sections_together", () => {
+  it("app_wires_sidebar_navigation_and_sections_together", () => {
     mockViewport(false);
     const onSelectAgent = vi.fn();
     const onSelectSession = vi.fn();

@@ -169,4 +169,46 @@ describe("CommandPalette", () => {
     expect(labels?.some((l) => l?.includes("Ace"))).toBe(true);
     expect(labels?.some((l) => l?.includes("New Session"))).toBe(false);
   });
+
+  it("palette_message_search_jumps_to_message", () => {
+    const onJumpToMessage = vi.fn();
+    const onClose = vi.fn();
+    const { container } = render(
+      <CommandPalette
+        open={true}
+        onClose={onClose}
+        agents={agents}
+        sessions={sessions}
+        selectedAgent="lyre"
+        messages={[
+          {
+            id: "m1",
+            sender_id: "lyre",
+            sender_kind: "assistant",
+            content: "the build passed",
+            timestamp: "2026-07-04T00:00:01.000Z",
+            message_kind: "text",
+          },
+        ]}
+        onNavigate={noop}
+        onSelectAgent={noop}
+        onSelectSession={noop}
+        onNewSession={noop}
+        onRefresh={noop}
+        onJumpToMessage={onJumpToMessage}
+      />,
+    );
+
+    const input = container.querySelector(".palette-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "build" } });
+
+    const messageItem = Array.from(
+      container.querySelectorAll(".palette-item"),
+    ).find((i) => i.textContent?.includes("the build passed"));
+    expect(messageItem).toBeTruthy();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onJumpToMessage).toHaveBeenCalledWith(0);
+    expect(onClose).toHaveBeenCalled();
+  });
 });

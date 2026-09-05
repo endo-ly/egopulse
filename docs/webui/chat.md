@@ -29,37 +29,27 @@ Chat タブは、選択中 agent との Web セッションでの対話、およ
 └──────────────────────────────────────────────────────┘
 ```
 
-Chat Tab は3領域で構成される：
+Chat Tab は2領域で構成される：
 
 | 領域 | 役割 | 高さ |
 |---|---|---|
-| Chat Header | セッション情報・操作 | auto |
 | Timeline | メッセージ履歴・ストリーミング応答 | 1fr（スクロール） |
 | Composer | 入力欄・送信 | auto |
 
+ヘッダー行は持たない。セッション情報は Sidebar の SESSIONS 選択表示に集約され、チャットは Composer を除く縦領域をすべて使う。
+
 ---
 
-## 2. Chat Header
+## 2. Channel と read-only
 
-バー（背景・枠線）を持たない、小さなテキストのみの帯。
-
-- session label（小サイズ・muted）+ channel 名（テキスト）。badge は使わない
-- 全要素（情報テキスト + 検索）をチャット領域の左端に寄せて 1 行に固める。右側は空け、Timeline の領域を圧迫しない
-- read-only の場合のみ `Read-only` を追加表示
-- 情報テキストの隣に検索ボタン（小アイコン）。開くと小型のインライン検索ボックスに切り替わる（[3.3](#33-メッセージ検索cmdf)）
-
-### Channel 表示
+`web` 以外の channel のセッションは read-only 監査ビューになる。Composer の代わりに ReadOnlyBanner（channel 名 + 誘導テキスト）を表示する。
 
 | Channel | 表示 |
 |---|---|
-| `web` | `web` |
-| `discord` | `discord`（+ `Read-only`） |
-| `telegram` | `telegram`（+ `Read-only`） |
-| `cli` | `cli`（+ `Read-only`） |
-| `tui` | `tui`（+ `Read-only`） |
-| `voice` | `voice`（+ `Read-only`） |
+| `web` | 入力可能 |
+| `discord` / `telegram` / `cli` / `tui` / `voice` | read-only（banner 表示） |
 
-`web` 以外は read-only 監査ビューになる。
+メッセージ検索は Command Palette の Messages セクションに統合されている（[command-palette.md §4.5](./command-palette.md)）。
 
 ---
 
@@ -77,17 +67,14 @@ Chat Tab は3領域で構成される：
 - 最下部からの距離が一定値未満（画面高の 10% 程度）の場合に auto-follow と判定
 - auto-follow 中でなければ "Jump to latest" ボタンを表示
 
-### 3.3 メッセージ検索（Cmd+F）
+### 3.3 メッセージ検索
 
-Timeline 内キーワード検索機能。
+Command Palette（`Cmd/Ctrl+K`）の Messages セクションから行う。
 
-- `Cmd/Ctrl+F` で検索バーを Timeline 右上に表示
-- 入力するとマッチ箇所をハイライト（`warning-soft` 背景）
-- `Enter` / `Shift+Enter` で次/前のマッチへジャンプ（スクロール）
-- `Esc` で検索バーを閉じる
-- マッチ件数を "N / M" 形式で表示
-- 検索対象: 全メッセージの本文（Markdown レンダリング前のプレーンテキスト）。sender label・timestamp は対象外
-- 大文字小文字を区別しない
+- クエリでメッセージ本文（Markdown レンダリング前のプレーンテキスト）を部分一致検索（大文字小文字を区別しない）
+- 項目を選択すると当該メッセージへスクロールし、一時的にハイライト表示する
+- tool call メッセージは検索対象外
+- Chat タブ外で実行した場合は Chat タブへ切り替わる
 
 ### 3.4 空状態・ロード中
 

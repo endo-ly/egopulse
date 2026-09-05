@@ -53,6 +53,10 @@ export function WebUI() {
   // session of the active agent.
   const [sessionExplicit, setSessionExplicit] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [messageJump, setMessageJump] = useState<{
+    index: number;
+    seq: number;
+  } | null>(null);
   const [authToken, setAuthToken] = useState(loadAuthToken);
   const [authDraft, setAuthDraft] = useState(authToken);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
@@ -276,14 +280,24 @@ export function WebUI() {
     }
   };
 
+  const handleJumpToMessage = useCallback(
+    (index: number) => {
+      setMessageJump((prev) => ({ index, seq: (prev?.seq ?? 0) + 1 }));
+      if (activeTab !== "chat") {
+        handleTabChange("chat");
+      }
+    },
+    [activeTab, handleTabChange],
+  );
+
   const chatMain = (
     <ChatTab
-      sessionLabel={selectedSessionData?.label ?? "Web Chat"}
       channel={channel}
       readOnly={isReadOnly}
       messages={messages}
       onSend={handleSend}
       storageKey={selectedSession}
+      jumpRequest={messageJump ?? undefined}
     />
   );
 
@@ -318,11 +332,13 @@ export function WebUI() {
         agents={agents}
         sessions={sessions}
         selectedAgent={selectedAgent}
+        messages={messages}
         onNavigate={setActiveTab}
         onSelectAgent={handleSelectAgent}
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}
         onRefresh={refreshCurrentTab}
+        onJumpToMessage={handleJumpToMessage}
       />
       {authMessage && (
         <AuthModal

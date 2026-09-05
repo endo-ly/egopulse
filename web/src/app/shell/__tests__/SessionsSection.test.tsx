@@ -105,4 +105,20 @@ describe("SessionsSection", () => {
     });
     expect(screen.getByText(/No TUI sessions for this agent/)).toBeTruthy();
   });
+
+  it("sessions_section_header_new_session_button_triggers_callback", () => {
+    const onNewSession = vi.fn();
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+        onNewSession={onNewSession}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "New Session" }));
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+  });
 });

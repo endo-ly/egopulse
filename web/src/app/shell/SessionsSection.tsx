@@ -10,6 +10,7 @@ export interface SessionsSectionProps {
   selectedAgent: string;
   selectedSession: string;
   onSelectSession: (key: string) => void;
+  onNewSession?: () => void;
 }
 
 const CHANNEL_FILTERS = [
@@ -59,6 +60,7 @@ export function SessionsSection({
   selectedAgent,
   selectedSession,
   onSelectSession,
+  onNewSession,
 }: SessionsSectionProps) {
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
 
@@ -71,18 +73,43 @@ export function SessionsSection({
     <div className="sessions-section">
       <div className="sessions-header">
         <h2 className="section-title">SESSIONS</h2>
-        <select
-          className="channel-filter"
-          value={channelFilter}
-          onChange={(e) => setChannelFilter(e.target.value as ChannelFilter)}
-          aria-label="Filter sessions by channel"
-        >
-          {CHANNEL_FILTERS.map((c) => (
-            <option key={c} value={c}>
-              {CHANNEL_LABELS[c]}
-            </option>
-          ))}
-        </select>
+        <div className="sessions-header-actions">
+          <select
+            className="channel-filter"
+            value={channelFilter}
+            onChange={(e) => setChannelFilter(e.target.value as ChannelFilter)}
+            aria-label="Filter sessions by channel"
+          >
+            {CHANNEL_FILTERS.map((c) => (
+              <option key={c} value={c}>
+                {CHANNEL_LABELS[c]}
+              </option>
+            ))}
+          </select>
+          {onNewSession && (
+            <button
+              type="button"
+              className="sessions-new-btn"
+              onClick={onNewSession}
+              aria-label="New Session"
+              title="New Session"
+            >
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                aria-hidden="true"
+              >
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
 
       {visible.length === 0 ? (
