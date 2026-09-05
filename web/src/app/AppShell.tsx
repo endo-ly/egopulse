@@ -1,7 +1,7 @@
 import { useState, useEffect, type ReactNode } from "react";
 import { useMediaQuery } from "../shared/hooks/useMediaQuery";
 import { Sidebar } from "./shell/Sidebar";
-import { TopBar } from "./shell/TopBar";
+import { MobileBar } from "./shell/MobileBar";
 import { AgentsSection } from "./shell/AgentsSection";
 import { SessionsSection } from "./shell/SessionsSection";
 import type { HealthStatus } from "./runtimeStatus";
@@ -15,7 +15,6 @@ export interface AppProps {
   selectedSession?: string;
   activeTab?: TabId;
   healthStatus?: HealthStatus;
-  activeTurns?: number;
   onSelectAgent?: (id: string) => void;
   onSelectSession?: (key: string) => void;
   onTabChange?: (tab: TabId) => void;
@@ -34,7 +33,6 @@ export function App({
   selectedSession = "",
   activeTab = "chat",
   healthStatus = "ok",
-  activeTurns = 0,
   onSelectAgent = noop,
   onSelectSession = noop,
   onTabChange = noop,
@@ -91,9 +89,10 @@ export function App({
     <div className={`app-shell ${showCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className={`sidebar ${sidebarOpen ? "open" : "closed"} ${showCollapsed ? "collapsed" : ""}`}>
         <Sidebar
-          onNewSession={onNewSession}
+          activeTab={activeTab}
+          onTabChange={onTabChange}
+          onOpenPalette={onOpenPalette}
           healthStatus={healthStatus}
-          activeTurns={activeTurns}
           collapsed={!isMobile && sidebarCollapsed}
           onToggleCollapse={isMobile ? undefined : toggleSidebarCollapse}
           agents={
@@ -109,6 +108,7 @@ export function App({
               selectedAgent={selectedAgent}
               selectedSession={selectedSession}
               onSelectSession={onSelectSession}
+              onNewSession={onNewSession}
             />
           }
         />
@@ -120,38 +120,18 @@ export function App({
           aria-hidden="true"
         />
       )}
-      <header className="topbar">
-        {isMobile && (
-          <button
-            type="button"
-            className="hamburger-btn"
-            aria-label="Toggle sidebar"
-            aria-expanded={sidebarOpen}
-            onClick={toggleSidebar}
-          >
-            <svg
-              width="20"
-              height="20"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2"
-              strokeLinecap="round"
-              aria-hidden="true"
-            >
-              <line x1="3" y1="6" x2="21" y2="6" />
-              <line x1="3" y1="12" x2="21" y2="12" />
-              <line x1="3" y1="18" x2="21" y2="18" />
-            </svg>
-          </button>
-        )}
-        <TopBar
-          activeTab={activeTab}
-          onTabChange={onTabChange}
-          onOpenPalette={onOpenPalette}
-          healthStatus={healthStatus}
-        />
-      </header>
+      {isMobile && (
+        <header className="topbar">
+          <MobileBar
+            activeTab={activeTab}
+            onTabChange={onTabChange}
+            onOpenPalette={onOpenPalette}
+            onToggleSidebar={toggleSidebar}
+            sidebarOpen={sidebarOpen}
+            healthStatus={healthStatus}
+          />
+        </header>
+      )}
       <main className="main">{main}</main>
     </div>
   );

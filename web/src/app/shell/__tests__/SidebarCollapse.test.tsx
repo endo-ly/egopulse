@@ -3,10 +3,20 @@ import { fireEvent, render } from "@testing-library/react";
 import { Sidebar } from "../Sidebar";
 
 describe("Sidebar collapse", () => {
+  const baseProps = {
+    activeTab: "chat" as const,
+    onTabChange: vi.fn(),
+    onOpenPalette: vi.fn(),
+  };
+
   it("sidebar_collapses_to_icon_only_bar", () => {
     const onToggle = vi.fn();
     const { container, rerender } = render(
-      <Sidebar onNewSession={vi.fn()} onToggleCollapse={onToggle} collapsed={false} />,
+      <Sidebar
+        {...baseProps}
+        onToggleCollapse={onToggle}
+        collapsed={false}
+      />,
     );
 
     const collapseBtn = container.querySelector(".sidebar-collapse-btn");
@@ -19,7 +29,11 @@ describe("Sidebar collapse", () => {
     expect(onToggle).toHaveBeenCalled();
 
     rerender(
-      <Sidebar onNewSession={vi.fn()} onToggleCollapse={onToggle} collapsed={true} />,
+      <Sidebar
+        {...baseProps}
+        onToggleCollapse={onToggle}
+        collapsed={true}
+      />,
     );
 
     const nav = container.querySelector(".sidebar-nav") as HTMLElement;

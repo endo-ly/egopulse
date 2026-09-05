@@ -1,5 +1,5 @@
 import type { TabId } from "../navigation";
-import type { AgentEntry, SessionEntry } from "../../shared/api/types";
+import type { AgentEntry, ChatMessage, SessionEntry } from "../../shared/api/types";
 import { loadPaletteHistory, pushPaletteHistory } from "./paletteHistory";
 
 export interface PaletteItem {
@@ -18,12 +18,15 @@ export interface PaletteActions {
   selectSession: (key: string) => void;
   newSession: () => void;
   refresh: () => void;
+  jumpToMessage: (index: number) => void;
 }
 
 export interface BuildPaletteItemsInput {
   agents: AgentEntry[];
   sessions: SessionEntry[];
   selectedAgent: string;
+  query: string;
+  messages: ChatMessage[];
   actions: PaletteActions;
 }
 
@@ -36,11 +39,14 @@ const TAB_LABELS: Record<TabId, string> = {
 };
 
 const DISABLED_TABS: TabId[] = ["pulse", "metrics", "config"];
+const MAX_MESSAGE_RESULTS = 20;
 
 export function buildPaletteItems({
   agents,
   sessions,
   selectedAgent,
+  query,
+  messages,
   actions,
 }: BuildPaletteItemsInput): PaletteItem[] {
   const liveItems = [
@@ -48,6 +54,7 @@ export function buildPaletteItems({
     ...navigationItems(actions),
     ...agentItems(agents, selectedAgent, actions),
     ...sessionItems(sessions, selectedAgent, actions),
+    ...messageItems(messages, query, actions),
   ];
   const recentItems = loadPaletteHistory().map((historyItem) => {
     const original = liveItems.find((item) => item.id === historyItem.id);
@@ -123,6 +130,35 @@ function sessionItems(
         actions,
       ),
     }));
+}
+
+function messageItems(
+  messages: ChatMessage[],
+  query: string,
+  actions: PaletteActions,
+): PaletteItem[] {
+  if (!query) return [];
+  const q = query.toLowerCase();
+  const results: PaletteItem[] = [];
+  for (let index = 0; index < messages.length; index++) {
+    if (results.length >= MAX_MESSAGE_RESULTS) break;
+    const message = messages[index];
+    if (message.message_kind === "tool_call") continue;
+    if (!message.content.toLowerCase().includes(q)) continue;
+    results.push({
+      id: `msg-${message.id}`,
+      // Full content: the palette filter re-matches against the label, and CSS
+      // ellipsis handles display truncation.
+      label: message.content,
+      section: "Messages",
+      description: message.sender_kind,
+      onSelect: () => {
+        actions.jumpToMessage(index);
+        actions.close();
+      },
+    });
+  }
+  return results;
 }
 
 function actionItem(

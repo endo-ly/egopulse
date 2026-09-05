@@ -2,18 +2,15 @@ import { useRef, useEffect, useState, type ReactNode } from "react";
 
 export interface TimelineProps {
   children?: ReactNode;
-  /** Message indices of the current search matches (drives match highlight). */
-  searchMatches?: number[];
-  /** Index within searchMatches of the active match. */
-  activeMatchIndex?: number;
+  /** Jump request: scroll to and flash the message at `index`; `seq` re-triggers repeat jumps. */
+  jumpRequest?: { index: number; seq: number };
 }
 
 const FOLLOW_THRESHOLD_RATIO = 0.1;
 
 export function Timeline({
   children,
-  searchMatches,
-  activeMatchIndex = 0,
+  jumpRequest,
 }: TimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
@@ -60,13 +57,12 @@ export function Timeline({
     setShowJumpButton(false);
   };
 
-  // Scroll the active search match into view and flash it.
-  const messageIndex = searchMatches?.[activeMatchIndex];
+  // Scroll the requested message into view and flash it.
   useEffect(() => {
-    if (messageIndex == null) return;
+    if (!jumpRequest) return;
     const container = messagesRef.current;
     if (!container) return;
-    const targetChild = container.children[messageIndex] as
+    const targetChild = container.children[jumpRequest.index] as
       | HTMLElement
       | undefined;
     if (!targetChild) return;
@@ -79,7 +75,7 @@ export function Timeline({
       1500,
     );
     return () => clearTimeout(timeout);
-  }, [messageIndex, activeMatchIndex]);
+  }, [jumpRequest]);
 
   return (
     <div className="timeline" ref={scrollRef} onScroll={handleScroll}>

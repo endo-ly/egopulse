@@ -1,28 +1,25 @@
 # EgoPulse WebUI — Layout
 
-WebUI の全体レイアウト、Sidebar / Top Bar の構造、レスポンシブ挙動を定義する。
+WebUI の全体レイアウト、Sidebar の構造、レスポンシブ挙動を定義する。
 
 ## 1. 全体構造
 
 ```
-┌─ Sidebar (216px) ──┬─ Top Bar (h:56px) ──────────────────────┐
+┌─ Sidebar (216px) ──┬─ Main ──────────────────────────────────┐
 │                    │                                          │
-│ (logo + version)   │ [⌘K] [Chat][Sleep][Pulse][Metrics][⚙]   │
-│             (+)    │                              [Health]    │
-│                    ├─ Main ──────────────────────────────────┤
-│ AGENTS             │                                          │
-│ (agent list)       │   選択タブ + 選択 agent のコンテンツ      │
-│                    │                                          │
-│ SESSIONS           │                                          │
-│ (filter + list)    │                                          │
-│                    │                                          │
-│ Runtime Status     │                                          │
+│ ◆ EgoPulse      [🔍][<]│  選択タブ + 選択 agent のコンテンツ      │
+│ [💬][🌙][◌][◔]     │                                          │
+│ ────────────────── │   チャットは Composer 以外の              │
+│ AGENTS             │   縦領域をすべて使う                      │
+│ SESSIONS  [All ▼] +│                                          │
+│ ────────────────── │                                          │
+│ ● ok [⚙]           │                                          │
 └────────────────────┴──────────────────────────────────────────┘
 ```
 
+- Desktop では 2 カラムグリッド（Sidebar + Main）。Top Bar は存在しない
 - Sidebar は全高・固定幅（desktop）
-- Top Bar は右側全幅・固定高（56px）
-- Main は残り全幅・全高、内部スクロール
+- Main は残り全幅・全高、内部スクロール。Chat タブでは Timeline + Composer のみで構成され、ヘッダー行を持たない
 
 ---
 
@@ -32,20 +29,18 @@ WebUI の全体レイアウト、Sidebar / Top Bar の構造、レスポンシ�
 
 ```
 ┌─ Sidebar ──────────────┐
-│ ◆ EgoPulse  v0.1.0  [<]│  ← Brand header + collapse button
-│                (+)     │  ← 円形 New Session ボタン（最上部右端）
+│ ◆ EgoPulse       [🔍][<]│  ← Brand row（検索は右端）
+│ [💬][🌙][◌][◔]         │  ← Nav（運用ビュー4タブのミニタブバー）
 │ ──────────────────     │
 │ AGENTS                 │
 │ ● lyre (default)       │
 │ ○ ace                  │
-│ ○ vega                 │
 │ ──────────────────     │
-│ SESSIONS  [All ▼]      │
+│ SESSIONS  [All ▼]  (+) │  ← New Session はヘッダー右端
 │ ▸ [web]   preview…  ●  │
 │ ▸ [dis…]  preview…     │
-│ ▸ [cli]   preview…     │
 │ ──────────────────     │
-│ ◴ ok    ●2 turns live  │
+│ ● ok [⚙]                 │  ← Footer（WS接続状態 + Config）
 └────────────────────────┘
 ```
 
@@ -56,18 +51,30 @@ Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の
 | 状態 | 幅 | 表示内容 |
 |---|---|---|
 | expanded（デフォルト） | 216px (desktop / tablet) | 全要素表示 |
-| collapsed | 48px | ロゴ・agent StatusDot（縦並び）・New Session アイコン・Runtime Status StatusDot のみ。ラベル・セッション一覧は非表示 |
+| collapsed | 48px | ブランドマーク「E」・nav（縦並びアイコンのみ）・Config 歯車・Runtime Status StatusDot。ラベル・セッション一覧・Search・New Session は非表示 |
 
 - 畳み込み状態は URL query (`?sidebar=collapsed`) で永続化し、リロード後も維持
 - collapsed 状態でアイコン click すると expanded に戻る
+- collapsed の nav 行は `title` 属性でアクセシブルな名称を保持する
+- Search ボタンは collapsed では非表示。`Cmd+K` で常に palette を開ける
 - Mobile では折りたたみ機能を提供しない（Mobile は hamburger overlay のみ）
 
-### 2.2 Brand Header
+### 2.2 Brand Row
 
-- 高さ 56px（Top Bar と整合）
-- 左にロゴ画像（40×40）、右に product name と version
+- 高さ 40px のコンパクトな1行。左に product name、右端に検索アイコン＋ collapse ボタン
+- 検索アイコン（24px・ghost）：クリックで Command Palette を開く（[command-palette.md](./command-palette.md)）。hover で tooltip（"Search or jump… (⌘K)"）。collapsed では非表示（`Cmd+K` で常に開ける）
 
-### 2.3 AGENTS Section
+### 2.3 Nav（タブ）
+
+**運用ビューの4タブ（Chat / Sleep / Pulse / Metrics）** を **1行のミニタブバー** に収める。サイドバー幅を4等分したセルに、アイコン + 微小ラベル（9px）を縦積みで並べる。これらは agent の運用を操作・観測する同種のビューであり、セットとして1か所に置く。
+
+- 現在位置は `aria-current="page"` で示す。選択中セルは背景チントで強調表示
+- 有効タブ（Chat / Sleep）：セル click で URL 遷移する（§3.1 の URL 構造）
+- 無効タブ（Pulse / Metrics）：`disabled` でミュート表示。hover で "coming soon" の tooltip を表示し、有効化の際は同じセルのまま有効化する
+- collapsed 時は縦並びのアイコン列になる（ラベルは CSS で非表示、`title` 属性でアクセシブルな名称を保持）
+- Config（§2.7）はシステム設定というメタレベルの機能のためバーに含めず、Footer に置く
+
+### 2.4 AGENTS Section
 
 Sidebar の第1セクション。必ず表示する。
 
@@ -98,7 +105,7 @@ Sidebar の第1セクション。必ず表示する。
 
 **polling 戦略**：`/api/agents` を5秒間隔でポーリングし、`active` フィールドを更新する。これにより最大5秒の遅延で StatusDot が active 状態に切り替わる。
 
-### 2.4 SESSIONS Section
+### 2.5 SESSIONS Section
 
 Sidebar の第2セクション。
 
@@ -139,9 +146,9 @@ SESSIONS ヘッダーに単一選択のドロップダウンを置く：
 | ロード中 | Spinner（中）を中央 |
 | ロード失敗 | EmptyState: error message + Retry button |
 
-### 2.5 New Session
+### 2.6 New Session
 
-Brand header の直下、Sidebar 最上部右端に円形の「+」アイコンボタン（28px・radius full）を固定表示。hover で tooltip（title）表示。
+SESSIONS ヘッダー右端の「+」アイコンボタン（22px・ghost）。新規セッションの作成口がセッション一覧の文脈上にあることで、操作対象が直感的に分かる。
 
 - 選択中 agent を親とする新規 web セッションを作成
 - クリック → 楽観的に `session-{timestamp}` キーを生成し Sidebar 先頭へ挿入 → Chat タブへ遷移 → Composer へフォーカス
@@ -149,15 +156,17 @@ Brand header の直下、Sidebar 最上部右端に円形の「+」アイコン�
 - 未送信の新規セッションはブラウザリロードで消失する（ドラフト扱い、永続化は提供しない）
 - agent 未選択時は `default_agent` を使用
 
-### 2.6 Runtime Status Footer
+### 2.7 Runtime Status Footer
 
-Sidebar 最下部。
+Sidebar 最下部。左に WS 接続状態、右に Config 歯車を置く。
 
-- Health status + active turn 数
-- 小テキスト・muted
+- Health status（`ok` / `degraded`）：WebSocket の接続状態のみを写す。`closed` で `degraded`、それ以外で `ok`
+- 小テキスト・muted。長い場合は ellipsis
 - StatusDot で状態を視覚的に示す
-- hover で Metrics タブへのリンクを表示
-- `/health` と `/api/status` を定期的にポーリングして更新（間隔は [metrics.md](./metrics.md) に準拠）
+
+#### Config Utility
+
+Footer 右端の歯車アイコン（24px・ghost）。Config はシステム設定というメタレベルの機能のため Nav バーには含めず、定番の「フッターの歯車」位置に置く。無効化中は `disabled` でミュート表示 + "coming soon" tooltip。collapsed 時は StatusDot の下に縦並びで残る。
 
 #### Health status の定義
 
@@ -169,29 +178,26 @@ Sidebar 最下部。
 
 ---
 
-## 3. Top Bar
+## 3. Mobile Top Bar
+
+Mobile（< 640px）のみ表示されるスリムなバー（高さ 44px）。
 
 ```
-┌─ Top Bar ────────────────────────────────────────────┐
-│ [🔍 ⌘K Search…]  [Chat][Sleep][Pulse][Metrics][⚙]   │
-│                                       [● 3/3 ch]     │
-└──────────────────────────────────────────────────────┘
+┌─ Top Bar ────────────────────────────────┐
+│ [☰]  [Chat ▼]            ●  [🔍]         │
+└──────────────────────────────────────────┘
 ```
 
-### 3.1 Command Palette Trigger
+| 要素 | 動作 |
+|---|---|
+| hamburger `[☰]` | Sidebar overlay の開閉。`aria-expanded` で状態を持つ |
+| tab select | ドロップダウンで5タブへ遷移。無効タブは選択不可 |
+| StatusDot | Runtime health の簡易表示 |
+| palette `[🔍]` | Command Palette を開く |
 
-- 左端に検索アイコン + プレースホルダー "Search or jump…"
-- クリックまたは `Cmd+K` / `Ctrl+K` で palette 開く（[command-palette.md](./command-palette.md)）
-- 見た目は secondary button 相だが、右端にキーボードショートカット表示を伴う
+Desktop では Top Bar はレンダリングされない。
 
-### 3.2 Tabs
-
-- 5つのタブ（Chat / Sleep / Pulse / Metrics / Config）を常時表示
-- 現在位置は `aria-current="page"` で示す
-- アクティブタブは下線アクセント色、非アクティブは muted
-- Tab click で URL 遷移
-
-#### URL 構造
+### 3.1 タブと URL 構造
 
 | タブ | URL | agent スコープ |
 |---|---|---|
@@ -202,12 +208,6 @@ Sidebar 最下部。
 | Config | `/config` | global |
 
 Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped）。Metrics / Config はグローバルで、Sidebar の agent 選択の影響を受けない。
-
-### 3.3 Health Badge
-
-- 通常時：success トーン、"3/3 channels · 2 MCP" のような簡易表示
-- 異常時：warning / danger トーン、`recent_errors_count > 0` なら数値表示
-- click → Metrics タブへ遷移
 
 ---
 
@@ -223,14 +223,13 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
 
 ### 4.2 Desktop (`lg`)
 
-- Sidebar：常時表示、216px 固定
-- Top Bar：全タブ + palette + health badge を1行に表示
-- Chat：timeline / tool cards / composer すべて標準レイアウト
+- Sidebar：常時表示、216px 固定。Nav（運用4タブ）/ Search / New Session / Config utility を含む
+- Top Bar：なし
+- Chat：timeline / composer のみで構成され、チャットが縦領域をすべて使う
 
 ### 4.3 Tablet (`md`)
 
-- Sidebar：216px、可能なら常時表示
-- Top Bar：tab label を短縮（アイコンのみまたは略称）、label は tooltip で補完
+- Sidebar：216px、常時表示
 - Sleep / Pulse diff：unified をデフォルトに（split は選択可能）
 
 ### 4.4 Mobile (`sm`)
@@ -239,11 +238,7 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
   - overlay 時：固定配置、左からスライドイン（slow motion）
   - backdrop：暗い半透明、タップで閉じる
   - 開閉状態は ephemeral state（URL には乗せない）
-- Top Bar：
-  - hamburger ボタンを左端に表示
-  - tabs は Chat / Sleep / Pulse の3つのみ表示。Metrics / Config は右端の `⋯`（オーバーフロー）メニューへ格納
-  - palette trigger はアイコンのみ
-  - health badge は StatusDot のみ（詳細数字省略）
+- Top Bar：高さ 44px のスリムバー（§3）
 - Chat：
   - message bubble の最大幅を 90% に拡大
   - composer：toolbar 上部、textarea は2行表示（展開で4行）
@@ -255,7 +250,7 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
 
 | 画面サイズ | デフォルト状態 | 開閉トリガ |
 |---|---|---|
-| desktop (`lg`) | 常時 open | 閉じる手段なし |
+| desktop (`lg`) | 常時 open | collapse ボタンで icon-only 化 |
 | tablet / mobile | closed | hamburger tap で open、backdrop tap / item tap / ESC / route 変更 で close |
 
 ---

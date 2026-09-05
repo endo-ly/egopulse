@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, type KeyboardEvent } from "react";
 import type { TabId } from "../navigation";
-import type { AgentEntry, SessionEntry } from "../../shared/api/types";
+import type { AgentEntry, ChatMessage, SessionEntry } from "../../shared/api/types";
 import { buildPaletteItems, type PaletteItem } from "./buildPaletteItems";
 
 export interface CommandPaletteProps {
@@ -9,11 +9,14 @@ export interface CommandPaletteProps {
   agents: AgentEntry[];
   sessions: SessionEntry[];
   selectedAgent: string;
+  /** Messages of the active chat session, searchable and jumpable. */
+  messages?: ChatMessage[];
   onNavigate: (tab: TabId) => void;
   onSelectAgent: (id: string) => void;
   onSelectSession: (key: string) => void;
   onNewSession: () => void;
   onRefresh: () => void;
+  onJumpToMessage?: (index: number) => void;
 }
 
 export function CommandPalette({
@@ -22,11 +25,13 @@ export function CommandPalette({
   agents,
   sessions,
   selectedAgent,
+  messages = [],
   onNavigate,
   onSelectAgent,
   onSelectSession,
   onNewSession,
   onRefresh,
+  onJumpToMessage = () => {},
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
@@ -62,6 +67,8 @@ export function CommandPalette({
     agents,
     sessions,
     selectedAgent,
+    query,
+    messages,
     actions: {
       close: onClose,
       navigate: onNavigate,
@@ -69,6 +76,7 @@ export function CommandPalette({
       selectSession: onSelectSession,
       newSession: onNewSession,
       refresh: onRefresh,
+      jumpToMessage: onJumpToMessage,
     },
   });
 

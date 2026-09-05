@@ -45,9 +45,9 @@ describe("Timeline", () => {
     expect(tl.scrollTop).toBe(2000);
   });
 
-  it("timeline_highlights_active_search_match", () => {
+  it("timeline_highlights_requested_jump_target", () => {
     const { container } = render(
-      <Timeline searchMatches={[1]} activeMatchIndex={0}>
+      <Timeline jumpRequest={{ index: 1, seq: 1 }}>
         <div>first message</div>
         <div>second message</div>
       </Timeline>,
