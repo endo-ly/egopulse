@@ -6,12 +6,14 @@ WebUI 全体で共有するデザイントークンと、状態を持たない�
 
 ### 1.1 Surfaces
 
+サーフェスは無彩色（ニュートラルグレー）で統一し、長文読解の可読性を優先する。青の個性はアクセント系（§1.3）に持たせる。
+
 | 名称 | 色 | 用途 |
 |---|---|---|
-| `bg` | `#040812` | 最下層の背景。body 全体 |
-| `panel` | `#081020` | Sidebar・Card・Modal の表面 |
-| `panel-2` | `#0e1830` | panel 内の埋め込み要素（badge・code block 等の地面） |
-| `panel-hover` | `#142244` | hover 可能な panel 系要素の hover 色 |
+| `bg` | `#141416` | 最下層の背景。body 全体 |
+| `panel` | `#1a1a1e` | Sidebar・Card・Modal の表面 |
+| `panel-2` | `#232328` | panel 内の埋め込み要素（badge・code block 等の地面） |
+| `panel-hover` | `#2c2c33` | hover 可能な panel 系要素の hover 色 |
 
 ### 1.2 Text
 
@@ -45,7 +47,7 @@ WebUI 全体で共有するデザイントークンと、状態を持たない�
 
 | 名称 | 色 |
 |---|---|
-| `accent-2-soft` | `rgba(192, 132, 252, 0.08)` |
+| `accent-10` | `rgba(0, 212, 255, 0.1)` |
 | `danger-soft` | `rgba(248, 113, 113, 0.08)` |
 | `success-soft` | `rgba(92, 234, 255, 0.08)` |
 | `warning-soft` | `rgba(251, 191, 36, 0.08)` |

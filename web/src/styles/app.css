@@ -1291,7 +1291,14 @@
   }
 
   .bubble-user .message-body {
-    background: var(--color-accent-2-soft);
+    /* Deep cyan bubble; #155e75 keeps white-text contrast above AA (7:1). */
+    background: #155e75;
+    color: #ffffff;
+  }
+
+  .bubble-user .message-body a {
+    color: #ffffff;
+    text-decoration: underline;
   }
 
   /* Assistant messages render flat (no bubble) for a document-like flow. */

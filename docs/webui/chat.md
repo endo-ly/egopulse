@@ -91,7 +91,7 @@ Command Palette（`Cmd/Ctrl+K`）の Messages セクションから行う。
 
 | `sender_kind` | 配置 | 背景 | 備考 |
 |---|---|---|---|
-| `user` | 右寄せ | `accent-2-soft`（パープル系） | ユーザー入力 |
+| `user` | 右寄せ | 濃シアンソリッド | ユーザー入力 |
 | `assistant` | 中央 | なし（バブルなし・フラット表示） | LLM 応答・Pulse 通知 |
 | `system` | 中央（幅 60% 程度） | `panel-2` | システムメッセージ |
 
