@@ -665,7 +665,8 @@
 @layer components {
   .chat-tab {
     display: grid;
-    grid-template-rows: 1fr auto;
+    grid-template-rows: 1fr;
+    position: relative;
     height: 100%;
     overflow: hidden;
   }
@@ -673,7 +674,7 @@
   .timeline {
     overflow-y: auto;
     overflow-x: hidden;
-    padding: var(--space-lg);
+    padding: var(--space-lg) var(--space-lg) 150px;
     display: flex;
     flex-direction: column;
     gap: var(--space-lg);
@@ -690,7 +691,7 @@
 
   .jump-to-latest {
     position: sticky;
-    bottom: var(--space-base);
+    bottom: 150px;
     align-self: center;
     padding: var(--space-sm) var(--space-base);
     background: var(--color-panel-hover);
@@ -718,19 +719,33 @@
   }
 
   .composer {
-    padding: var(--space-sm) var(--space-lg);
-    background: var(--color-panel-80);
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    justify-content: center;
+    padding: var(--space-sm) var(--space-lg) var(--space-lg);
+    background: transparent;
+    pointer-events: none;
+  }
+
+  .composer-input-wrapper,
+  .readonly-banner {
+    width: min(640px, 100%);
+    pointer-events: auto;
   }
 
   .composer-input-wrapper {
     position: relative;
     display: flex;
-    align-items: flex-end;
+    align-items: center;
     gap: var(--space-sm);
     background: var(--color-panel-2);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
-    padding: var(--space-sm) var(--space-sm) var(--space-sm) var(--space-md);
+    padding: var(--space-xs) var(--space-xs) var(--space-xs) var(--space-md);
+    box-shadow: var(--shadow-card);
   }
 
   .composer-input-wrapper:focus-within {
@@ -739,15 +754,17 @@
 
   .composer-textarea {
     flex: 1;
+    box-sizing: border-box;
     background: none;
     border: none;
     outline: none;
     resize: none;
+    overflow-y: auto;
     color: var(--color-text);
     font-size: var(--text-base);
     font-family: inherit;
     line-height: 1.5;
-    padding: var(--space-sm) 0;
+    padding: var(--space-xs) 0;
     max-height: 200px;
   }
 
@@ -757,10 +774,10 @@
 
   .composer-send {
     flex-shrink: 0;
-    padding: var(--space-sm) var(--space-base);
-    border-radius: var(--radius-lg);
-    font-size: var(--text-sm);
-    font-weight: 500;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border-radius: var(--radius-full);
   }
 
   .command-suggest {
