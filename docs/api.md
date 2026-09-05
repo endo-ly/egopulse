@@ -345,7 +345,7 @@ Content-Type: application/json
 
 ### 2.9 Sleep Batch
 
-Sleep Batch の実行履歴とメモリ変更差分を確認するためのエンドポイント。
+Sleep Batch の実行履歴・ステップ結果・メモリ変更差分・現在の長期記憶を確認するためのエンドポイント。
 
 #### Agent 一覧
 
@@ -353,29 +353,30 @@ Sleep Batch の実行履歴とメモリ変更差分を確認するためのエ�
 GET /api/agents
 ```
 
-Sleep Batch 実行履歴がある agent ID の一覧を返す（`ok: true`, `agents: [id, ...]`）。
+設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, active}, ...]`）。
 
 ---
 
 #### Sleep Run 一覧
 
 ```text
-GET /api/sleep/runs?agent_id={agent_id}&limit={limit}
+GET /api/sleep/runs?agent_id={agent_id}&limit={limit}&offset={offset}
 ```
 
 ##### クエリパラメータ
 
 | パラメータ | 必須 | デフォルト | 説明 |
 |-----------|:---:|----------|------|
-| `agent_id` | 必須 | — | エージェント ID |
+| `agent_id` | 任意 | — | エージェント ID。省略時は全 agent |
 | `limit` | 任意 | `20` | 最大取得件数 |
+| `offset` | 任意 | `0` | スキップ件数（ページング用） |
 
-レスポンスの `runs` 配列の各要素: `id`, `agent_id`, `status`, `trigger_type`, `started_at`, `finished_at`, `input_tokens`, `output_tokens`, `session_count`。
+レスポンスの `runs` 配列は `started_at` 降順。各要素のフィールド: `id`, `agent_id`, `status`, `trigger`, `started_at`, `finished_at`, `source_chats_json`, `source_digest_md`, `input_tokens`, `output_tokens`, `total_tokens`, `error_message`, `session_count`。
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `status` | `string` | `running`, `success`, `partial_failure`, `failed`, `skipped` |
-| `trigger_type` | `string` | `manual`, `scheduled`, `backfill` |
+| `trigger` | `string` | `manual`, `scheduled`, `backfill` |
 | `session_count` | `number` | `source_chats_json` から算出した対象セッション数 |
 
 ---
@@ -388,8 +389,34 @@ GET /api/sleep/runs/{run_id}
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
-| `run` | `object` | sleep_runs テーブルの内容 |
-| `snapshots` | `array` | この run で変更された memory_snapshots（`content_before` ≠ `content_after` のもの）。ファイルは `episodic`, `semantic`, `prospective` |
+| `run` | `object` | sleep_runs テーブルの内容（一覧の各要素と同じ項目） |
+| `snapshots` | `array` | この run の memory_snapshots。確定済み run は `episodic`, `semantic`, `prospective` の3件フルセット（変更のないファイルは `content_before` = `content_after` で含まれる） |
+| `steps` | `array` | この run のステップ実行結果。パイプライン順にソート済み |
+
+`steps` の各要素: `step`, `status`, `started_at`, `finished_at`, `input_tokens`, `output_tokens`, `error_message`。
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `step` | `string` | `event_extraction`, `episodic_update`, `semantic_update`, `prospective_update` |
+| `status` | `string` | `pending`, `running`, `success`, `failed`, `skipped` |
+
+---
+
+#### Agent 長期記憶
+
+```text
+GET /api/agents/{agent_id}/memory
+```
+
+agent の現在の公開済み長期記憶3ファイルの内容を返す。
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `memory.episodic` | `string` | `episodic.md` の内容（未作成・空は空文字） |
+| `memory.semantic` | `string` | `semantic.md` の内容 |
+| `memory.prospective` | `string` | `prospective.md` の内容 |
+
+`agent_id` が不正な場合（パストラバーサル等）は `400` を返す。
 
 ---
 

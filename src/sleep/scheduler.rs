@@ -569,7 +569,10 @@ mod tests {
 
         run_scheduled_cycle(Arc::clone(&state)).await;
 
-        let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
+        let runs = state
+            .db
+            .list_sleep_runs("default", 10, 0)
+            .expect("list runs");
         let scheduled_runs: Vec<_> = runs
             .iter()
             .filter(|r| r.trigger == SleepRunTrigger::Scheduled)
@@ -592,7 +595,10 @@ mod tests {
 
         state.active_turns.end_turn("default");
 
-        let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
+        let runs = state
+            .db
+            .list_sleep_runs("default", 10, 0)
+            .expect("list runs");
         assert!(runs.is_empty());
     }
 
@@ -606,7 +612,10 @@ mod tests {
 
         run_scheduled_cycle(Arc::clone(&state)).await;
 
-        let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
+        let runs = state
+            .db
+            .list_sleep_runs("default", 10, 0)
+            .expect("list runs");
         assert!(runs.is_empty());
     }
 
@@ -626,7 +635,10 @@ mod tests {
 
         run_scheduled_cycle(Arc::clone(&state)).await;
 
-        let runs = state.db.list_sleep_runs("default", 10).expect("list runs");
+        let runs = state
+            .db
+            .list_sleep_runs("default", 10, 0)
+            .expect("list runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, SleepRunTrigger::Manual);
 
