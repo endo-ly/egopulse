@@ -5,7 +5,7 @@ WebUI の全体レイアウト、Sidebar の構造、レスポンシブ挙動を
 ## 1. 全体構造
 
 ```
-┌─ Sidebar (188px) ──┬─ Main ──────────────────────────────────┐
+┌─ Sidebar (200px) ──┬─ Main ──────────────────────────────────┐
 │                    │                                          │
 │ ◆ EgoPulse      [🔍][<]│  選択タブ + 選択 agent のコンテンツ      │
 │ [💬][🌙][◌][◔]     │                                          │
@@ -50,7 +50,7 @@ Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の
 
 | 状態 | 幅 | 表示内容 |
 |---|---|---|
-| expanded（デフォルト） | 188px (desktop / tablet) | 全要素表示 |
+| expanded（デフォルト） | 200px (desktop / tablet) | 全要素表示 |
 | collapsed | 48px | ブランドマーク「E」・nav（縦並びアイコンのみ）・Config 歯車・Runtime Status StatusDot。ラベル・セッション一覧・Search・New Session は非表示 |
 
 - 畳み込み状態は URL query (`?sidebar=collapsed`) で永続化し、リロード後も維持
@@ -196,6 +196,8 @@ Mobile（< 640px）のみ表示されるスリムなバー（高さ 44px）。
 
 タブ切替は Sidebar overlay の Nav に一任する（Top Bar にタブセレクタは置かない）。
 
+Sidebar は hamburger 以外にスワイプジェスチャーでも開閉できる。右方向へのフリックで open、左方向へのフリックで close（開始位置は画面内どこでもよい。左端は iOS/Android の戻るジェスチャーと競合するため特別扱いしない）。縦スクロールと誤動作しないよう、水平移動が垂直移動を上回る場合のみ判定する。
+
 Desktop では Top Bar はレンダリングされない。
 
 ### 3.1 タブと URL 構造
@@ -224,21 +226,21 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
 
 ### 4.2 Desktop (`lg`)
 
-- Sidebar：常時表示、188px 固定。Nav（運用4タブ）/ Search / New Session / Config utility を含む
+- Sidebar：常時表示、200px 固定。Nav（運用4タブ）/ Search / New Session / Config utility を含む
 - Top Bar：なし
 - Chat：timeline / composer のみで構成され、チャットが縦領域をすべて使う
 - Sleep：2 ペイン（run 一覧 + 詳細）。diff は split をデフォルトに
 
 ### 4.3 Tablet (`md`)
 
-- Sidebar：188px、常時表示
+- Sidebar：200px、常時表示
 - Sleep：1 ペイン。run 一覧が全幅で表示され、run 選択で詳細へ切替（`←` で戻る）。768-1023px は詳細が全幅でも meta×steps は 2 カラムを維持
 - Sleep / Pulse diff：unified をデフォルトに（split は選択可能）
 
 ### 4.4 Mobile (`sm`)
 
 - Sidebar：非表示、hamburger ボタンで overlay 表示
-  - overlay 時：固定配置（幅は desktop と同一の 188px）、左からスライドイン（slow motion）
+  - overlay 時：固定配置（幅は desktop と同一の 200px）、左からスライドイン（slow motion）
   - backdrop：暗い半透明、タップで閉じる
   - 開閉状態は ephemeral state（URL には乗せない）
 - Top Bar：高さ 44px のスリムバー（§3）
@@ -254,7 +256,7 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
 | 画面サイズ | デフォルト状態 | 開閉トリガ |
 |---|---|---|
 | desktop (`lg`) | 常時 open | collapse ボタンで icon-only 化 |
-| tablet / mobile | closed | hamburger tap で open、backdrop tap / item tap / ESC / route 変更 で close |
+| tablet / mobile | closed | hamburger tap / 右スワイプ で open、backdrop tap / item tap / ESC / route 変更 / 左スワイプ で close |
 
 ---
 

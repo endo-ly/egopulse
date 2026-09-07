@@ -38,7 +38,7 @@
 
   .app-shell {
     display: grid;
-    grid-template-columns: 188px 1fr;
+    grid-template-columns: 200px 1fr;
     grid-template-rows: 1fr;
     grid-template-areas:
       "sidebar main";
@@ -573,7 +573,7 @@
       top: 0;
       left: 0;
       bottom: 0;
-      width: 188px;
+      width: 200px;
       max-width: 80vw;
       z-index: 900;
       transform: translateX(-100%);
@@ -666,9 +666,12 @@
   }
 
   .jump-to-latest {
-    position: sticky;
-    bottom: 150px;
-    align-self: center;
+    /* Pinned just above the composer (chat-tab is the positioned ancestor),
+       independent of scroll position. */
+    position: absolute;
+    bottom: 104px;
+    left: 50%;
+    transform: translateX(-50%);
     padding: var(--space-sm) var(--space-base);
     background: var(--color-panel-hover);
     border: 1px solid var(--color-border-strong);
