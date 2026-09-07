@@ -589,14 +589,28 @@ mod tests {
             .execute(json!({"to": "vega", "message": "same message"}), &ctx_b)
             .await;
 
-        let turns = accepted_turns(&state);
-        assert_eq!(turns.len(), 2, "two distinct tool calls -> two child turns");
-        assert_ne!(
-            turns[0].context.request_key, turns[1].context.request_key,
-            "distinct tool call IDs must yield distinct request keys"
+        // Assert on the durable rows themselves: the second submit's await
+        // points let the spawned executor advance the first turn's state, so a
+        // resumable-state scan is not a stable view of "how many turns exist".
+        let conn = state.db.get_conn().expect("conn");
+        let request_keys: Vec<String> = conn
+            .prepare("SELECT request_key FROM turn_runs ORDER BY request_key")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("collect");
+        assert_eq!(
+            request_keys.len(),
+            2,
+            "two distinct tool calls -> two child turns: {request_keys:?}"
         );
-        assert!(turns[0].context.request_key.contains("call-1"));
-        assert!(turns[1].context.request_key.contains("call-2"));
+        assert!(
+            request_keys[0] != request_keys[1]
+                && request_keys.iter().any(|key| key.contains("call-1"))
+                && request_keys.iter().any(|key| key.contains("call-2")),
+            "distinct tool call IDs must yield distinct request keys: {request_keys:?}"
+        );
     }
 
     #[tokio::test]
