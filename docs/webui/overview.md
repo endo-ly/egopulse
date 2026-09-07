@@ -54,7 +54,7 @@ Mobile では Sidebar に加えて hamburger・タブ選択・パレット起動
 | タブ | 内容 | 詳細 |
 |---|---|---|
 | **Chat** | 選択 agent との Web セッション、または他チャネルセッションの read-only 監査 | [chat.md](./chat.md) |
-| **Sleep** | Sleep Batch の実行履歴とメモリ差分の監査 | [sleep-batch.md](./sleep-batch.md) |
+| **Sleep** | Sleep Batch の実行履歴・ステップ結果・メモリ差分・長期記憶の監査 | [sleep-batch.md](./sleep-batch.md) |
 | **Pulse** | Pulse run の実行履歴と結果確認 | [pulse.md](./pulse.md) |
 | **Metrics** | ランタイムの健全性・ターン履歴・エラーリスト | [metrics.md](./metrics.md) |
 | **Config** | プロバイダー・Web サーバー・チャネル別オーバーライドの設定 | [config.md](./config.md) |
@@ -160,6 +160,7 @@ WS 上で配信される事象と UI 側の関心事の対応を以下に示す�
 |---|---|
 | デザイントークン・共通コンポーネント | [design-system.md](./design-system.md) |
 | 全体レイアウト（Sidebar / Mobile Top Bar / レスポンシブ） | [layout.md](./layout.md) |
+| PWA（ホーム画面アプリ化） | [pwa.md](./pwa.md) |
 | Chat タブ | [chat.md](./chat.md) |
 | Sleep Batch タブ | [sleep-batch.md](./sleep-batch.md) |
 | Pulse タブ | [pulse.md](./pulse.md) |

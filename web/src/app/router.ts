@@ -1,10 +1,16 @@
 import type { TabId } from "./navigation";
 
+export type SleepView = "runs" | "memory";
+
 export interface AppRoute {
   tab: TabId;
   agentId: string;
   /** URL 上に明示された session key。未指定 (自動選択に任せる) 場合は null */
   sessionKey: string | null;
+  /** Sleep タブのサブビュー。sleep 以外のタブでは常に "runs" */
+  sleepView: SleepView;
+  /** Sleep タブで選択中の run。未選択は null */
+  runId: string | null;
 }
 
 /** Agent-scoped tabs that live under /agents/:agentId */
@@ -17,6 +23,22 @@ const TAB_IDS: ReadonlySet<string> = new Set<string>([
   "config",
 ]);
 
+function routeFor(
+  tab: TabId,
+  agentId: string,
+  sessionKey: string | null = null,
+  sleepView: SleepView = "runs",
+  runId: string | null = null,
+): AppRoute {
+  return {
+    tab,
+    agentId,
+    sessionKey,
+    sleepView: tab === "sleep" ? sleepView : "runs",
+    runId: tab === "sleep" ? runId : null,
+  };
+}
+
 /**
  * Parses a pathname into an AppRoute following the URL structure defined in
  * docs/webui/layout.md §3.2. Returns null for paths that don't map to a view.
@@ -25,7 +47,7 @@ export function parseRoute(pathname: string): AppRoute | null {
   const segments = pathname.split("/").filter(Boolean);
 
   if (segments.length === 0) {
-    return { tab: "chat", agentId: "", sessionKey: null };
+    return routeFor("chat", "");
   }
 
   if (segments[0] === "agents") {
@@ -36,21 +58,27 @@ export function parseRoute(pathname: string): AppRoute | null {
     }
     if (scope === "chat") {
       if (segments.length === 3) {
-        return { tab: "chat", agentId, sessionKey: null };
+        return routeFor("chat", agentId);
       }
       if (segments.length === 5 && segments[3] === "s" && segments[4]) {
-        return { tab: "chat", agentId, sessionKey: segments[4] };
+        return routeFor("chat", agentId, segments[4]);
       }
       return null;
     }
     if (segments.length === 3) {
-      return { tab: "sleep", agentId, sessionKey: null };
+      return routeFor("sleep", agentId);
+    }
+    if (segments.length === 4 && segments[3] === "memory") {
+      return routeFor("sleep", agentId, null, "memory");
+    }
+    if (segments.length === 5 && segments[3] === "runs" && segments[4]) {
+      return routeFor("sleep", agentId, null, "runs", segments[4]);
     }
     return null;
   }
 
   if (segments.length === 1 && TAB_IDS.has(segments[0])) {
-    return { tab: segments[0] as TabId, agentId: "", sessionKey: null };
+    return routeFor(segments[0] as TabId, "");
   }
 
   return null;
@@ -67,10 +95,13 @@ export function buildRoutePath(route: AppRoute): string | null {
       return route.tab === "chat" && !route.sessionKey ? "/" : null;
     }
     const base = `/agents/${route.agentId}/${route.tab}`;
-    if (route.tab === "chat" && route.sessionKey) {
-      return `${base}/s/${route.sessionKey}`;
+    if (route.tab === "chat") {
+      return route.sessionKey ? `${base}/s/${route.sessionKey}` : base;
     }
-    return base;
+    if (route.sleepView === "memory") {
+      return `${base}/memory`;
+    }
+    return route.runId ? `${base}/runs/${route.runId}` : base;
   }
   return `/${route.tab}`;
 }

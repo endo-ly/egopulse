@@ -107,7 +107,9 @@
 
   .dot-live,
   .dot-idle,
-  .dot-error {
+  .dot-error,
+  .dot-success,
+  .dot-warning {
     display: inline-block;
     flex-shrink: 0;
     width: 8px;
@@ -127,6 +129,14 @@
 
   .dot-error {
     background: var(--color-danger);
+  }
+
+  .dot-success {
+    background: var(--color-success);
+  }
+
+  .dot-warning {
+    background: var(--color-warning);
   }
 
   @keyframes dot-pulse {

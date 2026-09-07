@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import { computeLineDiff } from "../../shared/lib/diff";
+import { useMediaQuery } from "../../shared/hooks/useMediaQuery";
 
 type DiffViewerProps = {
   before: string;
@@ -8,12 +9,16 @@ type DiffViewerProps = {
   fileName: string;
 };
 
+const MAX_VISIBLE_LINES = 500;
+
 export function DiffViewer({ before, after, fileName }: DiffViewerProps) {
-  const [mode, setMode] = useState<"split" | "unified">(() =>
-    typeof window !== "undefined" && window.innerWidth < 768 ? "unified" : "split",
-  );
+  const compactViewport = useMediaQuery("(max-width: 1023px)");
+  const [modeOverride, setModeOverride] = useState<"split" | "unified" | null>(null);
+  const mode = modeOverride ?? (compactViewport ? "unified" : "split");
 
   const lines = useMemo(() => computeLineDiff(before, after), [before, after]);
+  const [showAll, setShowAll] = useState(false);
+  const visibleLines = showAll ? lines : lines.slice(0, MAX_VISIBLE_LINES);
 
   if (before === after) {
     return <p className="diff-no-changes">No changes in {fileName}</p>;
@@ -21,18 +26,18 @@ export function DiffViewer({ before, after, fileName }: DiffViewerProps) {
 
   return (
     <div className="diff-container">
-      <div className="diff-toolbar">
+      <div className="diff-toolbar" role="group" aria-label="Diff mode">
         <button
           type="button"
           className={mode === "split" ? "diff-mode-active" : "diff-mode-button"}
-          onClick={() => setMode("split")}
+          onClick={() => setModeOverride("split")}
         >
           Split
         </button>
         <button
           type="button"
           className={mode === "unified" ? "diff-mode-active" : "diff-mode-button"}
-          onClick={() => setMode("unified")}
+          onClick={() => setModeOverride("unified")}
         >
           Unified
         </button>
@@ -42,23 +47,29 @@ export function DiffViewer({ before, after, fileName }: DiffViewerProps) {
         <div className="diff-split">
           <div className="diff-column">
             <div className="diff-column-header">Before</div>
-            {lines.map((line, i) => (
+            {visibleLines.map((line, i) => (
               <DiffLineSplit key={i} line={line} side="before" />
             ))}
           </div>
           <div className="diff-column">
             <div className="diff-column-header">After</div>
-            {lines.map((line, i) => (
+            {visibleLines.map((line, i) => (
               <DiffLineSplit key={i} line={line} side="after" />
             ))}
           </div>
         </div>
       ) : (
         <div className="diff-unified">
-          {lines.map((line, i) => (
+          {visibleLines.map((line, i) => (
             <DiffLineUnified key={i} line={line} />
           ))}
         </div>
+      )}
+
+      {lines.length > MAX_VISIBLE_LINES && !showAll && (
+        <button type="button" className="diff-show-all" onClick={() => setShowAll(true)}>
+          Show all {lines.length} lines
+        </button>
       )}
     </div>
   );

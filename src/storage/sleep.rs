@@ -394,6 +394,7 @@ impl Database {
         &self,
         agent_id: &str,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<SleepRun>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
@@ -403,14 +404,18 @@ impl Database {
              FROM sleep_runs
              WHERE agent_id = ?1
              ORDER BY started_at DESC, rowid DESC
-             LIMIT ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        stmt.query_map(params![agent_id, limit], row_to_sleep_run)?
+        stmt.query_map(params![agent_id, limit, offset], row_to_sleep_run)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
-    pub(crate) fn list_all_sleep_runs(&self, limit: i64) -> Result<Vec<SleepRun>, StorageError> {
+    pub(crate) fn list_all_sleep_runs(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SleepRun>, StorageError> {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
@@ -418,9 +423,9 @@ impl Database {
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs
              ORDER BY started_at DESC, rowid DESC
-             LIMIT ?1",
+             LIMIT ?1 OFFSET ?2",
         )?;
-        stmt.query_map(params![limit], row_to_sleep_run)?
+        stmt.query_map(params![limit, offset], row_to_sleep_run)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -712,13 +717,6 @@ impl Database {
     }
 
     /// Lists all steps for a sleep run, ordered by step_name.
-    ///
-    /// Only called from integration tests (sleep/orchestrator.rs) which verify
-    /// that sleep batch steps transitioned to the expected terminal states.
-    /// No runtime callers yet — gated with #[cfg(test)] to avoid dead_code
-    /// warnings in production builds.  Remove the gate when a runtime caller
-    /// is introduced.
-    #[cfg(test)]
     pub(crate) fn list_sleep_run_steps(
         &self,
         sleep_run_id: &str,
@@ -1431,7 +1429,7 @@ mod tests {
         let id_a3 = create_test_sleep_run(&db, "agent-a");
         let _id_b1 = create_test_sleep_run(&db, "agent-b");
 
-        let runs = db.list_sleep_runs("agent-a", 2).expect("list");
+        let runs = db.list_sleep_runs("agent-a", 2, 0).expect("list");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, id_a3);
         assert_eq!(runs[1].id, id_a2);
@@ -1445,7 +1443,7 @@ mod tests {
         let id_b = create_test_sleep_run(&db, "agent-b");
         let id_c = create_test_sleep_run(&db, "agent-c");
 
-        let runs = db.list_all_sleep_runs(10).expect("list all");
+        let runs = db.list_all_sleep_runs(10, 0).expect("list all");
         assert_eq!(runs.len(), 3);
 
         assert_eq!(runs[0].id, id_c);
@@ -1466,7 +1464,7 @@ mod tests {
         create_test_sleep_run(&db, "agent-d");
         create_test_sleep_run(&db, "agent-e");
 
-        let runs = db.list_all_sleep_runs(3).expect("list all");
+        let runs = db.list_all_sleep_runs(3, 0).expect("list all");
         assert_eq!(runs.len(), 3);
     }
 

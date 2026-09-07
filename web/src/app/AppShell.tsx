@@ -25,6 +25,7 @@ export interface AppProps {
 
 const noop = () => {};
 const MOBILE_QUERY = "(max-width: 639px)";
+const SWIPE_MIN_PX = 56;
 
 export function App({
   agents = [],
@@ -61,6 +62,30 @@ export function App({
     globalThis.addEventListener("keydown", handler);
     return () => globalThis.removeEventListener("keydown", handler);
   }, [onOpenPalette]);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    let startX = 0;
+    let startY = 0;
+    const onTouchStart = (event: TouchEvent) => {
+      const touch = event.touches[0];
+      startX = touch.clientX;
+      startY = touch.clientY;
+    };
+    const onTouchEnd = (event: TouchEvent) => {
+      const touch = event.changedTouches[0];
+      const dx = touch.clientX - startX;
+      const dy = touch.clientY - startY;
+      if (Math.abs(dx) < SWIPE_MIN_PX || Math.abs(dx) < Math.abs(dy)) return;
+      setUserOpened(dx > 0);
+    };
+    document.addEventListener("touchstart", onTouchStart, { passive: true });
+    document.addEventListener("touchend", onTouchEnd, { passive: true });
+    return () => {
+      document.removeEventListener("touchstart", onTouchStart);
+      document.removeEventListener("touchend", onTouchEnd);
+    };
+  }, [isMobile]);
 
   const toggleSidebarCollapse = () => {
     setSidebarCollapsed((prev) => {
@@ -123,8 +148,6 @@ export function App({
       {isMobile && (
         <header className="topbar">
           <MobileBar
-            activeTab={activeTab}
-            onTabChange={onTabChange}
             onOpenPalette={onOpenPalette}
             onToggleSidebar={toggleSidebar}
             sidebarOpen={sidebarOpen}

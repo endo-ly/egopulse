@@ -1,4 +1,4 @@
-export type StatusTone = "live" | "idle" | "error";
+export type StatusTone = "live" | "idle" | "error" | "success" | "warning";
 
 export interface StatusDotProps {
   tone: StatusTone;

@@ -6,7 +6,6 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: SlashCommand[] = [
   { name: "/reset", description: "Clear conversation history" },
   { name: "/compact", description: "Compact messages" },
-  { name: "/sleep", description: "Run sleep batch" },
   { name: "/help", description: "Show available commands" },
 ];
 

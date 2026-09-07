@@ -11,8 +11,6 @@ describe("MobileBar", () => {
     const onToggleSidebar = vi.fn();
     render(
       <MobileBar
-        activeTab="chat"
-        onTabChange={vi.fn()}
         onOpenPalette={vi.fn()}
         onToggleSidebar={onToggleSidebar}
         sidebarOpen={false}
@@ -24,34 +22,10 @@ describe("MobileBar", () => {
     expect(onToggleSidebar).toHaveBeenCalledTimes(1);
   });
 
-  it("tab_select_changes_active_tab", () => {
-    const onTabChange = vi.fn();
-    render(
-      <MobileBar
-        activeTab="chat"
-        onTabChange={onTabChange}
-        onOpenPalette={vi.fn()}
-        onToggleSidebar={vi.fn()}
-        sidebarOpen={false}
-        healthStatus="ok"
-      />,
-    );
-
-    fireEvent.change(screen.getByLabelText("Primary navigation"), {
-      target: { value: "sleep" },
-    });
-    expect(onTabChange).toHaveBeenCalledWith("sleep");
-
-    const pulseOption = screen.getByRole("option", { name: "Pulse" });
-    expect((pulseOption as HTMLOptionElement).disabled).toBe(true);
-  });
-
   it("palette_button_opens_command_palette", () => {
     const onOpenPalette = vi.fn();
     render(
       <MobileBar
-        activeTab="chat"
-        onTabChange={vi.fn()}
         onOpenPalette={onOpenPalette}
         onToggleSidebar={vi.fn()}
         sidebarOpen={false}
@@ -61,5 +35,18 @@ describe("MobileBar", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /open command palette/i }));
     expect(onOpenPalette).toHaveBeenCalledTimes(1);
+  });
+
+  it("has_no_primary_navigation_select", () => {
+    render(
+      <MobileBar
+        onOpenPalette={vi.fn()}
+        onToggleSidebar={vi.fn()}
+        sidebarOpen={false}
+        healthStatus="ok"
+      />,
+    );
+
+    expect(screen.queryByLabelText("Primary navigation")).toBeNull();
   });
 });

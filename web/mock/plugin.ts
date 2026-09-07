@@ -369,6 +369,278 @@ function historyFor(sessionKey: string) {
   return messages;
 }
 
+// Mirrors src/channels/web/sleep.rs: field names (`trigger`, `session_count`)
+// and value sets must stay in sync with the real backend.
+const SLEEP_RUNS = [
+  {
+    id: "run-20260704-lyre-manual",
+    agent_id: "lyre",
+    status: "success",
+    trigger: "manual",
+    started_at: "2026-07-04T03:00:00.000Z",
+    finished_at: "2026-07-04T03:04:12.000Z",
+    source_chats_json: '["web:web-chat", "discord:dev-discussion"]',
+    source_digest_md: "2 chats · 41 messages · 2026-07-03",
+    input_tokens: 18240,
+    output_tokens: 3120,
+    total_tokens: 21360,
+    error_message: null,
+    session_count: 2,
+  },
+  {
+    id: "run-20260703-lyre-scheduled",
+    agent_id: "lyre",
+    status: "partial_failure",
+    trigger: "scheduled",
+    started_at: "2026-07-03T03:00:00.000Z",
+    finished_at: "2026-07-03T03:05:47.000Z",
+    source_chats_json: '["web:web-chat"]',
+    source_digest_md: "1 chat · 18 messages · 2026-07-02",
+    input_tokens: 12480,
+    output_tokens: 1960,
+    total_tokens: 14440,
+    error_message: "semantic update failed: rate limited, retry later",
+    session_count: 1,
+  },
+  {
+    id: "run-20260703-ace-scheduled",
+    agent_id: "ace",
+    status: "failed",
+    trigger: "scheduled",
+    started_at: "2026-07-03T03:00:00.000Z",
+    finished_at: "2026-07-03T03:00:58.000Z",
+    source_chats_json: '["cli:morning-notes"]',
+    source_digest_md: "1 chat · 6 messages · 2026-07-02",
+    input_tokens: 3200,
+    output_tokens: 0,
+    total_tokens: 3200,
+    error_message: "event extraction failed: model timeout after 45s",
+    session_count: 1,
+  },
+  {
+    id: "run-20260704-lyre-running",
+    agent_id: "lyre",
+    status: "running",
+    trigger: "scheduled",
+    started_at: "2026-07-04T03:00:00.000Z",
+    finished_at: null,
+    source_chats_json: '["web:web-chat"]',
+    source_digest_md: "1 chat · 9 messages · 2026-07-04",
+    input_tokens: 5120,
+    output_tokens: 480,
+    total_tokens: 5600,
+    error_message: null,
+    session_count: 1,
+  },
+  {
+    id: "run-20260702-ace-backfill",
+    agent_id: "ace",
+    status: "success",
+    trigger: "backfill",
+    started_at: "2026-07-02T12:00:00.000Z",
+    finished_at: "2026-07-02T12:03:31.000Z",
+    source_chats_json: '["cli:morning-notes", "web:notes"]',
+    source_digest_md: "2 chats · 22 messages · 2026-07-01",
+    input_tokens: 9840,
+    output_tokens: 1740,
+    total_tokens: 11580,
+    error_message: null,
+    session_count: 2,
+  },
+  {
+    id: "run-20260702-lyre-skipped",
+    agent_id: "lyre",
+    status: "skipped",
+    trigger: "scheduled",
+    started_at: "2026-07-02T03:00:00.000Z",
+    finished_at: "2026-07-02T03:00:04.000Z",
+    source_chats_json: "[]",
+    source_digest_md: "no new messages since last run",
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    error_message: null,
+    session_count: 0,
+  },
+];
+
+const SLEEP_SNAPSHOTS: Record<string, Array<Record<string, unknown>>> = {
+  "run-20260704-lyre-manual": [
+    {
+      id: "snap-001-episodic",
+      run_id: "run-20260704-lyre-manual",
+      agent_id: "lyre",
+      file: "episodic",
+      content_before: [
+        "# Episodic memory",
+        "",
+        "## 2026-07-02",
+        "- ace と run-cards の配色について議論。",
+        "",
+        "## 2026-07-03",
+        "- 決定: チャットヘッダーを廃止し、全高を使う。",
+      ].join("\n"),
+      content_after: [
+        "# Episodic memory",
+        "",
+        "## 2026-07-02",
+        "- ace と run-cards の配色について議論。",
+        "",
+        "## 2026-07-03",
+        "- 決定: チャットヘッダーを廃止し、全高を使う。",
+        "- Markdown ショーケース確認: ツールカードの状態色を見直し。",
+        "",
+        "## 2026-07-04",
+        "- 決定: サイドバーナビは4列ミニタブバー。",
+      ].join("\n"),
+      created_at: "2026-07-04T03:02:10.000Z",
+    },
+    {
+      id: "snap-001-semantic",
+      run_id: "run-20260704-lyre-manual",
+      agent_id: "lyre",
+      file: "semantic",
+      content_before: [
+        "# Semantic memory",
+        "",
+        "- コンパクトで装飾の少ないUIを好む。",
+        "- プライマリカラー: シアン (#00d4ff)。",
+      ].join("\n"),
+      content_after: [
+        "# Semantic memory",
+        "",
+        "- コンパクトで装飾の少ないUIを好む。",
+        "- プライマリカラー: シアン (#00d4ff)。読みやすさ優先。",
+        "- サーフェスは無彩色、アクセントはシアン/パープル。",
+      ].join("\n"),
+      created_at: "2026-07-04T03:03:02.000Z",
+    },
+    {
+      id: "snap-001-prospective",
+      run_id: "run-20260704-lyre-manual",
+      agent_id: "lyre",
+      file: "prospective",
+      content_before: [
+        "# Prospective memory",
+        "",
+        "- [ ] Sleep 画面を改修する (mock 不足)。",
+      ].join("\n"),
+      content_after: [
+        "# Prospective memory",
+        "",
+        "- [x] Sleep 画面を改修する (mock 不足)。",
+        "- [ ] Config タブのプレースホルダを置き換える。",
+      ].join("\n"),
+      created_at: "2026-07-04T03:03:44.000Z",
+    },
+  ],
+  "run-20260703-lyre-scheduled": [
+    {
+      id: "snap-002-episodic",
+      run_id: "run-20260703-lyre-scheduled",
+      agent_id: "lyre",
+      file: "episodic",
+      content_before: [
+        "# Episodic memory",
+        "",
+        "## 2026-07-02",
+        "- ace と run-cards の配色について議論。",
+      ].join("\n"),
+      content_after: [
+        "# Episodic memory",
+        "",
+        "## 2026-07-02",
+        "- ace と run-cards の配色について議論。",
+        "",
+        "## 2026-07-03",
+        "- 決定: チャットヘッダーを廃止し、全高を使う。",
+      ].join("\n"),
+      created_at: "2026-07-03T03:02:40.000Z",
+    },
+  ],
+  "run-20260702-ace-backfill": [
+    {
+      id: "snap-005-semantic",
+      run_id: "run-20260702-ace-backfill",
+      agent_id: "ace",
+      file: "semantic",
+      content_before: [
+        "# Semantic memory",
+        "",
+        "- 朝はCLIメモ、夜はレビュー。",
+      ].join("\n"),
+      content_after: [
+        "# Semantic memory",
+        "",
+        "- 朝はCLIメモ、夜はレビュー。",
+        "- Backfill は安定稼働。エラー率に異常なし。",
+      ].join("\n"),
+      created_at: "2026-07-02T12:02:15.000Z",
+    },
+  ],
+};
+
+// Mirrors src/channels/web/sleep.rs: step names, statuses, and response shapes
+// must stay in sync with the real backend.
+const SLEEP_STEPS: Record<string, Array<Record<string, unknown>>> = {
+  "run-20260704-lyre-manual": [
+    { step: "event_extraction", status: "success", started_at: "2026-07-04T03:00:05.000Z", finished_at: "2026-07-04T03:01:40.000Z", input_tokens: 8200, output_tokens: 640, error_message: null },
+    { step: "episodic_update", status: "success", started_at: "2026-07-04T03:01:42.000Z", finished_at: "2026-07-04T03:02:30.000Z", input_tokens: 5400, output_tokens: 980, error_message: null },
+    { step: "semantic_update", status: "success", started_at: "2026-07-04T03:02:32.000Z", finished_at: "2026-07-04T03:03:50.000Z", input_tokens: 4640, output_tokens: 1500, error_message: null },
+  ],
+  "run-20260703-lyre-scheduled": [
+    { step: "event_extraction", status: "success", started_at: "2026-07-03T03:00:04.000Z", finished_at: "2026-07-03T03:01:10.000Z", input_tokens: 7100, output_tokens: 520, error_message: null },
+    { step: "episodic_update", status: "success", started_at: "2026-07-03T03:01:12.000Z", finished_at: "2026-07-03T03:02:00.000Z", input_tokens: 4300, output_tokens: 860, error_message: null },
+    { step: "semantic_update", status: "failed", started_at: "2026-07-03T03:02:02.000Z", finished_at: "2026-07-03T03:05:40.000Z", input_tokens: 1080, output_tokens: 580, error_message: "semantic update failed: rate limited, retry later" },
+    { step: "prospective_update", status: "skipped", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+  ],
+  "run-20260703-ace-scheduled": [
+    { step: "event_extraction", status: "failed", started_at: "2026-07-03T03:00:06.000Z", finished_at: "2026-07-03T03:00:51.000Z", input_tokens: 3200, output_tokens: 0, error_message: "event extraction failed: model timeout after 45s" },
+    { step: "episodic_update", status: "skipped", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+    { step: "semantic_update", status: "skipped", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+    { step: "prospective_update", status: "skipped", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+  ],
+  "run-20260704-lyre-running": [
+    { step: "event_extraction", status: "running", started_at: "2026-07-04T03:00:05.000Z", finished_at: null, input_tokens: 5120, output_tokens: 480, error_message: null },
+    { step: "episodic_update", status: "pending", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+    { step: "semantic_update", status: "pending", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+    { step: "prospective_update", status: "pending", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
+  ],
+};
+
+// Mirrors ~/.egopulse/agents/<id>/memory/*.md served by GET /api/agents/:id/memory.
+const AGENT_MEMORY: Record<string, Record<string, string>> = {
+  lyre: {
+    episodic: [
+      "# Episodic memory",
+      "",
+      "## 2026-07-04",
+      "- 決定: サイドバーナビは4列ミニタブバー。",
+      "- Markdown ショーケース確認: ツールカードの状態色を見直し。",
+      "",
+      "## 2026-07-03",
+      "- 決定: チャットヘッダーを廃止し、全高を使う。",
+    ].join("\n"),
+    semantic: [
+      "# Semantic memory",
+      "",
+      "- コンパクトで装飾の少ないUIを好む。",
+      "- プライマリカラー: シアン (#00d4ff)。読みやすさ優先。",
+      "- サーフェスは無彩色、アクセントはシアン/パープル。",
+    ].join("\n"),
+    prospective: [
+      "# Prospective memory",
+      "",
+      "- [ ] Config タブのプレースホルダを置き換える。",
+    ].join("\n"),
+  },
+  ace: {
+    episodic: "",
+    semantic: "# Semantic memory\n\n- 朝はCLIメモ、夜はレビュー。\n- Backfill は安定稼働。\n",
+    prospective: "",
+  },
+};
+
 export function mockApiPlugin(): Plugin | null {
   if (process.env.VITE_MOCK !== "1") return null;
 
@@ -400,7 +672,33 @@ export function mockApiPlugin(): Plugin | null {
           return sendJson(res, { ok: true, messages });
         }
         if (pathname === "/api/sleep/runs") {
-          return sendJson(res, { ok: true, runs: [] });
+          const agentId = parsed.searchParams.get("agent_id") ?? "";
+          const runs = SLEEP_RUNS.filter(
+            (run) => !agentId || run.agent_id === agentId,
+          ).sort((a, b) => b.started_at.localeCompare(a.started_at));
+          return sendJson(res, { ok: true, runs });
+        }
+        if (pathname.startsWith("/api/sleep/runs/")) {
+          const runId = decodeURIComponent(pathname.slice("/api/sleep/runs/".length));
+          const run = SLEEP_RUNS.find((candidate) => candidate.id === runId);
+          if (!run) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "not_found" });
+          }
+          return sendJson(res, {
+            ok: true,
+            run,
+            snapshots: SLEEP_SNAPSHOTS[runId] ?? [],
+            steps: SLEEP_STEPS[runId] ?? [],
+          });
+        }
+        const memoryMatch = pathname.match(/^\/api\/agents\/([^/]+)\/memory$/);
+        if (memoryMatch) {
+          const agentId = decodeURIComponent(memoryMatch[1]);
+          return sendJson(res, {
+            ok: true,
+            memory: AGENT_MEMORY[agentId] ?? { episodic: "", semantic: "", prospective: "" },
+          });
         }
 
         next();

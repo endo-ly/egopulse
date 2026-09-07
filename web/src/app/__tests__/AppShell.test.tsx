@@ -58,6 +58,61 @@ describe("App shell", () => {
     expect(container.querySelector(".sidebar")?.className).toContain("closed");
   });
 
+  it("mobile_swipe_from_edge_opens_and_swipe_back_closes_sidebar", () => {
+    mockViewport(true);
+    const { container } = render(<App />);
+
+    const sidebar = () => container.querySelector(".sidebar") as HTMLElement;
+
+    const swipe = (startX: number, endX: number) => {
+      fireEvent.touchStart(document, {
+        touches: [{ clientX: startX, clientY: 300 }],
+      });
+      fireEvent.touchEnd(document, {
+        changedTouches: [{ clientX: endX, clientY: 300 }],
+      });
+    };
+
+    swipe(10, 120);
+    expect(sidebar().className).toContain("open");
+
+    swipe(300, 160);
+    expect(sidebar().className).toContain("closed");
+  });
+
+  it("mobile_swipe_right_anywhere_opens_sidebar", () => {
+    mockViewport(true);
+    const { container } = render(<App />);
+
+    const swipe = (startX: number, endX: number, startY = 300, endY = 300) => {
+      fireEvent.touchStart(document, {
+        touches: [{ clientX: startX, clientY: startY }],
+      });
+      fireEvent.touchEnd(document, {
+        changedTouches: [{ clientX: endX, clientY: endY }],
+      });
+    };
+
+    swipe(200, 320);
+    expect(
+      (container.querySelector(".sidebar") as HTMLElement).className,
+    ).toContain("open");
+  });
+
+  it("mobile_vertical_scroll_does_not_toggle_sidebar", () => {
+    mockViewport(true);
+    const { container } = render(<App />);
+
+    fireEvent.touchStart(document, {
+      touches: [{ clientX: 200, clientY: 200 }],
+    });
+    fireEvent.touchEnd(document, {
+      changedTouches: [{ clientX: 280, clientY: 380 }],
+    });
+
+    expect(container.querySelector(".sidebar")?.className).toContain("closed");
+  });
+
   it("app_wires_sidebar_navigation_and_sections_together", () => {
     mockViewport(false);
     const onSelectAgent = vi.fn();

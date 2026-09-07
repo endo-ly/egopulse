@@ -353,6 +353,10 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/stream", get(stream::api_stream))
         .route("/api/agents", get(agents::list_agents))
+        .route(
+            "/api/agents/{agent_id}/memory",
+            get(sleep::get_agent_memory),
+        )
         .route("/api/sleep/runs", get(sleep::list_sleep_runs))
         .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
         .route("/api/status", get(health::status))

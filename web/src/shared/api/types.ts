@@ -36,7 +36,7 @@ export interface SleepRun {
   id: string;
   agent_id: string;
   status: string;
-  trigger_type: string;
+  trigger: string;
   started_at: string;
   finished_at: string | null;
   source_chats_json: string;
@@ -45,6 +45,23 @@ export interface SleepRun {
   output_tokens: number;
   total_tokens: number;
   error_message: string | null;
+  session_count: number;
+}
+
+export interface SleepRunStep {
+  step: string;
+  status: string;
+  started_at: string | null;
+  finished_at: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  error_message: string | null;
+}
+
+export interface SleepRunDetail {
+  run: SleepRun;
+  snapshots: MemorySnapshot[];
+  steps: SleepRunStep[];
 }
 
 export interface MemorySnapshot {
@@ -55,4 +72,10 @@ export interface MemorySnapshot {
   content_before: string;
   content_after: string;
   created_at: string;
+}
+
+export interface AgentMemory {
+  episodic: string;
+  semantic: string;
+  prospective: string;
 }
