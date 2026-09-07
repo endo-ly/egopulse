@@ -1,0 +1,15 @@
+{
+  "name": "EgoPulse",
+  "short_name": "EgoPulse",
+  "description": "Self-hosted AI agent runtime",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#141416",
+  "theme_color": "#141416",
+  "icons": [
+    { "src": "/pwa-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/pwa-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/pwa-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

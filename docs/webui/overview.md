@@ -160,6 +160,7 @@ WS 上で配信される事象と UI 側の関心事の対応を以下に示す�
 |---|---|
 | デザイントークン・共通コンポーネント | [design-system.md](./design-system.md) |
 | 全体レイアウト（Sidebar / Mobile Top Bar / レスポンシブ） | [layout.md](./layout.md) |
+| PWA（ホーム画面アプリ化） | [pwa.md](./pwa.md) |
 | Chat タブ | [chat.md](./chat.md) |
 | Sleep Batch タブ | [sleep-batch.md](./sleep-batch.md) |
 | Pulse タブ | [pulse.md](./pulse.md) |
