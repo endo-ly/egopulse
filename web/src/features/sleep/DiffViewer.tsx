@@ -12,7 +12,7 @@ type DiffViewerProps = {
 const MAX_VISIBLE_LINES = 500;
 
 export function DiffViewer({ before, after, fileName }: DiffViewerProps) {
-  const compactViewport = useMediaQuery("(max-width: 767px)");
+  const compactViewport = useMediaQuery("(max-width: 1023px)");
   const [modeOverride, setModeOverride] = useState<"split" | "unified" | null>(null);
   const mode = modeOverride ?? (compactViewport ? "unified" : "split");
 

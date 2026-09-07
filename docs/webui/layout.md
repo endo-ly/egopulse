@@ -5,7 +5,7 @@ WebUI の全体レイアウト、Sidebar の構造、レスポンシブ挙動を
 ## 1. 全体構造
 
 ```
-┌─ Sidebar (216px) ──┬─ Main ──────────────────────────────────┐
+┌─ Sidebar (188px) ──┬─ Main ──────────────────────────────────┐
 │                    │                                          │
 │ ◆ EgoPulse      [🔍][<]│  選択タブ + 選択 agent のコンテンツ      │
 │ [💬][🌙][◌][◔]     │                                          │
@@ -50,7 +50,7 @@ Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の
 
 | 状態 | 幅 | 表示内容 |
 |---|---|---|
-| expanded（デフォルト） | 216px (desktop / tablet) | 全要素表示 |
+| expanded（デフォルト） | 188px (desktop / tablet) | 全要素表示 |
 | collapsed | 48px | ブランドマーク「E」・nav（縦並びアイコンのみ）・Config 歯車・Runtime Status StatusDot。ラベル・セッション一覧・Search・New Session は非表示 |
 
 - 畳み込み状態は URL query (`?sidebar=collapsed`) で永続化し、リロード後も維持
@@ -184,16 +184,17 @@ Mobile（< 640px）のみ表示されるスリムなバー（高さ 44px）。
 
 ```
 ┌─ Top Bar ────────────────────────────────┐
-│ [☰]  [Chat ▼]            ●  [🔍]         │
+│ [☰]                        ●  [🔍]      │
 └──────────────────────────────────────────┘
 ```
 
 | 要素 | 動作 |
 |---|---|
 | hamburger `[☰]` | Sidebar overlay の開閉。`aria-expanded` で状態を持つ |
-| tab select | ドロップダウンで5タブへ遷移。無効タブは選択不可 |
 | StatusDot | Runtime health の簡易表示 |
 | palette `[🔍]` | Command Palette を開く |
+
+タブ切替は Sidebar overlay の Nav に一任する（Top Bar にタブセレクタは置かない）。
 
 Desktop では Top Bar はレンダリングされない。
 
@@ -223,26 +224,28 @@ Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped�
 
 ### 4.2 Desktop (`lg`)
 
-- Sidebar：常時表示、216px 固定。Nav（運用4タブ）/ Search / New Session / Config utility を含む
+- Sidebar：常時表示、188px 固定。Nav（運用4タブ）/ Search / New Session / Config utility を含む
 - Top Bar：なし
 - Chat：timeline / composer のみで構成され、チャットが縦領域をすべて使う
+- Sleep：2 ペイン（run 一覧 + 詳細）。diff は split をデフォルトに
 
 ### 4.3 Tablet (`md`)
 
-- Sidebar：216px、常時表示
+- Sidebar：188px、常時表示
+- Sleep：1 ペイン。run 一覧が全幅で表示され、run 選択で詳細へ切替（`←` で戻る）。768-1023px は詳細が全幅でも meta×steps は 2 カラムを維持
 - Sleep / Pulse diff：unified をデフォルトに（split は選択可能）
 
 ### 4.4 Mobile (`sm`)
 
 - Sidebar：非表示、hamburger ボタンで overlay 表示
-  - overlay 時：固定配置、左からスライドイン（slow motion）
+  - overlay 時：固定配置（幅は desktop と同一の 188px）、左からスライドイン（slow motion）
   - backdrop：暗い半透明、タップで閉じる
   - 開閉状態は ephemeral state（URL には乗せない）
 - Top Bar：高さ 44px のスリムバー（§3）
 - Chat：
-  - message bubble の最大幅を 90% に拡大
-  - composer：toolbar 上部、textarea は2行表示（展開で4行）
-  - tool card：常に collapsed、tap で展開
+  - timeline / composer の左右 padding を狭める
+  - composer の送信ボタンと hamburger のタッチターゲットを拡大
+- Sleep：1 ペイン + run 詳細の meta×steps を縦積み。run 選択で詳細が全画面に切替（`←` で戻る）
 - Sleep / Pulse diff：常に unified
 - Metrics：数値カードを2列 → 1列へ
 

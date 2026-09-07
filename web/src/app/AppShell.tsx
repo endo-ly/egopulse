@@ -123,8 +123,6 @@ export function App({
       {isMobile && (
         <header className="topbar">
           <MobileBar
-            activeTab={activeTab}
-            onTabChange={onTabChange}
             onOpenPalette={onOpenPalette}
             onToggleSidebar={toggleSidebar}
             sidebarOpen={sidebarOpen}

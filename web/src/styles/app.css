@@ -559,25 +559,6 @@
     color: var(--color-text);
   }
 
-  /* Mobile-only dropdown for primary navigation (see the mobile media query). */
-  .tab-select {
-    display: none;
-    min-height: 30px;
-    padding: 0 var(--space-md);
-    border: 1px solid var(--color-border);
-    border-radius: var(--radius-md);
-    background: var(--color-panel);
-    color: var(--color-text);
-    font-family: inherit;
-    font-size: var(--text-sm);
-    cursor: pointer;
-  }
-
-  .tab-select:focus-visible {
-    outline: 2px solid var(--color-accent);
-    outline-offset: 1px;
-  }
-
   @media (max-width: 639px) {
     .app-shell {
       grid-template-columns: 1fr;
@@ -592,7 +573,7 @@
       top: 0;
       left: 0;
       bottom: 0;
-      width: 216px;
+      width: 188px;
       max-width: 80vw;
       z-index: 900;
       transform: translateX(-100%);
@@ -607,10 +588,8 @@
       transform: translateX(-100%);
     }
 
-    .tab-select {
-      display: block;
-      flex: 1;
-      min-width: 0;
+    .hamburger-btn {
+      padding: var(--space-md);
     }
 
     .timeline,
@@ -623,51 +602,17 @@
       max-width: 100%;
     }
 
+    .composer-send {
+      width: 32px;
+      height: 32px;
+    }
+
     .palette-overlay {
       padding: var(--space-md);
     }
 
     .palette-panel {
       max-height: calc(100vh - var(--space-2xl));
-    }
-
-    .sleep-panel {
-      padding: var(--space-base);
-    }
-
-    .sleep-runs-layout {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .run-summary {
-      grid-template-columns: minmax(0, 1fr);
-    }
-
-    .run-meta {
-      border-right: 0;
-      padding-right: 0;
-    }
-
-    .sleep-runs-pane {
-      border-right: 0;
-      padding-right: 0;
-      overflow: visible;
-    }
-
-    .sleep-detail-pane {
-      overflow: visible;
-    }
-
-    .sleep-runs-layout[data-mobile-view="detail"] .sleep-runs-pane {
-      display: none;
-    }
-
-    .sleep-runs-layout[data-mobile-view="list"] .sleep-detail-pane {
-      display: none;
-    }
-
-    .run-detail-back {
-      display: inline-flex;
     }
   }
 
@@ -1574,6 +1519,49 @@
   .diff-no-changes {
     margin: 0;
     color: var(--color-muted);
+  }
+
+  /* Content-level breakpoints, independent of the shell's 639px drawer.
+     - <=1023px: sleep collapses to a single pane; run list/detail switching
+       is driven by data-mobile-view and DiffViewer defaults to unified mode.
+     - <=767px: run detail stacks meta above steps, and the inline back
+       button replaces the two-pane flow. */
+  @media (max-width: 1023px) {
+    .sleep-panel {
+      padding: var(--space-base);
+    }
+
+    .sleep-runs-layout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .sleep-runs-layout[data-mobile-view="detail"] .sleep-runs-pane {
+      display: none;
+    }
+
+    .sleep-runs-layout[data-mobile-view="list"] .sleep-detail-pane {
+      display: none;
+    }
+
+    .sleep-runs-pane {
+      border-right: 0;
+      padding-right: 0;
+    }
+
+    .run-detail-back {
+      display: inline-flex;
+    }
+  }
+
+  @media (max-width: 767px) {
+    .run-summary {
+      grid-template-columns: minmax(0, 1fr);
+    }
+
+    .run-meta {
+      border-right: 0;
+      padding-right: 0;
+    }
   }
 
   .bubble-user .message-body {

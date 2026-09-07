@@ -1,21 +1,15 @@
 import { StatusDot } from "../../shared/ui/StatusDot";
 import { healthTone, type HealthStatus } from "../runtimeStatus";
-import { NAV_TABS } from "../navigation";
-import type { TabId } from "../navigation";
 
 export interface MobileBarProps {
-  activeTab: TabId;
-  onTabChange: (tab: TabId) => void;
   onOpenPalette: () => void;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
   healthStatus: HealthStatus;
 }
 
-/** Slim mobile-only top bar: sidebar toggle, tab selector, palette trigger. */
+/** Slim mobile-only top bar: sidebar toggle, runtime health, palette trigger. */
 export function MobileBar({
-  activeTab,
-  onTabChange,
   onOpenPalette,
   onToggleSidebar,
   sidebarOpen,
@@ -45,18 +39,6 @@ export function MobileBar({
           <line x1="3" y1="18" x2="21" y2="18" />
         </svg>
       </button>
-      <select
-        className="tab-select"
-        aria-label="Primary navigation"
-        value={activeTab}
-        onChange={(e) => onTabChange(e.target.value as TabId)}
-      >
-        {NAV_TABS.map((tab) => (
-          <option key={tab.id} value={tab.id} disabled={tab.disabled}>
-            {tab.label}
-          </option>
-        ))}
-      </select>
       <div className="mobilebar-status">
         <StatusDot tone={healthTone(healthStatus)} />
       </div>
