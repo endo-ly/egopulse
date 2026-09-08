@@ -21,6 +21,9 @@ export interface AppProps {
   onOpenPalette?: () => void;
   onNewSession?: () => void;
   main?: ReactNode;
+  authToken?: string;
+  /** Called after an agent avatar upload/removal so lists can refresh. */
+  onAvatarChanged?: () => void;
 }
 
 const noop = () => {};
@@ -40,6 +43,8 @@ export function App({
   onOpenPalette = noop,
   onNewSession = noop,
   main,
+  authToken,
+  onAvatarChanged,
 }: AppProps) {
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [userOpened, setUserOpened] = useState(false);
@@ -125,6 +130,8 @@ export function App({
               agents={agents}
               selectedAgent={selectedAgent}
               onSelectAgent={onSelectAgent}
+              authToken={authToken}
+              onAvatarChanged={onAvatarChanged}
             />
           }
           sessions={

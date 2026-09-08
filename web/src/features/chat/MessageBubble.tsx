@@ -3,6 +3,8 @@ import { MarkdownRenderer } from "./MarkdownRenderer";
 
 export interface MessageBubbleProps {
   message: ChatMessage;
+  /** agent id → avatar object URL; assistant messages use it when present. */
+  agentAvatars?: Record<string, string>;
 }
 
 function senderLabel(message: ChatMessage): string {
@@ -29,15 +31,25 @@ function avatarLetter(message: ChatMessage): string {
   return (message.sender_id[0] ?? "?").toUpperCase();
 }
 
-export function MessageBubble({ message }: MessageBubbleProps) {
+export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
   const cls = `message-row bubble-${message.sender_kind}`;
   const isDraft =
     message.id.startsWith("draft:") && !message.id.endsWith(":done");
+  const avatarSrc =
+    message.sender_kind === "assistant"
+      ? agentAvatars?.[message.sender_id]
+      : undefined;
 
   return (
     <div className={cls}>
       <div className="message-header">
-        <div className="message-avatar">{avatarLetter(message)}</div>
+        <div className="message-avatar">
+          {avatarSrc ? (
+            <img src={avatarSrc} alt="" />
+          ) : (
+            avatarLetter(message)
+          )}
+        </div>
         <span className="message-sender">{senderLabel(message)}</span>
         <span
           className="message-time"

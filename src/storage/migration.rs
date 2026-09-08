@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 15;
+pub(super) const SCHEMA_VERSION: i64 = 16;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -954,6 +954,26 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         set_schema_version_in_tx(&tx, 15, "add turn_origins for durable terminal stop reason")?;
         tx.commit()?;
         version = 15;
+    }
+
+    if version < 16 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Per-agent avatar image shown in the WebUI (sidebar agent list and
+        // chat message avatars). The client resizes before upload, so the
+        // stored BLOB stays small; no server-side image processing.
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_avatars (
+                agent_id     TEXT PRIMARY KEY,
+                content_type TEXT NOT NULL,
+                image        BLOB NOT NULL,
+                updated_at   TEXT NOT NULL
+            );",
+        )?;
+
+        set_schema_version_in_tx(&tx, 16, "add agent_avatars for webui agent icons")?;
+        tx.commit()?;
+        version = 16;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");

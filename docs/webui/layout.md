@@ -79,11 +79,17 @@ Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の
 Sidebar の第1セクション。必ず表示する。
 
 - Section title（小テキスト・uppercase・muted）
-- agent 一覧：各 agent を1行に並べる。左端に StatusDot、続けて agent name、必要に応じてタグ（`default` 等）
+- agent 一覧：各 agent を1行に並べる。左端に StatusDot または agent アイコン、続けて agent name、必要に応じてタグ（`default` 等）
 - 行は枠線・背景を持たない。hover で背景ハイライト、選択中 agent はアクセント2色の背景チントで強調表示
 - StatusDot の色：
   - `live`（`active === true`、accent 色 + pulse アニメーション）：active turn 実行中
   - `idle`（`active === false`、muted-2 色）：待機中
+- **agent アイコン**：ユーザーがデバイスから画像をアップロードできる（[api.md §2.11](../api.md#211-agent-avatar)）
+  - アイコン設定済み：行左端に 24px 円形アイコンを表示し、StatusDot はその右下に小さく重ねる
+  - 未設定：従来どおり StatusDot のみ
+  - 行 hover で鉛筆ボタンを表示 → クリックでミニメニュー（`Upload image…` / アイコン設定済みのとき `Remove image`）。メニューは外部クリック / Escape で閉じる
+  - アップロード時はトリミングモーダル（react-easy-crop）が開き、円形プレビュー上で表示領域をドラッグ移動・ズームして選び、`Apply` で 256×256 にエンコードして PUT する
+  - チャットの assistant アバターにも同じアイコンが使われる（未設定時は頭文字）。詳細は [chat.md §4.2](./chat.md#42-avatar)
 
 #### Agent 一覧のデータソース
 

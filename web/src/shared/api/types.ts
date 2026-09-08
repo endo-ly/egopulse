@@ -3,6 +3,8 @@ export interface AgentEntry {
   label: string;
   is_default: boolean;
   active: boolean;
+  /** Cache-busted avatar URL; null when the agent has no uploaded image. */
+  avatar_url?: string | null;
 }
 
 export interface SessionEntry {

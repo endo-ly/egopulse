@@ -11,6 +11,7 @@ import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
 import { createSessionKey, fetchSessions } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
+import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
 import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
 import type { TabId } from "./navigation";
 
@@ -358,6 +359,8 @@ export function WebUI() {
     [activeTab, handleTabChange],
   );
 
+  const agentAvatars = useAgentAvatars(agents, authToken);
+
   const chatMain = (
     <ChatTab
       channel={channel}
@@ -366,6 +369,7 @@ export function WebUI() {
       onSend={handleSend}
       storageKey={selectedSession}
       jumpRequest={messageJump ?? undefined}
+      agentAvatars={agentAvatars}
     />
   );
 
@@ -383,6 +387,8 @@ export function WebUI() {
         onSelectSession={handleSelectSession}
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
+        authToken={authToken}
+        onAvatarChanged={() => invalidateQueries("agents")}
         main={
           activeTab === "chat" ? (
             <>

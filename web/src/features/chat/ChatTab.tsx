@@ -13,6 +13,8 @@ export interface ChatTabProps {
   storageKey?: string;
   /** Jump request from the command palette: scroll to and flash the message. */
   jumpRequest?: { index: number; seq: number };
+  /** agent id → avatar object URL; absent entries fall back to the letter. */
+  agentAvatars?: Record<string, string>;
 }
 
 function parseToolEvent(message: ChatMessage): ToolEventData | null {
@@ -50,6 +52,7 @@ export function ChatTab({
   onSend,
   storageKey,
   jumpRequest,
+  agentAvatars,
 }: ChatTabProps) {
   return (
     <div className="chat-tab">
@@ -63,7 +66,7 @@ export function ChatTab({
               </div>
             );
           }
-          return <MessageBubble key={m.id} message={m} />;
+          return <MessageBubble key={m.id} message={m} agentAvatars={agentAvatars} />;
         })}
       </Timeline>
       <div className="composer">

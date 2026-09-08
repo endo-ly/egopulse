@@ -104,10 +104,11 @@ Command Palette（`Cmd/Ctrl+K`）の Messages セクションから行う。
 
 ### 4.2 Avatar
 
-24×24 の円形アイコン。
+32×32 の円形アイコン。
 
-- `assistant` / `system` / `tool`：agent アイコン（設定されていれば `icon.png` の縮小、なければ汎用 AgentIcon）
-- `user`：UserIcon
+- `assistant`：agent アイコン（設定済みなら `/api/agents/{agent_id}/avatar` の画像。bearer auth のため `useAgentAvatars` フックが authorized fetch → object URL に変換して `<img>` に渡す）。未設定なら sender_id の頭文字
+- `user`：頭文字 `U`
+- `system` / `tool`：頭文字
 
 ### 4.3 Sender Label
 

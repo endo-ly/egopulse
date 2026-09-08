@@ -16,6 +16,7 @@ WebUI と外部 voice client が使用する REST API、および WebSocket の�
     - [Voice turn](#28-voice-turn)
     - [Sleep Batch](#29-sleep-batch)
     - [Webhook](#210-webhook)
+    - [Agent Avatar](#211-agent-avatar)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -353,7 +354,7 @@ Sleep Batch の実行履歴・ステップ結果・メモリ変更差分・現�
 GET /api/agents
 ```
 
-設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, active}, ...]`）。
+設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, active, avatar_url}, ...]`）。`avatar_url` はアイコン未設定時は `null`、設定済みなら `?v=` 付きのキャッシュバスティング URL。
 
 ---
 
@@ -468,6 +469,46 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 - 解決後 agent が `config.agents` に存在
 - 非 Web target の `target.thread` が空でない
 - Discord / Telegram target の `target.thread` が `channels.<channel>` の登録エントリに解決できること（数値として parse 可能・未登録 thread・channel map 欠落は拒否。`Normal` への降格なし）
+
+---
+
+### 2.11 Agent Avatar
+
+WebUI で表示する agent アイコン画像のアップロード・取得・削除。画像は `agent_avatars` テーブルに BLOB として保存される（[db.md](./db.md)）。表示箇所は Sidebar の Agents セクションとチャットの assistant アバター。
+
+クライアントは画像を 256×256 にリサイズしてから送信する。サーバー側の画像処理は行わない。
+
+#### アップロード
+
+```text
+PUT /api/agents/{agent_id}/avatar
+Authorization: Bearer <channels.web.auth_token>
+Content-Type: image/png | image/jpeg | image/webp
+<binary image bytes>
+```
+
+- 上限 1 MiB。超過は `413`、未対応 Content-Type は `415`、空 body は `400`、未知 agent は `404`
+- レスポンス: `{ "ok": true, "avatar_url": "/api/agents/{agent_id}/avatar?v=<updated_at>" }`
+- 上書きアップロード可。`updated_at` が行バージョンを兼ねる
+
+#### 取得
+
+```text
+GET /api/agents/{agent_id}/avatar
+```
+
+- 画像バイト列を `Content-Type` / `ETag`（updated_at）/ `Cache-Control: private, max-age=3600` 付きで返す
+- 未設定・未知 agent は `404`。UI は頭文字アバターへフォールバックする
+- `avatar_url` が `?v=` を持つため、URL を変えずにキャッシュを無効化できる
+
+#### 削除
+
+```text
+DELETE /api/agents/{agent_id}/avatar
+```
+
+- `{ "ok": true }` を返す。未設定でも成功する（冪等）
+- 削除後は `avatar_url: null` となり、UI は頭文字アバターへ戻る
 
 ---
 

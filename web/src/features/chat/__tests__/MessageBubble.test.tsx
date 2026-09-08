@@ -70,4 +70,39 @@ describe("MessageBubble", () => {
     const badge = container.querySelector(".pulse-badge");
     expect(badge).toBeTruthy();
   });
+
+  it("assistant_message_renders_agent_avatar_image_when_available", () => {
+    const { container } = render(
+      <MessageBubble
+        message={msg({ sender_id: "lyre" })}
+        agentAvatars={{ lyre: "blob:lyre-avatar" }}
+      />,
+    );
+    const avatar = container.querySelector(".message-avatar");
+    const img = avatar?.querySelector("img");
+    expect(img?.getAttribute("src")).toBe("blob:lyre-avatar");
+    // Letter fallback stays for agents without an avatar.
+    expect(avatar?.textContent).toBe("");
+  });
+
+  it("assistant_message_falls_back_to_letter_avatar_without_image", () => {
+    const { container } = render(
+      <MessageBubble message={msg({ sender_id: "lyre" })} agentAvatars={{}} />,
+    );
+    const avatar = container.querySelector(".message-avatar");
+    expect(avatar?.querySelector("img")).toBeNull();
+    expect(avatar?.textContent).toBe("L");
+  });
+
+  it("user_message_never_uses_agent_avatar", () => {
+    const { container } = render(
+      <MessageBubble
+        message={msg({ sender_kind: "user", sender_id: "human" })}
+        agentAvatars={{ human: "blob:human-avatar" }}
+      />,
+    );
+    const avatar = container.querySelector(".message-avatar");
+    expect(avatar?.querySelector("img")).toBeNull();
+    expect(avatar?.textContent).toBe("U");
+  });
 });

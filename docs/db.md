@@ -32,7 +32,8 @@ egopulse.db (SQLite / WAL mode) — ConversationScope::Normal のストレージ
 ├── episode_rollups          — エピソード記憶の週次/月次派生要約（Call2 で生成）
 ├── memory_snapshots         — スリープ実行中のメモリファイル更新履歴（run×file log）
 ├── turn_runs                — Turn実行状態機械（durable turn lifecycle）
-└── turn_origins             — origin（人間入力の chain）ごとの実行 turn 数・終端理由
+├── turn_origins             — origin（人間入力の chain）ごとの実行 turn 数・終端理由
+└── agent_avatars            — WebUI 用 agent アイコン画像（BLOB）
 ```
 
 | 項目 | 値 |
@@ -637,6 +638,23 @@ origin（人間入力の chain）の実行状態の正本。chain が停止条�
 
 ---
 
+### agent_avatars
+
+WebUI で表示する agent アイコン画像。ユーザーがデバイスからアップロードし、クライアント側で 256×256 にリサイズしたものを保存する。サーバー側の画像処理は行わない。`GET /api/agents/{agent_id}/avatar` 経由で配信される（[api.md §2.11](./api.md#211-agent-avatar)）。
+
+| カラム | 型 | 制約 | 説明 |
+|--------|----|------|------|
+| agent_id | TEXT | PK | agent 識別子（小文字正規化済み） |
+| content_type | TEXT | NOT NULL | `image/png` / `image/jpeg` / `image/webp` のみ |
+| image | BLOB | NOT NULL | 画像バイト列（上限 1 MiB） |
+| updated_at | TEXT | NOT NULL | 最終更新時刻。行バージョンを兼ね、ETag と `avatar_url` のキャッシュバスティングに使用 |
+
+**設計ポイント**:
+- agent は config YAML 由来のため、config から削除された agent の行は残存する（無害。list API は config 上の agent のみを返す）
+- アップロードは upsert、削除は物理 DELETE。再アップロードで row version が更新される
+
+---
+
 ### db_meta
 
 スキーマバージョンの key-value ストア。現在は `schema_version` のみ格納。
@@ -709,7 +727,7 @@ origin（人間入力の chain）の実行状態の正本。chain が停止条�
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `15`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `16`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
@@ -720,7 +738,7 @@ origin（人間入力の chain）の実行状態の正本。chain が停止条�
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
 5. `set_schema_version(conn, 6, "description")` または transaction 用 helper を呼び出し
 
-> **Note**: 現行のコードラインでは v1 から v15 までを順に適用する。以下は主要なマイグレーションの履歴。
+> **Note**: 現行のコードラインでは v1 から v16 までを順に適用する。以下は主要なマイグレーションの履歴。
 
 #### v3: add episode_events table + 4 indexes
 
@@ -758,6 +776,10 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 #### v15: turn_origins table
 
 `turn_origins` 表を新設し、origin（人間入力の chain）ごとの実行 turn 数・terminal stop reason・更新日時を永続化する。chain が停止条件（LLM failure / chain depth / turn count / invalid agent）に到達した際、その理由を durably 記録し、再起動後に `TurnTracker` が rehydrate することで終了した chain の再実行を防ぐ。Normal / Secret 両 DB に適用する。
+
+#### v16: agent_avatars table
+
+`agent_avatars` 表を新設し、WebUI 表示用の agent アイコン画像（BLOB）を保存する。詳細は [§2](#2-テーブル定義) の `agent_avatars` を参照。
 
 ### 外部キー制約が最小限
 

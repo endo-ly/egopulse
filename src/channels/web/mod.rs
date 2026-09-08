@@ -372,6 +372,12 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/stream", get(stream::api_stream))
         .route("/api/agents", get(agents::list_agents))
         .route(
+            "/api/agents/{agent_id}/avatar",
+            get(agents::get_agent_avatar)
+                .put(agents::put_agent_avatar)
+                .delete(agents::delete_agent_avatar),
+        )
+        .route(
             "/api/agents/{agent_id}/memory",
             get(sleep::get_agent_memory),
         )
