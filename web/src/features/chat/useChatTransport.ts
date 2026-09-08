@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   initialChatState,
   reduceChatEvent,
+  reduceDiscardOptimisticUserMessage,
+  reduceOptimisticUserMessage,
   reduceUserInput,
   reduceToolResult,
   reduceToolStart,
@@ -131,6 +133,14 @@ export function useChatTransport({
         return;
       }
 
+      if (parsed.type === "res" && !parsed.ok) {
+        // A rejected send (e.g. busy) was never persisted; withdraw its
+        // optimistic message so it does not linger.
+        setState((prev) => reduceDiscardOptimisticUserMessage(prev, parsed.id));
+        onError?.(parsed.error?.message ?? "send failed");
+        return;
+      }
+
       if (parsed.type === "event" && parsed.event === "chat" && parsed.payload) {
         const event = parsed.payload as ChatEventPayload;
         setState((prev) => reduceChatEvent(prev, event));
@@ -145,6 +155,10 @@ export function useChatTransport({
           invalidateQueries("sessions");
           invalidateQueries("history");
           onDone?.();
+        } else if (event.state === "error") {
+          // A failed turn still persisted the user message; refetch it.
+          invalidateQueries("sessions");
+          invalidateQueries("history");
         }
         return;
       }
@@ -258,6 +272,7 @@ export function useChatTransport({
         },
       };
       ws.send(JSON.stringify(msg));
+      setState((prev) => reduceOptimisticUserMessage(prev, { requestId, text }));
       return requestId;
     },
     [connect, sessionKey],

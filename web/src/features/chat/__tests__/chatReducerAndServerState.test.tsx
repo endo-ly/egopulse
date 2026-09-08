@@ -3,6 +3,7 @@ import { renderHook, act } from "@testing-library/react";
 import {
   reduceChatEvent,
   initialChatState,
+  reduceOptimisticUserMessage,
   reduceToolStart,
   reduceToolResult,
   reduceUserInput,
@@ -125,6 +126,86 @@ describe("chatReducer", () => {
       content: "follow-up",
       timestamp: payload.timestamp,
     });
+  });
+
+  it("optimistic_message_shows_until_echo_replaces_it", () => {
+    // Arrange
+    let state = initialChatState();
+
+    // Act: send shows the text immediately with a local id.
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "hi" });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      id: "local:req-1",
+      sender_kind: "user",
+      content: "hi",
+    });
+
+    // Act: the server echo supersedes the optimistic copy.
+    state = reduceUserInput(state, {
+      messageId: "web:msg-1",
+      senderId: "web-user",
+      text: "hi",
+      timestamp: "2026-08-28T12:00:00Z",
+    });
+
+    // Assert: exactly one copy, under the persisted id.
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].id).toBe("web:msg-1");
+  });
+
+  it("optimistic_message_survives_resend_of_identical_text", () => {
+    // Arrange: an older identical message is already displayed.
+    let state = initialChatState();
+    state = reduceUserInput(state, {
+      messageId: "web:old",
+      senderId: "web-user",
+      text: "hi",
+      timestamp: "2026-08-28T11:00:00Z",
+    });
+
+    // Act: echo for the older message must not consume the fresh local.
+    state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "hi" });
+    state = reduceUserInput(state, {
+      messageId: "web:old",
+      senderId: "web-user",
+      text: "hi",
+      timestamp: "2026-08-28T11:00:00Z",
+    });
+
+    // Assert
+    expect(state.messages.map((m) => m.id).sort()).toEqual([
+      "local:req-2",
+      "web:old",
+    ]);
+  });
+
+  it("done_keeps_optimistic_locals_until_history_covers_them", () => {
+    // Arrange
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "hi" });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
+    });
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
+    });
+
+    // Assert: both stay; the merge drops them once fresh history lands.
+    expect(state.messages.map((m) => m.id).sort()).toEqual([
+      "draft:run-1:done",
+      "local:req-1",
+    ]);
   });
 
   it("separates_assistant_stream_segments_around_injected_user_input", () => {

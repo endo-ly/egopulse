@@ -6,6 +6,7 @@ import { ChatTab } from "../features/chat/ChatTab";
 import { SleepBatchPanel } from "../features/sleep/SleepBatchPanel";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
+import { useMergedChatMessages } from "../features/chat/mergeChatMessages";
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
@@ -308,9 +309,10 @@ export function WebUI() {
   const channel = selectedSessionData?.channel ?? "web";
   const isReadOnly = channel !== "web";
 
-  const messages = useMemo(
-    () => [...(historyState.data ?? []), ...transport.state.messages],
-    [historyState.data, transport.state.messages],
+  const messages = useMergedChatMessages(
+    selectedSession,
+    historyState.data ?? [],
+    transport.state.messages,
   );
 
   const handleSend = useCallback(

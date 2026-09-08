@@ -148,6 +148,71 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
+  it("chat_transport_shows_sent_text_immediately", async () => {
+    const { result } = setup();
+    act(() => {
+      void result.current.connect();
+    });
+    const ws = FakeWebSocket.instances[0];
+    act(() => ws.simulateOpen());
+    act(() => ws.receive({ type: "event", event: "connect.challenge" }));
+    act(() => ws.receive({ type: "res", id: "connect", ok: true }));
+    expect(result.current.connectionState).toBe("open");
+
+    let requestId: string | null = null;
+    await act(async () => {
+      requestId = await result.current.sendMessage("hello");
+    });
+
+    expect(requestId).not.toBeNull();
+    const sent = ws.sent.map((frame) => JSON.parse(frame) as { method?: string });
+    expect(sent.some((frame) => frame.method === "chat.send")).toBe(true);
+    expect(
+      result.current.state.messages.find((m) => m.id === `local:${requestId}`),
+    ).toMatchObject({ sender_kind: "user", content: "hello" });
+  });
+
+  it("chat_transport_withdraws_optimistic_message_on_rejected_send", async () => {
+    const onError = vi.fn();
+    const { result } = renderHook(() =>
+      useChatTransport({
+        sessionKey: "s1",
+        authToken: "token",
+        onAuthRequired: vi.fn(),
+        onError,
+      }),
+    );
+    act(() => {
+      void result.current.connect();
+    });
+    const ws = FakeWebSocket.instances[0];
+    act(() => ws.simulateOpen());
+    act(() => ws.receive({ type: "event", event: "connect.challenge" }));
+    act(() => ws.receive({ type: "res", id: "connect", ok: true }));
+
+    let requestId: string | null = null;
+    await act(async () => {
+      requestId = await result.current.sendMessage("hello");
+    });
+    expect(
+      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+    ).toBe(true);
+
+    act(() => {
+      ws.receive({
+        type: "res",
+        id: requestId,
+        ok: false,
+        error: { code: "busy", message: "busy" },
+      });
+    });
+
+    expect(
+      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+    ).toBe(false);
+    expect(onError).toHaveBeenCalledWith("busy");
+  });
+
   it("chat_transport_disconnect_suppresses_reconnect", () => {
     const { result } = setup();
 
