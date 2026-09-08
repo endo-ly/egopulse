@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, act } from "@testing-library/react";
 import { App } from "../AppShell";
 
 function mockViewport(mobile: boolean): void {
@@ -56,6 +56,97 @@ describe("App shell", () => {
 
     fireEvent.click(container.querySelector(".sidebar-backdrop") as HTMLElement);
     expect(container.querySelector(".sidebar")?.className).toContain("closed");
+  });
+
+  it("mobile_item_tap_closes_sidebar", () => {
+    mockViewport(true);
+    const onSelectAgent = vi.fn();
+    const onSelectSession = vi.fn();
+    const onTabChange = vi.fn();
+    const onNewSession = vi.fn();
+    const { container } = render(
+      <App
+        agents={[{ id: "lyre", label: "Lyre", is_default: true, active: true }]}
+        sessions={[
+          {
+            session_key: "s1",
+            label: "Web Chat",
+            channel: "web",
+            agent_id: "lyre",
+            last_message_preview: "hi",
+            last_message_time: 1,
+          },
+        ]}
+        selectedAgent="lyre"
+        selectedSession="s1"
+        onSelectAgent={onSelectAgent}
+        onSelectSession={onSelectSession}
+        onTabChange={onTabChange}
+        onNewSession={onNewSession}
+      />,
+    );
+    const sidebar = () => container.querySelector(".sidebar") as HTMLElement;
+    const openSidebar = () =>
+      fireEvent.click(screen.getByRole("button", { name: /toggle sidebar/i }));
+
+    // Arrange: session tap
+    openSidebar();
+    expect(sidebar().className).toContain("open");
+
+    // Act
+    fireEvent.click(screen.getByText("hi"));
+
+    // Assert
+    expect(onSelectSession).toHaveBeenCalledWith("s1");
+    expect(sidebar().className).toContain("closed");
+
+    // Arrange: tab tap
+    openSidebar();
+
+    // Act
+    fireEvent.click(screen.getByRole("button", { name: "Sleep" }));
+
+    // Assert
+    expect(onTabChange).toHaveBeenCalledWith("sleep");
+    expect(sidebar().className).toContain("closed");
+
+    // Arrange: agent tap
+    openSidebar();
+
+    // Act
+    fireEvent.click(screen.getByText("Lyre"));
+
+    // Assert
+    expect(onSelectAgent).toHaveBeenCalledWith("lyre");
+    expect(sidebar().className).toContain("closed");
+
+    // Arrange: new session tap
+    openSidebar();
+
+    // Act
+    fireEvent.click(screen.getByRole("button", { name: "New Session" }));
+
+    // Assert
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(sidebar().className).toContain("closed");
+  });
+
+  it("mobile_escape_closes_sidebar", () => {
+    mockViewport(true);
+    const { container } = render(<App />);
+
+    // Arrange
+    fireEvent.click(screen.getByRole("button", { name: /toggle sidebar/i }));
+    expect(container.querySelector(".sidebar")?.className).toContain("open");
+
+    // Act
+    act(() => {
+      globalThis.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    });
+
+    // Assert
+    expect(container.querySelector(".sidebar")?.className).toContain("closed");
+    expect(container.querySelector(".sidebar")?.className).not.toContain("open");
   });
 
   it("mobile_swipe_from_edge_opens_and_swipe_back_closes_sidebar", () => {

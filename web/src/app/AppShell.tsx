@@ -62,11 +62,13 @@ export function App({
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         onOpenPalette();
+      } else if (e.key === "Escape" && isMobile) {
+        setUserOpened(false);
       }
     };
     globalThis.addEventListener("keydown", handler);
     return () => globalThis.removeEventListener("keydown", handler);
-  }, [onOpenPalette]);
+  }, [onOpenPalette, isMobile]);
 
   useEffect(() => {
     if (!isMobile) return;
@@ -113,6 +115,27 @@ export function App({
   const toggleSidebar = () => setUserOpened((open) => !open);
   const closeSidebar = () => setUserOpened(false);
 
+  // Mobile overlay dismisses on navigation (layout.md §4.5).
+  const dismissOverlayOnMobile = () => {
+    if (isMobile) setUserOpened(false);
+  };
+  const handleTabChange = (tab: TabId) => {
+    onTabChange(tab);
+    dismissOverlayOnMobile();
+  };
+  const handleSelectAgent = (id: string) => {
+    onSelectAgent(id);
+    dismissOverlayOnMobile();
+  };
+  const handleSelectSession = (key: string) => {
+    onSelectSession(key);
+    dismissOverlayOnMobile();
+  };
+  const handleNewSession = () => {
+    onNewSession();
+    dismissOverlayOnMobile();
+  };
+
   const showCollapsed = !isMobile && sidebarCollapsed;
 
   return (
@@ -120,7 +143,7 @@ export function App({
       <aside className={`sidebar ${sidebarOpen ? "open" : "closed"} ${showCollapsed ? "collapsed" : ""}`}>
         <Sidebar
           activeTab={activeTab}
-          onTabChange={onTabChange}
+          onTabChange={handleTabChange}
           onOpenPalette={onOpenPalette}
           healthStatus={healthStatus}
           collapsed={!isMobile && sidebarCollapsed}
@@ -129,7 +152,7 @@ export function App({
             <AgentsSection
               agents={agents}
               selectedAgent={selectedAgent}
-              onSelectAgent={onSelectAgent}
+              onSelectAgent={handleSelectAgent}
               authToken={authToken}
               onAvatarChanged={onAvatarChanged}
             />
@@ -139,8 +162,8 @@ export function App({
               sessions={sessions}
               selectedAgent={selectedAgent}
               selectedSession={selectedSession}
-              onSelectSession={onSelectSession}
-              onNewSession={onNewSession}
+              onSelectSession={handleSelectSession}
+              onNewSession={handleNewSession}
             />
           }
         />
