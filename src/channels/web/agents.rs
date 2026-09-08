@@ -17,7 +17,6 @@ pub(super) struct AgentInfo {
     id: String,
     label: String,
     is_default: bool,
-    active: bool,
     avatar_url: Option<String>,
 }
 
@@ -52,7 +51,6 @@ pub(super) async fn list_agents(
             id: id.to_string(),
             label: agent_config.label.clone(),
             is_default: id == default_agent,
-            active: state.app_state.active_turns.is_active(id.as_str()),
             avatar_url: avatar_versions
                 .get(id.as_str())
                 .map(|version| avatar_url(id.as_str(), version)),
@@ -303,11 +301,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_agents_returns_configured_agents_with_active_flag() {
+    async fn api_agents_returns_configured_agents() {
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
-
-        web_state.app_state.active_turns.begin_turn("default");
 
         let result = list_agents(AxumState(web_state)).await.expect("ok");
         let body = result.0;
@@ -318,19 +314,7 @@ mod tests {
         assert_eq!(agents[0]["id"], "default");
         assert_eq!(agents[0]["label"], "Default Agent");
         assert_eq!(agents[0]["is_default"], true);
-        assert_eq!(agents[0]["active"], true);
         assert_eq!(agents[0]["avatar_url"], serde_json::Value::Null);
-    }
-
-    #[tokio::test]
-    async fn api_agents_active_false_when_no_turn_in_flight() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let web_state = test_web_state(&dir);
-
-        let result = list_agents(AxumState(web_state)).await.expect("ok");
-        let body = result.0;
-        let agents = body["agents"].as_array().expect("agents array");
-        assert_eq!(agents[0]["active"], false);
     }
 
     #[tokio::test]

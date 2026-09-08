@@ -29,10 +29,9 @@ const AGENTS: AgentEntry[] = [
     id: "lyre",
     label: "Lyre",
     is_default: true,
-    active: true,
     avatar_url: "/api/agents/lyre/avatar?v=1",
   },
-  { id: "ace", label: "Ace", is_default: false, active: false },
+  { id: "ace", label: "Ace", is_default: false },
 ];
 
 describe("AgentsSection", () => {
@@ -45,13 +44,14 @@ describe("AgentsSection", () => {
     cleanup();
   });
 
-  it("agents_section_renders_list_and_active_state", () => {
+  it("agents_section_renders_list_and_unread_state", () => {
     const onSelectAgent = vi.fn();
     render(
       <AgentsSection
         agents={AGENTS}
         selectedAgent="lyre"
         onSelectAgent={onSelectAgent}
+        unreadAgentIds={new Set(["lyre"])}
       />,
     );
 
@@ -63,7 +63,7 @@ describe("AgentsSection", () => {
     expect(lyreRow?.className).toContain("active");
     expect(aceRow?.className).not.toContain("active");
 
-    expect(lyreRow?.querySelector(".dot-live")).not.toBeNull();
+    expect(lyreRow?.querySelector(".dot-unread")).not.toBeNull();
     expect(aceRow?.querySelector(".dot-idle")).not.toBeNull();
 
     expect(lyreRow?.querySelector(".agent-default-tag")?.textContent).toBe(
@@ -75,16 +75,35 @@ describe("AgentsSection", () => {
     expect(onSelectAgent).toHaveBeenCalledWith("ace");
   });
 
+  it("agents_section_ignores_working_flag_without_unread", () => {
+    // Arrange: no unread anywhere.
+    render(
+      <AgentsSection agents={AGENTS} selectedAgent="ace" onSelectAgent={vi.fn()} />,
+    );
+
+    // Act + Assert: no pulse, plain idle dots everywhere.
+    expect(document.querySelector(".dot-unread")).toBeNull();
+    expect(document.querySelector(".dot-live")).toBeNull();
+    expect(screen.getByText("Lyre").closest(".agent-row")?.querySelector(".dot-idle"))
+      .not.toBeNull();
+    cleanup();
+  });
+
   it("agents_section_renders_avatar_image_with_status_dot_overlay", () => {
     const { container } = render(
-      <AgentsSection agents={AGENTS} selectedAgent="lyre" onSelectAgent={vi.fn()} />,
+      <AgentsSection
+        agents={AGENTS}
+        selectedAgent="lyre"
+        onSelectAgent={vi.fn()}
+        unreadAgentIds={new Set(["lyre"])}
+      />,
     );
 
     const avatar = container.querySelector(".agent-avatar");
     expect(avatar).not.toBeNull();
     const img = avatar?.querySelector("img");
     expect(img?.getAttribute("src")).toBe("/api/agents/lyre/avatar?v=1");
-    expect(avatar?.querySelector(".agent-avatar-dot.dot-live")).not.toBeNull();
+    expect(avatar?.querySelector(".agent-avatar-dot.dot-unread")).not.toBeNull();
 
     // Agents without an avatar keep the plain status dot.
     const aceRow = screen.getByText("Ace").closest(".agent-row");

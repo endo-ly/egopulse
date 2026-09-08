@@ -354,7 +354,7 @@ Sleep Batch の実行履歴・ステップ結果・メモリ変更差分・現�
 GET /api/agents
 ```
 
-設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, active, avatar_url}, ...]`）。`avatar_url` はアイコン未設定時は `null`、設定済みなら `?v=` 付きのキャッシュバスティング URL。
+設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, avatar_url}, ...]`）。`avatar_url` はアイコン未設定時は `null`、設定済みなら `?v=` 付きのキャッシュバスティング URL。
 
 ---
 

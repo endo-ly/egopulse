@@ -12,6 +12,7 @@ import { fetchHistory } from "../shared/api/history";
 import { createSessionKey, fetchSessions } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
 import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
+import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
 import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
 import type { TabId } from "./navigation";
 
@@ -360,6 +361,7 @@ export function WebUI() {
   );
 
   const agentAvatars = useAgentAvatars(agents, authToken);
+  const unreadSessionKeys = useUnreadSessions(sessions, selectedSession);
 
   const chatMain = (
     <ChatTab
@@ -389,6 +391,7 @@ export function WebUI() {
         onNewSession={handleNewSession}
         authToken={authToken}
         onAvatarChanged={() => invalidateQueries("agents")}
+        unreadSessionKeys={unreadSessionKeys}
         main={
           activeTab === "chat" ? (
             <>

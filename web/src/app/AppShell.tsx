@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode } from "react";
+import { useState, useEffect, useMemo, type ReactNode } from "react";
 import { useMediaQuery } from "../shared/hooks/useMediaQuery";
 import { Sidebar } from "./shell/Sidebar";
 import { MobileBar } from "./shell/MobileBar";
@@ -24,6 +24,8 @@ export interface AppProps {
   authToken?: string;
   /** Called after an agent avatar upload/removal so lists can refresh. */
   onAvatarChanged?: () => void;
+  /** Session keys with messages newer than the last view. */
+  unreadSessionKeys?: ReadonlySet<string>;
 }
 
 const noop = () => {};
@@ -45,6 +47,7 @@ export function App({
   main,
   authToken,
   onAvatarChanged,
+  unreadSessionKeys,
 }: AppProps) {
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [userOpened, setUserOpened] = useState(false);
@@ -115,6 +118,17 @@ export function App({
   const toggleSidebar = () => setUserOpened((open) => !open);
   const closeSidebar = () => setUserOpened(false);
 
+  const unreadAgentIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!unreadSessionKeys) return ids;
+    for (const session of sessions) {
+      if (unreadSessionKeys.has(session.session_key)) {
+        ids.add(session.agent_id);
+      }
+    }
+    return ids;
+  }, [sessions, unreadSessionKeys]);
+
   // Mobile overlay dismisses on navigation (layout.md §4.5).
   const dismissOverlayOnMobile = () => {
     if (isMobile) setUserOpened(false);
@@ -155,6 +169,7 @@ export function App({
               onSelectAgent={handleSelectAgent}
               authToken={authToken}
               onAvatarChanged={onAvatarChanged}
+              unreadAgentIds={unreadAgentIds}
             />
           }
           sessions={
@@ -164,6 +179,7 @@ export function App({
               selectedSession={selectedSession}
               onSelectSession={handleSelectSession}
               onNewSession={handleNewSession}
+              unreadSessionKeys={unreadSessionKeys}
             />
           }
         />

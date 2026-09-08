@@ -8,7 +8,6 @@ function agent(overrides: Partial<AgentEntry>): AgentEntry {
     id: "lyre",
     label: "Lyre",
     is_default: true,
-    active: false,
     ...overrides,
   };
 }

@@ -66,7 +66,7 @@ describe("App shell", () => {
     const onNewSession = vi.fn();
     const { container } = render(
       <App
-        agents={[{ id: "lyre", label: "Lyre", is_default: true, active: true }]}
+        agents={[{ id: "lyre", label: "Lyre", is_default: true }]}
         sessions={[
           {
             session_key: "s1",
@@ -149,6 +149,48 @@ describe("App shell", () => {
     expect(container.querySelector(".sidebar")?.className).not.toContain("open");
   });
 
+  it("wires_unread_sessions_to_agent_dot_and_session_row", () => {
+    mockViewport(false);
+    render(
+      <App
+        agents={[{ id: "lyre", label: "Lyre", is_default: true }]}
+        sessions={[
+          {
+            session_key: "s1",
+            label: "Web Chat",
+            channel: "web",
+            agent_id: "lyre",
+            last_message_preview: "hi",
+            last_message_time: 1,
+          },
+          {
+            session_key: "s2",
+            label: "Dev",
+            channel: "web",
+            agent_id: "lyre",
+            last_message_preview: "yo",
+            last_message_time: 2,
+          },
+        ]}
+        selectedAgent="lyre"
+        selectedSession="s1"
+        unreadSessionKeys={new Set(["s2"])}
+      />,
+    );
+
+    // Arrange + Act: only unread lights the dot.
+    // Assert
+    expect(
+      screen.getByText("Lyre").closest(".agent-row")?.querySelector(".dot-unread"),
+    ).not.toBeNull();
+    expect(screen.getByText("yo").closest(".session-item")?.className).toContain(
+      "unread",
+    );
+    expect(screen.getByText("hi").closest(".session-item")?.className).not.toContain(
+      "unread",
+    );
+  });
+
   it("mobile_swipe_from_edge_opens_and_swipe_back_closes_sidebar", () => {
     mockViewport(true);
     const { container } = render(<App />);
@@ -214,7 +256,7 @@ describe("App shell", () => {
     render(
       <App
         agents={[
-          { id: "lyre", label: "Lyre", is_default: true, active: true },
+          { id: "lyre", label: "Lyre", is_default: true },
         ]}
         sessions={[
           {

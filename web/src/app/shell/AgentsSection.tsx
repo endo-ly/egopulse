@@ -11,6 +11,8 @@ export interface AgentsSectionProps {
   authToken?: string;
   /** Called after an avatar upload/removal so the agent list can refresh. */
   onAvatarChanged?: () => void;
+  /** Agent ids with sessions newer than the last view. */
+  unreadAgentIds?: ReadonlySet<string>;
 }
 
 const PENCIL_ICON = (
@@ -35,6 +37,7 @@ export function AgentsSection({
   onSelectAgent,
   authToken,
   onAvatarChanged,
+  unreadAgentIds,
 }: AgentsSectionProps) {
   const [menuAgentId, setMenuAgentId] = useState<string | null>(null);
   const [cropFile, setCropFile] = useState<{ agentId: string; file: File } | null>(
@@ -134,12 +137,14 @@ export function AgentsSection({
                 <span className="agent-avatar">
                   <img src={agent.avatar_url} alt="" />
                   <StatusDot
-                    tone={agent.active ? "live" : "idle"}
+                    tone={unreadAgentIds?.has(agent.id) ? "unread" : "idle"}
                     className="agent-avatar-dot"
                   />
                 </span>
               ) : (
-                <StatusDot tone={agent.active ? "live" : "idle"} />
+                <StatusDot
+                  tone={unreadAgentIds?.has(agent.id) ? "unread" : "idle"}
+                />
               )}
               <span className="agent-label">{agent.label}</span>
               {agent.is_default && (

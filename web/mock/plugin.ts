@@ -3,18 +3,18 @@ import type { ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
 const AGENTS = [
-  { id: "lyre", label: "Lyre", is_default: true, active: false },
-  { id: "ace", label: "Ace", is_default: false, active: true },
-  { id: "vega", label: "Vega", is_default: false, active: false },
-  { id: "orion", label: "Orion", is_default: false, active: true },
-  { id: "nova", label: "Nova", is_default: false, active: false },
-  { id: "draco", label: "Draco", is_default: false, active: true },
-  { id: "pegasus", label: "Pegasus", is_default: false, active: false },
-  { id: "andromeda", label: "Andromeda", is_default: false, active: false },
-  { id: "phoenix", label: "Phoenix", is_default: false, active: true },
-  { id: "hydra", label: "Hydra", is_default: false, active: false },
-  { id: "cassiopeia", label: "Cassiopeia", is_default: false, active: false },
-  { id: "perseus", label: "Perseus", is_default: false, active: false },
+  { id: "lyre", label: "Lyre", is_default: true },
+  { id: "ace", label: "Ace", is_default: false },
+  { id: "vega", label: "Vega", is_default: false },
+  { id: "orion", label: "Orion", is_default: false },
+  { id: "nova", label: "Nova", is_default: false },
+  { id: "draco", label: "Draco", is_default: false },
+  { id: "pegasus", label: "Pegasus", is_default: false },
+  { id: "andromeda", label: "Andromeda", is_default: false },
+  { id: "phoenix", label: "Phoenix", is_default: false },
+  { id: "hydra", label: "Hydra", is_default: false },
+  { id: "cassiopeia", label: "Cassiopeia", is_default: false },
+  { id: "perseus", label: "Perseus", is_default: false },
 ];
 
 // Mirrors the agent_avatars table: in-memory uploads, with Lyre pre-seeded

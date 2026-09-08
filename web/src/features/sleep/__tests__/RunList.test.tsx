@@ -4,8 +4,8 @@ import { RunList } from "../RunList";
 import type { AgentEntry, SleepRun } from "../../../shared/api/types";
 
 const AGENTS: AgentEntry[] = [
-  { id: "lyre", label: "Lyre", is_default: true, active: true },
-  { id: "ace", label: "Ace", is_default: false, active: false },
+  { id: "lyre", label: "Lyre", is_default: true },
+  { id: "ace", label: "Ace", is_default: false },
 ];
 
 function makeRun(overrides: Partial<SleepRun>): SleepRun {

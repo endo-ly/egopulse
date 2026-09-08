@@ -11,6 +11,8 @@ export interface SessionsSectionProps {
   selectedSession: string;
   onSelectSession: (key: string) => void;
   onNewSession?: () => void;
+  /** Session keys with messages newer than the last view. */
+  unreadSessionKeys?: ReadonlySet<string>;
 }
 
 const CHANNEL_FILTERS = [
@@ -61,6 +63,7 @@ export function SessionsSection({
   selectedSession,
   onSelectSession,
   onNewSession,
+  unreadSessionKeys,
 }: SessionsSectionProps) {
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
 
@@ -134,7 +137,9 @@ export function SessionsSection({
                 active={selectedSession === s.session_key}
                 onClick={() => onSelectSession(s.session_key)}
               >
-                <div className="session-item">
+                <div
+                  className={`session-item${unreadSessionKeys?.has(s.session_key) ? " unread" : ""}`}
+                >
                   <Badge kind="channel">{channelLabel(s.channel)}</Badge>
                   <span className="session-preview">{s.last_message_preview}</span>
                 </div>

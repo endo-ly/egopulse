@@ -646,6 +646,11 @@
     white-space: nowrap;
   }
 
+  .session-item.unread .session-preview {
+    color: var(--color-text-strong);
+    font-weight: 700;
+  }
+
   .sessions-list .card {
     padding: var(--space-xs) var(--space-sm);
     border-radius: var(--radius-sm);

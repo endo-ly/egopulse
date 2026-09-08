@@ -106,6 +106,24 @@ describe("SessionsSection", () => {
     expect(screen.getByText(/No TUI sessions for this agent/)).toBeTruthy();
   });
 
+  it("sessions_section_highlights_unread_sessions", () => {
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession="s1"
+        onSelectSession={() => {}}
+        unreadSessionKeys={new Set(["s2"])}
+      />,
+    );
+
+    const unread = screen.getByText("review code").closest(".session-item");
+    const read = screen.getByText("hello world").closest(".session-item");
+    expect(unread?.className).toContain("unread");
+    expect(read?.className).not.toContain("unread");
+    cleanup();
+  });
+
   it("sessions_section_header_new_session_button_triggers_callback", () => {
     const onNewSession = vi.fn();
     render(
