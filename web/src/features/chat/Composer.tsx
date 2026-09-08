@@ -3,7 +3,8 @@ import { loadDraft, saveDraft } from "./draftStorage";
 import { matchSlashCommands } from "./slashCommands";
 
 export interface ComposerProps {
-  onSubmit: (text: string) => void;
+  /** Resolves true when the send was accepted; the text is kept otherwise. */
+  onSubmit: (text: string) => Promise<boolean>;
   disabled?: boolean;
   storageKey?: string;
 }
@@ -12,7 +13,16 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
   const [text, setText] = useState(() => loadDraft(storageKey));
   const [suggestIndex, setSuggestIndex] = useState(-1);
   const [suggestHidden, setSuggestHidden] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const submittingRef = useRef(false);
+  const storageKeyRef = useRef(storageKey);
+  const draftVersionRef = useRef(0);
+
+  if (storageKeyRef.current !== storageKey) {
+    storageKeyRef.current = storageKey;
+    draftVersionRef.current += 1;
+  }
 
   const matches = matchSlashCommands(text);
   const showSuggestPopup =
@@ -20,6 +30,8 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
 
   useEffect(() => {
     setText(loadDraft(storageKey));
+    submittingRef.current = false;
+    setSubmitting(false);
   }, [storageKey]);
 
   useEffect(() => {
@@ -37,14 +49,35 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
 
   const submit = () => {
     const trimmed = text.trim();
-    if (!trimmed) return;
-    onSubmit(trimmed);
-    setText("");
-    setSuggestIndex(-1);
-    setSuggestHidden(false);
+    if (!trimmed || disabled || submittingRef.current) return;
+    const keyAtSubmit = storageKey;
+    const draftVersionAtSubmit = draftVersionRef.current;
+    submittingRef.current = true;
+    setSubmitting(true);
+    void (async () => {
+      try {
+        const accepted = await onSubmit(trimmed);
+        if (!accepted) return;
+        // The user may have switched sessions or changed the draft while
+        // the ack was in flight; never clear a newer draft.
+        if (
+          storageKeyRef.current !== keyAtSubmit ||
+          draftVersionRef.current !== draftVersionAtSubmit
+        ) {
+          return;
+        }
+        setText("");
+        setSuggestIndex(-1);
+        setSuggestHidden(false);
+      } finally {
+        submittingRef.current = false;
+        setSubmitting(false);
+      }
+    })();
   };
 
   const acceptSuggestion = (index: number) => {
+    draftVersionRef.current += 1;
     setText(matches[index].name + " ");
     setSuggestIndex(-1);
     setSuggestHidden(false);
@@ -106,8 +139,9 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
         className="composer-textarea"
         value={text}
         placeholder="Type a message…"
-        disabled={disabled}
+        disabled={disabled || submitting}
         onChange={(e) => {
+          draftVersionRef.current += 1;
           setText(e.target.value);
           setSuggestIndex(-1);
           setSuggestHidden(false);
@@ -118,7 +152,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
       <button
         type="button"
         className="btn-primary composer-send"
-        disabled={disabled || !text.trim()}
+        disabled={disabled || submitting || !text.trim()}
         onClick={submit}
         aria-label="Send message"
         title="Send message"

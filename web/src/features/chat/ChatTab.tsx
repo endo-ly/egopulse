@@ -9,7 +9,7 @@ export interface ChatTabProps {
   channel: string;
   readOnly: boolean;
   messages?: ChatMessage[];
-  onSend?: (text: string) => void;
+  onSend?: (text: string) => Promise<boolean>;
   storageKey?: string;
   /** Jump request from the command palette: scroll to and flash the message. */
   jumpRequest?: { index: number; seq: number };
@@ -73,7 +73,10 @@ export function ChatTab({
         {readOnly ? (
           <ReadOnlyBanner channel={channel} />
         ) : (
-          <Composer onSubmit={onSend ?? (() => {})} storageKey={storageKey} />
+          <Composer
+            onSubmit={onSend ?? (() => Promise.resolve(true))}
+            storageKey={storageKey}
+          />
         )}
       </div>
     </div>

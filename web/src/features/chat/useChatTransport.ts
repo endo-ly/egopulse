@@ -43,6 +43,9 @@ type ServerFrame = ResponseFrame | EventFrame;
 
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
+// The server acks chat.send on acceptance (not completion), so this only
+// guards a lost frame, not a slow turn.
+const SEND_ACK_TIMEOUT_MS = 15_000;
 
 export function useChatTransport({
   sessionKey,
@@ -66,6 +69,19 @@ export function useChatTransport({
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
+  // chat.send request ids awaiting their ack, with settle callbacks.
+  const pendingSendsRef = useRef(
+    new Map<
+      string,
+      {
+        resolve: (requestId: string) => void;
+        reject: (error: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    >(),
+  );
+  // Set when a live socket drops unexpectedly so the next open resyncs.
+  const disruptedRef = useRef(false);
   // Tracks whether the current socket ever reached "open" so an unexpected
   // drop can be reported exactly once, instead of on every retry.
   const wasOpenRef = useRef(false);
@@ -81,15 +97,52 @@ export function useChatTransport({
     }
   }, []);
 
+  const settlePendingSend = useCallback(
+    (requestId: string, error: Error | null) => {
+      const pending = pendingSendsRef.current.get(requestId);
+      if (!pending) return;
+      pendingSendsRef.current.delete(requestId);
+      clearTimeout(pending.timer);
+      if (error) {
+        setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
+        pending.reject(error);
+      } else {
+        pending.resolve(requestId);
+      }
+    },
+    [],
+  );
+
+  const rejectAllPendingSends = useCallback((error: Error) => {
+    const pending = [...pendingSendsRef.current.entries()];
+    pendingSendsRef.current.clear();
+    for (const [, entry] of pending) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
+    if (pending.length > 0) {
+      setState((prev) =>
+        pending.reduce(
+          (state, [requestId]) => reduceDiscardOptimisticUserMessage(state, requestId),
+          prev,
+        ),
+      );
+    }
+  }, []);
+
   useEffect(() => {
     setState(initialChatState());
   }, [sessionKey]);
 
-  useEffect(() => () => {
-    intentionalCloseRef.current = true;
-    clearReconnectTimer();
-    wsRef.current?.close();
-  }, []);
+  useEffect(
+    () => () => {
+      intentionalCloseRef.current = true;
+      clearReconnectTimer();
+      rejectAllPendingSends(new Error("disconnected"));
+      wsRef.current?.close();
+    },
+    [clearReconnectTimer, rejectAllPendingSends],
+  );
 
   const handleMessage = useCallback(
     (raw: string) => {
@@ -133,11 +186,13 @@ export function useChatTransport({
         return;
       }
 
-      if (parsed.type === "res" && !parsed.ok) {
-        // A rejected send (e.g. busy) was never persisted; withdraw its
-        // optimistic message so it does not linger.
-        setState((prev) => reduceDiscardOptimisticUserMessage(prev, parsed.id));
-        onError?.(parsed.error?.message ?? "send failed");
+      if (parsed.type === "res" && parsed.id !== "connect") {
+        // The ack settles the sendMessage promise; failures surface there
+        // so the composer can keep the text.
+        settlePendingSend(
+          parsed.id,
+          parsed.ok ? null : new Error(parsed.error?.message ?? "send failed"),
+        );
         return;
       }
 
@@ -201,10 +256,19 @@ export function useChatTransport({
           reconnectAttemptRef.current = 0;
           wasOpenRef.current = true;
           setConnectionState("open");
+          if (disruptedRef.current) {
+            // The in-flight run lost its subscription; pull whatever
+            // persisted while we were away.
+            disruptedRef.current = false;
+            invalidateQueries("sessions");
+            invalidateQueries("history");
+          }
         };
         ws.onclose = () => {
           if (wasOpenRef.current && !intentionalCloseRef.current) {
             onError?.("Connection lost. Retrying…");
+            disruptedRef.current = true;
+            rejectAllPendingSends(new Error("Connection lost. Retrying…"));
           }
           wasOpenRef.current = false;
           setConnectionState("closed");
@@ -228,7 +292,7 @@ export function useChatTransport({
 
       return connectPromiseRef.current;
     },
-    [handleMessage, onError, clearReconnectTimer],
+    [handleMessage, onError, clearReconnectTimer, rejectAllPendingSends],
   );
 
   const scheduleReconnect = useCallback(() => {
@@ -249,10 +313,11 @@ export function useChatTransport({
   const disconnect = useCallback(() => {
     intentionalCloseRef.current = true;
     clearReconnectTimer();
+    rejectAllPendingSends(new Error("disconnected"));
     wsRef.current?.close();
     wsRef.current = null;
     setConnectionState("closed");
-  }, []);
+  }, [clearReconnectTimer, rejectAllPendingSends]);
 
   const sendMessage = useCallback(
     async (text: string): Promise<string | null> => {
@@ -273,7 +338,16 @@ export function useChatTransport({
       };
       ws.send(JSON.stringify(msg));
       setState((prev) => reduceOptimisticUserMessage(prev, { requestId, text }));
-      return requestId;
+      // Resolve on the server ack; reject on refusal or timeout so the
+      // caller can keep the text instead of losing it.
+      return new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingSendsRef.current.delete(requestId);
+          setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
+          reject(new Error("send acknowledgement timed out"));
+        }, SEND_ACK_TIMEOUT_MS);
+        pendingSendsRef.current.set(requestId, { resolve, reject, timer });
+      });
     },
     [connect, sessionKey],
   );

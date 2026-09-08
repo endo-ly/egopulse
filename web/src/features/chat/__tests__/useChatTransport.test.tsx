@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, cleanup } from "@testing-library/react";
 import { useChatTransport } from "../useChatTransport";
+import { invalidateQueries } from "../../../shared/hooks/useServerState";
+
+vi.mock("../../../shared/hooks/useServerState", async (importOriginal) => {
+  const mod =
+    await importOriginal<typeof import("../../../shared/hooks/useServerState")>();
+  return { ...mod, invalidateQueries: vi.fn() };
+});
 
 class FakeWebSocket {
   static CONNECTING = 0;
@@ -148,7 +155,7 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
-  it("chat_transport_shows_sent_text_immediately", async () => {
+  async function connectOpen() {
     const { result } = setup();
     act(() => {
       void result.current.connect();
@@ -158,21 +165,39 @@ describe("useChatTransport reconnect", () => {
     act(() => ws.receive({ type: "event", event: "connect.challenge" }));
     act(() => ws.receive({ type: "res", id: "connect", ok: true }));
     expect(result.current.connectionState).toBe("open");
+    return { result, ws };
+  }
 
-    let requestId: string | null = null;
+  function lastSentId(ws: FakeWebSocket): string {
+    const frame = JSON.parse(ws.sent[ws.sent.length - 1]) as { id: string };
+    return frame.id;
+  }
+
+  it("chat_transport_resolves_send_on_ack_and_shows_text_immediately", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
     await act(async () => {
-      requestId = await result.current.sendMessage("hello");
+      pending = result.current.sendMessage("hello");
     });
-
-    expect(requestId).not.toBeNull();
-    const sent = ws.sent.map((frame) => JSON.parse(frame) as { method?: string });
-    expect(sent.some((frame) => frame.method === "chat.send")).toBe(true);
+    const requestId = lastSentId(ws);
+    // Optimistic message is visible before the ack lands.
     expect(
       result.current.state.messages.find((m) => m.id === `local:${requestId}`),
     ).toMatchObject({ sender_kind: "user", content: "hello" });
+
+    let resolved: string | null = null;
+    await act(async () => {
+      ws.receive({ type: "res", id: requestId, ok: true });
+      resolved = await pending;
+    });
+    expect(resolved).toBe(requestId);
+    expect(
+      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+    ).toBe(true);
   });
 
-  it("chat_transport_withdraws_optimistic_message_on_rejected_send", async () => {
+  it("chat_transport_rejects_send_and_withdraws_text_on_busy", async () => {
     const onError = vi.fn();
     const { result } = renderHook(() =>
       useChatTransport({
@@ -190,27 +215,69 @@ describe("useChatTransport reconnect", () => {
     act(() => ws.receive({ type: "event", event: "connect.challenge" }));
     act(() => ws.receive({ type: "res", id: "connect", ok: true }));
 
-    let requestId: string | null = null;
+    let pending!: Promise<string | null>;
     await act(async () => {
-      requestId = await result.current.sendMessage("hello");
+      pending = result.current.sendMessage("hello");
+      pending.catch(() => {});
     });
-    expect(
-      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
-    ).toBe(true);
+    const requestId = lastSentId(ws);
 
-    act(() => {
+    await act(async () => {
       ws.receive({
         type: "res",
         id: requestId,
         ok: false,
         error: { code: "busy", message: "busy" },
       });
+      await expect(pending).rejects.toThrow("busy");
     });
 
     expect(
       result.current.state.messages.some((m) => m.id === `local:${requestId}`),
     ).toBe(false);
-    expect(onError).toHaveBeenCalledWith("busy");
+    // The caller surfaces the failure (composer keeps the text); the
+    // transport itself stays quiet.
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("chat_transport_rejects_send_on_ack_timeout", async () => {
+    const { result } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello");
+      pending.catch(() => {});
+    });
+    const ws = FakeWebSocket.instances[0];
+    const requestId = lastSentId(ws);
+
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+    });
+    await expect(pending).rejects.toThrow("timed out");
+    expect(
+      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+    ).toBe(false);
+  });
+
+  it("chat_transport_resyncs_after_unexpected_drop", async () => {
+    const mockInvalidate = vi.mocked(invalidateQueries);
+    mockInvalidate.mockClear();
+    const { result } = await connectOpen();
+
+    act(() => {
+      FakeWebSocket.instances[0].close();
+    });
+    expect(result.current.connectionState).toBe("closed");
+
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    act(() => FakeWebSocket.instances[1].simulateOpen());
+
+    expect(mockInvalidate).toHaveBeenCalledWith("sessions");
+    expect(mockInvalidate).toHaveBeenCalledWith("history");
   });
 
   it("chat_transport_disconnect_suppresses_reconnect", () => {

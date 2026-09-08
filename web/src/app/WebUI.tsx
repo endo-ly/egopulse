@@ -316,19 +316,22 @@ export function WebUI() {
   );
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (text: string): Promise<boolean> => {
       setTransportError(null);
       try {
         const requestId = await transport.sendMessage(text);
         if (!requestId) {
           setTransportError("gateway is not connected");
+          return false;
         }
+        return true;
       } catch (error) {
         if (error instanceof AuthRequiredError) {
           setAuthMessage(error.message);
         } else {
           setTransportError(error instanceof Error ? error.message : String(error));
         }
+        return false;
       }
     },
     [transport],
