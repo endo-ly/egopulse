@@ -26,7 +26,6 @@ function formatTimestamp(ts: string): string {
 }
 
 function avatarLetter(message: ChatMessage): string {
-  if (message.sender_kind === "user") return "U";
   if (message.message_kind === "pulse_notification") return "P";
   return (message.sender_id[0] ?? "?").toUpperCase();
 }
@@ -43,13 +42,15 @@ export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
   return (
     <div className={cls}>
       <div className="message-header">
-        <div className="message-avatar">
-          {avatarSrc ? (
-            <img src={avatarSrc} alt="" />
-          ) : (
-            avatarLetter(message)
-          )}
-        </div>
+        {message.sender_kind !== "user" && (
+          <div className="message-avatar">
+            {avatarSrc ? (
+              <img src={avatarSrc} alt="" />
+            ) : (
+              avatarLetter(message)
+            )}
+          </div>
+        )}
         <span className="message-sender">{senderLabel(message)}</span>
         <span
           className="message-time"

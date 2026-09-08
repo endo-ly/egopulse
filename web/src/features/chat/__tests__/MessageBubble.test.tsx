@@ -33,7 +33,8 @@ describe("MessageBubble", () => {
       const header = row?.querySelector(".message-header");
       expect(header).toBeTruthy();
       const avatar = header?.querySelector(".message-avatar");
-      expect(avatar).toBeTruthy();
+      // User messages render no avatar; all others do.
+      expect(avatar !== null).toBe(kind !== "user");
       const time = header?.querySelector(".message-time");
       expect(time).toBeTruthy();
     }
@@ -94,15 +95,14 @@ describe("MessageBubble", () => {
     expect(avatar?.textContent).toBe("L");
   });
 
-  it("user_message_never_uses_agent_avatar", () => {
+  it("user_message_renders_no_avatar", () => {
     const { container } = render(
       <MessageBubble
         message={msg({ sender_kind: "user", sender_id: "human" })}
         agentAvatars={{ human: "blob:human-avatar" }}
       />,
     );
-    const avatar = container.querySelector(".message-avatar");
-    expect(avatar?.querySelector("img")).toBeNull();
-    expect(avatar?.textContent).toBe("U");
+    expect(container.querySelector(".message-avatar")).toBeNull();
+    expect(container.querySelector(".message-sender")?.textContent).toBe("You");
   });
 });
