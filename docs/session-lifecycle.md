@@ -37,9 +37,10 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 
 `SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
 
-- `session_key()` は `channel:surface_thread` を返す（`agent_id` はキーに含まれない）
+- `session_key()` は agent を持つ会話では `channel:surface_thread:agent:agent_id` を返す
 - **Discord マルチボット**: `agent_thread(channel_id, agent_id)` ヘルパーが `{channel_id}:agent:{agent_id}` 形式の `surface_thread` を生成する
-- **Web / Telegram / CLI / TUI**: `default_agent` を使用し、従来のアイデンティティ形式を維持する
+- **Web**: 新規セッションはWebUIで選択中のagentを使用し、既存セッションは `chats.agent_id` を使用する
+- **Telegram / CLI / TUI**: 各チャネルの入力経路で解決されたagentを使用する
 
 ### 1.3 Multi-Agent Room 二層アーキテクチャ
 

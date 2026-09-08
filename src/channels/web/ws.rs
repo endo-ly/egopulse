@@ -102,6 +102,8 @@ struct ChatSendParams {
     #[serde(alias = "session_key", alias = "key")]
     session_key: String,
     message: String,
+    /// Agent selected by the WebUI when the session key is not yet persisted.
+    agent_id: Option<String>,
     /// Client-generated request id for deduplication. Mirrors `SendRequest::request_id`
     /// on the REST path; `start_stream_run` converts it into `context.request_key`
     /// so a re-delivered `chat.send` maps to the same Turn instead of a duplicate.
@@ -400,6 +402,7 @@ async fn handle_chat_send(
     let request = SendRequest {
         session_key: Some(payload.session_key),
         message: payload.message,
+        agent_id: payload.agent_id,
         request_id: payload.request_id,
     };
 
@@ -1050,6 +1053,7 @@ mod tests {
 
         let params = serde_json::json!({
             "sessionKey": "main",
+            "agentId": "default",
             "message": "hello"
         });
 
@@ -1131,6 +1135,7 @@ mod tests {
             &SendRequest {
                 session_key: Some("active-follow-up".to_string()),
                 message: "follow-up".to_string(),
+                agent_id: Some("default".to_string()),
                 request_id: Some("follow-up-request".to_string()),
             },
             WEB_ACTOR,
@@ -1146,6 +1151,7 @@ mod tests {
             "req-follow-up",
             serde_json::json!({
                 "sessionKey": "active-follow-up",
+                "agentId": "default",
                 "message": "follow-up",
                 "requestId": "follow-up-request"
             }),
@@ -1218,6 +1224,7 @@ mod tests {
             "req-unknown-session",
             serde_json::json!({
                 "sessionKey": "not-yet-created",
+                "agentId": "default",
                 "message": "follow-up"
             }),
         )

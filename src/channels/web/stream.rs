@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::agent_loop::{process_turn_with_events, resolve_chat_id};
+use crate::config::AgentId;
 use crate::conversation::SurfaceContext;
 use tracing::error;
 
@@ -80,6 +81,8 @@ struct ReplayMetaPayload {
 pub(super) struct SendRequest {
     pub session_key: Option<String>,
     pub message: String,
+    /// Agent selected by the WebUI when a new session is created.
+    pub agent_id: Option<String>,
     /// Client-generated request id for deduplication. The same id re-delivered
     /// after a transient failure maps to the same Turn instead of a duplicate.
     pub request_id: Option<String>,
@@ -209,9 +212,10 @@ pub(super) async fn api_stream(
 async fn resolve_new_web_session(
     state: &WebState,
     raw_session_key: &str,
+    agent_id: Option<&str>,
     actor: &str,
 ) -> Result<(String, SurfaceContext), (StatusCode, String)> {
-    let context = web_context_for_session(state, raw_session_key, actor);
+    let context = web_context_for_session(state, raw_session_key, agent_id, actor)?;
     let chat_id = resolve_chat_id(&state.app_state.turn_dependencies(), &context)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -226,6 +230,7 @@ async fn resolve_new_web_session(
 async fn resolve_existing_web_session(
     state: &WebState,
     raw_session_key: &str,
+    agent_id: Option<&str>,
     actor: &str,
 ) -> Result<Option<(String, SurfaceContext)>, (StatusCode, String)> {
     let db = Arc::clone(&state.app_state.db);
@@ -234,11 +239,11 @@ async fn resolve_existing_web_session(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
     } else {
-        let context = web_context_for_session(state, raw_session_key, actor);
+        let context = web_context_for_session(state, raw_session_key, agent_id, actor)?;
         let external_chat_id = context.session_key();
-        let default_agent = context.agent_id.clone();
+        let agent_id = context.agent_id.clone();
         call_blocking(db, move |db| {
-            db.get_chat_by_channel_external_and_agent("web", &external_chat_id, &default_agent)
+            db.get_chat_by_channel_external_and_agent("web", &external_chat_id, &agent_id)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
@@ -250,21 +255,36 @@ async fn resolve_existing_web_session(
     }))
 }
 
-fn web_context_for_session(state: &WebState, raw_session_key: &str, actor: &str) -> SurfaceContext {
-    let default_agent = state
-        .app_state
-        .config_manager
-        .current_blocking()
-        .config
-        .default_agent
-        .to_string();
-    SurfaceContext::new(
+fn web_context_for_session(
+    state: &WebState,
+    raw_session_key: &str,
+    requested_agent_id: Option<&str>,
+    actor: &str,
+) -> Result<SurfaceContext, (StatusCode, String)> {
+    let snapshot = state.app_state.config_manager.current_blocking();
+    let raw_agent_id = requested_agent_id
+        .filter(|agent_id| !agent_id.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "agent_id is required for a new web session".to_string(),
+            )
+        })?;
+    let agent_id = AgentId::new(raw_agent_id);
+    if !snapshot.config.agents.contains_key(&agent_id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown agent: {agent_id}"),
+        ));
+    }
+
+    Ok(SurfaceContext::new(
         "web".to_string(),
         actor.to_string(),
         web_session_key(raw_session_key),
         "web".to_string(),
-        default_agent,
-    )
+        agent_id.to_string(),
+    ))
 }
 
 /// Resolves a WebSocket follow-up against an existing chat only.
@@ -280,7 +300,8 @@ pub(super) async fn resolve_existing_send_request(
 
     let raw_session_key = request.session_key.as_deref().unwrap_or("main");
     let Some((session_key, mut context)) =
-        resolve_existing_web_session(state, raw_session_key, actor).await?
+        resolve_existing_web_session(state, raw_session_key, request.agent_id.as_deref(), actor)
+            .await?
     else {
         return Ok(None);
     };
@@ -323,10 +344,13 @@ pub(super) async fn resolve_send_request(
                 format!("chat:{chat_id}"),
                 surface_context_from_chat_info(info, actor),
             ),
-            None => resolve_new_web_session(state, raw_session_key, actor).await?,
+            None => {
+                resolve_new_web_session(state, raw_session_key, request.agent_id.as_deref(), actor)
+                    .await?
+            }
         }
     } else {
-        resolve_new_web_session(state, raw_session_key, actor).await?
+        resolve_new_web_session(state, raw_session_key, request.agent_id.as_deref(), actor).await?
     };
 
     if let Some(id) = request
@@ -604,6 +628,151 @@ pub(super) async fn start_stream_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_web_state_with_agents(dir: &tempfile::TempDir) -> WebState {
+        let state_root = dir.path().to_string_lossy().to_string();
+        let mut config = crate::test_util::test_config(&state_root);
+        config.agents.insert(
+            crate::config::AgentId::new("ace"),
+            crate::config::AgentConfig {
+                label: "Ace".to_string(),
+                ..Default::default()
+            },
+        );
+        let app_state = crate::test_util::build_state_with_config(config, None, None, None, None);
+        WebState {
+            app_state: Arc::new(app_state),
+            config_path: None,
+            run_hub: super::super::RunHub::default(),
+            active_ws_connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_web_session_uses_requested_agent() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let request = SendRequest {
+            session_key: Some("new-ace-session".to_string()),
+            message: "hello".to_string(),
+            agent_id: Some("ace".to_string()),
+            request_id: None,
+        };
+
+        // Act
+        let resolved = resolve_send_request(&state, &request, WEB_ACTOR)
+            .await
+            .expect("resolve request");
+
+        // Assert
+        assert_eq!(resolved.context.agent_id, "ace");
+        assert_eq!(
+            resolved.context.session_key(),
+            "web:new-ace-session:agent:ace"
+        );
+        assert!(
+            state
+                .app_state
+                .db
+                .get_chat_by_channel_external_and_agent(
+                    "web",
+                    "web:new-ace-session:agent:ace",
+                    "ace",
+                )
+                .expect("lookup created chat")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn new_web_session_requires_agent() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let request = SendRequest {
+            session_key: Some("missing-agent-session".to_string()),
+            message: "hello".to_string(),
+            agent_id: None,
+            request_id: None,
+        };
+
+        // Act
+        let error = resolve_send_request(&state, &request, WEB_ACTOR)
+            .await
+            .expect_err("agent must be required");
+
+        // Assert
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("agent_id is required"));
+        assert_eq!(
+            state
+                .app_state
+                .db
+                .list_sessions()
+                .expect("list sessions")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn new_web_session_rejects_unknown_agent() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let request = SendRequest {
+            session_key: Some("unknown-agent-session".to_string()),
+            message: "hello".to_string(),
+            agent_id: Some("missing".to_string()),
+            request_id: None,
+        };
+
+        // Act
+        let error = resolve_send_request(&state, &request, WEB_ACTOR)
+            .await
+            .expect_err("unknown agent must be rejected");
+
+        // Assert
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("unknown agent: missing"));
+        assert_eq!(
+            state
+                .app_state
+                .db
+                .list_sessions()
+                .expect("list sessions")
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_web_session_uses_persisted_agent() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:existing-session:agent:ace", None, "web", "ace")
+            .expect("create chat");
+        let request = SendRequest {
+            session_key: Some(format!("chat:{chat_id}")),
+            message: "hello".to_string(),
+            agent_id: Some("default".to_string()),
+            request_id: None,
+        };
+
+        // Act
+        let resolved = resolve_send_request(&state, &request, WEB_ACTOR)
+            .await
+            .expect("resolve request");
+
+        // Assert
+        assert_eq!(resolved.context.agent_id, "ace");
+        assert_eq!(resolved.session_key, format!("chat:{chat_id}"));
+    }
 
     #[test]
     fn stored_chat_context_preserves_stored_identity() {

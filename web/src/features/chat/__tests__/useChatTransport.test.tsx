@@ -51,6 +51,7 @@ function setup() {
   return renderHook(() =>
     useChatTransport({
       sessionKey: "s1",
+      agentId: "default",
       authToken: "token",
       onAuthRequired: vi.fn(),
       onError: vi.fn(),
@@ -76,6 +77,7 @@ describe("useChatTransport reconnect", () => {
     const { result } = renderHook(() =>
       useChatTransport({
         sessionKey: "s1",
+        agentId: "default",
         authToken: "token",
         onAuthRequired: vi.fn(),
         onError,
@@ -123,6 +125,7 @@ describe("useChatTransport reconnect", () => {
     const { result } = renderHook(() =>
       useChatTransport({
         sessionKey: "s1",
+        agentId: "default",
         authToken: "bad",
         onAuthRequired,
         onError: vi.fn(),
@@ -185,6 +188,10 @@ describe("useChatTransport reconnect", () => {
     expect(
       result.current.state.messages.find((m) => m.id === `local:${requestId}`),
     ).toMatchObject({ sender_kind: "user", content: "hello" });
+    const sentChat = JSON.parse(
+      ws.sent.find((frame) => frame.includes('"chat.send"'))!,
+    ) as { params: { agentId: string } };
+    expect(sentChat.params.agentId).toBe("default");
 
     let resolved: string | null = null;
     await act(async () => {
@@ -202,6 +209,7 @@ describe("useChatTransport reconnect", () => {
     const { result } = renderHook(() =>
       useChatTransport({
         sessionKey: "s1",
+        agentId: "default",
         authToken: "token",
         onAuthRequired: vi.fn(),
         onError,

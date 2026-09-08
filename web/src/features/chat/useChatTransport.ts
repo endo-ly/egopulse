@@ -19,6 +19,7 @@ import { invalidateQueries } from "../../shared/hooks/useServerState";
 
 export interface UseChatTransportOptions {
   sessionKey: string;
+  agentId: string;
   authToken: string;
   onDone?: () => void;
   onAuthRequired?: (message: string) => void;
@@ -49,6 +50,7 @@ const SEND_ACK_TIMEOUT_MS = 15_000;
 
 export function useChatTransport({
   sessionKey,
+  agentId,
   authToken,
   onDone,
   onAuthRequired,
@@ -332,6 +334,7 @@ export function useChatTransport({
         method: "chat.send",
         params: {
           sessionKey,
+          agentId,
           message: text,
           requestId,
         },
@@ -349,7 +352,7 @@ export function useChatTransport({
         pendingSendsRef.current.set(requestId, { resolve, reject, timer });
       });
     },
-    [connect, sessionKey],
+    [agentId, connect, sessionKey],
   );
 
   return {

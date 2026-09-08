@@ -259,7 +259,7 @@ GET /api/history?session_key=main&limit=100
 POST /api/send_stream
 ```
 
-- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）
+- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）。未永続の新規Webセッションでは `agent_id`（作成対象agent）も必須。既存の `chat:{id}` は保存済み `chats.agent_id` を使用する
 - レスポンス: `ok: true`, `run_id`（UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
 
 #### SSE イベント受信
@@ -560,6 +560,8 @@ JSON-RPC 風の双方向メッセージング。
 }
 ```
 
+`agentId` は未永続の新規Webセッションで必須。`sessionKey` が既存の `chat:{id}` の場合は、保存済みセッションのagentが優先される。
+
 ##### 成功レスポンス
 
 ```json
@@ -587,6 +589,7 @@ JSON-RPC 風の双方向メッセージング。
   "method": "chat.send",
   "params": {
     "sessionKey": "main",
+    "agentId": "default",
     "message": "こんにちは",
     "requestId": "client-generated-uuid"
   }

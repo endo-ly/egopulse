@@ -286,6 +286,7 @@ export function WebUI() {
 
   const transport = useChatTransport({
     sessionKey: selectedSession,
+    agentId: selectedAgent,
     authToken,
     onAuthRequired: setAuthMessage,
     onError: setTransportError,
