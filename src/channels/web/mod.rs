@@ -234,6 +234,7 @@ pub(crate) fn web_asset_response(path: &str) -> Response {
         Some("png") => "image/png",
         Some("ico") => "image/x-icon",
         Some("svg") => "image/svg+xml",
+        Some("webmanifest") => "application/manifest+json",
         Some("json") => "application/json; charset=utf-8",
         _ => "application/octet-stream",
     };
@@ -260,17 +261,34 @@ async fn index_or_asset(OriginalUri(uri): OriginalUri, method: Method) -> impl I
 }
 
 fn asset_or_index(uri: &Uri) -> Response {
-    match uri.path() {
-        "/favicon.ico" => web_asset_response("favicon.ico"),
-        "/icon.png" => web_asset_response("icon.png"),
-        path if path.starts_with("/assets/") => web_asset_response(path),
-        _ => match WEB_ASSETS.get_file("index.html") {
-            Some(file) => {
-                Html(String::from_utf8_lossy(file.contents()).into_owned()).into_response()
-            }
-            None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
+    if static_asset_exists(uri.path()) {
+        return web_asset_response(uri.path());
     }
+    match WEB_ASSETS.get_file("index.html") {
+        Some(file) => Html(String::from_utf8_lossy(file.contents()).into_owned()).into_response(),
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Reports whether the request path maps to an embedded static asset.
+///
+/// `web/dist` 直下の公開ファイル（manifest・アイコン類・favicon 等）を
+/// SPA フォールバックより優先して配信するための判定に使う。
+fn static_asset_exists(path: &str) -> bool {
+    let normalized = path.trim_start_matches('/');
+    if normalized.is_empty() {
+        return false;
+    }
+    [
+        normalized.to_string(),
+        format!("assets/{normalized}"),
+        normalized
+            .strip_prefix("assets/")
+            .unwrap_or(normalized)
+            .to_string(),
+    ]
+    .iter()
+    .any(|candidate| WEB_ASSETS.get_file(candidate).is_some())
 }
 
 /// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
@@ -456,6 +474,103 @@ mod tests {
         assert_eq!(web_session_key("web:   "), "main");
         assert_eq!(web_session_key("  web:foo  "), "foo");
         assert_eq!(web_session_key("web:web:nested"), "web:nested");
+    }
+
+    #[tokio::test]
+    async fn pwa_manifest_is_served_with_manifest_mime() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = web_only_test_router(&dir);
+
+        // Act
+        let response = app
+            .oneshot(
+                Request::get("/manifest.webmanifest")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type"),
+            "application/manifest+json"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let manifest: serde_json::Value = serde_json::from_slice(&body).expect("manifest json");
+        assert_eq!(manifest["display"], "standalone");
+        assert_eq!(manifest["start_url"], "/");
+    }
+
+    #[tokio::test]
+    async fn pwa_icons_are_served_as_png() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = web_only_test_router(&dir);
+
+        // Act + Assert
+        for path in [
+            "/pwa-192.png",
+            "/pwa-512.png",
+            "/pwa-maskable-512.png",
+            "/apple-touch-icon.png",
+            "/favicon.ico",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "path: {path}");
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .expect("content-type")
+                .to_str()
+                .expect("content-type str")
+                .to_string();
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            assert!(!body.is_empty(), "path: {path}");
+            if path.ends_with(".ico") {
+                assert_eq!(content_type, "image/x-icon", "path: {path}");
+            } else {
+                assert_eq!(content_type, "image/png", "path: {path}");
+            }
+            assert!(
+                !body.starts_with(b"<!doctype"),
+                "asset must not fall back to index.html: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_route_falls_back_to_index_html() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let app = web_only_test_router(&dir);
+
+        // Act
+        let response = app
+            .oneshot(Request::get("/chat").body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains(r#"<div id="root"></div>"#));
     }
 
     fn voice_test_router(dir: &tempfile::TempDir) -> (Router, Arc<AppState>) {
