@@ -208,17 +208,23 @@ pub(crate) fn web_external_chat_id(session_key: &str) -> String {
     format!("web:{}", web_session_key(session_key))
 }
 
-/// Serves an embedded static asset response for the requested path.
-pub(crate) fn web_asset_response(path: &str) -> Response {
+/// Lists the embedded asset paths a request path can resolve to.
+fn web_asset_candidates(path: &str) -> [String; 3] {
     let normalized = path.trim_start_matches('/');
-    let candidates = [
+    [
         normalized.to_string(),
         format!("assets/{normalized}"),
         normalized
             .strip_prefix("assets/")
             .unwrap_or(normalized)
             .to_string(),
-    ];
+    ]
+}
+
+/// Serves an embedded static asset response for the requested path.
+pub(crate) fn web_asset_response(path: &str) -> Response {
+    let normalized = path.trim_start_matches('/');
+    let candidates = web_asset_candidates(path);
 
     let file = candidates
         .iter()
@@ -275,20 +281,12 @@ fn asset_or_index(uri: &Uri) -> Response {
 /// `web/dist` 直下の公開ファイル（manifest・アイコン類・favicon 等）を
 /// SPA フォールバックより優先して配信するための判定に使う。
 fn static_asset_exists(path: &str) -> bool {
-    let normalized = path.trim_start_matches('/');
-    if normalized.is_empty() {
+    if path.trim_start_matches('/').is_empty() {
         return false;
     }
-    [
-        normalized.to_string(),
-        format!("assets/{normalized}"),
-        normalized
-            .strip_prefix("assets/")
-            .unwrap_or(normalized)
-            .to_string(),
-    ]
-    .iter()
-    .any(|candidate| WEB_ASSETS.get_file(candidate).is_some())
+    web_asset_candidates(path)
+        .iter()
+        .any(|candidate| WEB_ASSETS.get_file(candidate).is_some())
 }
 
 /// Starts the web server and mounts HTTP, SSE, and WebSocket routes.
