@@ -397,6 +397,110 @@ fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -
     )
 }
 
+pub(super) async fn publish_agent_event(run_hub: &super::RunHub, run_id: &str, event: AgentEvent) {
+    match event {
+        AgentEvent::Iteration { iteration } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "status",
+                    serde_json::to_string(&StatusPayload {
+                        message: format!("iteration {iteration}"),
+                    })
+                    .unwrap_or_default(),
+                )
+                .await;
+        }
+        AgentEvent::Delta { text } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "delta",
+                    serde_json::to_string(&DeltaPayload { delta: text }).unwrap_or_default(),
+                )
+                .await;
+        }
+        AgentEvent::ToolStart {
+            call_id,
+            name,
+            input,
+        } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "tool_start",
+                    serde_json::to_string(&ToolStartPayload {
+                        call_id,
+                        name,
+                        input,
+                    })
+                    .unwrap_or_default(),
+                )
+                .await;
+        }
+        AgentEvent::ToolResult {
+            call_id,
+            name,
+            is_error,
+            preview,
+            duration_ms,
+        } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "tool_result",
+                    serde_json::to_string(&ToolResultPayload {
+                        call_id,
+                        name,
+                        is_error,
+                        preview,
+                        duration_ms,
+                    })
+                    .unwrap_or_default(),
+                )
+                .await;
+        }
+        AgentEvent::UserInputInjected {
+            message_id,
+            sender_id,
+            text,
+            timestamp,
+        } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "user_input",
+                    serde_json::to_string(&UserInputPayload {
+                        message_id,
+                        sender_id,
+                        text,
+                        timestamp,
+                    })
+                    .unwrap_or_default(),
+                )
+                .await;
+        }
+        AgentEvent::FinalResponse { text } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "done",
+                    serde_json::to_string(&DonePayload { response: text }).unwrap_or_default(),
+                )
+                .await;
+        }
+        AgentEvent::Error { message } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "error",
+                    serde_json::to_string(&ErrorPayload { error: message }).unwrap_or_default(),
+                )
+                .await;
+        }
+    }
+}
+
 /// Creates a run and spawns the background task that publishes its events.
 pub(super) async fn start_stream_run(
     state: WebState,
@@ -480,110 +584,7 @@ pub(super) async fn start_stream_run(
         let run_id_for_events = run_id_for_task.clone();
         let forward = tokio::spawn(async move {
             while let Some(event) = evt_rx.recv().await {
-                match event {
-                    AgentEvent::Iteration { iteration } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "status",
-                                serde_json::to_string(&StatusPayload {
-                                    message: format!("iteration {iteration}"),
-                                })
-                                .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    AgentEvent::Delta { text } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "delta",
-                                serde_json::to_string(&DeltaPayload { delta: text })
-                                    .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    AgentEvent::ToolStart {
-                        call_id,
-                        name,
-                        input,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "tool_start",
-                                serde_json::to_string(&ToolStartPayload {
-                                    call_id,
-                                    name,
-                                    input,
-                                })
-                                .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    AgentEvent::ToolResult {
-                        call_id,
-                        name,
-                        is_error,
-                        preview,
-                        duration_ms,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "tool_result",
-                                serde_json::to_string(&ToolResultPayload {
-                                    call_id,
-                                    name,
-                                    is_error,
-                                    preview,
-                                    duration_ms,
-                                })
-                                .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    AgentEvent::UserInputInjected {
-                        message_id,
-                        sender_id,
-                        text,
-                        timestamp,
-                    } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "user_input",
-                                serde_json::to_string(&UserInputPayload {
-                                    message_id,
-                                    sender_id,
-                                    text,
-                                    timestamp,
-                                })
-                                .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    AgentEvent::FinalResponse { text } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "done",
-                                serde_json::to_string(&DonePayload { response: text })
-                                    .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                    AgentEvent::Error { message } => {
-                        run_hub
-                            .publish(
-                                &run_id_for_events,
-                                "error",
-                                serde_json::to_string(&ErrorPayload { error: message })
-                                    .unwrap_or_default(),
-                            )
-                            .await;
-                    }
-                }
+                publish_agent_event(&run_hub, &run_id_for_events, event).await;
             }
         });
 

@@ -2,6 +2,7 @@
 //!
 //! 接続ハンドシェイク、chat.send の受付、RunHub からのイベント転送を担う。
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,8 +18,13 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::auth;
-use super::stream::{SendRequest, resolve_existing_send_request, start_stream_run};
+use super::stream::{
+    SendRequest, publish_agent_event, resolve_existing_send_request, resolve_send_request,
+    start_stream_run,
+};
 use super::{RunEvent, WEB_ACTOR, WebState};
+use crate::runtime::channel_input::submit_observed_agent_turn_with_outcome;
+use crate::runtime::turn::{SubmitOutcome, TurnObserver};
 
 #[derive(Deserialize)]
 struct DeltaData {
@@ -38,7 +44,6 @@ struct ErrorData {
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_WS_CONNECTIONS: usize = 64;
 const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
-const MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION: usize = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
@@ -105,7 +110,7 @@ struct ChatSendParams {
     /// Agent selected by the WebUI when the session key is not yet persisted.
     agent_id: Option<String>,
     /// Client-generated request id for deduplication. Mirrors `SendRequest::request_id`
-    /// on the REST path; `start_stream_run` converts it into `context.request_key`
+    /// on the REST path; the Web runtime converts it into `context.request_key`
     /// so a re-delivered `chat.send` maps to the same Turn instead of a duplicate.
     request_id: Option<String>,
 }
@@ -166,14 +171,14 @@ struct GatewayChatContent {
 #[derive(Clone, Debug)]
 struct ActiveChatSend {
     run_id: String,
-    session_key: String,
 }
+
+type ActiveChatSends = HashMap<String, VecDeque<ActiveChatSend>>;
 
 struct SocketRequestContext<'a> {
     tx: &'a mpsc::UnboundedSender<Message>,
     connected: &'a AtomicBool,
-    in_flight_chat_sends: &'a Arc<AtomicUsize>,
-    active_chat_send: &'a Arc<Mutex<Option<ActiveChatSend>>>,
+    active_chat_sends: &'a Arc<Mutex<ActiveChatSends>>,
     conn_id: &'a str,
 }
 
@@ -240,8 +245,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     }
 
     let connected = Arc::new(AtomicBool::new(false));
-    let in_flight_chat_sends = Arc::new(AtomicUsize::new(0));
-    let active_chat_send = Arc::new(Mutex::new(None));
+    let active_chat_sends = Arc::new(Mutex::new(ActiveChatSends::new()));
 
     // 接続完了前は connect を期限付きで待ち、以降は通常の受信ループとして扱う。
     while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
@@ -277,8 +281,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                 let request_context = SocketRequestContext {
                     tx: &out_tx,
                     connected: &connected,
-                    in_flight_chat_sends: &in_flight_chat_sends,
-                    active_chat_send: &active_chat_send,
+                    active_chat_sends: &active_chat_sends,
                     conn_id: &conn_id,
                 };
                 if handle_request(&state, request_context, id, method, params).await {
@@ -406,10 +409,41 @@ async fn handle_chat_send(
         request_id: payload.request_id,
     };
 
-    if let Some(active) = context.active_chat_send.lock().await.clone() {
-        let resolved = match resolve_existing_send_request(state, &request, WEB_ACTOR).await {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => return send_busy(context.tx, id),
+    let existing = match resolve_existing_send_request(state, &request, WEB_ACTOR).await {
+        Ok(existing) => existing,
+        Err((status, message)) => {
+            return send_error(
+                context.tx,
+                id,
+                if status == StatusCode::BAD_REQUEST {
+                    "invalid_params"
+                } else {
+                    "internal_error"
+                },
+                message,
+            )
+            .is_err();
+        }
+    };
+
+    let is_slash_command = existing
+        .as_ref()
+        .map(|resolved| crate::slash_commands::is_slash_command(&resolved.message))
+        .unwrap_or_else(|| crate::slash_commands::is_slash_command(request.message.trim()));
+
+    if is_slash_command {
+        if let Some(resolved) = existing.as_ref()
+            && context
+                .active_chat_sends
+                .lock()
+                .await
+                .contains_key(&resolved.session_key)
+        {
+            return send_busy(context.tx, id);
+        }
+
+        let started = match start_stream_run(state.clone(), request, WEB_ACTOR).await {
+            Ok(started) => started,
             Err((status, message)) => {
                 return send_error(
                     context.tx,
@@ -425,53 +459,86 @@ async fn handle_chat_send(
             }
         };
 
-        if resolved.session_key != active.session_key
-            || crate::slash_commands::is_slash_command(&resolved.message)
-        {
-            return send_busy(context.tx, id);
-        }
+        context.active_chat_sends.lock().await.insert(
+            started.session_key.clone(),
+            VecDeque::from([ActiveChatSend {
+                run_id: started.run_id.clone(),
+            }]),
+        );
 
-        match crate::runtime::try_stage_tool_followup(
-            &state.app_state,
-            resolved.context,
-            resolved.message,
+        if send_response(
+            context.tx,
+            id,
+            ChatAckPayload {
+                run_id: started.run_id.clone(),
+                status: "accepted",
+            },
         )
-        .await
+        .is_err()
         {
-            Ok(crate::runtime::ToolFollowupOutcome::Accepted) => {
-                return send_response(
-                    context.tx,
-                    id,
-                    ChatAckPayload {
-                        run_id: active.run_id,
-                        status: "queued",
-                    },
-                )
-                .is_err();
-            }
-            Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {
-                return send_busy(context.tx, id);
-            }
-            Err(error) => {
-                return send_error(context.tx, id, "busy", error.to_string()).is_err();
+            remove_active_chat_send(
+                context.active_chat_sends,
+                &started.session_key,
+                &started.run_id,
+            )
+            .await;
+            return true;
+        }
+
+        spawn_chat_stream_forwarder(
+            state.clone(),
+            context.tx.clone(),
+            context.active_chat_sends.clone(),
+            started.run_id,
+            started.session_key,
+        );
+        return false;
+    }
+
+    if let Some(resolved) = existing {
+        let active = context
+            .active_chat_sends
+            .lock()
+            .await
+            .get(&resolved.session_key)
+            .and_then(|runs| runs.front().cloned());
+        if let Some(active) = active {
+            match crate::runtime::try_stage_tool_followup(
+                &state.app_state,
+                resolved.context,
+                resolved.message,
+            )
+            .await
+            {
+                Ok(crate::runtime::ToolFollowupOutcome::Accepted) => {
+                    return send_response(
+                        context.tx,
+                        id,
+                        ChatAckPayload {
+                            run_id: active.run_id,
+                            status: "queued",
+                        },
+                    )
+                    .is_err();
+                }
+                Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {}
+                Err(error) => {
+                    return send_error(context.tx, id, "busy", error.to_string()).is_err();
+                }
             }
         }
     }
 
-    if !try_acquire_chat_send(context.in_flight_chat_sends) {
-        return send_busy(context.tx, id);
-    }
-
-    let in_flight_permit = InFlightChatPermit::new(context.in_flight_chat_sends.clone());
-    let started = match start_stream_run(state.clone(), request, WEB_ACTOR).await {
-        Ok(started) => started,
+    let observed = match start_observed_stream_run(state.clone(), request, WEB_ACTOR).await {
+        Ok(observed) => observed,
         Err((status, message)) => {
-            drop(in_flight_permit);
             return send_error(
                 context.tx,
                 id,
-                if status == axum::http::StatusCode::BAD_REQUEST {
+                if status == StatusCode::BAD_REQUEST {
                     "invalid_params"
+                } else if status == StatusCode::TOO_MANY_REQUESTS {
+                    "busy"
                 } else {
                     "internal_error"
                 },
@@ -481,30 +548,49 @@ async fn handle_chat_send(
         }
     };
 
-    *context.active_chat_send.lock().await = Some(ActiveChatSend {
-        run_id: started.run_id.clone(),
-        session_key: started.session_key.clone(),
-    });
+    let ObservedRun {
+        started,
+        observer,
+        queued,
+    } = observed;
+    let ack_status = if queued { "queued" } else { "accepted" };
+    track_active_chat_send(
+        context.active_chat_sends,
+        &started.session_key,
+        &started.run_id,
+    )
+    .await;
 
     if send_response(
         context.tx,
         id,
         ChatAckPayload {
             run_id: started.run_id.clone(),
-            status: "accepted",
+            status: ack_status,
         },
     )
     .is_err()
     {
-        context.active_chat_send.lock().await.take();
+        remove_active_chat_send(
+            context.active_chat_sends,
+            &started.session_key,
+            &started.run_id,
+        )
+        .await;
         return true;
     }
 
+    spawn_observed_run_publisher(
+        state.clone(),
+        observer,
+        context.active_chat_sends.clone(),
+        started.run_id.clone(),
+        started.session_key.clone(),
+    );
     spawn_chat_stream_forwarder(
         state.clone(),
         context.tx.clone(),
-        in_flight_permit,
-        context.active_chat_send.clone(),
+        context.active_chat_sends.clone(),
         started.run_id,
         started.session_key,
     );
@@ -521,33 +607,115 @@ fn send_busy(tx: &mpsc::UnboundedSender<Message>, id: &str) -> bool {
     .is_err()
 }
 
-fn try_acquire_chat_send(in_flight_chat_sends: &AtomicUsize) -> bool {
-    in_flight_chat_sends
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            (current < MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION).then_some(current + 1)
-        })
-        .is_ok()
-}
-
 fn spawn_chat_stream_forwarder(
     state: WebState,
     tx: mpsc::UnboundedSender<Message>,
-    stream_permit: InFlightChatPermit,
-    active_chat_send: Arc<Mutex<Option<ActiveChatSend>>>,
+    active_chat_sends: Arc<Mutex<ActiveChatSends>>,
     run_id: String,
     session_key: String,
 ) {
     tokio::spawn(async move {
-        let _stream_permit = stream_permit;
-        forward_chat_stream(state, tx, run_id.clone(), session_key).await;
-        let mut active = active_chat_send.lock().await;
-        if active
-            .as_ref()
-            .is_some_and(|current| current.run_id == run_id)
-        {
-            *active = None;
-        }
+        forward_chat_stream(state, tx, run_id.clone(), session_key.clone()).await;
+        remove_active_chat_send(&active_chat_sends, &session_key, &run_id).await;
     });
+}
+
+struct ObservedRun {
+    started: super::stream::StartedRun,
+    observer: TurnObserver,
+    queued: bool,
+}
+
+async fn start_observed_stream_run(
+    state: WebState,
+    request: SendRequest,
+    actor: &str,
+) -> Result<ObservedRun, (StatusCode, String)> {
+    let super::stream::ResolvedSend {
+        message,
+        session_key,
+        context,
+    } = resolve_send_request(&state, &request, actor).await?;
+    let run_id = Uuid::new_v4().to_string();
+    let (observer, outcome) =
+        match submit_observed_agent_turn_with_outcome(&state.app_state, context, message).await {
+            Ok(result) => result,
+            Err(reason) => {
+                return Err((StatusCode::TOO_MANY_REQUESTS, reason.to_string()));
+            }
+        };
+    state.run_hub.create(&run_id, actor.to_string()).await;
+    Ok(ObservedRun {
+        started: super::stream::StartedRun {
+            run_id,
+            session_key,
+        },
+        observer,
+        queued: matches!(outcome, SubmitOutcome::Queued),
+    })
+}
+
+fn spawn_observed_run_publisher(
+    state: WebState,
+    observer: TurnObserver,
+    active_chat_sends: Arc<Mutex<ActiveChatSends>>,
+    run_id: String,
+    session_key: String,
+) {
+    tokio::spawn(async move {
+        let TurnObserver {
+            mut events,
+            mut completion,
+        } = observer;
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    publish_agent_event(&state.run_hub, &run_id, event).await;
+                }
+                _ = &mut completion => {
+                    while let Ok(event) = events.try_recv() {
+                        publish_agent_event(&state.run_hub, &run_id, event).await;
+                    }
+                    break;
+                }
+            }
+        }
+        remove_active_chat_send(&active_chat_sends, &session_key, &run_id).await;
+        state
+            .run_hub
+            .remove_later(run_id, super::RUN_TTL_SECONDS)
+            .await;
+    });
+}
+
+async fn track_active_chat_send(
+    active_chat_sends: &Arc<Mutex<ActiveChatSends>>,
+    session_key: &str,
+    run_id: &str,
+) {
+    active_chat_sends
+        .lock()
+        .await
+        .entry(session_key.to_string())
+        .or_default()
+        .push_back(ActiveChatSend {
+            run_id: run_id.to_string(),
+        });
+}
+
+async fn remove_active_chat_send(
+    active_chat_sends: &Arc<Mutex<ActiveChatSends>>,
+    session_key: &str,
+    run_id: &str,
+) {
+    let mut active = active_chat_sends.lock().await;
+    if let Some(runs) = active.get_mut(session_key) {
+        runs.retain(|current| current.run_id != run_id);
+        if runs.is_empty() {
+            active.remove(session_key);
+        }
+    }
 }
 
 async fn forward_chat_stream(
@@ -766,24 +934,6 @@ impl ConnectionPermit {
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.active_ws_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-struct InFlightChatPermit {
-    in_flight_chat_sends: Arc<AtomicUsize>,
-}
-
-impl InFlightChatPermit {
-    fn new(in_flight_chat_sends: Arc<AtomicUsize>) -> Self {
-        Self {
-            in_flight_chat_sends,
-        }
-    }
-}
-
-impl Drop for InFlightChatPermit {
-    fn drop(&mut self) {
-        self.in_flight_chat_sends.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1040,14 +1190,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let active_chat_send = Arc::new(Mutex::new(None));
+        let active_chat_sends = Arc::new(Mutex::new(HashMap::new()));
 
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
-            in_flight_chat_sends: &in_flight,
-            active_chat_send: &active_chat_send,
+            active_chat_sends: &active_chat_sends,
             conn_id: "test-conn",
         };
 
@@ -1070,6 +1218,94 @@ mod tests {
         let payload = &parsed["payload"];
         assert!(payload["runId"].as_str().is_some(), "runId must be present");
         assert_eq!(payload["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_queues_ordinary_message_behind_active_turn() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id(
+                "web",
+                "web:queued-session:agent:default",
+                None,
+                "web",
+                "default",
+            )
+            .expect("create chat");
+        let active_context = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some("queued-session".to_string()),
+                message: "active".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("active-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve active turn")
+        .context;
+        assert_eq!(
+            active_context.session_key(),
+            "web:queued-session:agent:default"
+        );
+        assert!(matches!(
+            state
+                .app_state
+                .turn_scheduler
+                .submit(crate::runtime::turn::ScheduledTurn {
+                    turn_id: "active-turn".to_string(),
+                    origin_id: "active-origin".to_string(),
+                    context: active_context,
+                    input: "active".to_string(),
+                    config_snapshot: None,
+                    received_at: None,
+                    response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
+                }),
+            crate::runtime::turn::ScheduleResult::Started(_)
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let active_chat_sends = Arc::new(Mutex::new(HashMap::from([(
+            format!("chat:{chat_id}"),
+            VecDeque::from([ActiveChatSend {
+                run_id: "active-run".to_string(),
+            }]),
+        )])));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            active_chat_sends: &active_chat_sends,
+            conn_id: "test-conn",
+        };
+
+        // Act
+        let stopped = handle_chat_send(
+            &state,
+            context,
+            "req-queued",
+            serde_json::json!({
+                "sessionKey": "queued-session",
+                "agentId": "default",
+                "message": "queued message",
+                "requestId": "queued-request"
+            }),
+        )
+        .await;
+
+        // Assert
+        assert!(!stopped);
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["payload"]["status"], "queued");
+        assert_ne!(response["payload"]["runId"], "active-run");
     }
 
     #[tokio::test]
@@ -1118,16 +1354,16 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
-        let in_flight = Arc::new(AtomicUsize::new(1));
-        let active_chat_send = Arc::new(Mutex::new(Some(ActiveChatSend {
-            run_id: "active-run".to_string(),
-            session_key: format!("chat:{chat_id}"),
-        })));
+        let active_chat_sends = Arc::new(Mutex::new(HashMap::from([(
+            format!("chat:{chat_id}"),
+            VecDeque::from([ActiveChatSend {
+                run_id: "active-run".to_string(),
+            }]),
+        )])));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
-            in_flight_chat_sends: &in_flight,
-            active_chat_send: &active_chat_send,
+            active_chat_sends: &active_chat_sends,
             conn_id: "test-conn",
         };
         let resolved = resolve_send_request(
@@ -1177,7 +1413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_chat_send_rejects_unknown_session_without_creating_chat() {
+    async fn ws_chat_send_accepts_unknown_session_while_another_session_runs() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
@@ -1204,16 +1440,16 @@ mod tests {
         let before = chat_count(&state);
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
-        let in_flight = Arc::new(AtomicUsize::new(1));
-        let active_chat_send = Arc::new(Mutex::new(Some(ActiveChatSend {
-            run_id: "active-run".to_string(),
-            session_key: format!("chat:{active_chat_id}"),
-        })));
+        let active_chat_sends = Arc::new(Mutex::new(HashMap::from([(
+            format!("chat:{active_chat_id}"),
+            VecDeque::from([ActiveChatSend {
+                run_id: "active-run".to_string(),
+            }]),
+        )])));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
-            in_flight_chat_sends: &in_flight,
-            active_chat_send: &active_chat_send,
+            active_chat_sends: &active_chat_sends,
             conn_id: "test-conn",
         };
 
@@ -1235,9 +1471,9 @@ mod tests {
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 1);
         let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
-        assert_eq!(response["ok"], false);
-        assert_eq!(response["error"]["code"], "busy");
-        assert_eq!(chat_count(&state), before);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["payload"]["status"], "accepted");
+        assert_eq!(chat_count(&state), before + 1);
     }
 
     #[test]

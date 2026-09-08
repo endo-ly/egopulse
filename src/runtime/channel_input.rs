@@ -202,9 +202,21 @@ pub(crate) async fn submit_agent_turn(
 /// Submits a turn through the shared durable scheduler and observes its output.
 pub(crate) async fn submit_observed_agent_turn(
     state: &Arc<AppState>,
-    mut context: SurfaceContext,
+    context: SurfaceContext,
     input: String,
 ) -> Result<TurnObserver, RejectReason> {
+    submit_observed_agent_turn_with_outcome(state, context, input)
+        .await
+        .map(|(observer, _)| observer)
+}
+
+/// Submits a turn through the shared durable scheduler and returns its observer
+/// together with whether execution started immediately or was queued.
+pub(crate) async fn submit_observed_agent_turn_with_outcome(
+    state: &Arc<AppState>,
+    mut context: SurfaceContext,
+    input: String,
+) -> Result<(TurnObserver, SubmitOutcome), RejectReason> {
     if context.request_key.is_empty() {
         context.request_key = format!("tui:{}", uuid::Uuid::new_v4());
     }
@@ -220,7 +232,7 @@ pub(crate) async fn submit_observed_agent_turn(
         response_delivery: ResponseDelivery::ClientOwned,
     };
     match submit_scheduled_turn(state, scheduled).await {
-        SubmitOutcome::Started | SubmitOutcome::Queued => Ok(observer),
+        outcome @ (SubmitOutcome::Started | SubmitOutcome::Queued) => Ok((observer, outcome)),
         SubmitOutcome::Rejected(reason) => {
             state.turn_observers.unregister(&request_key);
             Err(reason)

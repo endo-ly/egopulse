@@ -610,7 +610,7 @@ JSON-RPC 風の双方向メッセージング。
 }
 ```
 
-同一 WebSocket 接続で active run と同じ `sessionKey` に ordinary message を送った場合、current Turn が Tool 実行中なら `requestId` を message identity として durable staging する。受付 COMMIT 後、active run の `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。Tool 実行中でない、別 session、または slash command の送信は従来通り `busy` または通常の command routing となる。
+WebSocket の ordinary message は `requestId` を message identity として共通 TurnScheduler へ durable に投入する。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は active run の `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の `runId` と `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。別 session は独立して受け付ける。slash command は active session では `busy`、idle session では通常の command routing となる。
 
 `user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
 

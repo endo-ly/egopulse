@@ -79,7 +79,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 - 認証トークン未設定時は `/api/*` へのアクセスができない
 - WebSocket 最大接続数: 64
 - WebSocket 最大メッセージサイズ: 64KB
-- WebSocket の 1 接続あたり active `chat.send` は 1 つまで。active run と同一 session の ordinary message は Tool 実行中に follow-up として durable queue へ追加できる
+- WebSocket の ordinary `chat.send` は共通 TurnScheduler に投入され、同一 session では FIFO で実行される。active run と同一 session の Tool 実行中は follow-up として durable staging され、Tool Result 後に同じ interaction へ引き継がれる。slash command は active session では `busy` となる
 
 ---
 
