@@ -95,6 +95,7 @@ describe("AgentsSection", () => {
         agents={AGENTS}
         selectedAgent="lyre"
         onSelectAgent={vi.fn()}
+        avatarUrls={{ lyre: "blob:lyre-avatar" }}
         unreadAgentIds={new Set(["lyre"])}
       />,
     );
@@ -102,7 +103,7 @@ describe("AgentsSection", () => {
     const avatar = container.querySelector(".agent-avatar");
     expect(avatar).not.toBeNull();
     const img = avatar?.querySelector("img");
-    expect(img?.getAttribute("src")).toBe("/api/agents/lyre/avatar?v=1");
+    expect(img?.getAttribute("src")).toBe("blob:lyre-avatar");
     expect(avatar?.querySelector(".agent-avatar-dot.dot-unread")).not.toBeNull();
 
     // Agents without an avatar keep the plain status dot.

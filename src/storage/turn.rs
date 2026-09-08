@@ -371,6 +371,37 @@ impl Database {
         .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))
     }
 
+    /// Loads the durable Turn identified by one session-scoped request key.
+    pub(crate) fn get_turn_run_by_request_key(
+        &self,
+        chat_id: i64,
+        request_key: &str,
+    ) -> Result<Option<TurnRun>, StorageError> {
+        let conn = self.get_conn()?;
+        read_turn_run(
+            &conn,
+            &format!(
+                "SELECT {TURN_RUN_COLUMNS}
+                 FROM turn_runs
+                 WHERE chat_id = ?1 AND request_key = ?2"
+            ),
+            params![chat_id, request_key],
+        )
+    }
+
+    /// Reports whether a chat has any non-terminal durable Turn.
+    pub(crate) fn has_unfinished_turn(&self, chat_id: i64) -> Result<bool, StorageError> {
+        let conn = self.get_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turn_runs
+             WHERE chat_id = ?1
+               AND state NOT IN ('completed', 'failed', 'cancelled', 'uncertain')",
+            params![chat_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Returns durable Turns that can be dispatched or resumed after startup.
     ///
     /// In addition to queued `accepted` / `input_committed` Turns, this includes

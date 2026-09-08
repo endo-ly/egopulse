@@ -68,7 +68,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 
 ### データフロー
 
-- **メッセージ受信**: HTTP POST `/api/send_stream` または WebSocket `chat.send`
+- **メッセージ受信**: HTTP POST `/api/send_stream` または WebSocket `chat.send`。通常メッセージは共通のWeb入力境界からdurable Turnとして `TurnScheduler` へ投入する
 - **ストリーミング**: RunHub を介した publish/subscribe モデル
 - **再接続**: `last_event_id` によるイベントリプレイ対応（最大 512 イベント、5 分 TTL）
 - **応答**: WebAdapter は local-only で送信不可（Web クライアントへの送信は SSE/WS が直接行う）
@@ -79,7 +79,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 - 認証トークン未設定時は `/api/*` へのアクセスができない
 - WebSocket 最大接続数: 64
 - WebSocket 最大メッセージサイズ: 64KB
-- WebSocket の ordinary `chat.send` は共通 TurnScheduler に投入され、同一 session では FIFO で実行される。active run と同一 session の Tool 実行中は follow-up として durable staging され、Tool Result 後に同じ interaction へ引き継がれる。slash command は active session では `busy` となる
+- Webの ordinary message はRESTとWebSocketの入口にかかわらず共通 TurnScheduler に投入され、同一 session では FIFO で実行される。active run と同一 session の Tool 実行中は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じinteractionへ引き継がれる。slash command はdurableな未完了Turnを持つsessionでは `busy` となる
 
 ---
 

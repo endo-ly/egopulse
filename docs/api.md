@@ -260,7 +260,9 @@ POST /api/send_stream
 ```
 
 - リクエスト: `session_key`（識別キー）と `message`（送信テキスト）。未永続の新規Webセッションでは `agent_id`（作成対象agent）も必須。既存の `chat:{id}` は保存済み `chats.agent_id` を使用する
-- レスポンス: `ok: true`, `run_id`（UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
+- レスポンス: `ok: true`, `run_id`（durable Turn の UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
+
+通常メッセージはWebSocketと同じWeb共通入力を通り、`TurnScheduler` にdurableに投入される。同一sessionはFIFOで直列化され、Tool実行中の入力は既存Turnへdurable stagingされる。`request_id` が同じ再送は同じ `run_id` を返し、Turnを重複生成しない。slash commandはLLM Turnとして投入せず、対象sessionに未完了Turnがある場合は `429` で拒否する。
 
 #### SSE イベント受信
 
@@ -610,7 +612,7 @@ JSON-RPC 風の双方向メッセージング。
 }
 ```
 
-WebSocket の ordinary message は `requestId` を message identity として共通 TurnScheduler へ durable に投入する。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は active run の `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の `runId` と `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。別 session は独立して受け付ける。slash command は active session では `busy`、idle session では通常の command routing となる。
+WebSocket の ordinary message は `requestId` を message identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。別 session は独立して受け付ける。slash command は対象sessionに未完了Turnがある場合だけ `busy` となり、別sessionでは実行できる。
 
 `user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
 

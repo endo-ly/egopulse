@@ -22,6 +22,7 @@ export interface AppProps {
   onNewSession?: () => void;
   main?: ReactNode;
   authToken?: string;
+  agentAvatars?: Readonly<Record<string, string>>;
   /** Called after an agent avatar upload/removal so lists can refresh. */
   onAvatarChanged?: () => void;
   /** Session keys with messages newer than the last view. */
@@ -46,6 +47,7 @@ export function App({
   onNewSession = noop,
   main,
   authToken,
+  agentAvatars,
   onAvatarChanged,
   unreadSessionKeys,
 }: AppProps) {
@@ -168,6 +170,7 @@ export function App({
               selectedAgent={selectedAgent}
               onSelectAgent={handleSelectAgent}
               authToken={authToken}
+              avatarUrls={agentAvatars}
               onAvatarChanged={onAvatarChanged}
               unreadAgentIds={unreadAgentIds}
             />

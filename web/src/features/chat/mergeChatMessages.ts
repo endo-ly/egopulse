@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useRef } from "react";
 import type { ChatMessage } from "../../shared/api/types";
 import { isLiveMessageId } from "./chatReducer";
 
@@ -76,18 +76,11 @@ export function useMergedChatMessages(
     };
   }
   const seen: ReadonlySet<string> = seenRef.current?.ids ?? new Set();
-  // `seen` is intentionally not a dep: ref writes never re-render, so
-  // `freshIds` only needs recomputing when `history` itself changes.
-  const freshIds = useMemo(
-    () =>
-      new Set(
-        history.filter((message) => !seen.has(message.id)).map((m) => m.id),
-      ),
-    [history],
-  );
-  const merged = useMemo(
-    () => mergeChatMessages(history, live, freshIds),
-    [history, live, freshIds],
+  // Ref writes do not trigger renders. Recompute from the current seen set on
+  // every render so a fresh id cannot remain eligible during a later
+  // history-stable, live-only update.
+  const freshIds = new Set(
+    history.filter((message) => !seen.has(message.id)).map((message) => message.id),
   );
   useEffect(() => {
     const previous =
@@ -97,5 +90,5 @@ export function useMergedChatMessages(
       ids: new Set([...previous, ...history.map((message) => message.id)]),
     };
   }, [sessionKey, history]);
-  return merged;
+  return mergeChatMessages(history, live, freshIds);
 }

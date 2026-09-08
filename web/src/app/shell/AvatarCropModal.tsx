@@ -12,7 +12,7 @@ import {
 export interface AvatarCropModalProps {
   file: Blob;
   onCancel: () => void;
-  onApply: (blob: Blob) => void;
+  onApply: (blob: Blob) => void | Promise<void>;
 }
 
 const MIN_ZOOM = 1;
@@ -41,7 +41,7 @@ export function AvatarCropModal({ file, onCancel, onApply }: AvatarCropModalProp
       const blob = area
         ? await cropImageToAvatar(file, area)
         : await resizeImageToAvatar(file);
-      onApply(blob);
+      await onApply(blob);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {

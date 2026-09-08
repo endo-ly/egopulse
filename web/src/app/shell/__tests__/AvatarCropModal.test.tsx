@@ -81,6 +81,32 @@ describe("AvatarCropModal", () => {
     expect(onApply).not.toHaveBeenCalled();
   });
 
+  it("avatar_crop_waits_for_upload_before_accepting_another_apply", async () => {
+    let resolveApply!: () => void;
+    const onApply = vi.fn(
+      () => new Promise<void>((resolve) => {
+        resolveApply = resolve;
+      }),
+    );
+    render(
+      <AvatarCropModal file={FILE} onCancel={vi.fn()} onApply={onApply} />,
+    );
+
+    const apply = screen.getByRole("button", { name: /apply/i });
+    fireEvent.click(apply);
+    expect((apply as HTMLButtonElement).disabled).toBe(true);
+    expect(apply.getAttribute("aria-busy")).toBe("true");
+
+    await waitFor(() => expect(onApply).toHaveBeenCalledTimes(1));
+    fireEvent.click(apply);
+    expect(onApply).toHaveBeenCalledTimes(1);
+
+    resolveApply();
+    await waitFor(() =>
+      expect((apply as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
+
   it("avatar_crop_shows_zoom_control", () => {
     render(
       <AvatarCropModal file={FILE} onCancel={vi.fn()} onApply={vi.fn()} />,

@@ -9,6 +9,8 @@ export interface AgentsSectionProps {
   selectedAgent: string;
   onSelectAgent: (id: string) => void;
   authToken?: string;
+  /** Authorized object URLs resolved by the shared avatar hook. */
+  avatarUrls?: Readonly<Record<string, string>>;
   /** Called after an avatar upload/removal so the agent list can refresh. */
   onAvatarChanged?: () => void;
   /** Agent ids with sessions newer than the last view. */
@@ -36,6 +38,7 @@ export function AgentsSection({
   selectedAgent,
   onSelectAgent,
   authToken,
+  avatarUrls,
   onAvatarChanged,
   unreadAgentIds,
 }: AgentsSectionProps) {
@@ -133,9 +136,9 @@ export function AgentsSection({
               aria-current={selectedAgent === agent.id ? "true" : undefined}
               onClick={() => onSelectAgent(agent.id)}
             >
-              {agent.avatar_url ? (
+              {avatarUrls?.[agent.id] ? (
                 <span className="agent-avatar">
-                  <img src={agent.avatar_url} alt="" />
+                  <img src={avatarUrls[agent.id]} alt="" />
                   <StatusDot
                     tone={unreadAgentIds?.has(agent.id) ? "unread" : "idle"}
                     className="agent-avatar-dot"

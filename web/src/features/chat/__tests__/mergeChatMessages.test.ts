@@ -133,13 +133,29 @@ describe("useMergedChatMessages", () => {
     ]);
 
     // Act: refetch delivers the persisted copy.
+    const historyWithDb2 = [
+      ...history,
+      msg({ id: "db-2", sender_kind: "user", content: "hi" }),
+    ];
     rerender({
-      h: [...history, msg({ id: "db-2", sender_kind: "user", content: "hi" })],
+      h: historyWithDb2,
       l: live,
     });
 
     // Assert
     expect(result.current.map((m) => m.id).sort()).toEqual(["db-1", "db-2"]);
+
+    // A later live-only render must not reuse db-2 as a fresh reconciliation
+    // candidate for the next identical optimistic message.
+    rerender({
+      h: historyWithDb2,
+      l: [msg({ id: "local:req-2", sender_kind: "user", content: "hi" })],
+    });
+    expect(result.current.map((m) => m.id).sort()).toEqual([
+      "db-1",
+      "db-2",
+      "local:req-2",
+    ]);
   });
 
   it("resets_seen_history_on_session_switch", () => {

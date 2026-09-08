@@ -114,6 +114,21 @@ impl RunHub {
         );
     }
 
+    /// Creates a run channel without replacing one that is already being
+    /// observed. Durable Turn ids are reused as Web run ids for idempotent
+    /// requests and Tool follow-ups.
+    pub(crate) async fn create_if_absent(&self, run_id: &str, owner_actor: String) {
+        let (tx, _) = broadcast::channel(512);
+        let mut guard = self.channels.lock().await;
+        guard.entry(run_id.to_string()).or_insert(RunChannel {
+            sender: tx,
+            history: VecDeque::new(),
+            next_id: 1,
+            done: false,
+            owner_actor,
+        });
+    }
+
     pub(crate) async fn publish(&self, run_id: &str, event: &str, data: String) {
         let mut guard = self.channels.lock().await;
         let Some(channel) = guard.get_mut(run_id) else {

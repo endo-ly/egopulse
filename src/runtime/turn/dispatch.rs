@@ -211,7 +211,7 @@ async fn promote_terminal_staged_messages(
                     .await?;
                     accepted_turns.push(*turn);
                 }
-                Ok(channel_input::AcceptedScheduledTurn::Existing) => {
+                Ok(channel_input::AcceptedScheduledTurn::Existing(_)) => {
                     let chat_id = message.chat_id;
                     let message_id = message.id;
                     call_blocking(Arc::clone(&db), move |db| {

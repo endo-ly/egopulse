@@ -396,6 +396,7 @@ export function WebUI() {
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
         authToken={authToken}
+        agentAvatars={agentAvatars}
         onAvatarChanged={() => invalidateQueries("agents")}
         unreadSessionKeys={unreadSessionKeys}
         main={

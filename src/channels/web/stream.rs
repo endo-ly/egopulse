@@ -11,10 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::agent_loop::{process_turn_with_events, resolve_chat_id};
+use crate::agent_loop::resolve_chat_id;
 use crate::config::AgentId;
 use crate::conversation::SurfaceContext;
-use tracing::error;
+use crate::runtime::channel_input::{
+    ObservedTurnSubmission, find_turn_id_by_request_key, session_has_unfinished_turn,
+    submit_observed_agent_turn_with_identity, try_stage_tool_followup_with_turn_id,
+};
+use crate::runtime::turn::SubmitOutcome;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
@@ -116,12 +120,18 @@ struct SendStreamResponse {
     session_key: String,
 }
 
-/// Starts a streaming run and returns its identifiers.
+#[derive(Debug, Clone)]
+pub(super) struct AcceptedWebInput {
+    pub(super) started: StartedRun,
+    pub(super) status: &'static str,
+}
+
+/// Accepts a Web input and returns its streaming identifiers.
 pub(super) async fn api_send_stream(
     State(state): State<WebState>,
     Json(request): Json<SendRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let started = start_stream_run(state, request, WEB_ACTOR).await?;
+    let AcceptedWebInput { started, .. } = accept_web_input(state, request, WEB_ACTOR).await?;
 
     serde_json::to_value(SendStreamResponse {
         ok: true,
@@ -222,39 +232,6 @@ async fn resolve_new_web_session(
     Ok((format!("chat:{chat_id}"), context))
 }
 
-/// Resolves an existing web chat without creating a row for an unknown session.
-///
-/// Active WebSocket runs use this resolver before deciding whether a second
-/// request belongs to the active session. A rejected request must not create an
-/// empty chat as a side effect.
-async fn resolve_existing_web_session(
-    state: &WebState,
-    raw_session_key: &str,
-    agent_id: Option<&str>,
-    actor: &str,
-) -> Result<Option<(String, SurfaceContext)>, (StatusCode, String)> {
-    let db = Arc::clone(&state.app_state.db);
-    let chat_info = if let Some(chat_id) = parse_chat_id_from_session_key(raw_session_key) {
-        call_blocking(db, move |db| db.get_chat_by_id(chat_id))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    } else {
-        let context = web_context_for_session(state, raw_session_key, agent_id, actor)?;
-        let external_chat_id = context.session_key();
-        let agent_id = context.agent_id.clone();
-        call_blocking(db, move |db| {
-            db.get_chat_by_channel_external_and_agent("web", &external_chat_id, &agent_id)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    };
-
-    Ok(chat_info.map(|info| {
-        let session_key = format!("chat:{}", info.chat_id);
-        (session_key, surface_context_from_chat_info(info, actor))
-    }))
-}
-
 fn web_context_for_session(
     state: &WebState,
     raw_session_key: &str,
@@ -285,40 +262,6 @@ fn web_context_for_session(
         "web".to_string(),
         agent_id.to_string(),
     ))
-}
-
-/// Resolves a WebSocket follow-up against an existing chat only.
-pub(super) async fn resolve_existing_send_request(
-    state: &WebState,
-    request: &SendRequest,
-    actor: &str,
-) -> Result<Option<ResolvedSend>, (StatusCode, String)> {
-    let message = request.message.trim().to_string();
-    if message.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "message is required".to_string()));
-    }
-
-    let raw_session_key = request.session_key.as_deref().unwrap_or("main");
-    let Some((session_key, mut context)) =
-        resolve_existing_web_session(state, raw_session_key, request.agent_id.as_deref(), actor)
-            .await?
-    else {
-        return Ok(None);
-    };
-
-    if let Some(id) = request
-        .request_id
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        context.request_key = format!("web:{id}");
-    }
-
-    Ok(Some(ResolvedSend {
-        message,
-        session_key,
-        context,
-    }))
 }
 
 pub(super) async fn resolve_send_request(
@@ -353,13 +296,14 @@ pub(super) async fn resolve_send_request(
         resolve_new_web_session(state, raw_session_key, request.agent_id.as_deref(), actor).await?
     };
 
-    if let Some(id) = request
+    context.request_key = request
         .request_id
         .as_deref()
-        .filter(|s| !s.trim().is_empty())
-    {
-        context.request_key = format!("web:{id}");
-    }
+        .filter(|id| !id.trim().is_empty())
+        .map_or_else(
+            || format!("web:{}", Uuid::new_v4()),
+            |id| format!("web:{id}"),
+        );
 
     Ok(ResolvedSend {
         message,
@@ -501,21 +445,126 @@ pub(super) async fn publish_agent_event(run_hub: &super::RunHub, run_id: &str, e
     }
 }
 
-/// Creates a run and spawns the background task that publishes its events.
-pub(super) async fn start_stream_run(
+/// Accepts a Web input through the shared durable Turn boundary.
+pub(super) async fn accept_web_input(
     state: WebState,
     request: SendRequest,
     actor: &str,
-) -> Result<StartedRun, (StatusCode, String)> {
+) -> Result<AcceptedWebInput, (StatusCode, String)> {
     let ResolvedSend {
         message,
         session_key,
         context,
     } = resolve_send_request(&state, &request, actor).await?;
 
+    if crate::slash_commands::is_slash_command(&message) {
+        if session_has_unfinished_turn(&state.app_state, &context)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "another Turn is still running".to_string(),
+            ));
+        }
+        return execute_web_slash_command(state, session_key, context, message, actor).await;
+    }
+
+    if let Some(turn_id) = find_turn_id_by_request_key(&state.app_state, &context)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+    {
+        state
+            .run_hub
+            .create_if_absent(&turn_id, actor.to_string())
+            .await;
+        return Ok(AcceptedWebInput {
+            started: StartedRun {
+                run_id: turn_id,
+                session_key,
+            },
+            status: "queued",
+        });
+    }
+
+    if let Some(turn_id) =
+        try_stage_tool_followup_with_turn_id(&state.app_state, context.clone(), message.clone())
+            .await
+            .map_err(|error| (StatusCode::TOO_MANY_REQUESTS, error.to_string()))?
+    {
+        state
+            .run_hub
+            .create_if_absent(&turn_id, actor.to_string())
+            .await;
+        return Ok(AcceptedWebInput {
+            started: StartedRun {
+                run_id: turn_id,
+                session_key,
+            },
+            status: "queued",
+        });
+    }
+
+    match submit_observed_agent_turn_with_identity(&state.app_state, context, message)
+        .await
+        .map_err(|reason| {
+            let status = match reason {
+                crate::runtime::turn::RejectReason::SessionQueueFull
+                | crate::runtime::turn::RejectReason::GlobalQueueFull => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, reason.message().to_string())
+        })? {
+        ObservedTurnSubmission::Created {
+            observer,
+            outcome,
+            turn_id,
+        } => {
+            let status = if matches!(outcome, SubmitOutcome::Started) {
+                "accepted"
+            } else {
+                "queued"
+            };
+            state
+                .run_hub
+                .create_if_absent(&turn_id, actor.to_string())
+                .await;
+            spawn_observed_run_publisher(state.clone(), observer, turn_id.clone());
+            Ok(AcceptedWebInput {
+                started: StartedRun {
+                    run_id: turn_id,
+                    session_key,
+                },
+                status,
+            })
+        }
+        ObservedTurnSubmission::Existing { turn_id } => {
+            state
+                .run_hub
+                .create_if_absent(&turn_id, actor.to_string())
+                .await;
+            Ok(AcceptedWebInput {
+                started: StartedRun {
+                    run_id: turn_id,
+                    session_key,
+                },
+                status: "queued",
+            })
+        }
+    }
+}
+
+async fn execute_web_slash_command(
+    state: WebState,
+    session_key: String,
+    context: SurfaceContext,
+    message: String,
+    actor: &str,
+) -> Result<AcceptedWebInput, (StatusCode, String)> {
     let run_id = Uuid::new_v4().to_string();
     state.run_hub.create(&run_id, actor.to_string()).await;
-
     match crate::slash_commands::process_slash_command(
         &state.app_state,
         &context,
@@ -533,97 +582,58 @@ pub(super) async fn start_stream_run(
                     serde_json::to_string(&DonePayload { response }).unwrap_or_default(),
                 )
                 .await;
-            state
-                .run_hub
-                .remove_later(run_id.clone(), RUN_TTL_SECONDS)
-                .await;
-            return Ok(StartedRun {
-                run_id,
-                session_key,
-            });
         }
-        crate::slash_commands::SlashCommandOutcome::Error(e) => {
+        crate::slash_commands::SlashCommandOutcome::Error(error) => {
             state
                 .run_hub
                 .publish(
                     &run_id,
                     "error",
-                    serde_json::to_string(&ErrorPayload { error: e }).unwrap_or_default(),
+                    serde_json::to_string(&ErrorPayload { error }).unwrap_or_default(),
                 )
                 .await;
-            state
-                .run_hub
-                .remove_later(run_id.clone(), RUN_TTL_SECONDS)
-                .await;
-            return Ok(StartedRun {
-                run_id,
-                session_key,
-            });
         }
         crate::slash_commands::SlashCommandOutcome::NotHandled => {}
     }
-
-    let state_for_task = state.clone();
-    let run_id_for_task = run_id.clone();
-    let context_for_task = context;
-    tokio::spawn(async move {
-        state_for_task
-            .run_hub
-            .publish(
-                &run_id_for_task,
-                "status",
-                serde_json::to_string(&StatusPayload {
-                    message: "running".to_string(),
-                })
-                .unwrap_or_default(),
-            )
-            .await;
-
-        let (evt_tx, mut evt_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-        let run_hub = state_for_task.run_hub.clone();
-        let run_id_for_events = run_id_for_task.clone();
-        let forward = tokio::spawn(async move {
-            while let Some(event) = evt_rx.recv().await {
-                publish_agent_event(&run_hub, &run_id_for_events, event).await;
-            }
-        });
-
-        let evt_tx_clone = evt_tx.clone();
-        let result = process_turn_with_events(
-            &state_for_task.app_state.turn_dependencies(),
-            &context_for_task,
-            &message,
-            move |event| {
-                let _ = evt_tx_clone.send(event);
-            },
-        )
+    state
+        .run_hub
+        .remove_later(run_id.clone(), RUN_TTL_SECONDS)
         .await;
-
-        if let Err(error) = result {
-            error!(
-                session = %context_for_task.surface_thread,
-                error_kind = error.error_kind(),
-                error = %error,
-                error_debug = ?error,
-                "Web: error processing message"
-            );
-            let _ = evt_tx.send(super::sse::AgentEvent::Error {
-                message: error.user_message(),
-            });
-        }
-
-        drop(evt_tx);
-        let _ = forward.await;
-        state_for_task
-            .run_hub
-            .remove_later(run_id_for_task, RUN_TTL_SECONDS)
-            .await;
-    });
-
-    Ok(StartedRun {
-        run_id,
-        session_key,
+    Ok(AcceptedWebInput {
+        started: StartedRun {
+            run_id,
+            session_key,
+        },
+        status: "accepted",
     })
+}
+
+fn spawn_observed_run_publisher(
+    state: WebState,
+    observer: crate::runtime::turn::TurnObserver,
+    run_id: String,
+) {
+    tokio::spawn(async move {
+        let crate::runtime::turn::TurnObserver {
+            mut events,
+            mut completion,
+        } = observer;
+        loop {
+            tokio::select! {
+                event = events.recv() => {
+                    let Some(event) = event else { break };
+                    publish_agent_event(&state.run_hub, &run_id, event).await;
+                }
+                _ = &mut completion => {
+                    while let Ok(event) = events.try_recv() {
+                        publish_agent_event(&state.run_hub, &run_id, event).await;
+                    }
+                    break;
+                }
+            }
+        }
+        state.run_hub.remove_later(run_id, RUN_TTL_SECONDS).await;
+    });
 }
 
 #[cfg(test)]
@@ -912,5 +922,254 @@ mod tests {
         assert!(json.contains("\"replayTruncated\":true"));
         assert!(json.contains("\"oldestEventId\":5"));
         assert!(json.contains("\"requestedLastEventId\":3"));
+    }
+
+    #[tokio::test]
+    async fn web_inputs_share_fifo_scheduler_and_request_id_deduplication() {
+        // Arrange: occupy one session's scheduler slot without involving a
+        // WebSocket connection, so every following input must be durable and
+        // queued.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let active = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some("fifo-session".to_string()),
+                message: "active".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("active".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve active input");
+        assert!(matches!(
+            state
+                .app_state
+                .turn_scheduler
+                .submit(crate::runtime::turn::ScheduledTurn {
+                    turn_id: "active-turn".to_string(),
+                    origin_id: "active-origin".to_string(),
+                    context: active.context,
+                    input: "active".to_string(),
+                    config_snapshot: None,
+                    received_at: None,
+                    response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
+                }),
+            crate::runtime::turn::ScheduleResult::Started(_)
+        ));
+
+        let first = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("fifo-session".to_string()),
+                message: "first".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("first".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("accept first input");
+        let duplicate = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("fifo-session".to_string()),
+                message: "first".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("first".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("accept duplicate input");
+        let second = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("fifo-session".to_string()),
+                message: "second".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("second".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("accept second input");
+
+        // Assert: duplicate delivery reuses the same durable run, while the
+        // next request receives its own FIFO queue entry.
+        assert_eq!(first.started.run_id, duplicate.started.run_id);
+        assert_eq!(first.status, "queued");
+        assert_eq!(second.status, "queued");
+        assert_ne!(first.started.run_id, second.started.run_id);
+
+        let concurrent_request = SendRequest {
+            session_key: Some("fifo-session".to_string()),
+            message: "concurrent".to_string(),
+            agent_id: Some("default".to_string()),
+            request_id: Some("concurrent".to_string()),
+        };
+        let (left, right) = tokio::join!(
+            accept_web_input(state.clone(), concurrent_request.clone(), WEB_ACTOR),
+            accept_web_input(state.clone(), concurrent_request, WEB_ACTOR),
+        );
+        let left = left.expect("accept concurrent left input");
+        let right = right.expect("accept concurrent right input");
+
+        // Concurrent re-delivery still creates one durable Turn and keeps one
+        // live observer for the original request.
+        assert_eq!(left.started.run_id, right.started.run_id);
+        assert!(
+            state
+                .app_state
+                .turn_observers
+                .has_live_observer("web:concurrent")
+        );
+        assert_eq!(state.app_state.db.count_durable_pending().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn web_tool_followups_use_parent_run_without_connection_state() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id(
+                "web",
+                "web:tool-session:agent:default",
+                None,
+                "web",
+                "default",
+            )
+            .expect("create chat");
+        let turn_id = match state
+            .app_state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "tool-turn",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: "tool-turn-payload",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept turn")
+        {
+            crate::storage::AcceptOutcome::Created(run) => run.turn_id,
+            crate::storage::AcceptOutcome::Existing(_) => panic!("expected new turn"),
+        };
+        state
+            .app_state
+            .db
+            .get_conn()
+            .expect("connection")
+            .execute(
+                "UPDATE turn_runs SET state = 'tools_pending' WHERE turn_id = ?1",
+                rusqlite::params![&turn_id],
+            )
+            .expect("seed tool phase");
+
+        // Act: two independent Web entry points stage follow-ups.
+        let rest = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("tool-session".to_string()),
+                message: "from rest".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("rest-follow-up".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("accept REST follow-up");
+        let websocket = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("tool-session".to_string()),
+                message: "from websocket".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("ws-follow-up".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("accept WebSocket follow-up");
+
+        // Assert
+        assert_eq!(rest.started.run_id, turn_id);
+        assert_eq!(websocket.started.run_id, turn_id);
+        assert_eq!(rest.status, "queued");
+        assert_eq!(websocket.status, "queued");
+        let staged = state
+            .app_state
+            .db
+            .list_staged_user_messages(&turn_id)
+            .expect("staged follow-ups");
+        assert_eq!(staged.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn web_slash_commands_use_durable_session_busy_boundary() {
+        // Arrange: an accepted Turn is enough to make the session busy even
+        // when the request comes from a different Web connection.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id(
+                "web",
+                "web:busy-session:agent:default",
+                None,
+                "web",
+                "default",
+            )
+            .expect("create chat");
+        state
+            .app_state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "busy-turn",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: "busy-turn-payload",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept busy turn");
+
+        // Act
+        let busy = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("busy-session".to_string()),
+                message: "/new".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("busy-command".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect_err("command must be rejected while the session is busy");
+        let other_session = accept_web_input(
+            state,
+            SendRequest {
+                session_key: Some("idle-session".to_string()),
+                message: "/status".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("idle-command".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("different session command");
+
+        // Assert
+        assert_eq!(busy.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(other_session.status, "accepted");
     }
 }
