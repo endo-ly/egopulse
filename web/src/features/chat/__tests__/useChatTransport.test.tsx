@@ -556,6 +556,212 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
 
+  it("chat_transport_resubscribes_to_inflight_run_after_reconnect", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const rpcId = lastSentChat(ws).id;
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: rpcId,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "s1" },
+      });
+      await pending;
+    });
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+        },
+      });
+    });
+
+    // Act: the socket drops and reconnects.
+    act(() => ws.close());
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    const retry = FakeWebSocket.instances[1];
+    act(() => retry.simulateOpen());
+    act(() => retry.receive({ type: "event", event: "connect.challenge" }));
+    act(() => retry.receive({ type: "res", id: "connect", ok: true }));
+
+    // Assert: the in-flight run is resubscribed with the last applied seq.
+    const frames = retry.sent.map((sent) => JSON.parse(sent) as {
+      method?: string;
+      id: string;
+      params?: { runId: string; sessionKey: string; lastSeq: number };
+    });
+    const subscription = frames.find((frame) => frame.method === "run.subscribe");
+    expect(subscription).toBeTruthy();
+    expect(subscription?.params).toEqual({
+      runId: "run-a",
+      sessionKey: "s1",
+      lastSeq: 1,
+    });
+
+    // The replayed remainder completes the transcript.
+    act(() => {
+      retry.receive({
+        type: "res",
+        id: subscription!.id,
+        ok: true,
+        payload: { runId: "run-a", replayed: 1, done: false },
+      });
+      retry.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 2,
+          state: "done",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "Hello world" }],
+          },
+        },
+      });
+    });
+    expect(
+      result.current.state.messages.find((m) => m.id === "draft:run-a:done"),
+    ).toMatchObject({ content: "Hello world" });
+  });
+
+  it("chat_transport_drops_replayed_frames_at_or_below_last_seq", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const rpcId = lastSentChat(ws).id;
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: rpcId,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "s1" },
+      });
+      await pending;
+    });
+
+    const delta = (text: string) => ({
+      type: "event" as const,
+      event: "chat",
+      payload: {
+        runId: "run-a",
+        sessionKey: "s1",
+        seq: 1,
+        state: "delta",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      },
+    });
+
+    // Act: the same seq arrives twice (e.g. overlapping replay).
+    act(() => {
+      ws.receive(delta("Hello"));
+      ws.receive(delta("Hello"));
+    });
+
+    // Assert: the duplicate is not appended twice.
+    const draft = result.current.state.messages.find((m) => m.id === "draft:run-a");
+    expect(draft?.content).toBe("Hello");
+  });
+
+  it("chat_transport_forgets_run_after_run_not_found", async () => {
+    const mockInvalidate = vi.mocked(invalidateQueries);
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const rpcId = lastSentChat(ws).id;
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: rpcId,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "s1" },
+      });
+      await pending;
+    });
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "Hel" }] },
+        },
+      });
+    });
+
+    act(() => ws.close());
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    const retry = FakeWebSocket.instances[1];
+    act(() => retry.simulateOpen());
+    act(() => retry.receive({ type: "event", event: "connect.challenge" }));
+    act(() => retry.receive({ type: "res", id: "connect", ok: true }));
+    const frames = retry.sent.map((sent) => JSON.parse(sent) as {
+      method?: string;
+      id: string;
+    });
+    const subscription = frames.find((frame) => frame.method === "run.subscribe");
+    expect(subscription).toBeTruthy();
+
+    // Act: the run is no longer replayable (TTL expiry / restart).
+    mockInvalidate.mockClear();
+    act(() => {
+      retry.receive({
+        type: "res",
+        id: subscription!.id,
+        ok: false,
+        error: { code: "run_not_found", message: "run is gone" },
+      });
+    });
+
+    // Assert: the transport falls back to persisted history...
+    expect(mockInvalidate).toHaveBeenCalledWith("history");
+
+    // ...and discards the frozen draft its events can never complete.
+    expect(
+      result.current.state.messages.some((m) => m.id.startsWith("draft:run-a")),
+      "a forgotten run's frozen draft must not linger",
+    ).toBe(false);
+
+    // ...and stops resubscribing to the forgotten run.
+    act(() => retry.close());
+    await act(async () => {
+      vi.advanceTimersByTime(2_000);
+    });
+    const third = FakeWebSocket.instances[2];
+    act(() => third.simulateOpen());
+    act(() => third.receive({ type: "event", event: "connect.challenge" }));
+    act(() => third.receive({ type: "res", id: "connect", ok: true }));
+    expect(
+      third.sent.some((sent) => sent.includes("run.subscribe")),
+      "a forgotten run must not be resubscribed",
+    ).toBe(false);
+  });
+
   it("chat_transport_disconnect_suppresses_reconnect", () => {
     const { result } = setup();
 

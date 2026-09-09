@@ -108,6 +108,15 @@ export function useChatTransport({
   // Maps a server run to the original session used by this transport when the
   // server canonicalizes a newly-created session.
   const runSessionKeysRef = useRef(new Map<string, string>());
+  // Last gateway seq applied per run; frames at or below it are replays the
+  // client already applied, so they are dropped instead of appended twice.
+  const runLastSeqRef = useRef(new Map<string, number>());
+  // Runs accepted by the server but not yet terminated. After every reconnect
+  // they are resubscribed (run.subscribe) so streaming continues where the
+  // dropped socket left it.
+  const inFlightRunsRef = useRef(new Set<string>());
+  // RPC ids of pending run.subscribe requests, to interpret their responses.
+  const resubscribeRpcsRef = useRef(new Map<string, string>());
   // Set when a live socket drops unexpectedly so the next open resyncs.
   const disruptedRef = useRef(false);
   // Tracks whether the current socket ever reached "open" so an unexpected
@@ -187,6 +196,30 @@ export function useChatTransport({
     [clearReconnectTimer, rejectAllPendingSends],
   );
 
+  // Re-attaches this socket to runs accepted before the connection dropped.
+  // The server replays everything after the client's last applied seq, so
+  // streaming resumes without a gap or duplicates.
+  const resubscribeInFlightRuns = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const runId of inFlightRunsRef.current) {
+      const rpcId = crypto.randomUUID();
+      resubscribeRpcsRef.current.set(rpcId, runId);
+      ws.send(
+        JSON.stringify({
+          type: "req",
+          id: rpcId,
+          method: "run.subscribe",
+          params: {
+            runId,
+            sessionKey: runSessionKeysRef.current.get(runId) ?? sessionKeyRef.current,
+            lastSeq: runLastSeqRef.current.get(runId) ?? null,
+          },
+        }),
+      );
+    }
+  }, []);
+
   const handleMessage = useCallback(
     (raw: string) => {
       let parsed: ServerFrame;
@@ -210,6 +243,7 @@ export function useChatTransport({
       if (parsed.type === "res" && parsed.id === "connect") {
         if (parsed.ok) {
           connectResolveRef.current?.();
+          resubscribeInFlightRuns();
         } else {
           const message = parsed.error?.message ?? "gateway connection rejected";
           const error = parsed.error?.code === "unauthorized"
@@ -230,6 +264,28 @@ export function useChatTransport({
       }
 
       if (parsed.type === "res" && parsed.id !== "connect") {
+        const resubscribedRunId = resubscribeRpcsRef.current.get(parsed.id);
+        if (resubscribedRunId !== undefined) {
+          resubscribeRpcsRef.current.delete(parsed.id);
+          if (!parsed.ok) {
+            // The run is gone (TTL expiry, restart): its events will never
+            // arrive, so drop the frozen live transcript and per-run seq
+            // state, then reconcile from persisted history.
+            inFlightRunsRef.current.delete(resubscribedRunId);
+            runLastSeqRef.current.delete(resubscribedRunId);
+            setState((prev) => ({
+              ...prev,
+              messages: prev.messages.filter(
+                (message) =>
+                  message.id !== `draft:${resubscribedRunId}` &&
+                  !message.id.startsWith(`draft:${resubscribedRunId}:`),
+              ),
+            }));
+            invalidateQueries("sessions");
+            invalidateQueries("history");
+          }
+          return;
+        }
         // The ack settles the sendMessage promise; failures surface there
         // so the composer can keep the text.
         const pending = pendingSendsRef.current.get(parsed.id);
@@ -239,6 +295,7 @@ export function useChatTransport({
             if (pending) {
               runSessionKeysRef.current.set(ack.runId, pending.sessionKey);
             }
+            inFlightRunsRef.current.add(ack.runId);
           }
         } else if (!parsed.ok && pending) {
           uncertainSendRef.current = null;
@@ -255,6 +312,13 @@ export function useChatTransport({
         if (!belongsToCurrentSession(event, sessionKeyRef.current, runSessionKeysRef.current)) {
           return;
         }
+        // Replayed frames at or below the last applied seq are already in the
+        // transcript; applying them again would duplicate streamed text.
+        const lastSeq = runLastSeqRef.current.get(event.runId);
+        if (lastSeq !== undefined && event.seq <= lastSeq) {
+          return;
+        }
+        runLastSeqRef.current.set(event.runId, event.seq);
         setState((prev) => reduceChatEvent(prev, event, agentIdRef.current));
         if (event.state === "done") {
           if (
@@ -269,6 +333,8 @@ export function useChatTransport({
           if (event.terminal !== false) {
             onDone?.();
             runSessionKeysRef.current.delete(event.runId);
+            inFlightRunsRef.current.delete(event.runId);
+            runLastSeqRef.current.delete(event.runId);
           }
         } else if (event.state === "error") {
           // A failed turn still persisted the user message; refetch it.
@@ -276,6 +342,8 @@ export function useChatTransport({
           invalidateQueries("history");
           if (event.terminal !== false) {
             runSessionKeysRef.current.delete(event.runId);
+            inFlightRunsRef.current.delete(event.runId);
+            runLastSeqRef.current.delete(event.runId);
           }
         }
         return;
@@ -307,7 +375,7 @@ export function useChatTransport({
         setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
       }
     },
-    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend],
+    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend, resubscribeInFlightRuns],
   );
 
   const connect = useCallback(
