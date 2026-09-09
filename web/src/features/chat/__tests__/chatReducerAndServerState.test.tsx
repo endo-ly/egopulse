@@ -24,11 +24,13 @@ describe("chatReducer", () => {
         content: [{ type: "text", text: "Hello" }],
       },
     };
-    state = reduceChatEvent(state, delta1);
+    state = reduceChatEvent(state, delta1, "lyre");
 
     const draft = state.messages.find((m) => m.id === "draft:run-1");
     expect(draft).toBeTruthy();
     expect(draft?.content).toBe("Hello");
+    // The streamed sender is the real agent id so the avatar map resolves it.
+    expect(draft?.sender_id).toBe("lyre");
 
     const delta2: ChatEventPayload = {
       runId: "run-1",
@@ -40,7 +42,7 @@ describe("chatReducer", () => {
         content: [{ type: "text", text: " world" }],
       },
     };
-    state = reduceChatEvent(state, delta2);
+    state = reduceChatEvent(state, delta2, "lyre");
 
     const appended = state.messages.find((m) => m.id === "draft:run-1");
     expect(appended?.content).toBe("Hello world");
@@ -55,11 +57,31 @@ describe("chatReducer", () => {
         content: [{ type: "text", text: "Hello world" }],
       },
     };
-    state = reduceChatEvent(state, done);
+    state = reduceChatEvent(state, done, "lyre");
 
     const finalized = state.messages.find((m) => m.id === "draft:run-1:done");
     expect(finalized).toBeTruthy();
     expect(finalized?.content).toBe("Hello world");
+    expect(finalized?.sender_id).toBe("lyre");
+  });
+
+  it("done_without_prior_delta_stamps_the_agent_id", () => {
+    // Arrange: non-streaming runs only deliver the terminal event.
+    let state = initialChatState();
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-no-delta",
+      sessionKey: "main",
+      seq: 1,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "final" }] },
+    }, "lyre");
+
+    // Assert
+    const sealed = state.messages.find((m) => m.id === "draft:run-no-delta:done");
+    expect(sealed).toBeTruthy();
+    expect(sealed?.sender_id).toBe("lyre");
   });
 
   it("tool_start_and_result_inject_tool_messages", () => {
@@ -190,7 +212,7 @@ describe("chatReducer", () => {
       seq: 1,
       state: "delta",
       message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
-    });
+    }, "lyre");
 
     // Act
     state = reduceChatEvent(state, {
@@ -199,7 +221,7 @@ describe("chatReducer", () => {
       seq: 2,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
-    });
+    }, "lyre");
 
     // Assert: both stay; the merge drops them once fresh history lands.
     expect(state.messages.map((m) => m.id).sort()).toEqual([
@@ -216,7 +238,7 @@ describe("chatReducer", () => {
       seq: 1,
       state: "delta",
       message: { role: "assistant", content: [{ type: "text", text: "before" }] },
-    });
+    }, "lyre");
     state = reduceToolStart(state, {
       callId: "call-segments",
       name: "read",
@@ -242,14 +264,14 @@ describe("chatReducer", () => {
       seq: 2,
       state: "delta",
       message: { role: "assistant", content: [{ type: "text", text: "after" }] },
-    });
+    }, "lyre");
     state = reduceChatEvent(state, {
       runId: "run-segments",
       sessionKey: "main",
       seq: 3,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "after" }] },
-    });
+    }, "lyre");
 
     expect(state.messages.map((message) => message.content)).toEqual([
       "before",

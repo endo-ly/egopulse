@@ -95,6 +95,8 @@ export function useChatTransport({
   const connectRejectRef = useRef<((error: Error) => void) | null>(null);
   const sessionKeyRef = useRef(sessionKey);
   sessionKeyRef.current = sessionKey;
+  const agentIdRef = useRef(agentId);
+  agentIdRef.current = agentId;
   const onSessionResolvedRef = useRef(onSessionResolved);
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -253,7 +255,7 @@ export function useChatTransport({
         if (!belongsToCurrentSession(event, sessionKeyRef.current, runSessionKeysRef.current)) {
           return;
         }
-        setState((prev) => reduceChatEvent(prev, event));
+        setState((prev) => reduceChatEvent(prev, event, agentIdRef.current));
         if (event.state === "done") {
           if (
             event.sessionKey &&

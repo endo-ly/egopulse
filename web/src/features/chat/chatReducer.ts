@@ -75,7 +75,15 @@ export function reduceDiscardOptimisticUserMessage(
   };
 }
 
-export function reduceChatEvent(state: ChatState, event: ChatEventPayload): ChatState {
+/**
+ * Applies a streaming chat event. `agentId` — the session's agent — stamps the
+ * assistant sender so live bubbles resolve the same avatar as persisted ones.
+ */
+export function reduceChatEvent(
+  state: ChatState,
+  event: ChatEventPayload,
+  agentId: string,
+): ChatState {
   const draftId = `draft:${event.runId}`;
 
   switch (event.state) {
@@ -96,7 +104,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           ...messages,
           {
             id: draftId,
-            sender_id: "assistant",
+            sender_id: agentId,
             sender_kind: "assistant" as const,
             content: chunk,
             timestamp: new Date().toISOString(),
@@ -117,7 +125,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
         const sealedId = sealedAssistantDraftId(messages, draftId);
         messages = messages.map((m) =>
           m.id === draftId
-            ? { ...m, id: sealedId, content: finalText || m.content }
+            ? { ...m, id: sealedId, content: finalText || m.content, sender_id: agentId }
             : m,
         );
       } else if (finalText) {
@@ -126,7 +134,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           ...messages,
           {
             id: sealedId,
-            sender_id: "assistant",
+            sender_id: agentId,
             sender_kind: "assistant" as const,
             content: finalText,
             timestamp: new Date().toISOString(),
