@@ -1156,11 +1156,18 @@ mod tests {
 
         // Assert
         assert_eq!(forwarded_runs.lock().unwrap().len(), 1);
-        let responses = collect_text_messages(&mut rx);
+        let responses = collect_text_messages(&mut rx)
+            .into_iter()
+            .filter_map(|message| {
+                let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+                (parsed["type"] == "res").then_some(parsed)
+            })
+            .collect::<Vec<_>>();
         assert_eq!(responses.len(), 2);
-        let first: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
-        let second: serde_json::Value = serde_json::from_str(&responses[1]).unwrap();
-        assert_eq!(first["payload"]["runId"], second["payload"]["runId"]);
+        assert_eq!(
+            responses[0]["payload"]["runId"],
+            responses[1]["payload"]["runId"]
+        );
     }
 
     #[tokio::test]
