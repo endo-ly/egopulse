@@ -385,6 +385,23 @@ export function useChatTransport({
   }, [connect]);
   scheduleReconnectRef.current = scheduleReconnect;
 
+  // A backgrounded mobile browser kills the socket and the backoff timer may
+  // not fire until long after the user returns. Regaining visibility
+  // reconnects immediately (skipping the remaining backoff) so run events
+  // are missed for seconds rather than tens of seconds.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      if (wsRef.current || connectPromiseRef.current) return;
+      if (intentionalCloseRef.current) return;
+      clearReconnectTimer();
+      reconnectAttemptRef.current = 0;
+      void connect({ background: true }).catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [connect, clearReconnectTimer]);
+
   const disconnect = useCallback(() => {
     intentionalCloseRef.current = true;
     clearReconnectTimer();

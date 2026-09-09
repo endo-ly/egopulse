@@ -520,6 +520,42 @@ describe("useChatTransport reconnect", () => {
     expect(mockInvalidate).toHaveBeenCalledWith("history");
   });
 
+  it("chat_transport_reconnects_immediately_on_visibility_regain", () => {
+    const setVisibility = (state: "visible" | "hidden") => {
+      Object.defineProperty(document, "visibilityState", {
+        value: state,
+        configurable: true,
+      });
+    };
+    const { result } = setup();
+    act(() => {
+      void result.current.connect();
+    });
+    act(() => FakeWebSocket.instances[0].simulateOpen());
+    act(() => FakeWebSocket.instances[0].close());
+    // A retry is now pending behind the backoff timer.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+
+    // Regaining visibility skips the remaining backoff and reconnects now.
+    act(() => {
+      setVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    // The superseded backoff timer must not open another socket.
+    act(() => vi.advanceTimersByTime(30_000));
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+    // An open socket is left alone — visibility alone does not reconnect.
+    act(() => FakeWebSocket.instances[1].simulateOpen());
+    act(() => {
+      setVisibility("visible");
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    expect(FakeWebSocket.instances).toHaveLength(2);
+  });
+
   it("chat_transport_disconnect_suppresses_reconnect", () => {
     const { result } = setup();
 
