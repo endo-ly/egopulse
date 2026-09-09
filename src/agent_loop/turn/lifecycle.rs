@@ -678,7 +678,7 @@ mod tests {
         assert!(
             events.iter().any(|ev| matches!(
                 ev,
-                AgentEvent::FinalResponse { text } if text == &reply
+                AgentEvent::FinalResponse { text, .. } if text == &reply
             )),
             "in-progress duplicate must emit a matching FinalResponse event"
         );
@@ -754,7 +754,7 @@ mod tests {
         assert!(
             events.iter().any(|ev| matches!(
                 ev,
-                AgentEvent::FinalResponse { text } if text == &reply
+                AgentEvent::FinalResponse { text, .. } if text == &reply
             )),
             "terminated re-acceptance must emit a matching FinalResponse event"
         );

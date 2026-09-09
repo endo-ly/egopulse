@@ -9,7 +9,7 @@ export interface ChatTabProps {
   channel: string;
   readOnly: boolean;
   messages?: ChatMessage[];
-  onSend?: (text: string) => Promise<boolean>;
+  onSend?: (text: string, draftId: string) => Promise<boolean>;
   storageKey?: string;
   /** Jump request from the command palette: scroll to and flash the message. */
   jumpRequest?: { index: number; seq: number };

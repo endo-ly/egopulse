@@ -613,7 +613,7 @@ JSON-RPC 風の双方向メッセージング。
 }
 ```
 
-WebSocket の ordinary message は `requestId` を message identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
+WebSocket の ordinary message は `requestId` を durable request identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。`req.id` はWebSocketの1回のRPC attemptとresponse照合だけに使うため、ACK不明後のretryでは新しい `req.id` と同じ `requestId` を組み合わせる。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。複数Turnのinteractionでは個別の `done` / `error` が `terminal: false` で流れ、最後のTurnだけが `terminal: true` になる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
 
 `user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
 
@@ -642,10 +642,10 @@ WebSocket の ordinary message は `requestId` を message identity としてRES
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
-| `done` | 完了。`message` に最終応答を含む。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
+| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
 | `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する |
 
-`chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。本文を変更せずに再送するクライアントは、同じ `requestId` を再利用してdurable Turnのidempotencyを維持する。本文を変更した再利用は `409 Conflict` になる。
+`chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
 
 #### ツールイベント受信
 

@@ -352,12 +352,14 @@ impl TurnExecutor<'_> {
                 TurnAcceptance::Completed(saved) => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         text: saved.clone(),
+                        terminal: false,
                     });
                     return Ok(saved);
                 }
                 TurnAcceptance::Terminated(message) => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         text: message.clone(),
+                        terminal: false,
                     });
                     return Ok(message);
                 }
@@ -367,6 +369,7 @@ impl TurnExecutor<'_> {
                     // リクエスト自体は呼び出し元へ明確に終端させ、イベントも発する。
                     self.on_event.emit(AgentEvent::FinalResponse {
                         text: message.clone(),
+                        terminal: false,
                     });
                     return Ok(message);
                 }
@@ -1173,7 +1176,7 @@ mod tests {
         let last = events.last().expect("at least one event");
         assert!(matches!(
             last,
-            AgentEvent::FinalResponse { text } if text == "Hello world"
+            AgentEvent::FinalResponse { text, .. } if text == "Hello world"
         ));
     }
 

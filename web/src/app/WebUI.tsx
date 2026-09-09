@@ -317,11 +317,11 @@ export function WebUI() {
   );
 
   const handleSend = useCallback(
-    async (text: string): Promise<boolean> => {
+    async (text: string, draftId: string): Promise<boolean> => {
       setTransportError(null);
       try {
-        const requestId = await transport.sendMessage(text);
-        if (!requestId) {
+        const durableRequestId = await transport.sendMessage(text, draftId);
+        if (!durableRequestId) {
           setTransportError("gateway is not connected");
           return false;
         }

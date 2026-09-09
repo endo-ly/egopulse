@@ -48,10 +48,21 @@ interface ChatAckPayload {
   sessionKey?: string;
 }
 
-interface RetryableSend {
-  requestId: string;
+interface UncertainSend {
+  draftId: string;
+  durableRequestId: string;
   sessionKey: string;
   text: string;
+}
+
+interface PendingSend {
+  resolve: (durableRequestId: string) => void;
+  reject: (error: Error) => void;
+  draftId: string;
+  durableRequestId: string;
+  sessionKey: string;
+  text: string;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 interface RoutedEventPayload {
@@ -88,25 +99,12 @@ export function useChatTransport({
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
-  // chat.send request ids awaiting their ack, with settle callbacks.
-  const pendingSendsRef = useRef(
-    new Map<
-      string,
-      {
-        resolve: (requestId: string) => void;
-        reject: (error: Error) => void;
-        sessionKey: string;
-        text: string;
-        timer: ReturnType<typeof setTimeout>;
-      }
-    >(),
-  );
-  // A timeout means acceptance is unknown, not rejected. Keep the request id
-  // attached to the unchanged draft so an explicit retry remains idempotent.
-  const retryableSendsRef = useRef(new Map<string, RetryableSend>());
-  const runRequestIdsRef = useRef(new Map<string, string>());
-  // Maps a server run to the session key used by this transport when the
-  // server canonicalizes a newly-created session to `chat:{id}`.
+  // RPC ids identify one WebSocket attempt. Durable request ids identify the
+  // logical send and remain stable only while its current draft is uncertain.
+  const pendingSendsRef = useRef(new Map<string, PendingSend>());
+  const uncertainSendRef = useRef<UncertainSend | null>(null);
+  // Maps a server run to the original session used by this transport when the
+  // server canonicalizes a newly-created session.
   const runSessionKeysRef = useRef(new Map<string, string>());
   // Set when a live socket drops unexpectedly so the next open resyncs.
   const disruptedRef = useRef(false);
@@ -126,46 +124,44 @@ export function useChatTransport({
   }, []);
 
   const settlePendingSend = useCallback(
-    (requestId: string, error: Error | null) => {
-      const pending = pendingSendsRef.current.get(requestId);
+    (rpcId: string, error: Error | null) => {
+      const pending = pendingSendsRef.current.get(rpcId);
       if (!pending) return;
-      pendingSendsRef.current.delete(requestId);
+      pendingSendsRef.current.delete(rpcId);
       clearTimeout(pending.timer);
       if (error) {
-        setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
+        setState((prev) =>
+          reduceDiscardOptimisticUserMessage(prev, pending.durableRequestId),
+        );
         pending.reject(error);
       } else {
-        pending.resolve(requestId);
+        pending.resolve(pending.durableRequestId);
       }
     },
     [],
   );
 
-  const findRetryableSend = useCallback((requestId: string) => {
-    for (const [fingerprint, entry] of retryableSendsRef.current) {
-      if (entry.requestId === requestId) return { fingerprint, entry };
-    }
-    return null;
-  }, []);
-
   const rejectAllPendingSends = useCallback((error: Error, retryable: boolean) => {
     const pending = [...pendingSendsRef.current.entries()];
     pendingSendsRef.current.clear();
-    for (const [requestId, entry] of pending) {
+    for (const [_rpcId, entry] of pending) {
       clearTimeout(entry.timer);
       if (retryable) {
-        retryableSendsRef.current.set(`${entry.sessionKey}\u0000${entry.text}`, {
-          requestId,
+        uncertainSendRef.current = {
+          draftId: entry.draftId,
+          durableRequestId: entry.durableRequestId,
           sessionKey: entry.sessionKey,
           text: entry.text,
-        });
+        };
       }
       entry.reject(error);
     }
+    if (!retryable) uncertainSendRef.current = null;
     if (pending.length > 0) {
       setState((prev) =>
         pending.reduce(
-          (state, [requestId]) => reduceDiscardOptimisticUserMessage(state, requestId),
+          (state, [_rpcId, entry]) =>
+            reduceDiscardOptimisticUserMessage(state, entry.durableRequestId),
           prev,
         ),
       );
@@ -174,6 +170,9 @@ export function useChatTransport({
 
   useEffect(() => {
     setState(initialChatState());
+    if (uncertainSendRef.current?.sessionKey !== sessionKey) {
+      uncertainSendRef.current = null;
+    }
   }, [sessionKey]);
 
   useEffect(
@@ -231,20 +230,16 @@ export function useChatTransport({
       if (parsed.type === "res" && parsed.id !== "connect") {
         // The ack settles the sendMessage promise; failures surface there
         // so the composer can keep the text.
+        const pending = pendingSendsRef.current.get(parsed.id);
         if (parsed.ok && parsed.payload) {
           const ack = parsed.payload as ChatAckPayload;
           if (ack.runId && ack.sessionKey) {
-            const pending = pendingSendsRef.current.get(parsed.id);
-            const retryable = findRetryableSend(parsed.id);
-            const request = pending ?? retryable?.entry;
-            if (request) {
-              runSessionKeysRef.current.set(ack.runId, request.sessionKey);
-              runRequestIdsRef.current.set(ack.runId, parsed.id);
+            if (pending) {
+              runSessionKeysRef.current.set(ack.runId, pending.sessionKey);
             }
           }
-        } else if (!parsed.ok) {
-          const retryable = findRetryableSend(parsed.id);
-          if (retryable) retryableSendsRef.current.delete(retryable.fingerprint);
+        } else if (!parsed.ok && pending) {
+          uncertainSendRef.current = null;
         }
         settlePendingSend(
           parsed.id,
@@ -269,25 +264,15 @@ export function useChatTransport({
           }
           invalidateQueries("sessions");
           invalidateQueries("history");
-          onDone?.();
-          const requestId = runRequestIdsRef.current.get(event.runId);
-          if (requestId) {
-            const retryable = findRetryableSend(requestId);
-            if (retryable) retryableSendsRef.current.delete(retryable.fingerprint);
+          if (event.terminal !== false) {
+            onDone?.();
+            runSessionKeysRef.current.delete(event.runId);
           }
-          runRequestIdsRef.current.delete(event.runId);
-          runSessionKeysRef.current.delete(event.runId);
         } else if (event.state === "error") {
           // A failed turn still persisted the user message; refetch it.
           invalidateQueries("sessions");
           invalidateQueries("history");
           if (event.terminal !== false) {
-            const requestId = runRequestIdsRef.current.get(event.runId);
-            if (requestId) {
-              const retryable = findRetryableSend(requestId);
-              if (retryable) retryableSendsRef.current.delete(retryable.fingerprint);
-            }
-            runRequestIdsRef.current.delete(event.runId);
             runSessionKeysRef.current.delete(event.runId);
           }
         }
@@ -320,7 +305,7 @@ export function useChatTransport({
         setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
       }
     },
-    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, findRetryableSend, settlePendingSend],
+    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend],
   );
 
   const connect = useCallback(
@@ -408,46 +393,76 @@ export function useChatTransport({
   }, [clearReconnectTimer, rejectAllPendingSends]);
 
   const sendMessage = useCallback(
-    async (text: string): Promise<string | null> => {
+    async (text: string, draftId: string): Promise<string | null> => {
       await connect();
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return null;
 
-      const fingerprint = `${sessionKey}\u0000${text}`;
-      const retryable = retryableSendsRef.current.get(fingerprint);
-      const requestId = retryable?.requestId ?? crypto.randomUUID();
-      if (retryable) retryableSendsRef.current.delete(fingerprint);
+      const uncertain = uncertainSendRef.current;
+      const durableRequestId =
+        uncertain &&
+        uncertain.draftId === draftId &&
+        uncertain.sessionKey === sessionKey &&
+        uncertain.text === text
+          ? uncertain.durableRequestId
+          : crypto.randomUUID();
+      uncertainSendRef.current = null;
+      const rpcId = crypto.randomUUID();
       const msg = {
         type: "req",
-        id: requestId,
+        id: rpcId,
         method: "chat.send",
         params: {
           sessionKey,
           agentId,
           message: text,
-          requestId,
+          requestId: durableRequestId,
         },
       };
-      setState((prev) => reduceOptimisticUserMessage(prev, { requestId, text }));
+      setState((prev) =>
+        reduceOptimisticUserMessage(prev, { requestId: durableRequestId, text }),
+      );
       // Resolve on the server ack; reject on refusal or timeout so the
       // caller can keep the text instead of losing it.
       return new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
-          const pending = pendingSendsRef.current.get(requestId);
+          const pending = pendingSendsRef.current.get(rpcId);
           if (!pending) return;
-          pendingSendsRef.current.delete(requestId);
-          retryableSendsRef.current.set(fingerprint, { requestId, sessionKey, text });
-          setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
+          pendingSendsRef.current.delete(rpcId);
+          uncertainSendRef.current = {
+            draftId,
+            durableRequestId,
+            sessionKey,
+            text,
+          };
+          setState((prev) =>
+            reduceDiscardOptimisticUserMessage(prev, durableRequestId),
+          );
           reject(new Error("send acknowledgement timed out"));
         }, SEND_ACK_TIMEOUT_MS);
-        pendingSendsRef.current.set(requestId, { resolve, reject, sessionKey, text, timer });
+        pendingSendsRef.current.set(rpcId, {
+          resolve,
+          reject,
+          draftId,
+          durableRequestId,
+          sessionKey,
+          text,
+          timer,
+        });
         try {
           ws.send(JSON.stringify(msg));
         } catch (error) {
-          pendingSendsRef.current.delete(requestId);
+          pendingSendsRef.current.delete(rpcId);
           clearTimeout(timer);
-          retryableSendsRef.current.set(fingerprint, { requestId, sessionKey, text });
-          setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
+          uncertainSendRef.current = {
+            draftId,
+            durableRequestId,
+            sessionKey,
+            text,
+          };
+          setState((prev) =>
+            reduceDiscardOptimisticUserMessage(prev, durableRequestId),
+          );
           reject(error instanceof Error ? error : new Error("failed to send message"));
         }
       });
@@ -471,5 +486,8 @@ function belongsToCurrentSession(
   runSessionKeys: Map<string, string>,
 ): boolean {
   if (payload.sessionKey === currentSessionKey) return true;
-  return typeof payload.runId === "string" && runSessionKeys.get(payload.runId) === currentSessionKey;
+  return (
+    typeof payload.runId === "string" &&
+    runSessionKeys.get(payload.runId) === currentSessionKey
+  );
 }

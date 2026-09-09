@@ -104,9 +104,10 @@ struct ChatSendParams {
     message: String,
     /// Agent selected by the WebUI when the session key is not yet persisted.
     agent_id: Option<String>,
-    /// Client-generated request id for deduplication. Mirrors `SendRequest::request_id`
-    /// on the REST path; the Web runtime converts it into `context.request_key`
-    /// so a re-delivered `chat.send` maps to the same Turn instead of a duplicate.
+    /// Durable request id for deduplication. Mirrors `SendRequest::request_id`
+    /// on the REST path; it is independent from the enclosing frame's RPC id.
+    /// The Web runtime converts it into `context.request_key` so a re-delivered
+    /// `chat.send` maps to the same Turn instead of a duplicate.
     request_id: Option<String>,
 }
 
@@ -592,7 +593,7 @@ fn forward_run_event(
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
             }
-            true
+            event.terminal
         }
         "error" => {
             let data = serde_json::from_str::<ErrorData>(&event.data).unwrap_or_default();
@@ -1029,6 +1030,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ws_nonterminal_done_does_not_stop_the_shared_run() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        assert!(!forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            RunEvent {
+                id: 1,
+                event: "done".to_string(),
+                data: r#"{"response":"follow-up A"}"#.to_string(),
+                terminal: false,
+            }
+        ));
+        assert!(!forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            RunEvent {
+                id: 2,
+                event: "error".to_string(),
+                data: r#"{"error":"follow-up A failed later"}"#.to_string(),
+                terminal: false,
+            }
+        ));
+        assert!(forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            RunEvent {
+                id: 3,
+                event: "done".to_string(),
+                data: r#"{"response":"follow-up B"}"#.to_string(),
+                terminal: true,
+            }
+        ));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 3);
+        let first_done: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(first_done["payload"]["terminal"], false);
+        let last_done: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
+        assert_eq!(last_done["payload"]["terminal"], true);
+    }
+
     #[tokio::test]
     async fn ws_replays_parent_error_and_child_events_from_one_run() {
         // Arrange
@@ -1104,17 +1155,18 @@ mod tests {
         let params = serde_json::json!({
             "sessionKey": "main",
             "agentId": "default",
-            "message": "hello"
+            "message": "hello",
+            "requestId": "durable-request-1"
         });
 
-        let _ = handle_chat_send(&state, context, "req-1", params).await;
+        let _ = handle_chat_send(&state, context, "rpc-attempt-1", params).await;
 
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 1, "exactly one response frame expected");
 
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(parsed["type"], "res");
-        assert_eq!(parsed["id"], "req-1");
+        assert_eq!(parsed["id"], "rpc-attempt-1");
         assert_eq!(parsed["ok"], true);
 
         let payload = &parsed["payload"];

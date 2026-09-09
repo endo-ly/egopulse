@@ -142,6 +142,20 @@ impl RunHub {
         publish_locked(channel, event, data, event == "done" || event == "error");
     }
 
+    /// Publishes a final response with terminality supplied by the shared
+    /// runtime observer interaction.
+    pub(crate) async fn publish_agent_response(&self, run_id: &str, data: String, terminal: bool) {
+        let mut guard = self.channels.lock().await;
+        let Some(channel) = guard.get_mut(run_id) else {
+            return;
+        };
+        if channel.done {
+            return;
+        }
+
+        publish_locked(channel, "done", data, terminal);
+    }
+
     /// Publishes an agent error while preserving the interaction when a
     /// staged follow-up remains assigned to the same observer.
     pub(crate) async fn publish_agent_error(&self, run_id: &str, data: String, terminal: bool) {

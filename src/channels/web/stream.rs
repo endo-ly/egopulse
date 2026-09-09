@@ -425,12 +425,12 @@ pub(super) async fn publish_agent_event(run_hub: &super::RunHub, run_id: &str, e
                 )
                 .await;
         }
-        AgentEvent::FinalResponse { text } => {
+        AgentEvent::FinalResponse { text, terminal } => {
             run_hub
-                .publish(
+                .publish_agent_response(
                     run_id,
-                    "done",
                     serde_json::to_string(&DonePayload { response: text }).unwrap_or_default(),
+                    terminal,
                 )
                 .await;
         }
@@ -1038,10 +1038,10 @@ mod tests {
             r#"{"messageId":"follow-up","text":"continue"}"#.to_string(),
         )
         .await;
-        hub.publish(
+        hub.publish_agent_response(
             "shared-run",
-            "done",
             r#"{"response":"continued"}"#.to_string(),
+            true,
         )
         .await;
 
@@ -1059,6 +1059,44 @@ mod tests {
             vec!["error", "user_input", "done"]
         );
         assert!(!replay[0].terminal);
+        assert!(replay[2].terminal);
+    }
+
+    #[tokio::test]
+    async fn web_run_stays_open_until_all_follow_up_results_are_terminal() {
+        // Arrange
+        let hub = super::super::RunHub::default();
+        hub.create("multi-follow-up", WEB_ACTOR.to_string()).await;
+
+        // Act
+        hub.publish_agent_response(
+            "multi-follow-up",
+            r#"{"response":"follow-up A"}"#.to_string(),
+            false,
+        )
+        .await;
+        hub.publish_agent_error(
+            "multi-follow-up",
+            r#"{"error":"follow-up A failed later"}"#.to_string(),
+            false,
+        )
+        .await;
+        hub.publish_agent_response(
+            "multi-follow-up",
+            r#"{"response":"follow-up B"}"#.to_string(),
+            true,
+        )
+        .await;
+
+        // Assert
+        let (_rx, replay, done, _, _) = hub
+            .subscribe_with_replay("multi-follow-up", None, WEB_ACTOR, false)
+            .await
+            .expect("subscribe multi-follow-up run");
+        assert!(done);
+        assert_eq!(replay.len(), 3);
+        assert!(!replay[0].terminal);
+        assert!(!replay[1].terminal);
         assert!(replay[2].terminal);
     }
 

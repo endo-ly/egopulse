@@ -171,9 +171,15 @@ describe("useChatTransport reconnect", () => {
     return { result, ws };
   }
 
-  function lastSentId(ws: FakeWebSocket): string {
-    const frame = JSON.parse(ws.sent[ws.sent.length - 1]) as { id: string };
-    return frame.id;
+  function lastSentChat(ws: FakeWebSocket): {
+    id: string;
+    params: { requestId: string };
+  } {
+    const chatFrames = ws.sent.filter((sent) => sent.includes('"chat.send"'));
+    return JSON.parse(chatFrames[chatFrames.length - 1]) as {
+      id: string;
+      params: { requestId: string };
+    };
   }
 
   it("chat_transport_resolves_send_on_ack_and_shows_text_immediately", async () => {
@@ -181,26 +187,29 @@ describe("useChatTransport reconnect", () => {
 
     let pending!: Promise<string | null>;
     await act(async () => {
-      pending = result.current.sendMessage("hello");
+      pending = result.current.sendMessage("hello", "draft-1");
     });
-    const requestId = lastSentId(ws);
+    const chatFrame = lastSentChat(ws);
+    const rpcId = chatFrame.id;
+    const durableRequestId = chatFrame.params.requestId;
     // Optimistic message is visible before the ack lands.
     expect(
-      result.current.state.messages.find((m) => m.id === `local:${requestId}`),
+      result.current.state.messages.find((m) => m.id === `local:${durableRequestId}`),
     ).toMatchObject({ sender_kind: "user", content: "hello" });
     const sentChat = JSON.parse(
       ws.sent.find((frame) => frame.includes('"chat.send"'))!,
-    ) as { params: { agentId: string } };
+    ) as { params: { agentId: string; requestId: string } };
     expect(sentChat.params.agentId).toBe("default");
+    expect(sentChat.params.requestId).toBe(durableRequestId);
 
     let resolved: string | null = null;
     await act(async () => {
-      ws.receive({ type: "res", id: requestId, ok: true });
+      ws.receive({ type: "res", id: rpcId, ok: true });
       resolved = await pending;
     });
-    expect(resolved).toBe(requestId);
+    expect(resolved).toBe(durableRequestId);
     expect(
-      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+      result.current.state.messages.some((m) => m.id === `local:${durableRequestId}`),
     ).toBe(true);
   });
 
@@ -209,14 +218,14 @@ describe("useChatTransport reconnect", () => {
 
     let pending!: Promise<string | null>;
     await act(async () => {
-      pending = result.current.sendMessage("hello");
+      pending = result.current.sendMessage("hello", "draft-1");
     });
-    const requestId = lastSentId(ws);
+    const rpcId = lastSentChat(ws).id;
 
     await act(async () => {
       ws.receive({
         type: "res",
-        id: requestId,
+        id: rpcId,
         ok: true,
         payload: { runId: "run-a", sessionKey: "chat:42" },
       });
@@ -297,15 +306,15 @@ describe("useChatTransport reconnect", () => {
 
     let pending!: Promise<string | null>;
     await act(async () => {
-      pending = result.current.sendMessage("hello");
+      pending = result.current.sendMessage("hello", "draft-1");
       pending.catch(() => {});
     });
-    const requestId = lastSentId(ws);
+    const durableRequestId = lastSentChat(ws).params.requestId;
 
     await act(async () => {
       ws.receive({
         type: "res",
-        id: requestId,
+        id: lastSentChat(ws).id,
         ok: false,
         error: { code: "busy", message: "busy" },
       });
@@ -313,7 +322,7 @@ describe("useChatTransport reconnect", () => {
     });
 
     expect(
-      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+      result.current.state.messages.some((m) => m.id === `local:${durableRequestId}`),
     ).toBe(false);
     // The caller surfaces the failure (composer keeps the text); the
     // transport itself stays quiet.
@@ -325,18 +334,18 @@ describe("useChatTransport reconnect", () => {
 
     let pending!: Promise<string | null>;
     await act(async () => {
-      pending = result.current.sendMessage("hello");
+      pending = result.current.sendMessage("hello", "draft-1");
       pending.catch(() => {});
     });
     const ws = FakeWebSocket.instances[0];
-    const requestId = lastSentId(ws);
+    const durableRequestId = lastSentChat(ws).params.requestId;
 
     await act(async () => {
       vi.advanceTimersByTime(15_000);
     });
     await expect(pending).rejects.toThrow("timed out");
     expect(
-      result.current.state.messages.some((m) => m.id === `local:${requestId}`),
+      result.current.state.messages.some((m) => m.id === `local:${durableRequestId}`),
     ).toBe(false);
   });
 
@@ -345,10 +354,11 @@ describe("useChatTransport reconnect", () => {
 
     let first!: Promise<string | null>;
     await act(async () => {
-      first = result.current.sendMessage("hello");
+      first = result.current.sendMessage("hello", "draft-1");
       first.catch(() => {});
     });
-    const requestId = lastSentId(ws);
+    const firstFrame = lastSentChat(ws);
+    const durableRequestId = firstFrame.params.requestId;
 
     await act(async () => {
       vi.advanceTimersByTime(15_000);
@@ -357,19 +367,137 @@ describe("useChatTransport reconnect", () => {
 
     let retry!: Promise<string | null>;
     await act(async () => {
-      retry = result.current.sendMessage("hello");
+      retry = result.current.sendMessage("hello", "draft-1");
     });
-    expect(lastSentId(ws)).toBe(requestId);
+    const retryFrame = lastSentChat(ws);
+    expect(retryFrame.id).not.toBe(firstFrame.id);
+    expect(retryFrame.params.requestId).toBe(durableRequestId);
+
+    let retrySettled = false;
+    retry.then(() => {
+      retrySettled = true;
+    });
+    await act(async () => {
+      ws.receive({ type: "res", id: firstFrame.id, ok: true });
+      await Promise.resolve();
+    });
+    expect(retrySettled).toBe(false);
 
     await act(async () => {
       ws.receive({
         type: "res",
-        id: requestId,
+        id: retryFrame.id,
         ok: true,
         payload: { runId: "run-retried", sessionKey: "s1" },
       });
       await retry;
     });
+  });
+
+  it("chat_transport_uses_a_new_durable_id_after_the_draft_changes", async () => {
+    const { result, ws } = await connectOpen();
+
+    let first!: Promise<string | null>;
+    await act(async () => {
+      first = result.current.sendMessage("hello", "draft-1");
+      first.catch(() => {});
+    });
+    const firstFrame = lastSentChat(ws);
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+    });
+    await expect(first).rejects.toThrow("timed out");
+
+    let replacement!: Promise<string | null>;
+    await act(async () => {
+      replacement = result.current.sendMessage("hello", "draft-2");
+    });
+    const replacementFrame = lastSentChat(ws);
+    expect(replacementFrame.params.requestId).not.toBe(firstFrame.params.requestId);
+
+    await act(async () => {
+      ws.receive({ type: "res", id: replacementFrame.id, ok: true });
+      await replacement;
+    });
+  });
+
+  it("chat_transport_reuses_the_durable_id_after_connection_loss", async () => {
+    const { result, ws } = await connectOpen();
+
+    let first!: Promise<string | null>;
+    await act(async () => {
+      first = result.current.sendMessage("hello", "draft-1");
+      first.catch(() => {});
+    });
+    const firstFrame = lastSentChat(ws);
+
+    act(() => ws.close());
+    await expect(first).rejects.toThrow("Connection lost");
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    const retrySocket = FakeWebSocket.instances[1];
+    act(() => retrySocket.simulateOpen());
+    act(() => retrySocket.receive({ type: "event", event: "connect.challenge" }));
+    act(() => retrySocket.receive({ type: "res", id: "connect", ok: true }));
+
+    let retry!: Promise<string | null>;
+    await act(async () => {
+      retry = result.current.sendMessage("hello", "draft-1");
+    });
+    const retryFrame = lastSentChat(retrySocket);
+    expect(retryFrame.id).not.toBe(firstFrame.id);
+    expect(retryFrame.params.requestId).toBe(firstFrame.params.requestId);
+
+    await act(async () => {
+      retrySocket.receive({ type: "res", id: retryFrame.id, ok: true });
+      await retry;
+    });
+  });
+
+  it("chat_transport_does_not_reuse_uncertain_identity_after_session_change", async () => {
+    const hook = renderHook(
+      ({ sessionKey }: { sessionKey: string }) =>
+        useChatTransport({
+          sessionKey,
+          agentId: "default",
+          authToken: "token",
+          onAuthRequired: vi.fn(),
+          onError: vi.fn(),
+        }),
+      { initialProps: { sessionKey: "s1" } },
+    );
+    act(() => {
+      void hook.result.current.connect();
+    });
+    const ws = FakeWebSocket.instances[0];
+    act(() => ws.simulateOpen());
+    act(() => ws.receive({ type: "event", event: "connect.challenge" }));
+    act(() => ws.receive({ type: "res", id: "connect", ok: true }));
+
+    let first!: Promise<string | null>;
+    await act(async () => {
+      first = hook.result.current.sendMessage("hello", "draft-1");
+      first.catch(() => {});
+    });
+    const firstFrame = lastSentChat(ws);
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+    });
+    await expect(first).rejects.toThrow("timed out");
+
+    hook.rerender({ sessionKey: "s2" });
+    let second!: Promise<string | null>;
+    await act(async () => {
+      second = hook.result.current.sendMessage("hello", "draft-1");
+    });
+    const secondFrame = lastSentChat(ws);
+    expect(secondFrame.params.requestId).not.toBe(firstFrame.params.requestId);
+    await act(async () => {
+      ws.receive({ type: "res", id: secondFrame.id, ok: true });
+      await second;
+    });
+    hook.unmount();
   });
 
   it("chat_transport_resyncs_after_unexpected_drop", async () => {

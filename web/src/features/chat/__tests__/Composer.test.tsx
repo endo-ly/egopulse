@@ -11,7 +11,7 @@ describe("Composer", () => {
     fireEvent.change(ta, { target: { value: "hello" } });
     fireEvent.keyDown(ta, { key: "Enter", shiftKey: false });
 
-    expect(onSubmit).toHaveBeenCalledWith("hello");
+    expect(onSubmit).toHaveBeenCalledWith("hello", expect.any(String));
     await waitFor(() => expect(ta.value).toBe(""));
   });
 
@@ -23,7 +23,7 @@ describe("Composer", () => {
     fireEvent.change(ta, { target: { value: "hello" } });
     fireEvent.keyDown(ta, { key: "Enter", shiftKey: false });
 
-    expect(onSubmit).toHaveBeenCalledWith("hello");
+    expect(onSubmit).toHaveBeenCalledWith("hello", expect.any(String));
     await act(async () => {});
     expect(ta.value).toBe("hello");
   });
@@ -63,7 +63,7 @@ describe("Composer", () => {
     const ta = container.querySelector(".composer-textarea") as HTMLTextAreaElement;
     fireEvent.change(ta, { target: { value: "hello" } });
     fireEvent.keyDown(ta, { key: "Enter", shiftKey: false });
-    expect(onSubmit).toHaveBeenCalledWith("hello");
+    expect(onSubmit).toHaveBeenCalledWith("hello", expect.any(String));
 
     // Arrange: switch sessions while the ack is in flight.
     rerender(<Composer onSubmit={onSubmit} storageKey="s2" />);

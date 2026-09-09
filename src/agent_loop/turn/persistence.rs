@@ -161,6 +161,7 @@ impl<'a> TurnPersistence<'a> {
 
         on_event.emit(AgentEvent::FinalResponse {
             text: final_content.clone(),
+            terminal: false,
         });
         Ok(final_content)
     }

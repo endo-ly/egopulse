@@ -1311,8 +1311,8 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum DeliveredEvent {
         Input(String),
-        Response(String),
-        Error(String),
+        Response(String, bool),
+        Error(String, bool),
     }
 
     async fn run_terminal_staged_follow_up_case(
@@ -1443,11 +1443,11 @@ mod tests {
                 crate::agent_loop::event::AgentEvent::UserInputInjected { text, .. } => {
                     delivered.push(DeliveredEvent::Input(text));
                 }
-                crate::agent_loop::event::AgentEvent::FinalResponse { text } => {
-                    delivered.push(DeliveredEvent::Response(text));
+                crate::agent_loop::event::AgentEvent::FinalResponse { text, terminal } => {
+                    delivered.push(DeliveredEvent::Response(text, terminal));
                 }
-                crate::agent_loop::event::AgentEvent::Error { message, .. } => {
-                    delivered.push(DeliveredEvent::Error(message));
+                crate::agent_loop::event::AgentEvent::Error { message, terminal } => {
+                    delivered.push(DeliveredEvent::Error(message, terminal));
                 }
                 _ => {}
             }
@@ -2461,18 +2461,29 @@ mod tests {
                 DeliveredEvent::Input("recovered follow-up 2".to_string())
             );
             match (first_succeeds, &events[1]) {
-                (true, DeliveredEvent::Response(text)) => assert_eq!(text, "ok"),
-                (false, DeliveredEvent::Error(message)) => {
+                (true, DeliveredEvent::Response(text, terminal)) => {
+                    assert_eq!(text, "ok");
+                    assert!(!terminal, "the first child must not end the interaction");
+                }
+                (false, DeliveredEvent::Error(message, terminal)) => {
                     assert!(message.contains("follow-up 0 failed"));
+                    assert!(
+                        !terminal,
+                        "the first child error must not end the interaction"
+                    );
                 }
                 (succeeds, event) => {
                     panic!("unexpected first child outcome: succeeds={succeeds}, event={event:?}")
                 }
             }
             match (second_succeeds, &events[3]) {
-                (true, DeliveredEvent::Response(text)) => assert_eq!(text, "ok"),
-                (false, DeliveredEvent::Error(message)) => {
+                (true, DeliveredEvent::Response(text, terminal)) => {
+                    assert_eq!(text, "ok");
+                    assert!(terminal, "the last child must end the interaction");
+                }
+                (false, DeliveredEvent::Error(message, terminal)) => {
                     assert!(message.contains("follow-up 1 failed"));
+                    assert!(terminal, "the last child error must end the interaction");
                 }
                 (succeeds, event) => {
                     panic!("unexpected second child outcome: succeeds={succeeds}, event={event:?}")

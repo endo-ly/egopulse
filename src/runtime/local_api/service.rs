@@ -411,7 +411,7 @@ fn map_agent_event(event: AgentEvent) -> TurnEvent {
             text,
             timestamp,
         },
-        AgentEvent::FinalResponse { text } => TurnEvent::FinalResponse { text },
+        AgentEvent::FinalResponse { text, .. } => TurnEvent::FinalResponse { text },
         AgentEvent::Error { message, .. } => TurnEvent::Error { message },
     }
 }

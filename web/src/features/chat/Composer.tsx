@@ -4,7 +4,7 @@ import { matchSlashCommands } from "./slashCommands";
 
 export interface ComposerProps {
   /** Resolves true when the send was accepted; the text is kept otherwise. */
-  onSubmit: (text: string) => Promise<boolean>;
+  onSubmit: (text: string, draftId: string) => Promise<boolean>;
   disabled?: boolean;
   storageKey?: string;
 }
@@ -18,10 +18,12 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
   const submittingRef = useRef(false);
   const storageKeyRef = useRef(storageKey);
   const draftVersionRef = useRef(0);
+  const draftIdRef = useRef(crypto.randomUUID());
 
   if (storageKeyRef.current !== storageKey) {
     storageKeyRef.current = storageKey;
     draftVersionRef.current += 1;
+    draftIdRef.current = crypto.randomUUID();
   }
 
   const matches = matchSlashCommands(text);
@@ -30,6 +32,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
 
   useEffect(() => {
     setText(loadDraft(storageKey));
+    draftIdRef.current = crypto.randomUUID();
     submittingRef.current = false;
     setSubmitting(false);
   }, [storageKey]);
@@ -52,11 +55,12 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
     if (!trimmed || disabled || submittingRef.current) return;
     const keyAtSubmit = storageKey;
     const draftVersionAtSubmit = draftVersionRef.current;
+    const draftIdAtSubmit = draftIdRef.current;
     submittingRef.current = true;
     setSubmitting(true);
     void (async () => {
       try {
-        const accepted = await onSubmit(trimmed);
+        const accepted = await onSubmit(trimmed, draftIdAtSubmit);
         if (!accepted) return;
         // The user may have switched sessions or changed the draft while
         // the ack was in flight; never clear a newer draft.
@@ -67,6 +71,8 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
           return;
         }
         setText("");
+        draftIdRef.current = crypto.randomUUID();
+        draftVersionRef.current += 1;
         setSuggestIndex(-1);
         setSuggestHidden(false);
       } finally {
@@ -78,6 +84,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
 
   const acceptSuggestion = (index: number) => {
     draftVersionRef.current += 1;
+    draftIdRef.current = crypto.randomUUID();
     setText(matches[index].name + " ");
     setSuggestIndex(-1);
     setSuggestHidden(false);
@@ -142,6 +149,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
         disabled={disabled || submitting}
         onChange={(e) => {
           draftVersionRef.current += 1;
+          draftIdRef.current = crypto.randomUUID();
           setText(e.target.value);
           setSuggestIndex(-1);
           setSuggestHidden(false);
