@@ -107,6 +107,7 @@
 
   .dot-live,
   .dot-idle,
+  .dot-unread,
   .dot-error,
   .dot-success,
   .dot-warning {
@@ -121,6 +122,12 @@
     background: var(--color-accent);
     box-shadow: var(--shadow-glow-accent);
     animation: dot-pulse 1.6s ease-in-out infinite;
+  }
+
+  /* Unseen replies: solid accent without the working pulse. */
+  .dot-unread {
+    background: var(--color-accent);
+    box-shadow: var(--shadow-glow-accent);
   }
 
   .dot-idle {

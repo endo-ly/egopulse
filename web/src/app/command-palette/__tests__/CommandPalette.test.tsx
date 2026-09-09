@@ -6,8 +6,8 @@ import type { AgentEntry, SessionEntry } from "../../../shared/api/types";
 const noop = () => {};
 
 const agents: AgentEntry[] = [
-  { id: "lyre", label: "Lyre", is_default: true, active: false },
-  { id: "ace", label: "Ace", is_default: false, active: true },
+  { id: "lyre", label: "Lyre", is_default: true },
+  { id: "ace", label: "Ace", is_default: false },
 ];
 
 const sessions: SessionEntry[] = [

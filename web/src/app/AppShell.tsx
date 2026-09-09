@@ -1,4 +1,4 @@
-import { useState, useEffect, type ReactNode } from "react";
+import { useState, useEffect, useMemo, type ReactNode } from "react";
 import { useMediaQuery } from "../shared/hooks/useMediaQuery";
 import { Sidebar } from "./shell/Sidebar";
 import { MobileBar } from "./shell/MobileBar";
@@ -21,6 +21,12 @@ export interface AppProps {
   onOpenPalette?: () => void;
   onNewSession?: () => void;
   main?: ReactNode;
+  authToken?: string;
+  agentAvatars?: Readonly<Record<string, string>>;
+  /** Called after an agent avatar upload/removal so lists can refresh. */
+  onAvatarChanged?: () => void;
+  /** Session keys with messages newer than the last view. */
+  unreadSessionKeys?: ReadonlySet<string>;
 }
 
 const noop = () => {};
@@ -40,6 +46,10 @@ export function App({
   onOpenPalette = noop,
   onNewSession = noop,
   main,
+  authToken,
+  agentAvatars,
+  onAvatarChanged,
+  unreadSessionKeys,
 }: AppProps) {
   const isMobile = useMediaQuery(MOBILE_QUERY);
   const [userOpened, setUserOpened] = useState(false);
@@ -57,11 +67,13 @@ export function App({
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         onOpenPalette();
+      } else if (e.key === "Escape" && isMobile) {
+        setUserOpened(false);
       }
     };
     globalThis.addEventListener("keydown", handler);
     return () => globalThis.removeEventListener("keydown", handler);
-  }, [onOpenPalette]);
+  }, [onOpenPalette, isMobile]);
 
   useEffect(() => {
     if (!isMobile) return;
@@ -108,6 +120,38 @@ export function App({
   const toggleSidebar = () => setUserOpened((open) => !open);
   const closeSidebar = () => setUserOpened(false);
 
+  const unreadAgentIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (!unreadSessionKeys) return ids;
+    for (const session of sessions) {
+      if (unreadSessionKeys.has(session.session_key)) {
+        ids.add(session.agent_id);
+      }
+    }
+    return ids;
+  }, [sessions, unreadSessionKeys]);
+
+  // Mobile overlay dismisses on navigation (layout.md §4.5).
+  const dismissOverlayOnMobile = () => {
+    if (isMobile) setUserOpened(false);
+  };
+  const handleTabChange = (tab: TabId) => {
+    onTabChange(tab);
+    dismissOverlayOnMobile();
+  };
+  const handleSelectAgent = (id: string) => {
+    onSelectAgent(id);
+    dismissOverlayOnMobile();
+  };
+  const handleSelectSession = (key: string) => {
+    onSelectSession(key);
+    dismissOverlayOnMobile();
+  };
+  const handleNewSession = () => {
+    onNewSession();
+    dismissOverlayOnMobile();
+  };
+
   const showCollapsed = !isMobile && sidebarCollapsed;
 
   return (
@@ -115,7 +159,7 @@ export function App({
       <aside className={`sidebar ${sidebarOpen ? "open" : "closed"} ${showCollapsed ? "collapsed" : ""}`}>
         <Sidebar
           activeTab={activeTab}
-          onTabChange={onTabChange}
+          onTabChange={handleTabChange}
           onOpenPalette={onOpenPalette}
           healthStatus={healthStatus}
           collapsed={!isMobile && sidebarCollapsed}
@@ -124,7 +168,11 @@ export function App({
             <AgentsSection
               agents={agents}
               selectedAgent={selectedAgent}
-              onSelectAgent={onSelectAgent}
+              onSelectAgent={handleSelectAgent}
+              authToken={authToken}
+              avatarUrls={agentAvatars}
+              onAvatarChanged={onAvatarChanged}
+              unreadAgentIds={unreadAgentIds}
             />
           }
           sessions={
@@ -132,8 +180,9 @@ export function App({
               sessions={sessions}
               selectedAgent={selectedAgent}
               selectedSession={selectedSession}
-              onSelectSession={onSelectSession}
-              onNewSession={onNewSession}
+              onSelectSession={handleSelectSession}
+              onNewSession={handleNewSession}
+              unreadSessionKeys={unreadSessionKeys}
             />
           }
         />

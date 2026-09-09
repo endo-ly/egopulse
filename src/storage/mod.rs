@@ -78,6 +78,7 @@ macro_rules! parse_row_enum {
     }};
 }
 
+mod avatar;
 pub(crate) mod backup;
 mod chat;
 mod episode;

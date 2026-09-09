@@ -22,6 +22,7 @@ struct ObserverSink {
 struct ObserverState {
     completion: Option<oneshot::Sender<()>>,
     pending_turns: usize,
+    pending_final_response: Option<String>,
 }
 
 /// Routes runtime-owned turn output to a client without owning the turn.
@@ -36,35 +37,40 @@ impl TurnObserverRegistry {
         }
     }
 
-    pub(crate) fn register(&self, request_key: String) -> TurnObserver {
+    /// Registers an observer only when the request key has no live owner.
+    ///
+    /// The decision and insertion share one lock so a duplicate delivery can
+    /// never replace the observer that owns the original request.
+    pub(crate) fn register_if_absent(&self, request_key: String) -> Option<TurnObserver> {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (completion_tx, completion) = oneshot::channel();
-        self.sinks.lock().expect("turn observer lock").insert(
+        let mut sinks = self.sinks.lock().expect("turn observer lock");
+        if let Some(existing) = sinks.get(&request_key).cloned() {
+            let completion_closed = existing
+                .state
+                .lock()
+                .expect("turn observer state lock")
+                .completion
+                .as_ref()
+                .is_none_or(oneshot::Sender::is_closed);
+            if !existing.events.is_closed() && !completion_closed {
+                return None;
+            }
+            remove_sink_routes(&mut sinks, &existing);
+        }
+        sinks.insert(
             request_key,
             Arc::new(ObserverSink {
                 events: events_tx,
                 state: Mutex::new(ObserverState {
                     completion: Some(completion_tx),
                     pending_turns: 1,
+                    pending_final_response: None,
                 }),
                 initial_events: Mutex::new(HashMap::new()),
             }),
         );
-        TurnObserver { events, completion }
-    }
-
-    pub(crate) fn unregister(&self, request_key: &str) {
-        let sink = self
-            .sinks
-            .lock()
-            .expect("turn observer lock")
-            .remove(request_key);
-        if let Some(sink) = sink {
-            sink.initial_events
-                .lock()
-                .expect("turn observer initial event lock")
-                .remove(request_key);
-        }
+        Some(TurnObserver { events, completion })
     }
 
     pub(crate) fn has_live_observer(&self, request_key: &str) -> bool {
@@ -181,45 +187,65 @@ impl TurnObserverRegistry {
         let Some(sink) = sinks.get(request_key).cloned() else {
             return;
         };
+        if let AgentEvent::FinalResponse { text, .. } = event {
+            sink.state
+                .lock()
+                .expect("turn observer state lock")
+                .pending_final_response = Some(text);
+            return;
+        }
         if sink.events.send(event).is_err() {
             remove_sink_routes(&mut sinks, &sink);
         }
     }
 
     pub(crate) fn finish(&self, request_key: &str, result: Result<(), String>) {
-        let Some(sink) = self
-            .sinks
-            .lock()
-            .expect("turn observer lock")
-            .remove(request_key)
-        else {
+        let mut sinks = self.sinks.lock().expect("turn observer lock");
+        let Some(sink) = sinks.get(request_key).cloned() else {
             return;
         };
+        sinks.remove(request_key);
         sink.initial_events
             .lock()
             .expect("turn observer initial event lock")
             .remove(request_key);
-        if let Err(message) = &result {
-            // A shared observer represents one client interaction, but each
-            // assigned turn still has its own terminal event. Completion is
-            // only an interaction-level signal, so an intermediate failure
-            // must be sent before the remaining turns finish.
-            let _ = sink.events.send(AgentEvent::Error {
-                message: message.clone(),
-            });
-        }
-        let completion = {
+        let (terminal, final_response, completion) = {
             let mut state = sink.state.lock().expect("turn observer state lock");
+            let terminal = state.pending_turns == 1;
+            let final_response = if result.is_ok() {
+                state.pending_final_response.take()
+            } else {
+                state.pending_final_response.take();
+                None
+            };
             state.pending_turns = state
                 .pending_turns
                 .checked_sub(1)
                 .expect("turn observer finished more times than assigned");
-            if state.pending_turns == 0 {
+            let completion = if terminal {
                 state.completion.take()
             } else {
                 None
-            }
+            };
+            (terminal, final_response, completion)
         };
+        if terminal {
+            remove_sink_routes(&mut sinks, &sink);
+        }
+        drop(sinks);
+
+        match result {
+            Ok(()) => {
+                if let Some(text) = final_response {
+                    let _ = sink
+                        .events
+                        .send(AgentEvent::FinalResponse { text, terminal });
+                }
+            }
+            Err(message) => {
+                let _ = sink.events.send(AgentEvent::Error { message, terminal });
+            }
+        }
         if let Some(sender) = completion {
             let _ = sender.send(());
         }
@@ -250,7 +276,9 @@ mod tests {
     async fn transfer_many_keeps_the_live_observer_until_all_turns_finish() {
         // Arrange
         let registry = TurnObserverRegistry::new();
-        let observer = registry.register("parent-request".to_string());
+        let observer = registry
+            .register_if_absent("parent-request".to_string())
+            .expect("observer should be registered");
         let TurnObserver {
             mut events,
             completion,
@@ -276,5 +304,122 @@ mod tests {
         completion.await.expect("completion sender");
         assert!(!registry.has_live_observer("promoted-request-1"));
         assert!(!registry.has_live_observer("promoted-request-2"));
+    }
+
+    #[tokio::test]
+    async fn final_response_becomes_terminal_only_after_all_transferred_turns_finish() {
+        // Arrange
+        let registry = TurnObserverRegistry::new();
+        let observer = registry
+            .register_if_absent("parent-request".to_string())
+            .expect("observer should be registered");
+        let TurnObserver {
+            mut events,
+            completion,
+        } = observer;
+        assert!(registry.transfer_many(
+            "parent-request",
+            &["follow-up-a".to_string(), "follow-up-b".to_string()]
+        ));
+
+        // Act
+        registry.emit(
+            "follow-up-a",
+            AgentEvent::FinalResponse {
+                text: "response A".to_string(),
+                terminal: false,
+            },
+        );
+        registry.finish("follow-up-a", Ok(()));
+        registry.emit(
+            "follow-up-b",
+            AgentEvent::FinalResponse {
+                text: "response B".to_string(),
+                terminal: false,
+            },
+        );
+        registry.finish("follow-up-b", Ok(()));
+
+        // Assert
+        assert!(matches!(
+            events.recv().await,
+            Some(AgentEvent::FinalResponse {
+                text,
+                terminal: false
+            }) if text == "response A"
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(AgentEvent::FinalResponse {
+                text,
+                terminal: true
+            }) if text == "response B"
+        ));
+        completion.await.expect("completion sender");
+    }
+
+    #[tokio::test]
+    async fn intermediate_error_does_not_close_a_transferred_observer() {
+        // Arrange
+        let registry = TurnObserverRegistry::new();
+        let observer = registry
+            .register_if_absent("parent-request".to_string())
+            .expect("observer should be registered");
+        let TurnObserver {
+            mut events,
+            completion,
+        } = observer;
+        assert!(registry.transfer_many(
+            "parent-request",
+            &["follow-up-a".to_string(), "follow-up-b".to_string()]
+        ));
+
+        // Act
+        registry.finish("follow-up-a", Err("follow-up A failed".to_string()));
+        registry.emit(
+            "follow-up-b",
+            AgentEvent::FinalResponse {
+                text: "response B".to_string(),
+                terminal: false,
+            },
+        );
+        registry.finish("follow-up-b", Ok(()));
+
+        // Assert
+        assert!(matches!(
+            events.recv().await,
+            Some(AgentEvent::Error {
+                message,
+                terminal: false
+            }) if message == "follow-up A failed"
+        ));
+        assert!(matches!(
+            events.recv().await,
+            Some(AgentEvent::FinalResponse {
+                text,
+                terminal: true
+            }) if text == "response B"
+        ));
+        completion.await.expect("completion sender");
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_keeps_the_original_observer() {
+        // Arrange
+        let registry = TurnObserverRegistry::new();
+        let mut owner = registry
+            .register_if_absent("request-1".to_string())
+            .expect("owner observer should be registered");
+
+        // Act
+        let duplicate = registry.register_if_absent("request-1".to_string());
+        registry.emit("request-1", AgentEvent::Iteration { iteration: 1 });
+
+        // Assert
+        assert!(duplicate.is_none());
+        assert!(matches!(
+            owner.events.recv().await,
+            Some(AgentEvent::Iteration { iteration: 1 })
+        ));
     }
 }

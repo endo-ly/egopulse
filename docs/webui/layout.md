@@ -79,11 +79,19 @@ Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の
 Sidebar の第1セクション。必ず表示する。
 
 - Section title（小テキスト・uppercase・muted）
-- agent 一覧：各 agent を1行に並べる。左端に StatusDot、続けて agent name、必要に応じてタグ（`default` 等）
+- agent 一覧：各 agent を1行に並べる。左端に StatusDot または agent アイコン、続けて agent name、必要に応じてタグ（`default` 等）
 - 行は枠線・背景を持たない。hover で背景ハイライト、選択中 agent はアクセント2色の背景チントで強調表示
-- StatusDot の色：
-  - `live`（`active === true`、accent 色 + pulse アニメーション）：active turn 実行中
-  - `idle`（`active === false`、muted-2 色）：待機中
+- StatusDot の色（未読表示。実行中の pulse 表示は廃止）：
+  - `unread`（accent 色、アニメーションなし）：未読の返事がある session を持つ agent
+  - `idle`（muted-2 色）：未読なし
+- 未読の判定はフロントのみで行う（`useUnreadSessions`）。各 session の `last_message_time` が初見以降に進み、かつ選択中でなければ未読。開いた session は既読化する。既読時刻は `localStorage`（`egopulse.lastSeen.v1`）に保存し、リロード後も維持する。初回ロード時は全面青を避けるため現状を既読として初期化する
+- 未読 session の行は preview を太字・強テキスト色で強調する（Discord の未読チャンネル相当）
+- **agent アイコン**：ユーザーがデバイスから画像をアップロードできる（[api.md §2.11](../api.md#211-agent-avatar)）
+  - アイコン設定済み：行左端に 24px 円形アイコンを表示し、StatusDot はその右下に小さく重ねる
+  - 未設定：従来どおり StatusDot のみ
+  - 行 hover で鉛筆ボタンを表示 → クリックでミニメニュー（`Upload image…` / アイコン設定済みのとき `Remove image`）。メニューは外部クリック / Escape で閉じる
+  - アップロード時はトリミングモーダル（react-easy-crop）が開き、円形プレビュー上で表示領域をドラッグ移動・ズームして選び、`Apply` で 256×256 にエンコードして PUT する
+  - チャットの assistant アバターにも同じアイコンが使われる（未設定時は頭文字）。詳細は [chat.md §4.2](./chat.md#42-avatar)
 
 #### Agent 一覧のデータソース
 
@@ -95,15 +103,13 @@ Sidebar の第1セクション。必ず表示する。
 {
   "ok": true,
   "agents": [
-    { "id": "lyre", "label": "Lyre", "is_default": true, "active": false },
-    { "id": "ace", "label": "Ace", "is_default": false, "active": true }
+    { "id": "lyre", "label": "Lyre", "is_default": true },
+    { "id": "ace", "label": "Ace", "is_default": false }
   ]
 }
 ```
 
-`active` フィールドは内部で `ActiveTurnTracker::is_active(agent_id)` を呼んで判定する（既存の `src/runtime/turn/scheduler.rs` に tracker が存在する）。
-
-**polling 戦略**：`/api/agents` を5秒間隔でポーリングし、`active` フィールドを更新する。これにより最大5秒の遅延で StatusDot が active 状態に切り替わる。
+**polling 戦略**：session 一覧のポーリングで `last_message_time` を更新し、未読判定に使う。選択中 session の新着は次回ポーリングで既読化される。
 
 ### 2.5 SESSIONS Section
 

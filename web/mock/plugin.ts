@@ -1,20 +1,50 @@
+import fs from "node:fs";
 import type { ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
 const AGENTS = [
-  { id: "lyre", label: "Lyre", is_default: true, active: false },
-  { id: "ace", label: "Ace", is_default: false, active: true },
-  { id: "vega", label: "Vega", is_default: false, active: false },
-  { id: "orion", label: "Orion", is_default: false, active: true },
-  { id: "nova", label: "Nova", is_default: false, active: false },
-  { id: "draco", label: "Draco", is_default: false, active: true },
-  { id: "pegasus", label: "Pegasus", is_default: false, active: false },
-  { id: "andromeda", label: "Andromeda", is_default: false, active: false },
-  { id: "phoenix", label: "Phoenix", is_default: false, active: true },
-  { id: "hydra", label: "Hydra", is_default: false, active: false },
-  { id: "cassiopeia", label: "Cassiopeia", is_default: false, active: false },
-  { id: "perseus", label: "Perseus", is_default: false, active: false },
+  { id: "lyre", label: "Lyre", is_default: true },
+  { id: "ace", label: "Ace", is_default: false },
+  { id: "vega", label: "Vega", is_default: false },
+  { id: "orion", label: "Orion", is_default: false },
+  { id: "nova", label: "Nova", is_default: false },
+  { id: "draco", label: "Draco", is_default: false },
+  { id: "pegasus", label: "Pegasus", is_default: false },
+  { id: "andromeda", label: "Andromeda", is_default: false },
+  { id: "phoenix", label: "Phoenix", is_default: false },
+  { id: "hydra", label: "Hydra", is_default: false },
+  { id: "cassiopeia", label: "Cassiopeia", is_default: false },
+  { id: "perseus", label: "Perseus", is_default: false },
 ];
+
+// Mirrors the agent_avatars table: in-memory uploads, with Lyre pre-seeded
+// from the bundled app icon so both avatar states are visible in the UI.
+const avatarStore = new Map<string, { body: Buffer; type: string }>();
+const avatarVersions = new Map<string, number>();
+let lyreDefaultAvatarActive = true;
+
+let defaultIcon: Buffer | null = null;
+function defaultAvatar(): Buffer {
+  if (!defaultIcon) {
+    defaultIcon = fs.readFileSync(new URL("../public/icon.png", import.meta.url));
+  }
+  return defaultIcon;
+}
+
+function agentsPayload() {
+  return {
+    ok: true,
+    agents: AGENTS.map((agent) => {
+      const uploaded = avatarStore.has(agent.id);
+      const version = avatarVersions.get(agent.id);
+      const avatar_url =
+        uploaded || (agent.id === "lyre" && lyreDefaultAvatarActive)
+          ? `/api/agents/${agent.id}/avatar?v=${uploaded ? version : "default"}`
+          : null;
+      return { ...agent, avatar_url };
+    }),
+  };
+}
 
 const SESSIONS = [
   {
@@ -647,7 +677,7 @@ export function mockApiPlugin(): Plugin | null {
   return {
     name: "egopulse-mock-api",
     configureServer(server) {
-      server.middlewares.use((req, res, next) => {
+      server.middlewares.use(async (req, res, next) => {
         const url = req.url ?? "";
         if (!url.startsWith("/api")) {
           next();
@@ -658,7 +688,7 @@ export function mockApiPlugin(): Plugin | null {
         const { pathname } = parsed;
 
         if (pathname === "/api/agents") {
-          return sendJson(res, { ok: true, agents: AGENTS });
+          return sendJson(res, agentsPayload());
         }
         if (pathname === "/api/sessions") {
           return sendJson(res, { ok: true, sessions: SESSIONS });
@@ -692,6 +722,51 @@ export function mockApiPlugin(): Plugin | null {
             steps: SLEEP_STEPS[runId] ?? [],
           });
         }
+        const avatarMatch = pathname.match(/^\/api\/agents\/([^/]+)\/avatar$/);
+        if (avatarMatch) {
+          const agentId = decodeURIComponent(avatarMatch[1]);
+          if (req.method === "PUT") {
+            const chunks: Buffer[] = [];
+            for await (const chunk of req) {
+              chunks.push(chunk as Buffer);
+            }
+            const body = Buffer.concat(chunks);
+            if (body.length === 0) {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "empty_body" });
+            }
+            const type = req.headers["content-type"] ?? "image/png";
+            avatarStore.set(agentId, { body, type });
+            const version = Date.now();
+            avatarVersions.set(agentId, version);
+            return sendJson(res, {
+              ok: true,
+              avatar_url: `/api/agents/${agentId}/avatar?v=${version}`,
+            });
+          }
+          if (req.method === "DELETE") {
+            avatarStore.delete(agentId);
+            avatarVersions.delete(agentId);
+            if (agentId === "lyre") {
+              lyreDefaultAvatarActive = false;
+            }
+            return sendJson(res, { ok: true });
+          }
+          const stored = avatarStore.get(agentId);
+          if (!stored && agentId === "lyre" && lyreDefaultAvatarActive) {
+            res.setHeader("Content-Type", "image/png");
+            res.end(defaultAvatar());
+            return;
+          }
+          if (!stored) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "not_found" });
+          }
+          res.setHeader("Content-Type", stored.type);
+          res.end(stored.body);
+          return;
+        }
+
         const memoryMatch = pathname.match(/^\/api\/agents\/([^/]+)\/memory$/);
         if (memoryMatch) {
           const agentId = decodeURIComponent(memoryMatch[1]);

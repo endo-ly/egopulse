@@ -2,8 +2,9 @@
 //!
 //! 接続ハンドシェイク、chat.send の受付、RunHub からのイベント転送を担う。
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -12,12 +13,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::auth;
-use super::stream::{SendRequest, resolve_existing_send_request, start_stream_run};
+use super::stream::{SendRequest, accept_web_input};
 use super::{RunEvent, WEB_ACTOR, WebState};
 
 #[derive(Deserialize)]
@@ -38,7 +39,6 @@ struct ErrorData {
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_WS_CONNECTIONS: usize = 64;
 const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
-const MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION: usize = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
@@ -102,9 +102,12 @@ struct ChatSendParams {
     #[serde(alias = "session_key", alias = "key")]
     session_key: String,
     message: String,
-    /// Client-generated request id for deduplication. Mirrors `SendRequest::request_id`
-    /// on the REST path; `start_stream_run` converts it into `context.request_key`
-    /// so a re-delivered `chat.send` maps to the same Turn instead of a duplicate.
+    /// Agent selected by the WebUI when the session key is not yet persisted.
+    agent_id: Option<String>,
+    /// Durable request id for deduplication. Mirrors `SendRequest::request_id`
+    /// on the REST path; it is independent from the enclosing frame's RPC id.
+    /// The Web runtime converts it into `context.request_key` so a re-delivered
+    /// `chat.send` maps to the same Turn instead of a duplicate.
     request_id: Option<String>,
 }
 
@@ -132,6 +135,7 @@ struct ConnectFeatures {
 #[serde(rename_all = "camelCase")]
 struct ChatAckPayload {
     run_id: String,
+    session_key: String,
     status: &'static str,
 }
 
@@ -146,6 +150,7 @@ struct GatewayChatEvent {
     message: Option<GatewayChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_message: Option<String>,
+    terminal: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,18 +166,11 @@ struct GatewayChatContent {
     text: String,
 }
 
-#[derive(Clone, Debug)]
-struct ActiveChatSend {
-    run_id: String,
-    session_key: String,
-}
-
 struct SocketRequestContext<'a> {
     tx: &'a mpsc::UnboundedSender<Message>,
     connected: &'a AtomicBool,
-    in_flight_chat_sends: &'a Arc<AtomicUsize>,
-    active_chat_send: &'a Arc<Mutex<Option<ActiveChatSend>>>,
     conn_id: &'a str,
+    forwarded_runs: &'a Arc<Mutex<HashSet<String>>>,
 }
 
 /// Upgrades an authenticated request into the web gateway WebSocket.
@@ -238,9 +236,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     }
 
     let connected = Arc::new(AtomicBool::new(false));
-    let in_flight_chat_sends = Arc::new(AtomicUsize::new(0));
-    let active_chat_send = Arc::new(Mutex::new(None));
-
+    let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
     // 接続完了前は connect を期限付きで待ち、以降は通常の受信ループとして扱う。
     while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
         let Message::Text(text) = message else {
@@ -275,9 +271,8 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                 let request_context = SocketRequestContext {
                     tx: &out_tx,
                     connected: &connected,
-                    in_flight_chat_sends: &in_flight_chat_sends,
-                    active_chat_send: &active_chat_send,
                     conn_id: &conn_id,
+                    forwarded_runs: &forwarded_runs,
                 };
                 if handle_request(&state, request_context, id, method, params).await {
                     break;
@@ -400,75 +395,22 @@ async fn handle_chat_send(
     let request = SendRequest {
         session_key: Some(payload.session_key),
         message: payload.message,
+        agent_id: payload.agent_id,
         request_id: payload.request_id,
     };
 
-    if let Some(active) = context.active_chat_send.lock().await.clone() {
-        let resolved = match resolve_existing_send_request(state, &request, WEB_ACTOR).await {
-            Ok(Some(resolved)) => resolved,
-            Ok(None) => return send_busy(context.tx, id),
-            Err((status, message)) => {
-                return send_error(
-                    context.tx,
-                    id,
-                    if status == StatusCode::BAD_REQUEST {
-                        "invalid_params"
-                    } else {
-                        "internal_error"
-                    },
-                    message,
-                )
-                .is_err();
-            }
-        };
-
-        if resolved.session_key != active.session_key
-            || crate::slash_commands::is_slash_command(&resolved.message)
-        {
-            return send_busy(context.tx, id);
-        }
-
-        match crate::runtime::try_stage_tool_followup(
-            &state.app_state,
-            resolved.context,
-            resolved.message,
-        )
-        .await
-        {
-            Ok(crate::runtime::ToolFollowupOutcome::Accepted) => {
-                return send_response(
-                    context.tx,
-                    id,
-                    ChatAckPayload {
-                        run_id: active.run_id,
-                        status: "queued",
-                    },
-                )
-                .is_err();
-            }
-            Ok(crate::runtime::ToolFollowupOutcome::NoToolPhase) => {
-                return send_busy(context.tx, id);
-            }
-            Err(error) => {
-                return send_error(context.tx, id, "busy", error.to_string()).is_err();
-            }
-        }
-    }
-
-    if !try_acquire_chat_send(context.in_flight_chat_sends) {
-        return send_busy(context.tx, id);
-    }
-
-    let in_flight_permit = InFlightChatPermit::new(context.in_flight_chat_sends.clone());
-    let started = match start_stream_run(state.clone(), request, WEB_ACTOR).await {
-        Ok(started) => started,
+    let accepted = match accept_web_input(state.clone(), request, WEB_ACTOR).await {
+        Ok(accepted) => accepted,
         Err((status, message)) => {
-            drop(in_flight_permit);
             return send_error(
                 context.tx,
                 id,
-                if status == axum::http::StatusCode::BAD_REQUEST {
+                if status == StatusCode::BAD_REQUEST {
                     "invalid_params"
+                } else if status == StatusCode::TOO_MANY_REQUESTS {
+                    "busy"
+                } else if status == StatusCode::CONFLICT {
+                    "request_conflict"
                 } else {
                     "internal_error"
                 },
@@ -477,73 +419,48 @@ async fn handle_chat_send(
             .is_err();
         }
     };
-
-    *context.active_chat_send.lock().await = Some(ActiveChatSend {
-        run_id: started.run_id.clone(),
-        session_key: started.session_key.clone(),
-    });
+    let super::stream::AcceptedWebInput { started, status } = accepted;
 
     if send_response(
         context.tx,
         id,
         ChatAckPayload {
             run_id: started.run_id.clone(),
-            status: "accepted",
+            session_key: started.session_key.clone(),
+            status,
         },
     )
     .is_err()
     {
-        context.active_chat_send.lock().await.take();
         return true;
     }
 
-    spawn_chat_stream_forwarder(
-        state.clone(),
-        context.tx.clone(),
-        in_flight_permit,
-        context.active_chat_send.clone(),
-        started.run_id,
-        started.session_key,
-    );
+    let should_forward = context
+        .forwarded_runs
+        .lock()
+        .expect("forwarded runs lock")
+        .insert(started.run_id.clone());
+    if should_forward {
+        spawn_chat_stream_forwarder(
+            state.clone(),
+            context.tx.clone(),
+            started.run_id,
+            started.session_key,
+            Arc::clone(context.forwarded_runs),
+        );
+    }
     false
-}
-
-fn send_busy(tx: &mpsc::UnboundedSender<Message>, id: &str) -> bool {
-    send_error(
-        tx,
-        id,
-        "busy",
-        "another chat.send is still running".to_string(),
-    )
-    .is_err()
-}
-
-fn try_acquire_chat_send(in_flight_chat_sends: &AtomicUsize) -> bool {
-    in_flight_chat_sends
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            (current < MAX_IN_FLIGHT_CHAT_SENDS_PER_CONNECTION).then_some(current + 1)
-        })
-        .is_ok()
 }
 
 fn spawn_chat_stream_forwarder(
     state: WebState,
     tx: mpsc::UnboundedSender<Message>,
-    stream_permit: InFlightChatPermit,
-    active_chat_send: Arc<Mutex<Option<ActiveChatSend>>>,
     run_id: String,
     session_key: String,
+    forwarded_runs: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
-        let _stream_permit = stream_permit;
-        forward_chat_stream(state, tx, run_id.clone(), session_key).await;
-        let mut active = active_chat_send.lock().await;
-        if active
-            .as_ref()
-            .is_some_and(|current| current.run_id == run_id)
-        {
-            *active = None;
-        }
+        forward_chat_stream(state, tx, run_id, session_key, forwarded_runs).await;
     });
 }
 
@@ -552,7 +469,12 @@ async fn forward_chat_stream(
     tx: mpsc::UnboundedSender<Message>,
     run_id: String,
     session_key: String,
+    forwarded_runs: Arc<Mutex<HashSet<String>>>,
 ) {
+    let _registration = ForwardedRunRegistration {
+        run_id: run_id.clone(),
+        forwarded_runs,
+    };
     let Ok((mut rx, replay, done, _, _)) = state
         .run_hub
         .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
@@ -583,6 +505,20 @@ async fn forward_chat_stream(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+struct ForwardedRunRegistration {
+    run_id: String,
+    forwarded_runs: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ForwardedRunRegistration {
+    fn drop(&mut self) {
+        self.forwarded_runs
+            .lock()
+            .expect("forwarded runs lock")
+            .remove(&self.run_id);
     }
 }
 
@@ -629,6 +565,7 @@ fn forward_run_event(
                     }],
                 }),
                 error_message: None,
+                terminal: event.terminal,
             };
             send_event(tx, "chat", gateway_event).is_err()
         }
@@ -651,11 +588,12 @@ fn forward_run_event(
                     }
                 }),
                 error_message: None,
+                terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
             }
-            true
+            event.terminal
         }
         "error" => {
             let data = serde_json::from_str::<ErrorData>(&event.data).unwrap_or_default();
@@ -667,32 +605,59 @@ fn forward_run_event(
                 state: "error",
                 message: None,
                 error_message: Some(data.error.unwrap_or_else(|| "stream error".to_string())),
+                terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
             }
-            true
+            event.terminal
         }
         "tool_start" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                 return false;
             };
-            send_event(tx, "tool_start", payload).is_err()
+            send_event(
+                tx,
+                "tool_start",
+                routed_event_payload(run_id, session_key, payload),
+            )
+            .is_err()
         }
         "tool_result" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                 return false;
             };
-            send_event(tx, "tool_result", payload).is_err()
+            send_event(
+                tx,
+                "tool_result",
+                routed_event_payload(run_id, session_key, payload),
+            )
+            .is_err()
         }
         "user_input" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                 return false;
             };
-            send_event(tx, "user_input", payload).is_err()
+            send_event(
+                tx,
+                "user_input",
+                routed_event_payload(run_id, session_key, payload),
+            )
+            .is_err()
         }
         _ => false,
     }
+}
+
+fn routed_event_payload(
+    run_id: &str,
+    session_key: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let mut object = payload.as_object().cloned().unwrap_or_default();
+    object.insert("runId".to_string(), serde_json::json!(run_id));
+    object.insert("sessionKey".to_string(), serde_json::json!(session_key));
+    serde_json::Value::Object(object)
 }
 
 fn send_response<T: Serialize>(
@@ -763,24 +728,6 @@ impl ConnectionPermit {
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.active_ws_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-struct InFlightChatPermit {
-    in_flight_chat_sends: Arc<AtomicUsize>,
-}
-
-impl InFlightChatPermit {
-    fn new(in_flight_chat_sends: Arc<AtomicUsize>) -> Self {
-        Self {
-            in_flight_chat_sends,
-        }
-    }
-}
-
-impl Drop for InFlightChatPermit {
-    fn drop(&mut self) {
-        self.in_flight_chat_sends.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -865,6 +812,7 @@ mod tests {
             id: 1,
             event: "delta".to_string(),
             data: r#"{"delta":"chunk"}"#.to_string(),
+            terminal: false,
         };
         forward_run_event(&tx, "run-1", test_session, &seq, delta_event);
 
@@ -872,6 +820,7 @@ mod tests {
             id: 2,
             event: "done".to_string(),
             data: r#"{"response":"final"}"#.to_string(),
+            terminal: true,
         };
         forward_run_event(&tx, "run-1", test_session, &seq, done_event);
 
@@ -893,6 +842,7 @@ mod tests {
             id: 1,
             event: "error".to_string(),
             data: r#"{"error":"fail"}"#.to_string(),
+            terminal: true,
         };
         forward_run_event(&tx2, "run-2", test_session, &seq2, error_event);
 
@@ -911,6 +861,7 @@ mod tests {
             id: 1,
             event: "delta".to_string(),
             data: r#"{"delta":"hello world"}"#.to_string(),
+            terminal: false,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
@@ -945,6 +896,7 @@ mod tests {
             id: 1,
             event: "delta".to_string(),
             data: r#"{"delta":""}"#.to_string(),
+            terminal: false,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
@@ -963,6 +915,7 @@ mod tests {
             id: 10,
             event: "done".to_string(),
             data: r#"{"response":"final answer"}"#.to_string(),
+            terminal: true,
         };
 
         let should_stop = forward_run_event(&tx, "run-42", "sess-done", &seq, done_event);
@@ -993,6 +946,7 @@ mod tests {
             id: 1,
             event: "done".to_string(),
             data: r#"{"response":""}"#.to_string(),
+            terminal: true,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, done_event);
@@ -1015,6 +969,7 @@ mod tests {
             id: 1,
             event: "error".to_string(),
             data: r#"{"error":"something went wrong"}"#.to_string(),
+            terminal: true,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, error_event);
@@ -1030,6 +985,157 @@ mod tests {
         assert!(payload.get("message").is_none());
     }
 
+    #[test]
+    fn ws_nonterminal_error_does_not_stop_the_shared_run() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let error_event = RunEvent {
+            id: 1,
+            event: "error".to_string(),
+            data: r#"{"error":"parent failed"}"#.to_string(),
+            terminal: false,
+        };
+        assert!(!forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            error_event
+        ));
+
+        let done_event = RunEvent {
+            id: 2,
+            event: "done".to_string(),
+            data: r#"{"response":"follow-up response"}"#.to_string(),
+            terminal: true,
+        };
+        assert!(forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            done_event
+        ));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 2);
+        let parent_error: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parent_error["payload"]["terminal"], false);
+        let child_done: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(child_done["payload"]["terminal"], true);
+        assert_eq!(
+            child_done["payload"]["message"]["content"][0]["text"],
+            "follow-up response"
+        );
+    }
+
+    #[test]
+    fn ws_nonterminal_done_does_not_stop_the_shared_run() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        assert!(!forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            RunEvent {
+                id: 1,
+                event: "done".to_string(),
+                data: r#"{"response":"follow-up A"}"#.to_string(),
+                terminal: false,
+            }
+        ));
+        assert!(!forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            RunEvent {
+                id: 2,
+                event: "error".to_string(),
+                data: r#"{"error":"follow-up A failed later"}"#.to_string(),
+                terminal: false,
+            }
+        ));
+        assert!(forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            RunEvent {
+                id: 3,
+                event: "done".to_string(),
+                data: r#"{"response":"follow-up B"}"#.to_string(),
+                terminal: true,
+            }
+        ));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 3);
+        let first_done: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(first_done["payload"]["terminal"], false);
+        let last_done: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
+        assert_eq!(last_done["payload"]["terminal"], true);
+    }
+
+    #[tokio::test]
+    async fn ws_replays_parent_error_and_child_events_from_one_run() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        state
+            .run_hub
+            .create("shared-replay", WEB_ACTOR.to_string())
+            .await;
+        state
+            .run_hub
+            .publish_agent_error(
+                "shared-replay",
+                r#"{"error":"parent failed"}"#.to_string(),
+                false,
+            )
+            .await;
+        state
+            .run_hub
+            .publish(
+                "shared-replay",
+                "user_input",
+                r#"{"messageId":"follow-up","senderId":"web-user","text":"continue","timestamp":"2026-09-09T00:00:00Z"}"#.to_string(),
+            )
+            .await;
+        state
+            .run_hub
+            .publish(
+                "shared-replay",
+                "done",
+                r#"{"response":"continued"}"#.to_string(),
+            )
+            .await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+        // Act
+        forward_chat_stream(
+            state,
+            tx,
+            "shared-replay".to_string(),
+            "sess-1".to_string(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+
+        // Assert
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 3);
+        let parent_error: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parent_error["payload"]["terminal"], false);
+        let user_input: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(user_input["event"], "user_input");
+        let child_done: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
+        assert_eq!(child_done["payload"]["terminal"], true);
+    }
+
     #[tokio::test]
     async fn ws_chat_send_accepts_message_and_returns_run_id() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1037,35 +1143,155 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let active_chat_send = Arc::new(Mutex::new(None));
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
 
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
-            in_flight_chat_sends: &in_flight,
-            active_chat_send: &active_chat_send,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
 
         let params = serde_json::json!({
             "sessionKey": "main",
-            "message": "hello"
+            "agentId": "default",
+            "message": "hello",
+            "requestId": "durable-request-1"
         });
 
-        let _ = handle_chat_send(&state, context, "req-1", params).await;
+        let _ = handle_chat_send(&state, context, "rpc-attempt-1", params).await;
 
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 1, "exactly one response frame expected");
 
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(parsed["type"], "res");
-        assert_eq!(parsed["id"], "req-1");
+        assert_eq!(parsed["id"], "rpc-attempt-1");
         assert_eq!(parsed["ok"], true);
 
         let payload = &parsed["payload"];
         assert!(payload["runId"].as_str().is_some(), "runId must be present");
         assert_eq!(payload["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_forwards_one_run_once_per_connection() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let params = serde_json::json!({
+            "sessionKey": "duplicate-forward-session",
+            "agentId": "default",
+            "message": "hello",
+            "requestId": "duplicate-forward-request"
+        });
+
+        // Act: the second delivery is idempotent and must reuse the same
+        // connection-local forwarding registration.
+        let first_context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+        handle_chat_send(&state, first_context, "req-1", params.clone()).await;
+        let second_context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+        handle_chat_send(&state, second_context, "req-2", params).await;
+
+        // Assert
+        assert_eq!(forwarded_runs.lock().unwrap().len(), 1);
+        let responses = collect_text_messages(&mut rx)
+            .into_iter()
+            .filter_map(|message| {
+                let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+                (parsed["type"] == "res").then_some(parsed)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(
+            responses[0]["payload"]["runId"],
+            responses[1]["payload"]["runId"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_queues_ordinary_message_behind_active_turn() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let active_context = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some("queued-session".to_string()),
+                message: "active".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("active-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve active turn")
+        .context;
+        assert_eq!(
+            active_context.session_key(),
+            "web:queued-session:agent:default"
+        );
+        assert!(matches!(
+            state
+                .app_state
+                .turn_scheduler
+                .submit(crate::runtime::turn::ScheduledTurn {
+                    turn_id: "active-turn".to_string(),
+                    origin_id: "active-origin".to_string(),
+                    context: active_context,
+                    input: "active".to_string(),
+                    config_snapshot: None,
+                    received_at: None,
+                    response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
+                }),
+            crate::runtime::turn::ScheduleResult::Started(_)
+        ));
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+
+        // Act
+        let stopped = handle_chat_send(
+            &state,
+            context,
+            "req-queued",
+            serde_json::json!({
+                "sessionKey": "queued-session",
+                "agentId": "default",
+                "message": "queued message",
+                "requestId": "queued-request"
+            }),
+        )
+        .await;
+
+        // Assert
+        assert!(!stopped);
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["payload"]["status"], "queued");
+        assert_ne!(response["payload"]["runId"], "active-run");
     }
 
     #[tokio::test]
@@ -1114,23 +1340,19 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
-        let in_flight = Arc::new(AtomicUsize::new(1));
-        let active_chat_send = Arc::new(Mutex::new(Some(ActiveChatSend {
-            run_id: "active-run".to_string(),
-            session_key: format!("chat:{chat_id}"),
-        })));
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
-            in_flight_chat_sends: &in_flight,
-            active_chat_send: &active_chat_send,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
         let resolved = resolve_send_request(
             &state,
             &SendRequest {
                 session_key: Some("active-follow-up".to_string()),
                 message: "follow-up".to_string(),
+                agent_id: Some("default".to_string()),
                 request_id: Some("follow-up-request".to_string()),
             },
             WEB_ACTOR,
@@ -1146,6 +1368,7 @@ mod tests {
             "req-follow-up",
             serde_json::json!({
                 "sessionKey": "active-follow-up",
+                "agentId": "default",
                 "message": "follow-up",
                 "requestId": "follow-up-request"
             }),
@@ -1158,7 +1381,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(response["ok"], true, "response={response}");
-        assert_eq!(response["payload"]["runId"], "active-run");
+        assert_eq!(response["payload"]["runId"], turn_id);
         assert_eq!(response["payload"]["status"], "queued");
         let staged = state
             .app_state
@@ -1171,21 +1394,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ws_chat_send_rejects_unknown_session_without_creating_chat() {
+    async fn ws_chat_send_accepts_unknown_session_while_another_session_runs() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
-        let active_chat_id = state
-            .app_state
-            .db
-            .resolve_or_create_chat_id(
-                "web",
-                "web:active-session:agent:default",
-                None,
-                "web",
-                "default",
-            )
-            .expect("create active chat");
         let chat_count = |state: &WebState| {
             state
                 .app_state
@@ -1198,17 +1410,12 @@ mod tests {
         let before = chat_count(&state);
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
-        let in_flight = Arc::new(AtomicUsize::new(1));
-        let active_chat_send = Arc::new(Mutex::new(Some(ActiveChatSend {
-            run_id: "active-run".to_string(),
-            session_key: format!("chat:{active_chat_id}"),
-        })));
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
-            in_flight_chat_sends: &in_flight,
-            active_chat_send: &active_chat_send,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
 
         // Act
@@ -1218,6 +1425,7 @@ mod tests {
             "req-unknown-session",
             serde_json::json!({
                 "sessionKey": "not-yet-created",
+                "agentId": "default",
                 "message": "follow-up"
             }),
         )
@@ -1228,9 +1436,9 @@ mod tests {
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 1);
         let response: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
-        assert_eq!(response["ok"], false);
-        assert_eq!(response["error"]["code"], "busy");
-        assert_eq!(chat_count(&state), before);
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["payload"]["status"], "accepted");
+        assert_eq!(chat_count(&state), before + 1);
     }
 
     #[test]
@@ -1247,6 +1455,7 @@ mod tests {
                 "timestamp": "2026-08-28T12:00:00Z"
             })
             .to_string(),
+            terminal: false,
         };
 
         assert!(!forward_run_event(&tx, "run-1", "sess-1", &sequence, event));
@@ -1256,6 +1465,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(parsed["event"], "user_input");
         assert_eq!(parsed["payload"]["messageId"], "web:req-2");
+        assert_eq!(parsed["payload"]["runId"], "run-1");
+        assert_eq!(parsed["payload"]["sessionKey"], "sess-1");
     }
 
     #[test]
@@ -1272,6 +1483,7 @@ mod tests {
                 "input": {"path": "a.txt"}
             }))
             .unwrap(),
+            terminal: false,
         };
         assert!(!forward_run_event(
             &tx,
@@ -1292,6 +1504,7 @@ mod tests {
                 "durationMs": 42
             }))
             .unwrap(),
+            terminal: false,
         };
         assert!(!forward_run_event(
             &tx,
@@ -1309,10 +1522,14 @@ mod tests {
         assert_eq!(start["event"], "tool_start");
         assert_eq!(start["payload"]["callId"], "call-1");
         assert_eq!(start["payload"]["input"]["path"], "a.txt");
+        assert_eq!(start["payload"]["runId"], "run-1");
+        assert_eq!(start["payload"]["sessionKey"], "sess-1");
 
         let result: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
         assert_eq!(result["event"], "tool_result");
         assert_eq!(result["payload"]["isError"], false);
         assert_eq!(result["payload"]["durationMs"], 42);
+        assert_eq!(result["payload"]["runId"], "run-1");
+        assert_eq!(result["payload"]["sessionKey"], "sess-1");
     }
 }

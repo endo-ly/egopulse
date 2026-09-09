@@ -3,7 +3,7 @@ import { render, fireEvent, waitFor } from "@testing-library/react";
 import { RunDetail } from "../RunDetail";
 import type { AgentEntry } from "../../../shared/api/types";
 
-const AGENTS: AgentEntry[] = [{ id: "lyre", label: "Lyre", is_default: true, active: true }];
+const AGENTS: AgentEntry[] = [{ id: "lyre", label: "Lyre", is_default: true }];
 
 function stubDetail(detail: Record<string, unknown>) {
   vi.stubGlobal(

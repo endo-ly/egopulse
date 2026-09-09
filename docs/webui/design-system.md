@@ -194,11 +194,12 @@ channel 名・status・trigger_type 等の短いラベル表示用。高さは 2
 
 ### 9.3 Status Dot
 
-agent の live 状態・runtime health の簡易表示に使う小円（8px 程度）。
+agent の未読状態・runtime health の簡易表示に使う小円（8px 程度）。
 
 | 色 | 意味 |
 |---|---|
-| live（accent + pulse アニメーション） | 実行中・アクティブ |
+| live（accent + pulse アニメーション） | 稼働中（runtime health・sleep run 状態用。agent 行では使わない） |
+| unread（accent、アニメーションなし） | 未読の返事あり（agent 行用） |
 | idle（muted-2） | 待機中 |
 | error（danger） | 直近でエラー |
 

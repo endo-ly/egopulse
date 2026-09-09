@@ -37,9 +37,10 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 
 `SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
 
-- `session_key()` は `channel:surface_thread` を返す（`agent_id` はキーに含まれない）
+- `session_key()` は agent を持つ会話では `channel:surface_thread:agent:agent_id` を返す
 - **Discord マルチボット**: `agent_thread(channel_id, agent_id)` ヘルパーが `{channel_id}:agent:{agent_id}` 形式の `surface_thread` を生成する
-- **Web / Telegram / CLI / TUI**: `default_agent` を使用し、従来のアイデンティティ形式を維持する
+- **Web**: 新規セッションはWebUIで選択中のagentを使用し、既存セッションは `chats.agent_id` を使用する
+- **Telegram / CLI / TUI**: 各チャネルの入力経路で解決されたagentを使用する
 
 ### 1.3 Multi-Agent Room 二層アーキテクチャ
 
@@ -105,7 +106,7 @@ execute_scheduled_turn():
 
 **バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
 
-- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）、`input_committed`（model loop resume）、`tools_completed`（未commitの staged follow-upを反映してから、Tool を再実行せず次の model iteration だけ resume）である。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown` / 同一 `request_key` への異なる本文は `internal`）。
+- Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）、`input_committed`（model loop resume）、`tools_completed`（未commitの staged follow-upを反映してから、Tool を再実行せず次の model iteration だけ resume）である。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`）。Webの同一 `request_key` への異なる本文は `409 Conflict` として拒否する。
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
 - Agent Send (`agent_send`): 非同期のため、拒否時に Channel Log へ SystemEvent を記録する。
 

@@ -1,10 +1,12 @@
 //! Per-session turn scheduler with concurrency control and runaway prevention.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 use super::ScheduledTurn;
+use crate::conversation::ConversationScope;
 use crate::runtime::metrics;
 use crate::storage::RecoveredOrigin;
 
@@ -123,6 +125,8 @@ pub(crate) enum RejectReason {
     SessionQueueFull,
     /// The runtime-wide queue reached [`MAX_GLOBAL_QUEUED_TURNS`].
     GlobalQueueFull,
+    /// The request key was already used for a different payload.
+    RequestConflict,
     /// The origin tracker reached [`MAX_TRACKED_ORIGINS`] capacity for a new
     /// origin. The turn is refused at acceptance so it is never silently
     /// dropped after a `202 Accepted` was already returned.
@@ -148,6 +152,7 @@ impl RejectReason {
         match self {
             Self::SessionQueueFull => "session_queue_full",
             Self::GlobalQueueFull => "global_queue_full",
+            Self::RequestConflict => "request_conflict",
             Self::OriginTrackerFull => "tracker_full",
             Self::ChainTerminated => "chain_terminated",
             Self::Shutdown => "shutdown",
@@ -164,6 +169,7 @@ impl RejectReason {
         match self {
             Self::SessionQueueFull => "session turn queue is at capacity",
             Self::GlobalQueueFull => "global turn queue is at capacity",
+            Self::RequestConflict => "request id was already used for different input",
             Self::OriginTrackerFull => "origin turn tracker is at capacity",
             Self::ChainTerminated => "turn chain already terminated",
             Self::Shutdown => "runtime is shutting down",
@@ -592,6 +598,30 @@ struct SchedulerInner {
 /// invokes [`TurnScheduler::on_turn_completed`] to drain the next queued turn.
 pub(crate) struct TurnScheduler {
     inner: Mutex<SchedulerInner>,
+    session_locks: SessionLocks,
+}
+
+#[derive(Default)]
+struct SessionLocks {
+    locks: AsyncMutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+}
+
+impl SessionLocks {
+    async fn lock(&self, scope: ConversationScope, chat_id: i64) -> OwnedMutexGuard<()> {
+        let key = format!("{scope}:{chat_id}");
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            locks.retain(|_, lock| lock.upgrade().is_some());
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
 }
 
 impl TurnScheduler {
@@ -601,7 +631,22 @@ impl TurnScheduler {
                 slots: HashMap::new(),
                 global_queued: 0,
             }),
+            session_locks: SessionLocks::default(),
         }
+    }
+
+    /// Serializes Web session input admission and control operations.
+    ///
+    /// The guard is shared by every WebSocket and REST request in this
+    /// runtime. It protects the durable busy check from racing with ordinary
+    /// Turn acceptance; execution ordering remains the responsibility of the
+    /// scheduler's existing per-session queue.
+    pub(crate) async fn lock_session(
+        &self,
+        scope: ConversationScope,
+        chat_id: i64,
+    ) -> OwnedMutexGuard<()> {
+        self.session_locks.lock(scope, chat_id).await
     }
 
     /// Submits a turn for execution.

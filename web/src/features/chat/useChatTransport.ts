@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   initialChatState,
   reduceChatEvent,
+  reduceDiscardOptimisticUserMessage,
+  reduceOptimisticUserMessage,
   reduceUserInput,
   reduceToolResult,
   reduceToolStart,
@@ -17,6 +19,7 @@ import { invalidateQueries } from "../../shared/hooks/useServerState";
 
 export interface UseChatTransportOptions {
   sessionKey: string;
+  agentId: string;
   authToken: string;
   onDone?: () => void;
   onAuthRequired?: (message: string) => void;
@@ -28,6 +31,7 @@ interface ResponseFrame {
   type: "res";
   id: string;
   ok: boolean;
+  payload?: unknown;
   error?: { code?: string; message?: string };
 }
 
@@ -39,11 +43,42 @@ interface EventFrame {
 
 type ServerFrame = ResponseFrame | EventFrame;
 
+interface ChatAckPayload {
+  runId?: string;
+  sessionKey?: string;
+}
+
+interface UncertainSend {
+  draftId: string;
+  durableRequestId: string;
+  sessionKey: string;
+  text: string;
+}
+
+interface PendingSend {
+  resolve: (durableRequestId: string) => void;
+  reject: (error: Error) => void;
+  draftId: string;
+  durableRequestId: string;
+  sessionKey: string;
+  text: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface RoutedEventPayload {
+  runId?: unknown;
+  sessionKey?: unknown;
+}
+
 const RECONNECT_BASE_DELAY_MS = 1_000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
+// The server acks chat.send on acceptance (not completion), so this only
+// guards a lost frame, not a slow turn.
+const SEND_ACK_TIMEOUT_MS = 15_000;
 
 export function useChatTransport({
   sessionKey,
+  agentId,
   authToken,
   onDone,
   onAuthRequired,
@@ -64,6 +99,15 @@ export function useChatTransport({
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
+  // RPC ids identify one WebSocket attempt. Durable request ids identify the
+  // logical send and remain stable only while its current draft is uncertain.
+  const pendingSendsRef = useRef(new Map<string, PendingSend>());
+  const uncertainSendRef = useRef<UncertainSend | null>(null);
+  // Maps a server run to the original session used by this transport when the
+  // server canonicalizes a newly-created session.
+  const runSessionKeysRef = useRef(new Map<string, string>());
+  // Set when a live socket drops unexpectedly so the next open resyncs.
+  const disruptedRef = useRef(false);
   // Tracks whether the current socket ever reached "open" so an unexpected
   // drop can be reported exactly once, instead of on every retry.
   const wasOpenRef = useRef(false);
@@ -79,15 +123,67 @@ export function useChatTransport({
     }
   }, []);
 
+  const settlePendingSend = useCallback(
+    (rpcId: string, error: Error | null) => {
+      const pending = pendingSendsRef.current.get(rpcId);
+      if (!pending) return;
+      pendingSendsRef.current.delete(rpcId);
+      clearTimeout(pending.timer);
+      if (error) {
+        setState((prev) =>
+          reduceDiscardOptimisticUserMessage(prev, pending.durableRequestId),
+        );
+        pending.reject(error);
+      } else {
+        pending.resolve(pending.durableRequestId);
+      }
+    },
+    [],
+  );
+
+  const rejectAllPendingSends = useCallback((error: Error, retryable: boolean) => {
+    const pending = [...pendingSendsRef.current.entries()];
+    pendingSendsRef.current.clear();
+    for (const [_rpcId, entry] of pending) {
+      clearTimeout(entry.timer);
+      if (retryable) {
+        uncertainSendRef.current = {
+          draftId: entry.draftId,
+          durableRequestId: entry.durableRequestId,
+          sessionKey: entry.sessionKey,
+          text: entry.text,
+        };
+      }
+      entry.reject(error);
+    }
+    if (!retryable) uncertainSendRef.current = null;
+    if (pending.length > 0) {
+      setState((prev) =>
+        pending.reduce(
+          (state, [_rpcId, entry]) =>
+            reduceDiscardOptimisticUserMessage(state, entry.durableRequestId),
+          prev,
+        ),
+      );
+    }
+  }, []);
+
   useEffect(() => {
     setState(initialChatState());
+    if (uncertainSendRef.current?.sessionKey !== sessionKey) {
+      uncertainSendRef.current = null;
+    }
   }, [sessionKey]);
 
-  useEffect(() => () => {
-    intentionalCloseRef.current = true;
-    clearReconnectTimer();
-    wsRef.current?.close();
-  }, []);
+  useEffect(
+    () => () => {
+      intentionalCloseRef.current = true;
+      clearReconnectTimer();
+      rejectAllPendingSends(new Error("disconnected"), false);
+      wsRef.current?.close();
+    },
+    [clearReconnectTimer, rejectAllPendingSends],
+  );
 
   const handleMessage = useCallback(
     (raw: string) => {
@@ -131,8 +227,32 @@ export function useChatTransport({
         return;
       }
 
+      if (parsed.type === "res" && parsed.id !== "connect") {
+        // The ack settles the sendMessage promise; failures surface there
+        // so the composer can keep the text.
+        const pending = pendingSendsRef.current.get(parsed.id);
+        if (parsed.ok && parsed.payload) {
+          const ack = parsed.payload as ChatAckPayload;
+          if (ack.runId && ack.sessionKey) {
+            if (pending) {
+              runSessionKeysRef.current.set(ack.runId, pending.sessionKey);
+            }
+          }
+        } else if (!parsed.ok && pending) {
+          uncertainSendRef.current = null;
+        }
+        settlePendingSend(
+          parsed.id,
+          parsed.ok ? null : new Error(parsed.error?.message ?? "send failed"),
+        );
+        return;
+      }
+
       if (parsed.type === "event" && parsed.event === "chat" && parsed.payload) {
         const event = parsed.payload as ChatEventPayload;
+        if (!belongsToCurrentSession(event, sessionKeyRef.current, runSessionKeysRef.current)) {
+          return;
+        }
         setState((prev) => reduceChatEvent(prev, event));
         if (event.state === "done") {
           if (
@@ -144,26 +264,48 @@ export function useChatTransport({
           }
           invalidateQueries("sessions");
           invalidateQueries("history");
-          onDone?.();
+          if (event.terminal !== false) {
+            onDone?.();
+            runSessionKeysRef.current.delete(event.runId);
+          }
+        } else if (event.state === "error") {
+          // A failed turn still persisted the user message; refetch it.
+          invalidateQueries("sessions");
+          invalidateQueries("history");
+          if (event.terminal !== false) {
+            runSessionKeysRef.current.delete(event.runId);
+          }
         }
         return;
       }
 
       if (parsed.type === "event" && parsed.event === "tool_start" && parsed.payload) {
+        const payload = parsed.payload as RoutedEventPayload;
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runSessionKeysRef.current)) {
+          return;
+        }
         setState((prev) => reduceToolStart(prev, parsed.payload as ToolStartPayload));
         return;
       }
 
       if (parsed.type === "event" && parsed.event === "tool_result" && parsed.payload) {
+        const payload = parsed.payload as RoutedEventPayload;
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runSessionKeysRef.current)) {
+          return;
+        }
         setState((prev) => reduceToolResult(prev, parsed.payload as ToolResultPayload));
         return;
       }
 
       if (parsed.type === "event" && parsed.event === "user_input" && parsed.payload) {
+        const payload = parsed.payload as RoutedEventPayload;
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runSessionKeysRef.current)) {
+          return;
+        }
         setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
       }
     },
-    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer],
+    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend],
   );
 
   const connect = useCallback(
@@ -187,10 +329,19 @@ export function useChatTransport({
           reconnectAttemptRef.current = 0;
           wasOpenRef.current = true;
           setConnectionState("open");
+          if (disruptedRef.current) {
+            // The in-flight run lost its subscription; pull whatever
+            // persisted while we were away.
+            disruptedRef.current = false;
+            invalidateQueries("sessions");
+            invalidateQueries("history");
+          }
         };
         ws.onclose = () => {
           if (wasOpenRef.current && !intentionalCloseRef.current) {
             onError?.("Connection lost. Retrying…");
+            disruptedRef.current = true;
+            rejectAllPendingSends(new Error("Connection lost. Retrying…"), true);
           }
           wasOpenRef.current = false;
           setConnectionState("closed");
@@ -214,7 +365,7 @@ export function useChatTransport({
 
       return connectPromiseRef.current;
     },
-    [handleMessage, onError, clearReconnectTimer],
+    [handleMessage, onError, clearReconnectTimer, rejectAllPendingSends],
   );
 
   const scheduleReconnect = useCallback(() => {
@@ -235,32 +386,88 @@ export function useChatTransport({
   const disconnect = useCallback(() => {
     intentionalCloseRef.current = true;
     clearReconnectTimer();
+    rejectAllPendingSends(new Error("disconnected"), false);
     wsRef.current?.close();
     wsRef.current = null;
     setConnectionState("closed");
-  }, []);
+  }, [clearReconnectTimer, rejectAllPendingSends]);
 
   const sendMessage = useCallback(
-    async (text: string): Promise<string | null> => {
+    async (text: string, draftId: string): Promise<string | null> => {
       await connect();
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return null;
 
-      const requestId = crypto.randomUUID();
+      const uncertain = uncertainSendRef.current;
+      const durableRequestId =
+        uncertain &&
+        uncertain.draftId === draftId &&
+        uncertain.sessionKey === sessionKey &&
+        uncertain.text === text
+          ? uncertain.durableRequestId
+          : crypto.randomUUID();
+      uncertainSendRef.current = null;
+      const rpcId = crypto.randomUUID();
       const msg = {
         type: "req",
-        id: requestId,
+        id: rpcId,
         method: "chat.send",
         params: {
           sessionKey,
+          agentId,
           message: text,
-          requestId,
+          requestId: durableRequestId,
         },
       };
-      ws.send(JSON.stringify(msg));
-      return requestId;
+      setState((prev) =>
+        reduceOptimisticUserMessage(prev, { requestId: durableRequestId, text }),
+      );
+      // Resolve on the server ack; reject on refusal or timeout so the
+      // caller can keep the text instead of losing it.
+      return new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          const pending = pendingSendsRef.current.get(rpcId);
+          if (!pending) return;
+          pendingSendsRef.current.delete(rpcId);
+          uncertainSendRef.current = {
+            draftId,
+            durableRequestId,
+            sessionKey,
+            text,
+          };
+          setState((prev) =>
+            reduceDiscardOptimisticUserMessage(prev, durableRequestId),
+          );
+          reject(new Error("send acknowledgement timed out"));
+        }, SEND_ACK_TIMEOUT_MS);
+        pendingSendsRef.current.set(rpcId, {
+          resolve,
+          reject,
+          draftId,
+          durableRequestId,
+          sessionKey,
+          text,
+          timer,
+        });
+        try {
+          ws.send(JSON.stringify(msg));
+        } catch (error) {
+          pendingSendsRef.current.delete(rpcId);
+          clearTimeout(timer);
+          uncertainSendRef.current = {
+            draftId,
+            durableRequestId,
+            sessionKey,
+            text,
+          };
+          setState((prev) =>
+            reduceDiscardOptimisticUserMessage(prev, durableRequestId),
+          );
+          reject(error instanceof Error ? error : new Error("failed to send message"));
+        }
+      });
     },
-    [connect, sessionKey],
+    [agentId, connect, sessionKey],
   );
 
   return {
@@ -271,4 +478,16 @@ export function useChatTransport({
     sendMessage,
     handleMessage,
   };
+}
+
+function belongsToCurrentSession(
+  payload: RoutedEventPayload,
+  currentSessionKey: string,
+  runSessionKeys: Map<string, string>,
+): boolean {
+  if (payload.sessionKey === currentSessionKey) return true;
+  return (
+    typeof payload.runId === "string" &&
+    runSessionKeys.get(payload.runId) === currentSessionKey
+  );
 }

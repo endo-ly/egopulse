@@ -16,6 +16,7 @@ WebUI と外部 voice client が使用する REST API、および WebSocket の�
     - [Voice turn](#28-voice-turn)
     - [Sleep Batch](#29-sleep-batch)
     - [Webhook](#210-webhook)
+    - [Agent Avatar](#211-agent-avatar)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -258,8 +259,10 @@ GET /api/history?session_key=main&limit=100
 POST /api/send_stream
 ```
 
-- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）
-- レスポンス: `ok: true`, `run_id`（UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
+- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）。未永続の新規Webセッションでは `agent_id`（作成対象agent）も必須。既存の `chat:{id}` は保存済み `chats.agent_id` を使用する
+- レスポンス: `ok: true`, `run_id`（durable Turn の UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
+
+通常メッセージはWebSocketと同じWeb共通入力を通り、`TurnScheduler` にdurableに投入される。同一sessionはFIFOで直列化され、Tool実行中の入力は既存Turnへdurable stagingされる。`request_id` が同じで本文も同じ再送は同じ `run_id` を返し、Turnを重複生成しない。`request_id` を別本文で再利用した場合は `409 Conflict` で拒否する。完了済みTurnの再送でも、保存済みの最終応答またはエラーを同じ `run_id` のstreamへreplayする。slash commandはLLM Turnとして投入せず、対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `429` で拒否する。
 
 #### SSE イベント受信
 
@@ -353,7 +356,7 @@ Sleep Batch の実行履歴・ステップ結果・メモリ変更差分・現�
 GET /api/agents
 ```
 
-設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, active}, ...]`）。
+設定上の全 agent を返す（`ok: true`, `agents: [{id, label, is_default, avatar_url}, ...]`）。`avatar_url` はアイコン未設定時は `null`、設定済みなら `?v=` 付きのキャッシュバスティング URL。
 
 ---
 
@@ -434,7 +437,7 @@ Content-Type: application/json
 
 成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返る。commit 後に in-memory scheduler の同時実行上限に達しても拒否とは扱わず、dispatcher への deferred（容量が空き次第の再投入）として同じ `202` を返す。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）と `input_committed`（model loop から resume）の2状態のみで、モデル反復開始後（`model_pending` 以降）は再実行対象外となる。
 
-受付拒否時は理由コード違いで一律 `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、受付処理の内部エラーや同一 `request_key` へ異なる本文の再受付は `internal`）。エラーコード一覧は [§4](#4-エラーレスポンス) を参照。
+受付拒否時は理由コード違いで `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`）。同一 `request_key` へ異なる本文を再受付した場合は `409 Conflict`（`request_conflict`）となる。エラーコード一覧は [§4](#4-エラーレスポンス) を参照。
 
 #### Target 解決
 
@@ -468,6 +471,46 @@ payload format は設定項目化しない。JSON payload を受け、既知 pay
 - 解決後 agent が `config.agents` に存在
 - 非 Web target の `target.thread` が空でない
 - Discord / Telegram target の `target.thread` が `channels.<channel>` の登録エントリに解決できること（数値として parse 可能・未登録 thread・channel map 欠落は拒否。`Normal` への降格なし）
+
+---
+
+### 2.11 Agent Avatar
+
+WebUI で表示する agent アイコン画像のアップロード・取得・削除。画像は `agent_avatars` テーブルに BLOB として保存される（[db.md](./db.md)）。表示箇所は Sidebar の Agents セクションとチャットの assistant アバター。
+
+クライアントは画像を 256×256 にリサイズしてから送信する。サーバー側の画像処理は行わない。
+
+#### アップロード
+
+```text
+PUT /api/agents/{agent_id}/avatar
+Authorization: Bearer <channels.web.auth_token>
+Content-Type: image/png | image/jpeg | image/webp
+<binary image bytes>
+```
+
+- 上限 1 MiB。超過は `413`、未対応 Content-Type は `415`、空 body は `400`、未知 agent は `404`
+- レスポンス: `{ "ok": true, "avatar_url": "/api/agents/{agent_id}/avatar?v=<updated_at>" }`
+- 上書きアップロード可。`updated_at` が行バージョンを兼ねる
+
+#### 取得
+
+```text
+GET /api/agents/{agent_id}/avatar
+```
+
+- 画像バイト列を `Content-Type` / `ETag`（updated_at）/ `Cache-Control: private, max-age=3600` 付きで返す
+- 未設定・未知 agent は `404`。UI は頭文字アバターへフォールバックする
+- `avatar_url` が `?v=` を持つため、URL を変えずにキャッシュを無効化できる
+
+#### 削除
+
+```text
+DELETE /api/agents/{agent_id}/avatar
+```
+
+- `{ "ok": true }` を返す。未設定でも成功する（冪等）
+- 削除後は `avatar_url: null` となり、UI は頭文字アバターへ戻る
 
 ---
 
@@ -519,6 +562,8 @@ JSON-RPC 風の双方向メッセージング。
 }
 ```
 
+`agentId` は未永続の新規Webセッションで必須。`sessionKey` が既存の `chat:{id}` の場合は、保存済みセッションのagentが優先される。
+
 ##### 成功レスポンス
 
 ```json
@@ -546,6 +591,7 @@ JSON-RPC 風の双方向メッセージング。
   "method": "chat.send",
   "params": {
     "sessionKey": "main",
+    "agentId": "default",
     "message": "こんにちは",
     "requestId": "client-generated-uuid"
   }
@@ -561,12 +607,13 @@ JSON-RPC 風の双方向メッセージング。
   "ok": true,
   "payload": {
     "runId": "uuid",
+    "sessionKey": "main",
     "status": "accepted"
   }
 }
 ```
 
-同一 WebSocket 接続で active run と同じ `sessionKey` に ordinary message を送った場合、current Turn が Tool 実行中なら `requestId` を message identity として durable staging する。受付 COMMIT 後、active run の `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。Tool 実行中でない、別 session、または slash command の送信は従来通り `busy` または通常の command routing となる。
+WebSocket の ordinary message は `requestId` を durable request identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。`req.id` はWebSocketの1回のRPC attemptとresponse照合だけに使うため、ACK不明後のretryでは新しい `req.id` と同じ `requestId` を組み合わせる。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。複数Turnのinteractionでは個別の `done` / `error` が `terminal: false` で流れ、最後のTurnだけが `terminal: true` になる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
 
 `user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
 
@@ -583,6 +630,7 @@ JSON-RPC 風の双方向メッセージング。
     "sessionKey": "main",
     "seq": 1,
     "state": "delta",
+    "terminal": false,
     "message": {
       "role": "assistant",
       "content": [{"type": "text", "text": "こんにちは！"}]
@@ -594,8 +642,10 @@ JSON-RPC 風の双方向メッセージング。
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
-| `done` | 完了。`message` に最終応答を含む。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
-| `error` | エラー。`errorMessage` を含む |
+| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
+| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する |
+
+`chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
 
 #### ツールイベント受信
 
@@ -606,6 +656,8 @@ JSON-RPC 風の双方向メッセージング。
   "type": "event",
   "event": "tool_start",
   "payload": {
+    "runId": "uuid",
+    "sessionKey": "main",
     "callId": "call_1",
     "name": "read",
     "input": {"path": "a.txt"}
@@ -618,6 +670,8 @@ JSON-RPC 風の双方向メッセージング。
   "type": "event",
   "event": "tool_result",
   "payload": {
+    "runId": "uuid",
+    "sessionKey": "main",
     "callId": "call_1",
     "name": "read",
     "isError": false,
@@ -668,7 +722,8 @@ JSON-RPC 風の双方向メッセージング。
 | `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
 | `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 | `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
-| `internal` | 429 | 受付処理の内部エラー（同一 `request_key` へ異なる本文の再受付による hash 不一致を含む） |
+| `request_conflict` | 409 | 同一 `request_id` / `request_key` が別本文で再利用された |
+| `internal` | 500 | 受付処理の内部エラー |
 | `internal_error` | 500 | サーバー内部エラー |
 
 ---

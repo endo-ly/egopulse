@@ -202,14 +202,44 @@ pub(crate) async fn submit_agent_turn(
 /// Submits a turn through the shared durable scheduler and observes its output.
 pub(crate) async fn submit_observed_agent_turn(
     state: &Arc<AppState>,
-    mut context: SurfaceContext,
+    context: SurfaceContext,
     input: String,
 ) -> Result<TurnObserver, RejectReason> {
+    submit_observed_agent_turn_with_identity(state, context, input)
+        .await
+        .and_then(|submission| match submission {
+            ObservedTurnSubmission::Created {
+                observer: Some(observer),
+                ..
+            } => Ok(observer),
+            ObservedTurnSubmission::Existing { .. } => Err(RejectReason::Internal),
+            ObservedTurnSubmission::Created { observer: None, .. } => Err(RejectReason::Internal),
+        })
+}
+
+/// A client-owned Turn together with its live observer and durable identity.
+pub(crate) enum ObservedTurnSubmission {
+    Created {
+        observer: Option<TurnObserver>,
+        outcome: SubmitOutcome,
+        turn_id: String,
+    },
+    Existing {
+        run: Box<crate::storage::TurnRun>,
+        observer: Option<TurnObserver>,
+    },
+}
+
+/// Submits a client-owned Turn and returns its durable identity.
+pub(crate) async fn submit_observed_agent_turn_with_identity(
+    state: &Arc<AppState>,
+    mut context: SurfaceContext,
+    input: String,
+) -> Result<ObservedTurnSubmission, RejectReason> {
     if context.request_key.is_empty() {
         context.request_key = format!("tui:{}", uuid::Uuid::new_v4());
     }
     let request_key = context.request_key.clone();
-    let observer = state.turn_observers.register(request_key.clone());
     let scheduled = ScheduledTurn {
         turn_id: uuid::Uuid::new_v4().to_string(),
         origin_id: context.origin_id.clone(),
@@ -219,12 +249,24 @@ pub(crate) async fn submit_observed_agent_turn(
         received_at: Some(chrono::Utc::now().to_rfc3339()),
         response_delivery: ResponseDelivery::ClientOwned,
     };
-    match submit_scheduled_turn(state, scheduled).await {
-        SubmitOutcome::Started | SubmitOutcome::Queued => Ok(observer),
-        SubmitOutcome::Rejected(reason) => {
-            state.turn_observers.unregister(&request_key);
-            Err(reason)
+    match accept_scheduled_turn(state, scheduled).await {
+        Ok(AcceptedScheduledTurn::Created(scheduled)) => {
+            let turn_id = scheduled.turn_id.clone();
+            let observer = state.turn_observers.register_if_absent(request_key);
+            let outcome = schedule_and_spawn(state, *scheduled);
+            Ok(ObservedTurnSubmission::Created {
+                observer,
+                outcome,
+                turn_id,
+            })
         }
+        Ok(AcceptedScheduledTurn::Existing(run)) => {
+            let observer = (!run.state.is_terminal())
+                .then(|| state.turn_observers.register_if_absent(request_key))
+                .flatten();
+            Ok(ObservedTurnSubmission::Existing { run, observer })
+        }
+        Err(reason) => Err(reason),
     }
 }
 
@@ -232,9 +274,23 @@ pub(crate) async fn submit_observed_agent_turn(
 /// of the context's chat.
 pub(crate) async fn try_stage_tool_followup(
     state: &Arc<AppState>,
-    mut context: SurfaceContext,
+    context: SurfaceContext,
     input: String,
 ) -> Result<ToolFollowupOutcome, EgoPulseError> {
+    Ok(
+        match try_stage_tool_followup_with_turn_id(state, context, input).await? {
+            Some(_) => ToolFollowupOutcome::Accepted,
+            None => ToolFollowupOutcome::NoToolPhase,
+        },
+    )
+}
+
+/// Attempts to durably stage ordinary input and returns its owning Turn ID.
+pub(crate) async fn try_stage_tool_followup_with_turn_id(
+    state: &Arc<AppState>,
+    mut context: SurfaceContext,
+    input: String,
+) -> Result<Option<String>, EgoPulseError> {
     if !state.supervisor.accepting_inputs() {
         tracing::info!("tool follow-up rejected: runtime not accepting input (shutdown)");
         metrics::inc_turn_queue_rejections("shutdown");
@@ -260,9 +316,24 @@ pub(crate) async fn try_stage_tool_followup(
     })
     .await?;
     Ok(match result {
-        StageToolFollowupOutcome::Accepted(_) => ToolFollowupOutcome::Accepted,
-        StageToolFollowupOutcome::NoToolPhase => ToolFollowupOutcome::NoToolPhase,
+        StageToolFollowupOutcome::Accepted(message) => Some(message.turn_id.ok_or_else(|| {
+            EgoPulseError::Internal("staged follow-up has no owning Turn".to_string())
+        })?),
+        StageToolFollowupOutcome::NoToolPhase => None,
     })
+}
+
+/// Reports whether the context's chat has a non-terminal durable Turn.
+pub(crate) async fn session_has_unfinished_turn(
+    state: &Arc<AppState>,
+    context: &SurfaceContext,
+) -> Result<bool, EgoPulseError> {
+    let chat_id = resolve_chat_id(&state.turn_dependencies(), context).await?;
+    call_blocking(state.db_for(context.scope), move |db| {
+        db.has_unfinished_turn(chat_id)
+    })
+    .await
+    .map_err(EgoPulseError::from)
 }
 
 /// Submits an agent turn and starts execution immediately when the session is idle.
@@ -285,7 +356,7 @@ pub(crate) async fn submit_scheduled_turn(
 ) -> SubmitOutcome {
     match accept_scheduled_turn(state, scheduled).await {
         Ok(AcceptedScheduledTurn::Created(scheduled)) => schedule_and_spawn(state, *scheduled),
-        Ok(AcceptedScheduledTurn::Existing) => SubmitOutcome::Queued,
+        Ok(AcceptedScheduledTurn::Existing(_)) => SubmitOutcome::Queued,
         Err(reason) => SubmitOutcome::Rejected(reason),
     }
 }
@@ -363,6 +434,10 @@ pub(crate) async fn accept_scheduled_turn(
                     metrics::inc_turn_queue_rejections("global_queue_full");
                     RejectReason::GlobalQueueFull
                 }
+                crate::error::EgoPulseError::Storage(crate::error::StorageError::Conflict(_)) => {
+                    metrics::inc_turn_queue_rejections("request_conflict");
+                    RejectReason::RequestConflict
+                }
                 _ => {
                     tracing::warn!(error = %error, "durable accept failed; rejecting turn");
                     metrics::inc_turn_queue_rejections(RejectReason::Internal.as_str());
@@ -377,9 +452,9 @@ pub(crate) async fn accept_scheduled_turn(
         crate::storage::AcceptOutcome::Created(run) => run,
         // Same request already accepted elsewhere: do not start a second
         // execution. Release this reservation; the existing owner holds its own.
-        crate::storage::AcceptOutcome::Existing(_) => {
+        crate::storage::AcceptOutcome::Existing(run) => {
             state.turn_tracker.release(&origin_id);
-            return Ok(AcceptedScheduledTurn::Existing);
+            return Ok(AcceptedScheduledTurn::Existing(Box::new(run)));
         }
     };
     // Stamp authoritative ids from the DB row; it is the source of truth for
@@ -395,7 +470,7 @@ pub(crate) async fn accept_scheduled_turn(
 
 pub(crate) enum AcceptedScheduledTurn {
     Created(Box<ScheduledTurn>),
-    Existing,
+    Existing(Box<crate::storage::TurnRun>),
 }
 
 /// Re-enqueues an already-durably-accepted turn (used by the turn dispatcher

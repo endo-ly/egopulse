@@ -371,6 +371,19 @@ impl Database {
         .ok_or_else(|| StorageError::NotFound(format!("turn_run:{turn_id}")))
     }
 
+    /// Reports whether a chat has any non-terminal durable Turn.
+    pub(crate) fn has_unfinished_turn(&self, chat_id: i64) -> Result<bool, StorageError> {
+        let conn = self.get_conn()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM turn_runs
+             WHERE chat_id = ?1
+               AND state NOT IN ('completed', 'failed', 'cancelled', 'uncertain')",
+            params![chat_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     /// Returns durable Turns that can be dispatched or resumed after startup.
     ///
     /// In addition to queued `accepted` / `input_committed` Turns, this includes

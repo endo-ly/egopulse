@@ -502,6 +502,7 @@ mod tests {
         tx.send(tool_start("read", "read")).unwrap();
         tx.send(AgentEvent::FinalResponse {
             text: "done".to_string(),
+            terminal: false,
         })
         .unwrap();
         drop(tx);
@@ -901,6 +902,7 @@ mod tests {
         .unwrap();
         tx.send(AgentEvent::FinalResponse {
             text: "完了した結果をお伝えします".to_string(),
+            terminal: false,
         })
         .unwrap();
         let () = handle.await.unwrap();

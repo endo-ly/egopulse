@@ -1,16 +1,29 @@
 import { useEffect, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 export interface ModalProps {
   open: boolean;
   onClose: () => void;
   labelledBy: string;
   children: ReactNode;
+  /**
+   * When false, clicking the backdrop does not request a close (Escape still
+   * does). Use for modals whose content must survive stray outside clicks,
+   * e.g. an interactive editor.
+   */
+  closeOnBackdrop?: boolean;
 }
 
 const FOCUSABLE_SELECTOR =
   'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
 
-export function Modal({ open, onClose, labelledBy, children }: ModalProps) {
+export function Modal({
+  open,
+  onClose,
+  labelledBy,
+  children,
+  closeOnBackdrop = true,
+}: ModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -63,8 +76,14 @@ export function Modal({ open, onClose, labelledBy, children }: ModalProps) {
 
   if (!open) return null;
 
-  return (
-    <div className="modal-backdrop" onClick={onClose}>
+  // Portal to <body>: ancestors with backdrop-filter/transform turn position:
+  // fixed into "fixed relative to that ancestor", which would confine the
+  // modal to e.g. the sidebar instead of the viewport.
+  return createPortal(
+    <div
+      className="modal-backdrop"
+      onClick={closeOnBackdrop ? onClose : undefined}
+    >
       <div
         ref={panelRef}
         className="modal-panel"
@@ -76,6 +95,7 @@ export function Modal({ open, onClose, labelledBy, children }: ModalProps) {
       >
         {children}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -5,6 +5,7 @@ export interface ChatEventPayload {
   sessionKey: string;
   seq: number;
   state: "delta" | "done" | "error";
+  terminal?: boolean;
   message?: {
     role: string;
     content: Array<{ type: string; text: string }>;
@@ -20,6 +21,58 @@ export interface ChatState {
 
 export function initialChatState(): ChatState {
   return { messages: [], runId: null, error: null };
+}
+
+/** Client-side ids (`draft:` streaming, `local:` optimistic, `tool:` cards). */
+export function isLiveMessageId(id: string): boolean {
+  return (
+    id.startsWith("draft:") || id.startsWith("local:") || id.startsWith("tool:")
+  );
+}
+
+function optimisticUserMessageId(requestId: string): string {
+  return `local:${requestId}`;
+}
+
+export interface OptimisticUserMessage {
+  requestId: string;
+  text: string;
+}
+
+/** Shows the sent text immediately; history or the echo replaces it later. */
+export function reduceOptimisticUserMessage(
+  state: ChatState,
+  message: OptimisticUserMessage,
+): ChatState {
+  const id = optimisticUserMessageId(message.requestId);
+  if (state.messages.some((m) => m.id === id)) return state;
+  return {
+    ...state,
+    messages: [
+      ...state.messages,
+      {
+        id,
+        sender_id: "user",
+        sender_kind: "user",
+        content: message.text,
+        timestamp: new Date().toISOString(),
+        message_kind: "message",
+      },
+    ],
+  };
+}
+
+/** Withdraws the optimistic message, e.g. when sending failed. */
+export function reduceDiscardOptimisticUserMessage(
+  state: ChatState,
+  requestId: string,
+): ChatState {
+  const id = optimisticUserMessageId(requestId);
+  if (!state.messages.some((m) => m.id === id)) return state;
+  return {
+    ...state,
+    messages: state.messages.filter((m) => m.id !== id),
+  };
 }
 
 export function reduceChatEvent(state: ChatState, event: ChatEventPayload): ChatState {
@@ -51,11 +104,13 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           },
         ];
       }
-      return { ...state, messages, runId: event.runId };
+      return { ...state, messages, runId: event.runId, error: null };
     }
 
     case "done": {
       const finalText = extractText(event);
+      // Locals stay until history actually delivers their copy; the merge
+      // reconciles them against newly arrived entries.
       let messages = state.messages;
       const existing = messages.find((m) => m.id === draftId);
       if (existing) {
@@ -79,7 +134,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           },
         ];
       }
-      return { ...state, messages };
+      return { ...state, messages, error: null };
     }
 
     case "error": {
@@ -145,14 +200,29 @@ export function reduceUserInput(
     return state;
   }
 
+  // The server echo supersedes one optimistic message with the same text.
+  let withoutLocal = state.messages;
+  const localIndex = withoutLocal.findIndex(
+    (message) =>
+      message.sender_kind === "user" &&
+      message.content === payload.text &&
+      message.id.startsWith("local:"),
+  );
+  if (localIndex >= 0) {
+    withoutLocal = [
+      ...withoutLocal.slice(0, localIndex),
+      ...withoutLocal.slice(localIndex + 1),
+    ];
+  }
+
   const draftId = state.runId ? `draft:${state.runId}` : null;
-  const messages = draftId && state.messages.some((message) => message.id === draftId)
-    ? state.messages.map((message) =>
+  const messages = draftId && withoutLocal.some((message) => message.id === draftId)
+    ? withoutLocal.map((message) =>
         message.id === draftId
-          ? { ...message, id: sealedAssistantDraftId(state.messages, draftId) }
+          ? { ...message, id: sealedAssistantDraftId(withoutLocal, draftId) }
           : message,
       )
-    : state.messages;
+    : withoutLocal;
 
   return {
     ...state,

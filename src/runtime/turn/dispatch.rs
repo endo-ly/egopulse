@@ -211,7 +211,7 @@ async fn promote_terminal_staged_messages(
                     .await?;
                     accepted_turns.push(*turn);
                 }
-                Ok(channel_input::AcceptedScheduledTurn::Existing) => {
+                Ok(channel_input::AcceptedScheduledTurn::Existing(_)) => {
                     let chat_id = message.chat_id;
                     let message_id = message.id;
                     call_blocking(Arc::clone(&db), move |db| {
@@ -1039,6 +1039,7 @@ async fn execute_and_publish_scheduled_turn(
                             observer_key,
                             crate::agent_loop::event::AgentEvent::Error {
                                 message: error_message,
+                                terminal: false,
                             },
                         );
                     }
@@ -1310,8 +1311,8 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum DeliveredEvent {
         Input(String),
-        Response(String),
-        Error(String),
+        Response(String, bool),
+        Error(String, bool),
     }
 
     async fn run_terminal_staged_follow_up_case(
@@ -1357,7 +1358,10 @@ mod tests {
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
             response_delivery: ResponseDelivery::ClientOwned,
         };
-        let observer = state.turn_observers.register(context.request_key.clone());
+        let observer = state
+            .turn_observers
+            .register_if_absent(context.request_key.clone())
+            .expect("observer should be registered");
         let mut events = observer.events;
         let completion = observer.completion;
         let scheduled_json =
@@ -1439,11 +1443,11 @@ mod tests {
                 crate::agent_loop::event::AgentEvent::UserInputInjected { text, .. } => {
                     delivered.push(DeliveredEvent::Input(text));
                 }
-                crate::agent_loop::event::AgentEvent::FinalResponse { text } => {
-                    delivered.push(DeliveredEvent::Response(text));
+                crate::agent_loop::event::AgentEvent::FinalResponse { text, terminal } => {
+                    delivered.push(DeliveredEvent::Response(text, terminal));
                 }
-                crate::agent_loop::event::AgentEvent::Error { message } => {
-                    delivered.push(DeliveredEvent::Error(message));
+                crate::agent_loop::event::AgentEvent::Error { message, terminal } => {
+                    delivered.push(DeliveredEvent::Error(message, terminal));
                 }
                 _ => {}
             }
@@ -2260,7 +2264,10 @@ mod tests {
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
             response_delivery: ResponseDelivery::ClientOwned,
         };
-        let observer = state.turn_observers.register(context.request_key.clone());
+        let observer = state
+            .turn_observers
+            .register_if_absent(context.request_key.clone())
+            .expect("observer should be registered");
         let mut events = observer.events;
         let completion = observer.completion;
         let scheduled_json =
@@ -2454,18 +2461,29 @@ mod tests {
                 DeliveredEvent::Input("recovered follow-up 2".to_string())
             );
             match (first_succeeds, &events[1]) {
-                (true, DeliveredEvent::Response(text)) => assert_eq!(text, "ok"),
-                (false, DeliveredEvent::Error(message)) => {
+                (true, DeliveredEvent::Response(text, terminal)) => {
+                    assert_eq!(text, "ok");
+                    assert!(!terminal, "the first child must not end the interaction");
+                }
+                (false, DeliveredEvent::Error(message, terminal)) => {
                     assert!(message.contains("follow-up 0 failed"));
+                    assert!(
+                        !terminal,
+                        "the first child error must not end the interaction"
+                    );
                 }
                 (succeeds, event) => {
                     panic!("unexpected first child outcome: succeeds={succeeds}, event={event:?}")
                 }
             }
             match (second_succeeds, &events[3]) {
-                (true, DeliveredEvent::Response(text)) => assert_eq!(text, "ok"),
-                (false, DeliveredEvent::Error(message)) => {
+                (true, DeliveredEvent::Response(text, terminal)) => {
+                    assert_eq!(text, "ok");
+                    assert!(terminal, "the last child must end the interaction");
+                }
+                (false, DeliveredEvent::Error(message, terminal)) => {
                     assert!(message.contains("follow-up 1 failed"));
+                    assert!(terminal, "the last child error must end the interaction");
                 }
                 (succeeds, event) => {
                     panic!("unexpected second child outcome: succeeds={succeeds}, event={event:?}")
@@ -2485,7 +2503,10 @@ mod tests {
         ));
         let mut context = crate::test_util::cli_context("staged-read-failure");
         context.request_key = "staged-read-failure-client".to_string();
-        let _observer = state.turn_observers.register(context.request_key.clone());
+        let _observer = state
+            .turn_observers
+            .register_if_absent(context.request_key.clone())
+            .expect("observer should be registered");
         let turn = ScheduledTurn {
             turn_id: "staged-read-failure-turn".to_string(),
             context,

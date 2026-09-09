@@ -6,11 +6,14 @@ import { ChatTab } from "../features/chat/ChatTab";
 import { SleepBatchPanel } from "../features/sleep/SleepBatchPanel";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
+import { useMergedChatMessages } from "../features/chat/mergeChatMessages";
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
 import { createSessionKey, fetchSessions } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
+import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
+import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
 import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
 import type { TabId } from "./navigation";
 
@@ -283,6 +286,7 @@ export function WebUI() {
 
   const transport = useChatTransport({
     sessionKey: selectedSession,
+    agentId: selectedAgent,
     authToken,
     onAuthRequired: setAuthMessage,
     onError: setTransportError,
@@ -306,25 +310,29 @@ export function WebUI() {
   const channel = selectedSessionData?.channel ?? "web";
   const isReadOnly = channel !== "web";
 
-  const messages = useMemo(
-    () => [...(historyState.data ?? []), ...transport.state.messages],
-    [historyState.data, transport.state.messages],
+  const messages = useMergedChatMessages(
+    selectedSession,
+    historyState.data ?? [],
+    transport.state.messages,
   );
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (text: string, draftId: string): Promise<boolean> => {
       setTransportError(null);
       try {
-        const requestId = await transport.sendMessage(text);
-        if (!requestId) {
+        const durableRequestId = await transport.sendMessage(text, draftId);
+        if (!durableRequestId) {
           setTransportError("gateway is not connected");
+          return false;
         }
+        return true;
       } catch (error) {
         if (error instanceof AuthRequiredError) {
           setAuthMessage(error.message);
         } else {
           setTransportError(error instanceof Error ? error.message : String(error));
         }
+        return false;
       }
     },
     [transport],
@@ -358,6 +366,9 @@ export function WebUI() {
     [activeTab, handleTabChange],
   );
 
+  const agentAvatars = useAgentAvatars(agents, authToken);
+  const unreadSessionKeys = useUnreadSessions(sessions, selectedSession);
+
   const chatMain = (
     <ChatTab
       channel={channel}
@@ -366,6 +377,7 @@ export function WebUI() {
       onSend={handleSend}
       storageKey={selectedSession}
       jumpRequest={messageJump ?? undefined}
+      agentAvatars={agentAvatars}
     />
   );
 
@@ -383,6 +395,10 @@ export function WebUI() {
         onSelectSession={handleSelectSession}
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
+        authToken={authToken}
+        agentAvatars={agentAvatars}
+        onAvatarChanged={() => invalidateQueries("agents")}
+        unreadSessionKeys={unreadSessionKeys}
         main={
           activeTab === "chat" ? (
             <>

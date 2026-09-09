@@ -30,6 +30,23 @@ describe("common components", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     cleanup();
 
+    const ignoreBackdropClose = vi.fn();
+    render(
+      <Modal
+        open
+        onClose={ignoreBackdropClose}
+        labelledBy="modal-title"
+        closeOnBackdrop={false}
+      >
+        <h2 id="modal-title">Dialog</h2>
+      </Modal>,
+    );
+    fireEvent.click(document.querySelector(".modal-backdrop") as HTMLElement);
+    expect(ignoreBackdropClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(ignoreBackdropClose).toHaveBeenCalledTimes(1);
+    cleanup();
+
     render(<Spinner />);
     const spinner = screen.getByRole("status");
     expect(spinner.getAttribute("aria-label")).toBe("Loading");
