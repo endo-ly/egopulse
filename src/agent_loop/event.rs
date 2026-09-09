@@ -41,8 +41,9 @@ pub(crate) enum AgentEvent {
     },
     /// Final response.
     FinalResponse { text: String },
-    /// Error occurred.
-    Error { message: String },
+    /// Error occurred. `terminal` is false when the shared interaction still
+    /// owns a staged follow-up that will continue on the same observer.
+    Error { message: String, terminal: bool },
 }
 
 /// Type-erased callback for agent lifecycle events.

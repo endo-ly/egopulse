@@ -5,6 +5,7 @@ export interface ChatEventPayload {
   sessionKey: string;
   seq: number;
   state: "delta" | "done" | "error";
+  terminal?: boolean;
   message?: {
     role: string;
     content: Array<{ type: string; text: string }>;
@@ -103,7 +104,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           },
         ];
       }
-      return { ...state, messages, runId: event.runId };
+      return { ...state, messages, runId: event.runId, error: null };
     }
 
     case "done": {
@@ -133,7 +134,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           },
         ];
       }
-      return { ...state, messages };
+      return { ...state, messages, error: null };
     }
 
     case "error": {

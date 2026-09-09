@@ -173,7 +173,7 @@ pub(super) async fn api_stream(
 
         let mut finished = false;
         for evt in replay {
-            let is_done = evt.event == "done" || evt.event == "error";
+            let is_done = evt.terminal;
             let event = Event::default()
                 .id(evt.id.to_string())
                 .event(evt.event)
@@ -192,7 +192,7 @@ pub(super) async fn api_stream(
         loop {
             match rx.recv().await {
                 Ok(evt) => {
-                    let is_done = evt.event == "done" || evt.event == "error";
+                    let is_done = evt.terminal;
                     let event = Event::default()
                         .id(evt.id.to_string())
                         .event(evt.event)
@@ -434,12 +434,12 @@ pub(super) async fn publish_agent_event(run_hub: &super::RunHub, run_id: &str, e
                 )
                 .await;
         }
-        AgentEvent::Error { message } => {
+        AgentEvent::Error { message, terminal } => {
             run_hub
-                .publish(
+                .publish_agent_error(
                     run_id,
-                    "error",
                     serde_json::to_string(&ErrorPayload { error: message }).unwrap_or_default(),
+                    terminal,
                 )
                 .await;
         }
@@ -583,9 +583,17 @@ async fn accept_existing_web_run(
             .create_if_absent(&run.turn_id, actor.to_string())
             .await;
         if let Some(observer) = observer {
-            spawn_observed_run_publisher(state.clone(), observer, run.turn_id.clone());
+            let latest = load_turn_run(state, scope, &run.turn_id).await?;
+            if latest.state.is_terminal() {
+                drop(observer);
+                publish_terminal_web_run(state, scope, &latest, actor).await?
+            } else {
+                spawn_observed_run_publisher(state.clone(), observer, run.turn_id.clone());
+                "queued"
+            }
+        } else {
+            "queued"
         }
-        "queued"
     };
     Ok(AcceptedWebInput {
         started: StartedRun {
@@ -1011,6 +1019,49 @@ mod tests {
         assert_eq!(parsed_error["error"], "fail");
     }
 
+    #[tokio::test]
+    async fn web_run_keeps_parent_error_nonterminal_for_staged_follow_up() {
+        // Arrange
+        let hub = super::super::RunHub::default();
+        hub.create("shared-run", WEB_ACTOR.to_string()).await;
+
+        // Act
+        hub.publish_agent_error(
+            "shared-run",
+            r#"{"error":"parent failed"}"#.to_string(),
+            false,
+        )
+        .await;
+        hub.publish(
+            "shared-run",
+            "user_input",
+            r#"{"messageId":"follow-up","text":"continue"}"#.to_string(),
+        )
+        .await;
+        hub.publish(
+            "shared-run",
+            "done",
+            r#"{"response":"continued"}"#.to_string(),
+        )
+        .await;
+
+        // Assert
+        let (_rx, replay, done, _, _) = hub
+            .subscribe_with_replay("shared-run", None, WEB_ACTOR, false)
+            .await
+            .expect("subscribe shared run");
+        assert!(done);
+        assert_eq!(
+            replay
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["error", "user_input", "done"]
+        );
+        assert!(!replay[0].terminal);
+        assert!(replay[2].terminal);
+    }
+
     #[test]
     fn replay_meta_serializes_with_camel_case() {
         let meta = ReplayMetaPayload {
@@ -1229,6 +1280,102 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "done");
         assert_eq!(events[0].data, r#"{"response":"saved response"}"#);
+    }
+
+    #[tokio::test]
+    async fn existing_web_run_rechecks_terminal_state_after_observer_registration() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let resolved = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some("recovery-race-session".to_string()),
+                message: "hello".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("recovery-race-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve recovery request");
+        let chat_id = resolve_chat_id(&state.app_state.turn_dependencies(), &resolved.context)
+            .await
+            .expect("resolve recovery chat");
+        let payload_hash =
+            crate::runtime::turn::canonical_request_hash(&resolved.context, &resolved.message);
+        let run = match state
+            .app_state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "web:recovery-race-request",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: &payload_hash,
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept recovery request")
+        {
+            crate::storage::AcceptOutcome::Created(run) => run,
+            crate::storage::AcceptOutcome::Existing(_) => panic!("expected new turn"),
+        };
+        let observer = state
+            .app_state
+            .turn_observers
+            .register_if_absent(run.request_key.clone())
+            .expect("register recovery observer");
+        let final_message_id = "web:recovery-race-response";
+        let conn = state.app_state.db.get_conn().expect("database connection");
+        conn.execute(
+            "INSERT INTO messages
+                 (id, chat_id, sender_id, content, sender_kind, timestamp,
+                  message_kind, recipient_agent_id, seq, turn_id, parent_message_id)
+             VALUES (?1, ?2, 'default', 'saved after race', 'assistant', ?3,
+                     'message', NULL, 0, ?4, NULL)",
+            rusqlite::params![
+                final_message_id,
+                chat_id,
+                "2026-09-09T00:00:00Z",
+                &run.turn_id
+            ],
+        )
+        .expect("insert recovery response");
+        conn.execute(
+            "UPDATE turn_runs SET state = 'model_completed' WHERE turn_id = ?1",
+            rusqlite::params![&run.turn_id],
+        )
+        .expect("mark recovery turn model completed");
+        state
+            .app_state
+            .db
+            .complete_turn(&run.turn_id, final_message_id)
+            .expect("complete recovery turn");
+
+        // Act
+        let replay = accept_existing_web_run(
+            &state,
+            resolved.session_key,
+            resolved.context.scope,
+            run,
+            Some(observer),
+            WEB_ACTOR,
+        )
+        .await
+        .expect("replay terminal recovery turn");
+
+        // Assert
+        assert_eq!(replay.status, "completed");
+        let (_rx, events, done, _, _) = state
+            .run_hub
+            .subscribe_with_replay(&replay.started.run_id, None, WEB_ACTOR, false)
+            .await
+            .expect("subscribe recovery replay");
+        assert!(done);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "done");
+        assert_eq!(events[0].data, r#"{"response":"saved after race"}"#);
     }
 
     #[tokio::test]

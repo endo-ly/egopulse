@@ -1039,6 +1039,7 @@ async fn execute_and_publish_scheduled_turn(
                             observer_key,
                             crate::agent_loop::event::AgentEvent::Error {
                                 message: error_message,
+                                terminal: false,
                             },
                         );
                     }
@@ -1445,7 +1446,7 @@ mod tests {
                 crate::agent_loop::event::AgentEvent::FinalResponse { text } => {
                     delivered.push(DeliveredEvent::Response(text));
                 }
-                crate::agent_loop::event::AgentEvent::Error { message } => {
+                crate::agent_loop::event::AgentEvent::Error { message, .. } => {
                     delivered.push(DeliveredEvent::Error(message));
                 }
                 _ => {}

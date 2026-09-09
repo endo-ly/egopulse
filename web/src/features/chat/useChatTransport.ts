@@ -48,6 +48,12 @@ interface ChatAckPayload {
   sessionKey?: string;
 }
 
+interface RetryableSend {
+  requestId: string;
+  sessionKey: string;
+  text: string;
+}
+
 interface RoutedEventPayload {
   runId?: unknown;
   sessionKey?: unknown;
@@ -90,10 +96,15 @@ export function useChatTransport({
         resolve: (requestId: string) => void;
         reject: (error: Error) => void;
         sessionKey: string;
+        text: string;
         timer: ReturnType<typeof setTimeout>;
       }
     >(),
   );
+  // A timeout means acceptance is unknown, not rejected. Keep the request id
+  // attached to the unchanged draft so an explicit retry remains idempotent.
+  const retryableSendsRef = useRef(new Map<string, RetryableSend>());
+  const runRequestIdsRef = useRef(new Map<string, string>());
   // Maps a server run to the session key used by this transport when the
   // server canonicalizes a newly-created session to `chat:{id}`.
   const runSessionKeysRef = useRef(new Map<string, string>());
@@ -130,11 +141,25 @@ export function useChatTransport({
     [],
   );
 
-  const rejectAllPendingSends = useCallback((error: Error) => {
+  const findRetryableSend = useCallback((requestId: string) => {
+    for (const [fingerprint, entry] of retryableSendsRef.current) {
+      if (entry.requestId === requestId) return { fingerprint, entry };
+    }
+    return null;
+  }, []);
+
+  const rejectAllPendingSends = useCallback((error: Error, retryable: boolean) => {
     const pending = [...pendingSendsRef.current.entries()];
     pendingSendsRef.current.clear();
-    for (const [, entry] of pending) {
+    for (const [requestId, entry] of pending) {
       clearTimeout(entry.timer);
+      if (retryable) {
+        retryableSendsRef.current.set(`${entry.sessionKey}\u0000${entry.text}`, {
+          requestId,
+          sessionKey: entry.sessionKey,
+          text: entry.text,
+        });
+      }
       entry.reject(error);
     }
     if (pending.length > 0) {
@@ -155,7 +180,7 @@ export function useChatTransport({
     () => () => {
       intentionalCloseRef.current = true;
       clearReconnectTimer();
-      rejectAllPendingSends(new Error("disconnected"));
+      rejectAllPendingSends(new Error("disconnected"), false);
       wsRef.current?.close();
     },
     [clearReconnectTimer, rejectAllPendingSends],
@@ -210,10 +235,16 @@ export function useChatTransport({
           const ack = parsed.payload as ChatAckPayload;
           if (ack.runId && ack.sessionKey) {
             const pending = pendingSendsRef.current.get(parsed.id);
-            if (pending) {
-              runSessionKeysRef.current.set(ack.runId, pending.sessionKey);
+            const retryable = findRetryableSend(parsed.id);
+            const request = pending ?? retryable?.entry;
+            if (request) {
+              runSessionKeysRef.current.set(ack.runId, request.sessionKey);
+              runRequestIdsRef.current.set(ack.runId, parsed.id);
             }
           }
+        } else if (!parsed.ok) {
+          const retryable = findRetryableSend(parsed.id);
+          if (retryable) retryableSendsRef.current.delete(retryable.fingerprint);
         }
         settlePendingSend(
           parsed.id,
@@ -239,12 +270,26 @@ export function useChatTransport({
           invalidateQueries("sessions");
           invalidateQueries("history");
           onDone?.();
+          const requestId = runRequestIdsRef.current.get(event.runId);
+          if (requestId) {
+            const retryable = findRetryableSend(requestId);
+            if (retryable) retryableSendsRef.current.delete(retryable.fingerprint);
+          }
+          runRequestIdsRef.current.delete(event.runId);
           runSessionKeysRef.current.delete(event.runId);
         } else if (event.state === "error") {
           // A failed turn still persisted the user message; refetch it.
           invalidateQueries("sessions");
           invalidateQueries("history");
-          runSessionKeysRef.current.delete(event.runId);
+          if (event.terminal !== false) {
+            const requestId = runRequestIdsRef.current.get(event.runId);
+            if (requestId) {
+              const retryable = findRetryableSend(requestId);
+              if (retryable) retryableSendsRef.current.delete(retryable.fingerprint);
+            }
+            runRequestIdsRef.current.delete(event.runId);
+            runSessionKeysRef.current.delete(event.runId);
+          }
         }
         return;
       }
@@ -275,7 +320,7 @@ export function useChatTransport({
         setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
       }
     },
-    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer],
+    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, findRetryableSend, settlePendingSend],
   );
 
   const connect = useCallback(
@@ -311,7 +356,7 @@ export function useChatTransport({
           if (wasOpenRef.current && !intentionalCloseRef.current) {
             onError?.("Connection lost. Retrying…");
             disruptedRef.current = true;
-            rejectAllPendingSends(new Error("Connection lost. Retrying…"));
+            rejectAllPendingSends(new Error("Connection lost. Retrying…"), true);
           }
           wasOpenRef.current = false;
           setConnectionState("closed");
@@ -356,7 +401,7 @@ export function useChatTransport({
   const disconnect = useCallback(() => {
     intentionalCloseRef.current = true;
     clearReconnectTimer();
-    rejectAllPendingSends(new Error("disconnected"));
+    rejectAllPendingSends(new Error("disconnected"), false);
     wsRef.current?.close();
     wsRef.current = null;
     setConnectionState("closed");
@@ -368,7 +413,10 @@ export function useChatTransport({
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return null;
 
-      const requestId = crypto.randomUUID();
+      const fingerprint = `${sessionKey}\u0000${text}`;
+      const retryable = retryableSendsRef.current.get(fingerprint);
+      const requestId = retryable?.requestId ?? crypto.randomUUID();
+      if (retryable) retryableSendsRef.current.delete(fingerprint);
       const msg = {
         type: "req",
         id: requestId,
@@ -380,17 +428,28 @@ export function useChatTransport({
           requestId,
         },
       };
-      ws.send(JSON.stringify(msg));
       setState((prev) => reduceOptimisticUserMessage(prev, { requestId, text }));
       // Resolve on the server ack; reject on refusal or timeout so the
       // caller can keep the text instead of losing it.
       return new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
+          const pending = pendingSendsRef.current.get(requestId);
+          if (!pending) return;
           pendingSendsRef.current.delete(requestId);
+          retryableSendsRef.current.set(fingerprint, { requestId, sessionKey, text });
           setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
           reject(new Error("send acknowledgement timed out"));
         }, SEND_ACK_TIMEOUT_MS);
-        pendingSendsRef.current.set(requestId, { resolve, reject, sessionKey, timer });
+        pendingSendsRef.current.set(requestId, { resolve, reject, sessionKey, text, timer });
+        try {
+          ws.send(JSON.stringify(msg));
+        } catch (error) {
+          pendingSendsRef.current.delete(requestId);
+          clearTimeout(timer);
+          retryableSendsRef.current.set(fingerprint, { requestId, sessionKey, text });
+          setState((prev) => reduceDiscardOptimisticUserMessage(prev, requestId));
+          reject(error instanceof Error ? error : new Error("failed to send message"));
+        }
       });
     },
     [agentId, connect, sessionKey],

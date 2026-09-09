@@ -437,7 +437,7 @@ Content-Type: application/json
 
 成功時は turn 完了を待たず `202 Accepted` を返す。`202` は `turn_runs` への accepted commit が完了した後に返る。commit 後に in-memory scheduler の同時実行上限に達しても拒否とは扱わず、dispatcher への deferred（容量が空き次第の再投入）として同じ `202` を返す。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）と `input_committed`（model loop から resume）の2状態のみで、モデル反復開始後（`model_pending` 以降）は再実行対象外となる。
 
-受付拒否時は理由コード違いで一律 `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`、受付処理の内部エラーや同一 `request_key` へ異なる本文の再受付は `internal`）。エラーコード一覧は [§4](#4-エラーレスポンス) を参照。
+受付拒否時は理由コード違いで `429` を返す。拒否はすべて accepted commit と同一トランザクション内で判定され、`429` を返した turn は `turn_runs` に書き込まれない（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`）。同一 `request_key` へ異なる本文を再受付した場合は `409 Conflict`（`request_conflict`）となる。エラーコード一覧は [§4](#4-エラーレスポンス) を参照。
 
 #### Target 解決
 
@@ -630,6 +630,7 @@ WebSocket の ordinary message は `requestId` を message identity としてRES
     "sessionKey": "main",
     "seq": 1,
     "state": "delta",
+    "terminal": false,
     "message": {
       "role": "assistant",
       "content": [{"type": "text", "text": "こんにちは！"}]
@@ -642,7 +643,9 @@ WebSocket の ordinary message は `requestId` を message identity としてRES
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
 | `done` | 完了。`message` に最終応答を含む。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
-| `error` | エラー。`errorMessage` を含む |
+| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する |
+
+`chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。本文を変更せずに再送するクライアントは、同じ `requestId` を再利用してdurable Turnのidempotencyを維持する。本文を変更した再利用は `409 Conflict` になる。
 
 #### ツールイベント受信
 

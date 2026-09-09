@@ -149,6 +149,7 @@ struct GatewayChatEvent {
     message: Option<GatewayChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_message: Option<String>,
+    terminal: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -563,6 +564,7 @@ fn forward_run_event(
                     }],
                 }),
                 error_message: None,
+                terminal: event.terminal,
             };
             send_event(tx, "chat", gateway_event).is_err()
         }
@@ -585,6 +587,7 @@ fn forward_run_event(
                     }
                 }),
                 error_message: None,
+                terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
@@ -601,11 +604,12 @@ fn forward_run_event(
                 state: "error",
                 message: None,
                 error_message: Some(data.error.unwrap_or_else(|| "stream error".to_string())),
+                terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
             }
-            true
+            event.terminal
         }
         "tool_start" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
@@ -807,6 +811,7 @@ mod tests {
             id: 1,
             event: "delta".to_string(),
             data: r#"{"delta":"chunk"}"#.to_string(),
+            terminal: false,
         };
         forward_run_event(&tx, "run-1", test_session, &seq, delta_event);
 
@@ -814,6 +819,7 @@ mod tests {
             id: 2,
             event: "done".to_string(),
             data: r#"{"response":"final"}"#.to_string(),
+            terminal: true,
         };
         forward_run_event(&tx, "run-1", test_session, &seq, done_event);
 
@@ -835,6 +841,7 @@ mod tests {
             id: 1,
             event: "error".to_string(),
             data: r#"{"error":"fail"}"#.to_string(),
+            terminal: true,
         };
         forward_run_event(&tx2, "run-2", test_session, &seq2, error_event);
 
@@ -853,6 +860,7 @@ mod tests {
             id: 1,
             event: "delta".to_string(),
             data: r#"{"delta":"hello world"}"#.to_string(),
+            terminal: false,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
@@ -887,6 +895,7 @@ mod tests {
             id: 1,
             event: "delta".to_string(),
             data: r#"{"delta":""}"#.to_string(),
+            terminal: false,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
@@ -905,6 +914,7 @@ mod tests {
             id: 10,
             event: "done".to_string(),
             data: r#"{"response":"final answer"}"#.to_string(),
+            terminal: true,
         };
 
         let should_stop = forward_run_event(&tx, "run-42", "sess-done", &seq, done_event);
@@ -935,6 +945,7 @@ mod tests {
             id: 1,
             event: "done".to_string(),
             data: r#"{"response":""}"#.to_string(),
+            terminal: true,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, done_event);
@@ -957,6 +968,7 @@ mod tests {
             id: 1,
             event: "error".to_string(),
             data: r#"{"error":"something went wrong"}"#.to_string(),
+            terminal: true,
         };
 
         let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, error_event);
@@ -970,6 +982,107 @@ mod tests {
         assert_eq!(payload["state"], "error");
         assert_eq!(payload["errorMessage"], "something went wrong");
         assert!(payload.get("message").is_none());
+    }
+
+    #[test]
+    fn ws_nonterminal_error_does_not_stop_the_shared_run() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let seq = AtomicU64::new(1);
+
+        let error_event = RunEvent {
+            id: 1,
+            event: "error".to_string(),
+            data: r#"{"error":"parent failed"}"#.to_string(),
+            terminal: false,
+        };
+        assert!(!forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            error_event
+        ));
+
+        let done_event = RunEvent {
+            id: 2,
+            event: "done".to_string(),
+            data: r#"{"response":"follow-up response"}"#.to_string(),
+            terminal: true,
+        };
+        assert!(forward_run_event(
+            &tx,
+            "run-shared",
+            "sess-1",
+            &seq,
+            done_event
+        ));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 2);
+        let parent_error: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parent_error["payload"]["terminal"], false);
+        let child_done: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(child_done["payload"]["terminal"], true);
+        assert_eq!(
+            child_done["payload"]["message"]["content"][0]["text"],
+            "follow-up response"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_replays_parent_error_and_child_events_from_one_run() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        state
+            .run_hub
+            .create("shared-replay", WEB_ACTOR.to_string())
+            .await;
+        state
+            .run_hub
+            .publish_agent_error(
+                "shared-replay",
+                r#"{"error":"parent failed"}"#.to_string(),
+                false,
+            )
+            .await;
+        state
+            .run_hub
+            .publish(
+                "shared-replay",
+                "user_input",
+                r#"{"messageId":"follow-up","senderId":"web-user","text":"continue","timestamp":"2026-09-09T00:00:00Z"}"#.to_string(),
+            )
+            .await;
+        state
+            .run_hub
+            .publish(
+                "shared-replay",
+                "done",
+                r#"{"response":"continued"}"#.to_string(),
+            )
+            .await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+        // Act
+        forward_chat_stream(
+            state,
+            tx,
+            "shared-replay".to_string(),
+            "sess-1".to_string(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+
+        // Assert
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 3);
+        let parent_error: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parent_error["payload"]["terminal"], false);
+        let user_input: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(user_input["event"], "user_input");
+        let child_done: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
+        assert_eq!(child_done["payload"]["terminal"], true);
     }
 
     #[tokio::test]
@@ -1283,6 +1396,7 @@ mod tests {
                 "timestamp": "2026-08-28T12:00:00Z"
             })
             .to_string(),
+            terminal: false,
         };
 
         assert!(!forward_run_event(&tx, "run-1", "sess-1", &sequence, event));
@@ -1310,6 +1424,7 @@ mod tests {
                 "input": {"path": "a.txt"}
             }))
             .unwrap(),
+            terminal: false,
         };
         assert!(!forward_run_event(
             &tx,
@@ -1330,6 +1445,7 @@ mod tests {
                 "durationMs": 42
             }))
             .unwrap(),
+            terminal: false,
         };
         assert!(!forward_run_event(
             &tx,

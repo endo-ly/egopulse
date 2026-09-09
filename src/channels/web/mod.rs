@@ -74,6 +74,7 @@ pub(crate) struct RunEvent {
     pub(crate) id: u64,
     pub(crate) event: String,
     pub(crate) data: String,
+    pub(crate) terminal: bool,
 }
 
 #[derive(Clone, Default)]
@@ -138,7 +139,21 @@ impl RunHub {
             return;
         }
 
-        publish_locked(channel, event, data);
+        publish_locked(channel, event, data, event == "done" || event == "error");
+    }
+
+    /// Publishes an agent error while preserving the interaction when a
+    /// staged follow-up remains assigned to the same observer.
+    pub(crate) async fn publish_agent_error(&self, run_id: &str, data: String, terminal: bool) {
+        let mut guard = self.channels.lock().await;
+        let Some(channel) = guard.get_mut(run_id) else {
+            return;
+        };
+        if channel.done {
+            return;
+        }
+
+        publish_locked(channel, "error", data, terminal);
     }
 
     /// Publishes a durable terminal result without replacing an existing run.
@@ -163,7 +178,7 @@ impl RunHub {
             owner_actor,
         });
         if !channel.done {
-            publish_locked(channel, event, data);
+            publish_locked(channel, event, data, true);
         }
     }
 
@@ -221,18 +236,19 @@ impl RunHub {
     }
 }
 
-fn publish_locked(channel: &mut RunChannel, event: &str, data: String) {
+fn publish_locked(channel: &mut RunChannel, event: &str, data: String, terminal: bool) {
     let evt = RunEvent {
         id: channel.next_id,
         event: event.to_string(),
         data,
+        terminal,
     };
     channel.next_id = channel.next_id.saturating_add(1);
     if channel.history.len() >= RUN_HISTORY_LIMIT {
         let _ = channel.history.pop_front();
     }
     channel.history.push_back(evt.clone());
-    if evt.event == "done" || evt.event == "error" {
+    if terminal {
         channel.done = true;
     }
     let _ = channel.sender.send(evt);

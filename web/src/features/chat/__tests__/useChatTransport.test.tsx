@@ -340,6 +340,38 @@ describe("useChatTransport reconnect", () => {
     ).toBe(false);
   });
 
+  it("chat_transport_reuses_the_request_id_when_retrying_after_ack_timeout", async () => {
+    const { result, ws } = await connectOpen();
+
+    let first!: Promise<string | null>;
+    await act(async () => {
+      first = result.current.sendMessage("hello");
+      first.catch(() => {});
+    });
+    const requestId = lastSentId(ws);
+
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+    });
+    await expect(first).rejects.toThrow("timed out");
+
+    let retry!: Promise<string | null>;
+    await act(async () => {
+      retry = result.current.sendMessage("hello");
+    });
+    expect(lastSentId(ws)).toBe(requestId);
+
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: requestId,
+        ok: true,
+        payload: { runId: "run-retried", sessionKey: "s1" },
+      });
+      await retry;
+    });
+  });
+
   it("chat_transport_resyncs_after_unexpected_drop", async () => {
     const mockInvalidate = vi.mocked(invalidateQueries);
     mockInvalidate.mockClear();

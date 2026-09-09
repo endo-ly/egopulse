@@ -210,6 +210,7 @@ impl TurnObserverRegistry {
             // must be sent before the remaining turns finish.
             let _ = sink.events.send(AgentEvent::Error {
                 message: message.clone(),
+                terminal: true,
             });
         }
         let completion = {
