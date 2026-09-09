@@ -3,7 +3,7 @@
 //! 接続ハンドシェイク、chat.send の受付、RunHub からのイベント転送を担う。
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use super::auth;
 use super::stream::{SendRequest, accept_web_input};
-use super::{RunEvent, WEB_ACTOR, WebState};
+use super::{RunEvent, RunLookupError, WEB_ACTOR, WebState};
 
 #[derive(Deserialize)]
 struct DeltaData {
@@ -109,6 +109,27 @@ struct ChatSendParams {
     /// The Web runtime converts it into `context.request_key` so a re-delivered
     /// `chat.send` maps to the same Turn instead of a duplicate.
     request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSubscribeParams {
+    run_id: String,
+    /// Session label used to route forwarded events; the actor check on the
+    /// run channel is the security boundary, not this label.
+    session_key: String,
+    /// Last gateway `seq` the client already applied; replay starts after it.
+    last_seq: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSubscribePayload {
+    run_id: String,
+    /// Number of replayed events actually forwarded by this request. Zero
+    /// when the run was already being forwarded on this connection.
+    replayed: usize,
+    done: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -296,6 +317,7 @@ async fn handle_request(
     match method.as_str() {
         "connect" => handle_connect(state, context, &id, params),
         "chat.send" => handle_chat_send(state, context, &id, params).await,
+        "run.subscribe" => handle_run_subscribe(state, context, &id, params).await,
         _ => send_error(
             context.tx,
             &id,
@@ -361,7 +383,7 @@ fn handle_connect(
                 conn_id: context.conn_id.to_string(),
             },
             features: ConnectFeatures {
-                methods: vec!["connect", "chat.send"],
+                methods: vec!["connect", "chat.send", "run.subscribe"],
                 events: vec![
                     "connect.challenge",
                     "chat",
@@ -446,9 +468,98 @@ async fn handle_chat_send(
             context.tx.clone(),
             started.run_id,
             started.session_key,
+            None,
             Arc::clone(context.forwarded_runs),
         );
     }
+    false
+}
+
+/// Re-attaches a reconnecting client to a still-running run.
+///
+/// Replays the events after the client's last applied `seq` and keeps
+/// forwarding live events until the run terminates. Missing runs (TTL expiry,
+/// restart, non-terminal history) fail with `run_not_found`, which tells the
+/// client to reconcile from persisted history instead.
+async fn handle_run_subscribe(
+    state: &WebState,
+    context: SocketRequestContext<'_>,
+    id: &str,
+    params: serde_json::Value,
+) -> bool {
+    if !context.connected.load(Ordering::SeqCst) {
+        return send_error(context.tx, id, "not_connected", "connect first".to_string()).is_err();
+    }
+
+    let payload = match serde_json::from_value::<RunSubscribeParams>(params) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return send_error(context.tx, id, "invalid_params", error.to_string()).is_err();
+        }
+    };
+
+    let (rx, replay, done, _, _) = match state
+        .run_hub
+        .subscribe_with_replay(&payload.run_id, payload.last_seq, WEB_ACTOR, false)
+        .await
+    {
+        Ok(value) => value,
+        Err(RunLookupError::NotFound) => {
+            return send_error(
+                context.tx,
+                id,
+                "run_not_found",
+                "run is gone or not replayable".to_string(),
+            )
+            .is_err();
+        }
+        Err(RunLookupError::Forbidden) => {
+            return send_error(
+                context.tx,
+                id,
+                "forbidden",
+                "run belongs to another actor".to_string(),
+            )
+            .is_err();
+        }
+    };
+
+    let should_forward = context
+        .forwarded_runs
+        .lock()
+        .expect("forwarded runs lock")
+        .insert(payload.run_id.clone());
+    let replayed = if should_forward { replay.len() } else { 0 };
+    if send_response(
+        context.tx,
+        id,
+        RunSubscribePayload {
+            run_id: payload.run_id.clone(),
+            replayed,
+            done,
+        },
+    )
+    .is_err()
+    {
+        return true;
+    }
+    if !should_forward {
+        // The run is already forwarded on this connection (e.g. started by
+        // chat.send); a second forwarder would duplicate every event.
+        return false;
+    }
+
+    let forwarded_runs = Arc::clone(context.forwarded_runs);
+    let tx = context.tx.clone();
+    let run_id = payload.run_id;
+    let session_key = payload.session_key;
+    tokio::spawn(async move {
+        let _registration = ForwardedRunRegistration {
+            run_id: run_id.clone(),
+            forwarded_runs,
+        };
+        forward_run_subscription(&tx, &run_id, &session_key, rx, replay, done).await;
+    });
     false
 }
 
@@ -457,10 +568,19 @@ fn spawn_chat_stream_forwarder(
     tx: mpsc::UnboundedSender<Message>,
     run_id: String,
     session_key: String,
+    last_event_id: Option<u64>,
     forwarded_runs: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
-        forward_chat_stream(state, tx, run_id, session_key, forwarded_runs).await;
+        forward_chat_stream(
+            state,
+            tx,
+            run_id,
+            session_key,
+            last_event_id,
+            forwarded_runs,
+        )
+        .await;
     });
 }
 
@@ -469,24 +589,35 @@ async fn forward_chat_stream(
     tx: mpsc::UnboundedSender<Message>,
     run_id: String,
     session_key: String,
+    last_event_id: Option<u64>,
     forwarded_runs: Arc<Mutex<HashSet<String>>>,
 ) {
     let _registration = ForwardedRunRegistration {
         run_id: run_id.clone(),
         forwarded_runs,
     };
-    let Ok((mut rx, replay, done, _, _)) = state
+    let Ok((rx, replay, done, _, _)) = state
         .run_hub
-        .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
+        .subscribe_with_replay(&run_id, last_event_id, WEB_ACTOR, false)
         .await
     else {
         return;
     };
+    forward_run_subscription(&tx, &run_id, &session_key, rx, replay, done).await;
+}
 
-    let sequence = Arc::new(AtomicU64::new(1));
+/// Streams one subscription's replay plus live events until the run ends.
+async fn forward_run_subscription(
+    tx: &mpsc::UnboundedSender<Message>,
+    run_id: &str,
+    session_key: &str,
+    mut rx: tokio::sync::broadcast::Receiver<RunEvent>,
+    replay: Vec<RunEvent>,
+    done: bool,
+) {
     // まず保持済みイベントを流し、その後に live イベントへ追従する。
     for event in replay {
-        if forward_run_event(&tx, &run_id, &session_key, &sequence, event) {
+        if forward_run_event(tx, run_id, session_key, event) {
             return;
         }
     }
@@ -498,7 +629,7 @@ async fn forward_chat_stream(
     loop {
         match rx.recv().await {
             Ok(event) => {
-                if forward_run_event(&tx, &run_id, &session_key, &sequence, event) {
+                if forward_run_event(tx, run_id, session_key, event) {
                     break;
                 }
             }
@@ -540,7 +671,6 @@ fn forward_run_event(
     tx: &mpsc::UnboundedSender<Message>,
     run_id: &str,
     session_key: &str,
-    sequence: &AtomicU64,
     event: RunEvent,
 ) -> bool {
     match event.event.as_str() {
@@ -551,11 +681,10 @@ fn forward_run_event(
             if data.delta.is_empty() {
                 return false;
             }
-            let seq = sequence.fetch_add(1, Ordering::SeqCst);
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
-                seq,
+                seq: event.id,
                 state: "delta",
                 message: Some(GatewayChatMessage {
                     role: "assistant",
@@ -571,11 +700,10 @@ fn forward_run_event(
         }
         "done" => {
             let data = serde_json::from_str::<DoneData>(&event.data).unwrap_or_default();
-            let seq = sequence.fetch_add(1, Ordering::SeqCst);
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
-                seq,
+                seq: event.id,
                 state: "done",
                 message: data.response.and_then(|text| {
                     if text.is_empty() {
@@ -597,11 +725,10 @@ fn forward_run_event(
         }
         "error" => {
             let data = serde_json::from_str::<ErrorData>(&event.data).unwrap_or_default();
-            let seq = sequence.fetch_add(1, Ordering::SeqCst);
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
-                seq,
+                seq: event.id,
                 state: "error",
                 message: None,
                 error_message: Some(data.error.unwrap_or_else(|| "stream error".to_string())),
@@ -804,7 +931,6 @@ mod tests {
     #[test]
     fn ws_chat_event_includes_session_key() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(0);
 
         let test_session = "test-session";
 
@@ -814,7 +940,7 @@ mod tests {
             data: r#"{"delta":"chunk"}"#.to_string(),
             terminal: false,
         };
-        forward_run_event(&tx, "run-1", test_session, &seq, delta_event);
+        forward_run_event(&tx, "run-1", test_session, delta_event);
 
         let done_event = RunEvent {
             id: 2,
@@ -822,7 +948,7 @@ mod tests {
             data: r#"{"response":"final"}"#.to_string(),
             terminal: true,
         };
-        forward_run_event(&tx, "run-1", test_session, &seq, done_event);
+        forward_run_event(&tx, "run-1", test_session, done_event);
 
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 2);
@@ -837,14 +963,13 @@ mod tests {
         }
 
         let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
-        let seq2 = AtomicU64::new(0);
         let error_event = RunEvent {
             id: 1,
             event: "error".to_string(),
             data: r#"{"error":"fail"}"#.to_string(),
             terminal: true,
         };
-        forward_run_event(&tx2, "run-2", test_session, &seq2, error_event);
+        forward_run_event(&tx2, "run-2", test_session, error_event);
 
         let error_messages = collect_text_messages(&mut rx2);
         assert_eq!(error_messages.len(), 1);
@@ -855,7 +980,6 @@ mod tests {
     #[test]
     fn ws_delta_without_intermediate_value() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         let delta_event = RunEvent {
             id: 1,
@@ -864,7 +988,7 @@ mod tests {
             terminal: false,
         };
 
-        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", delta_event);
         assert!(!should_stop, "delta event should not terminate the stream");
 
         let messages = collect_text_messages(&mut rx);
@@ -877,20 +1001,17 @@ mod tests {
         let payload = &parsed["payload"];
         assert_eq!(payload["runId"], "run-1");
         assert_eq!(payload["sessionKey"], "sess-1");
-        assert_eq!(payload["seq"], 1);
+        assert_eq!(payload["seq"], 1, "seq must mirror the RunHub event id");
         assert_eq!(payload["state"], "delta");
         assert_eq!(payload["message"]["role"], "assistant");
         assert_eq!(payload["message"]["content"][0]["type"], "text");
         assert_eq!(payload["message"]["content"][0]["text"], "hello world");
         assert!(payload.get("errorMessage").is_none());
-
-        assert_eq!(seq.load(Ordering::SeqCst), 2);
     }
 
     #[test]
     fn ws_delta_with_empty_text_is_skipped() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         let delta_event = RunEvent {
             id: 1,
@@ -899,17 +1020,15 @@ mod tests {
             terminal: false,
         };
 
-        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, delta_event);
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", delta_event);
         assert!(!should_stop);
         let messages = collect_text_messages(&mut rx);
         assert!(messages.is_empty());
-        assert_eq!(seq.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn ws_done_event_structure() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(5);
 
         let done_event = RunEvent {
             id: 10,
@@ -918,7 +1037,7 @@ mod tests {
             terminal: true,
         };
 
-        let should_stop = forward_run_event(&tx, "run-42", "sess-done", &seq, done_event);
+        let should_stop = forward_run_event(&tx, "run-42", "sess-done", done_event);
         assert!(should_stop, "done event should terminate the stream");
 
         let messages = collect_text_messages(&mut rx);
@@ -931,7 +1050,7 @@ mod tests {
         let payload = &parsed["payload"];
         assert_eq!(payload["runId"], "run-42");
         assert_eq!(payload["sessionKey"], "sess-done");
-        assert_eq!(payload["seq"], 5);
+        assert_eq!(payload["seq"], 10, "seq must mirror the RunHub event id");
         assert_eq!(payload["state"], "done");
         assert_eq!(payload["message"]["role"], "assistant");
         assert_eq!(payload["message"]["content"][0]["text"], "final answer");
@@ -940,7 +1059,6 @@ mod tests {
     #[test]
     fn ws_done_without_response_has_no_message() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         let done_event = RunEvent {
             id: 1,
@@ -949,7 +1067,7 @@ mod tests {
             terminal: true,
         };
 
-        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, done_event);
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", done_event);
         assert!(should_stop);
 
         let messages = collect_text_messages(&mut rx);
@@ -963,7 +1081,6 @@ mod tests {
     #[test]
     fn ws_error_event_structure() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         let error_event = RunEvent {
             id: 1,
@@ -972,7 +1089,7 @@ mod tests {
             terminal: true,
         };
 
-        let should_stop = forward_run_event(&tx, "run-1", "sess-1", &seq, error_event);
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", error_event);
         assert!(should_stop, "error event should terminate the stream");
 
         let messages = collect_text_messages(&mut rx);
@@ -988,7 +1105,6 @@ mod tests {
     #[test]
     fn ws_nonterminal_error_does_not_stop_the_shared_run() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         let error_event = RunEvent {
             id: 1,
@@ -996,13 +1112,7 @@ mod tests {
             data: r#"{"error":"parent failed"}"#.to_string(),
             terminal: false,
         };
-        assert!(!forward_run_event(
-            &tx,
-            "run-shared",
-            "sess-1",
-            &seq,
-            error_event
-        ));
+        assert!(!forward_run_event(&tx, "run-shared", "sess-1", error_event));
 
         let done_event = RunEvent {
             id: 2,
@@ -1010,13 +1120,7 @@ mod tests {
             data: r#"{"response":"follow-up response"}"#.to_string(),
             terminal: true,
         };
-        assert!(forward_run_event(
-            &tx,
-            "run-shared",
-            "sess-1",
-            &seq,
-            done_event
-        ));
+        assert!(forward_run_event(&tx, "run-shared", "sess-1", done_event));
 
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 2);
@@ -1033,13 +1137,11 @@ mod tests {
     #[test]
     fn ws_nonterminal_done_does_not_stop_the_shared_run() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         assert!(!forward_run_event(
             &tx,
             "run-shared",
             "sess-1",
-            &seq,
             RunEvent {
                 id: 1,
                 event: "done".to_string(),
@@ -1051,7 +1153,6 @@ mod tests {
             &tx,
             "run-shared",
             "sess-1",
-            &seq,
             RunEvent {
                 id: 2,
                 event: "error".to_string(),
@@ -1063,7 +1164,6 @@ mod tests {
             &tx,
             "run-shared",
             "sess-1",
-            &seq,
             RunEvent {
                 id: 3,
                 event: "done".to_string(),
@@ -1121,6 +1221,7 @@ mod tests {
             tx,
             "shared-replay".to_string(),
             "sess-1".to_string(),
+            None,
             Arc::new(Mutex::new(HashSet::new())),
         )
         .await;
@@ -1444,7 +1545,6 @@ mod tests {
     #[test]
     fn ws_forwards_user_input_events() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let sequence = AtomicU64::new(1);
         let event = RunEvent {
             id: 1,
             event: "user_input".to_string(),
@@ -1458,7 +1558,7 @@ mod tests {
             terminal: false,
         };
 
-        assert!(!forward_run_event(&tx, "run-1", "sess-1", &sequence, event));
+        assert!(!forward_run_event(&tx, "run-1", "sess-1", event));
 
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 1);
@@ -1472,7 +1572,6 @@ mod tests {
     #[test]
     fn ws_forwards_tool_start_and_result_events() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        let seq = AtomicU64::new(1);
 
         let start_event = RunEvent {
             id: 1,
@@ -1485,13 +1584,7 @@ mod tests {
             .unwrap(),
             terminal: false,
         };
-        assert!(!forward_run_event(
-            &tx,
-            "run-1",
-            "sess-1",
-            &seq,
-            start_event
-        ));
+        assert!(!forward_run_event(&tx, "run-1", "sess-1", start_event));
 
         let result_event = RunEvent {
             id: 2,
@@ -1506,13 +1599,7 @@ mod tests {
             .unwrap(),
             terminal: false,
         };
-        assert!(!forward_run_event(
-            &tx,
-            "run-1",
-            "sess-1",
-            &seq,
-            result_event
-        ));
+        assert!(!forward_run_event(&tx, "run-1", "sess-1", result_event));
 
         let messages = collect_text_messages(&mut rx);
         assert_eq!(messages.len(), 2);
@@ -1531,5 +1618,177 @@ mod tests {
         assert_eq!(result["payload"]["durationMs"], 42);
         assert_eq!(result["payload"]["runId"], "run-1");
         assert_eq!(result["payload"]["sessionKey"], "sess-1");
+    }
+
+    #[tokio::test]
+    async fn ws_run_subscribe_replays_after_last_seq_and_reports_done() {
+        // Arrange: a run with two persisted events, already terminal.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        state
+            .run_hub
+            .create("resubscribe-run", WEB_ACTOR.to_string())
+            .await;
+        state
+            .run_hub
+            .publish(
+                "resubscribe-run",
+                "delta",
+                r#"{"delta":"Hello"}"#.to_string(),
+            )
+            .await;
+        state
+            .run_hub
+            .publish(
+                "resubscribe-run",
+                "done",
+                r#"{"response":"Hello world"}"#.to_string(),
+            )
+            .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+
+        // Act: the client already holds seq 1 (the first delta).
+        let stopped = handle_run_subscribe(
+            &state,
+            context,
+            "resubscribe-1",
+            serde_json::json!({
+                "runId": "resubscribe-run",
+                "sessionKey": "sess-1",
+                "lastSeq": 1
+            }),
+        )
+        .await;
+
+        // Assert: ack reports exactly the replayed remainder. The forwarder
+        // runs on a spawned task; yield until it flushes the replay.
+        assert!(!stopped);
+        let messages = loop {
+            tokio::task::yield_now().await;
+            let messages = collect_text_messages(&mut rx);
+            if messages.len() >= 2 {
+                break messages;
+            }
+        };
+        assert_eq!(messages.len(), 2, "ack plus the replayed done event");
+        let ack: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(ack["type"], "res");
+        assert_eq!(ack["id"], "resubscribe-1");
+        assert_eq!(ack["ok"], true);
+        assert_eq!(ack["payload"]["runId"], "resubscribe-run");
+        assert_eq!(ack["payload"]["replayed"], 1);
+        assert_eq!(ack["payload"]["done"], true);
+
+        let done: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(done["event"], "chat");
+        assert_eq!(done["payload"]["seq"], 2);
+        assert_eq!(done["payload"]["state"], "done");
+        assert_eq!(
+            done["payload"]["message"]["content"][0]["text"],
+            "Hello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_run_subscribe_reports_missing_run_as_run_not_found() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+
+        // Act
+        let stopped = handle_run_subscribe(
+            &state,
+            context,
+            "resubscribe-missing",
+            serde_json::json!({
+                "runId": "gone-run",
+                "sessionKey": "sess-1",
+                "lastSeq": 7
+            }),
+        )
+        .await;
+
+        // Assert: the client is told to reconcile from persisted history.
+        assert!(!stopped);
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["type"], "res");
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["error"]["code"], "run_not_found");
+    }
+
+    #[tokio::test]
+    async fn ws_run_subscribe_does_not_duplicate_an_active_forward() {
+        // Arrange: a forwarding task already streams this run (chat.send path).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        state
+            .run_hub
+            .create("already-forwarded", WEB_ACTOR.to_string())
+            .await;
+        state
+            .run_hub
+            .publish(
+                "already-forwarded",
+                "delta",
+                r#"{"delta":"chunk"}"#.to_string(),
+            )
+            .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        forwarded_runs
+            .lock()
+            .unwrap()
+            .insert("already-forwarded".to_string());
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+
+        // Act
+        let stopped = handle_run_subscribe(
+            &state,
+            context,
+            "resubscribe-dup",
+            serde_json::json!({
+                "runId": "already-forwarded",
+                "sessionKey": "sess-1",
+                "lastSeq": 1
+            }),
+        )
+        .await;
+
+        // Assert: ack only; no second forwarder replays the events.
+        assert!(!stopped);
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["type"], "res");
+        assert_eq!(parsed["ok"], true);
+        // The ack must not claim a replay that will never arrive.
+        assert_eq!(parsed["payload"]["replayed"], 0);
     }
 }
