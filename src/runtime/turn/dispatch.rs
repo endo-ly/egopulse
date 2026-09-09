@@ -1357,7 +1357,10 @@ mod tests {
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
             response_delivery: ResponseDelivery::ClientOwned,
         };
-        let observer = state.turn_observers.register(context.request_key.clone());
+        let observer = state
+            .turn_observers
+            .register_if_absent(context.request_key.clone())
+            .expect("observer should be registered");
         let mut events = observer.events;
         let completion = observer.completion;
         let scheduled_json =
@@ -2260,7 +2263,10 @@ mod tests {
             received_at: Some("2026-08-28T12:00:00Z".to_string()),
             response_delivery: ResponseDelivery::ClientOwned,
         };
-        let observer = state.turn_observers.register(context.request_key.clone());
+        let observer = state
+            .turn_observers
+            .register_if_absent(context.request_key.clone())
+            .expect("observer should be registered");
         let mut events = observer.events;
         let completion = observer.completion;
         let scheduled_json =
@@ -2485,7 +2491,10 @@ mod tests {
         ));
         let mut context = crate::test_util::cli_context("staged-read-failure");
         context.request_key = "staged-read-failure-client".to_string();
-        let _observer = state.turn_observers.register(context.request_key.clone());
+        let _observer = state
+            .turn_observers
+            .register_if_absent(context.request_key.clone())
+            .expect("observer should be registered");
         let turn = ScheduledTurn {
             turn_id: "staged-read-failure-turn".to_string(),
             context,

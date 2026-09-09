@@ -204,6 +204,78 @@ describe("useChatTransport reconnect", () => {
     ).toBe(true);
   });
 
+  it("chat_transport_routes_events_to_the_current_session", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello");
+    });
+    const requestId = lastSentId(ws);
+
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: requestId,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "chat:42" },
+      });
+      await pending;
+    });
+
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "tool_start",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          callId: "call-a",
+          name: "read",
+          input: { path: "a.txt" },
+        },
+      });
+      ws.receive({
+        type: "event",
+        event: "tool_start",
+        payload: {
+          runId: "run-b",
+          sessionKey: "session-b",
+          callId: "call-b",
+          name: "write",
+          input: { path: "b.txt" },
+        },
+      });
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-b",
+          sessionKey: "session-b",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "wrong session" }] },
+        },
+      });
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "right session" }] },
+        },
+      });
+    });
+
+    expect(result.current.state.messages.some((message) => message.id === "tool:call-a")).toBe(true);
+    expect(result.current.state.messages.some((message) => message.id === "tool:call-b")).toBe(false);
+    expect(result.current.state.messages.some((message) => message.content === "wrong session")).toBe(false);
+    expect(result.current.state.messages.some((message) => message.content === "right session")).toBe(true);
+  });
+
   it("chat_transport_rejects_send_and_withdraws_text_on_busy", async () => {
     const onError = vi.fn();
     const { result } = renderHook(() =>

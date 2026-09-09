@@ -79,7 +79,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 - 認証トークン未設定時は `/api/*` へのアクセスができない
 - WebSocket 最大接続数: 64
 - WebSocket 最大メッセージサイズ: 64KB
-- Webの ordinary message はRESTとWebSocketの入口にかかわらず共通 TurnScheduler に投入され、同一 session では FIFO で実行される。active run と同一 session の Tool 実行中は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じinteractionへ引き継がれる。slash command はdurableな未完了Turnを持つsessionでは `busy` となる
+- Webの ordinary message はRESTとWebSocketの入口にかかわらず共通 TurnScheduler に投入され、同一 session では FIFO で実行される。active run と同一 session の Tool 実行中は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じinteractionへ引き継がれる。`request_id` / `request_key` の別本文再利用は `409 Conflict` として拒否される。slash command はdurableな未完了Turnを持つsessionでは `busy` となり、busy確認からcommand完了まで通常入力と同じsession排他を保持する
 
 ---
 

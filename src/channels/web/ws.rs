@@ -2,8 +2,9 @@
 //!
 //! 接続ハンドシェイク、chat.send の受付、RunHub からのイベント転送を担う。
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::State;
@@ -133,6 +134,7 @@ struct ConnectFeatures {
 #[serde(rename_all = "camelCase")]
 struct ChatAckPayload {
     run_id: String,
+    session_key: String,
     status: &'static str,
 }
 
@@ -166,6 +168,7 @@ struct SocketRequestContext<'a> {
     tx: &'a mpsc::UnboundedSender<Message>,
     connected: &'a AtomicBool,
     conn_id: &'a str,
+    forwarded_runs: &'a Arc<Mutex<HashSet<String>>>,
 }
 
 /// Upgrades an authenticated request into the web gateway WebSocket.
@@ -231,6 +234,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
     }
 
     let connected = Arc::new(AtomicBool::new(false));
+    let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
     // 接続完了前は connect を期限付きで待ち、以降は通常の受信ループとして扱う。
     while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
         let Message::Text(text) = message else {
@@ -266,6 +270,7 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                     tx: &out_tx,
                     connected: &connected,
                     conn_id: &conn_id,
+                    forwarded_runs: &forwarded_runs,
                 };
                 if handle_request(&state, request_context, id, method, params).await {
                     break;
@@ -402,6 +407,8 @@ async fn handle_chat_send(
                     "invalid_params"
                 } else if status == StatusCode::TOO_MANY_REQUESTS {
                     "busy"
+                } else if status == StatusCode::CONFLICT {
+                    "request_conflict"
                 } else {
                     "internal_error"
                 },
@@ -417,6 +424,7 @@ async fn handle_chat_send(
         id,
         ChatAckPayload {
             run_id: started.run_id.clone(),
+            session_key: started.session_key.clone(),
             status,
         },
     )
@@ -425,12 +433,20 @@ async fn handle_chat_send(
         return true;
     }
 
-    spawn_chat_stream_forwarder(
-        state.clone(),
-        context.tx.clone(),
-        started.run_id,
-        started.session_key,
-    );
+    let should_forward = context
+        .forwarded_runs
+        .lock()
+        .expect("forwarded runs lock")
+        .insert(started.run_id.clone());
+    if should_forward {
+        spawn_chat_stream_forwarder(
+            state.clone(),
+            context.tx.clone(),
+            started.run_id,
+            started.session_key,
+            Arc::clone(context.forwarded_runs),
+        );
+    }
     false
 }
 
@@ -439,9 +455,10 @@ fn spawn_chat_stream_forwarder(
     tx: mpsc::UnboundedSender<Message>,
     run_id: String,
     session_key: String,
+    forwarded_runs: Arc<Mutex<HashSet<String>>>,
 ) {
     tokio::spawn(async move {
-        forward_chat_stream(state, tx, run_id, session_key).await;
+        forward_chat_stream(state, tx, run_id, session_key, forwarded_runs).await;
     });
 }
 
@@ -450,7 +467,12 @@ async fn forward_chat_stream(
     tx: mpsc::UnboundedSender<Message>,
     run_id: String,
     session_key: String,
+    forwarded_runs: Arc<Mutex<HashSet<String>>>,
 ) {
+    let _registration = ForwardedRunRegistration {
+        run_id: run_id.clone(),
+        forwarded_runs,
+    };
     let Ok((mut rx, replay, done, _, _)) = state
         .run_hub
         .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
@@ -481,6 +503,20 @@ async fn forward_chat_stream(
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+struct ForwardedRunRegistration {
+    run_id: String,
+    forwarded_runs: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ForwardedRunRegistration {
+    fn drop(&mut self) {
+        self.forwarded_runs
+            .lock()
+            .expect("forwarded runs lock")
+            .remove(&self.run_id);
     }
 }
 
@@ -575,22 +611,48 @@ fn forward_run_event(
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                 return false;
             };
-            send_event(tx, "tool_start", payload).is_err()
+            send_event(
+                tx,
+                "tool_start",
+                routed_event_payload(run_id, session_key, payload),
+            )
+            .is_err()
         }
         "tool_result" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                 return false;
             };
-            send_event(tx, "tool_result", payload).is_err()
+            send_event(
+                tx,
+                "tool_result",
+                routed_event_payload(run_id, session_key, payload),
+            )
+            .is_err()
         }
         "user_input" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
                 return false;
             };
-            send_event(tx, "user_input", payload).is_err()
+            send_event(
+                tx,
+                "user_input",
+                routed_event_payload(run_id, session_key, payload),
+            )
+            .is_err()
         }
         _ => false,
     }
+}
+
+fn routed_event_payload(
+    run_id: &str,
+    session_key: &str,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let mut object = payload.as_object().cloned().unwrap_or_default();
+    object.insert("runId".to_string(), serde_json::json!(run_id));
+    object.insert("sessionKey".to_string(), serde_json::json!(session_key));
+    serde_json::Value::Object(object)
 }
 
 fn send_response<T: Serialize>(
@@ -917,11 +979,13 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
 
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
 
         let params = serde_json::json!({
@@ -943,6 +1007,47 @@ mod tests {
         let payload = &parsed["payload"];
         assert!(payload["runId"].as_str().is_some(), "runId must be present");
         assert_eq!(payload["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn ws_chat_send_forwards_one_run_once_per_connection() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let params = serde_json::json!({
+            "sessionKey": "duplicate-forward-session",
+            "agentId": "default",
+            "message": "hello",
+            "requestId": "duplicate-forward-request"
+        });
+
+        // Act: the second delivery is idempotent and must reuse the same
+        // connection-local forwarding registration.
+        let first_context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+        handle_chat_send(&state, first_context, "req-1", params.clone()).await;
+        let second_context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+        handle_chat_send(&state, second_context, "req-2", params).await;
+
+        // Assert
+        assert_eq!(forwarded_runs.lock().unwrap().len(), 1);
+        let responses = collect_text_messages(&mut rx);
+        assert_eq!(responses.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(&responses[0]).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&responses[1]).unwrap();
+        assert_eq!(first["payload"]["runId"], second["payload"]["runId"]);
     }
 
     #[tokio::test]
@@ -985,10 +1090,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
 
         // Act
@@ -1061,10 +1168,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
         let resolved = resolve_send_request(
             &state,
@@ -1129,10 +1238,12 @@ mod tests {
         let before = chat_count(&state);
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
         let context = SocketRequestContext {
             tx: &tx,
             connected: &connected,
             conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
         };
 
         // Act
@@ -1181,6 +1292,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(parsed["event"], "user_input");
         assert_eq!(parsed["payload"]["messageId"], "web:req-2");
+        assert_eq!(parsed["payload"]["runId"], "run-1");
+        assert_eq!(parsed["payload"]["sessionKey"], "sess-1");
     }
 
     #[test]
@@ -1234,10 +1347,14 @@ mod tests {
         assert_eq!(start["event"], "tool_start");
         assert_eq!(start["payload"]["callId"], "call-1");
         assert_eq!(start["payload"]["input"]["path"], "a.txt");
+        assert_eq!(start["payload"]["runId"], "run-1");
+        assert_eq!(start["payload"]["sessionKey"], "sess-1");
 
         let result: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
         assert_eq!(result["event"], "tool_result");
         assert_eq!(result["payload"]["isError"], false);
         assert_eq!(result["payload"]["durationMs"], 42);
+        assert_eq!(result["payload"]["runId"], "run-1");
+        assert_eq!(result["payload"]["sessionKey"], "sess-1");
     }
 }

@@ -14,16 +14,17 @@ use uuid::Uuid;
 use crate::agent_loop::resolve_chat_id;
 use crate::config::AgentId;
 use crate::conversation::SurfaceContext;
+use crate::error::EgoPulseError;
 use crate::runtime::channel_input::{
-    ObservedTurnSubmission, find_turn_id_by_request_key, session_has_unfinished_turn,
-    submit_observed_agent_turn_with_identity, try_stage_tool_followup_with_turn_id,
+    ObservedTurnSubmission, session_has_unfinished_turn, submit_observed_agent_turn_with_identity,
+    try_stage_tool_followup_with_turn_id,
 };
 use crate::runtime::turn::SubmitOutcome;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
 use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
-use crate::storage::call_blocking;
+use crate::storage::{TurnRun, TurnRunState, call_blocking};
 
 #[derive(Debug, Serialize)]
 struct StatusPayload {
@@ -456,6 +457,14 @@ pub(super) async fn accept_web_input(
         session_key,
         context,
     } = resolve_send_request(&state, &request, actor).await?;
+    let chat_id = resolve_chat_id(&state.app_state.turn_dependencies(), &context)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let _session_lock = state
+        .app_state
+        .turn_scheduler
+        .lock_session(context.scope, chat_id)
+        .await;
 
     if crate::slash_commands::is_slash_command(&message) {
         if session_has_unfinished_turn(&state.app_state, &context)
@@ -470,41 +479,25 @@ pub(super) async fn accept_web_input(
         return execute_web_slash_command(state, session_key, context, message, actor).await;
     }
 
-    if let Some(turn_id) = find_turn_id_by_request_key(&state.app_state, &context)
-        .await
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-    {
-        state
-            .run_hub
-            .create_if_absent(&turn_id, actor.to_string())
-            .await;
-        return Ok(AcceptedWebInput {
-            started: StartedRun {
-                run_id: turn_id,
-                session_key,
-            },
-            status: "queued",
-        });
-    }
-
     if let Some(turn_id) =
         try_stage_tool_followup_with_turn_id(&state.app_state, context.clone(), message.clone())
             .await
-            .map_err(|error| (StatusCode::TOO_MANY_REQUESTS, error.to_string()))?
+            .map_err(web_input_error)?
     {
-        state
-            .run_hub
-            .create_if_absent(&turn_id, actor.to_string())
+        let run = load_turn_run(&state, context.scope, &turn_id).await?;
+        let observer = (!run.state.is_terminal())
+            .then(|| {
+                state
+                    .app_state
+                    .turn_observers
+                    .register_if_absent(run.request_key.clone())
+            })
+            .flatten();
+        return accept_existing_web_run(&state, session_key, context.scope, run, observer, actor)
             .await;
-        return Ok(AcceptedWebInput {
-            started: StartedRun {
-                run_id: turn_id,
-                session_key,
-            },
-            status: "queued",
-        });
     }
 
+    let scope = context.scope;
     match submit_observed_agent_turn_with_identity(&state.app_state, context, message)
         .await
         .map_err(|reason| {
@@ -513,6 +506,7 @@ pub(super) async fn accept_web_input(
                 | crate::runtime::turn::RejectReason::GlobalQueueFull => {
                     StatusCode::TOO_MANY_REQUESTS
                 }
+                crate::runtime::turn::RejectReason::RequestConflict => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (status, reason.message().to_string())
@@ -531,7 +525,9 @@ pub(super) async fn accept_web_input(
                 .run_hub
                 .create_if_absent(&turn_id, actor.to_string())
                 .await;
-            spawn_observed_run_publisher(state.clone(), observer, turn_id.clone());
+            if let Some(observer) = observer {
+                spawn_observed_run_publisher(state.clone(), observer, turn_id.clone());
+            }
             Ok(AcceptedWebInput {
                 started: StartedRun {
                     run_id: turn_id,
@@ -540,20 +536,124 @@ pub(super) async fn accept_web_input(
                 status,
             })
         }
-        ObservedTurnSubmission::Existing { turn_id } => {
-            state
-                .run_hub
-                .create_if_absent(&turn_id, actor.to_string())
-                .await;
-            Ok(AcceptedWebInput {
-                started: StartedRun {
-                    run_id: turn_id,
-                    session_key,
-                },
-                status: "queued",
-            })
+        ObservedTurnSubmission::Existing { run, observer } => {
+            accept_existing_web_run(&state, session_key, scope, *run, observer, actor).await
         }
     }
+}
+
+fn web_input_error(error: EgoPulseError) -> (StatusCode, String) {
+    let status = match &error {
+        EgoPulseError::Storage(crate::error::StorageError::Conflict(_)) => StatusCode::CONFLICT,
+        EgoPulseError::Storage(
+            crate::error::StorageError::ToolFollowupSessionCapacityFull
+            | crate::error::StorageError::ToolFollowupScopeCapacityFull,
+        ) => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
+}
+
+async fn load_turn_run(
+    state: &WebState,
+    scope: crate::conversation::ConversationScope,
+    turn_id: &str,
+) -> Result<TurnRun, (StatusCode, String)> {
+    let turn_id = turn_id.to_string();
+    call_blocking(state.app_state.db_for(scope), move |db| {
+        db.get_turn_run(&turn_id)
+    })
+    .await
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn accept_existing_web_run(
+    state: &WebState,
+    session_key: String,
+    scope: crate::conversation::ConversationScope,
+    run: TurnRun,
+    observer: Option<crate::runtime::turn::TurnObserver>,
+    actor: &str,
+) -> Result<AcceptedWebInput, (StatusCode, String)> {
+    let status = if run.state.is_terminal() {
+        publish_terminal_web_run(state, scope, &run, actor).await?
+    } else {
+        state
+            .run_hub
+            .create_if_absent(&run.turn_id, actor.to_string())
+            .await;
+        if let Some(observer) = observer {
+            spawn_observed_run_publisher(state.clone(), observer, run.turn_id.clone());
+        }
+        "queued"
+    };
+    Ok(AcceptedWebInput {
+        started: StartedRun {
+            run_id: run.turn_id,
+            session_key,
+        },
+        status,
+    })
+}
+
+async fn publish_terminal_web_run(
+    state: &WebState,
+    scope: crate::conversation::ConversationScope,
+    run: &TurnRun,
+    actor: &str,
+) -> Result<&'static str, (StatusCode, String)> {
+    let (event, data, status) = match run.state {
+        TurnRunState::Completed => {
+            let final_message_id = run.final_message_id.clone().ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "completed turn has no final response".to_string(),
+                )
+            })?;
+            let response = call_blocking(state.app_state.db_for(scope), move |db| {
+                db.get_message_content(&final_message_id)
+            })
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "completed turn final response is missing".to_string(),
+                )
+            })?;
+            (
+                "done",
+                serde_json::to_string(&DonePayload { response }).unwrap_or_default(),
+                "completed",
+            )
+        }
+        TurnRunState::Failed | TurnRunState::Cancelled | TurnRunState::Uncertain => (
+            "error",
+            serde_json::to_string(&ErrorPayload {
+                error: run
+                    .error_message
+                    .clone()
+                    .unwrap_or_else(|| format!("turn ended in state {}", run.state)),
+            })
+            .unwrap_or_default(),
+            "failed",
+        ),
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "turn is not terminal".to_string(),
+            ));
+        }
+    };
+    state
+        .run_hub
+        .publish_terminal_if_absent(&run.turn_id, actor.to_string(), event, data)
+        .await;
+    state
+        .run_hub
+        .remove_later(run.turn_id.clone(), RUN_TTL_SECONDS)
+        .await;
+    Ok(status)
 }
 
 async fn execute_web_slash_command(
@@ -1003,6 +1103,20 @@ mod tests {
         assert_eq!(second.status, "queued");
         assert_ne!(first.started.run_id, second.started.run_id);
 
+        let conflict = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("fifo-session".to_string()),
+                message: "different payload".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("first".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect_err("request key collision must be rejected");
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+
         let concurrent_request = SendRequest {
             session_key: Some("fifo-session".to_string()),
             message: "concurrent".to_string(),
@@ -1026,6 +1140,95 @@ mod tests {
                 .has_live_observer("web:concurrent")
         );
         assert_eq!(state.app_state.db.count_durable_pending().unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn web_duplicate_of_completed_turn_replays_saved_response() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let resolved = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some("completed-session".to_string()),
+                message: "hello".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("completed-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve completed request");
+        let chat_id = resolve_chat_id(&state.app_state.turn_dependencies(), &resolved.context)
+            .await
+            .expect("resolve completed chat");
+        let payload_hash =
+            crate::runtime::turn::canonical_request_hash(&resolved.context, &resolved.message);
+        let run_id = match state
+            .app_state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "web:completed-request",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: &payload_hash,
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept completed request")
+        {
+            crate::storage::AcceptOutcome::Created(run) => run.turn_id,
+            crate::storage::AcceptOutcome::Existing(_) => panic!("expected new turn"),
+        };
+        let final_message_id = "web:completed-response";
+        let conn = state.app_state.db.get_conn().expect("database connection");
+        conn.execute(
+            "INSERT INTO messages
+                 (id, chat_id, sender_id, content, sender_kind, timestamp,
+                  message_kind, recipient_agent_id, seq, turn_id, parent_message_id)
+             VALUES (?1, ?2, 'default', 'saved response', 'assistant', ?3,
+                     'message', NULL, 0, ?4, NULL)",
+            rusqlite::params![final_message_id, chat_id, "2026-09-09T00:00:00Z", &run_id],
+        )
+        .expect("insert final response");
+        conn.execute(
+            "UPDATE turn_runs SET state = 'model_completed' WHERE turn_id = ?1",
+            rusqlite::params![&run_id],
+        )
+        .expect("mark model completed");
+        state
+            .app_state
+            .db
+            .complete_turn(&run_id, final_message_id)
+            .expect("complete turn");
+
+        // Act
+        let replay = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("completed-session".to_string()),
+                message: "hello".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("completed-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("replay completed request");
+
+        // Assert
+        assert_eq!(replay.started.run_id, run_id);
+        assert_eq!(replay.status, "completed");
+        let (_rx, events, done, _, _) = state
+            .run_hub
+            .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
+            .await
+            .expect("subscribe replayed run");
+        assert!(done);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "done");
+        assert_eq!(events[0].data, r#"{"response":"saved response"}"#);
     }
 
     #[tokio::test]
@@ -1171,5 +1374,85 @@ mod tests {
         // Assert
         assert_eq!(busy.0, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(other_session.status, "accepted");
+    }
+
+    #[tokio::test]
+    async fn web_slash_and_turn_admission_share_session_lock() {
+        // Arrange: keep the scheduler slot occupied so the ordinary request
+        // remains durably unfinished after admission.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let resolved = resolve_send_request(
+            &state,
+            &SendRequest {
+                session_key: Some("locked-session".to_string()),
+                message: "queued".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("queued-request".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("resolve locked session");
+        let chat_id = resolve_chat_id(&state.app_state.turn_dependencies(), &resolved.context)
+            .await
+            .expect("resolve locked chat");
+        assert!(matches!(
+            state
+                .app_state
+                .turn_scheduler
+                .submit(crate::runtime::turn::ScheduledTurn {
+                    turn_id: "lock-holder".to_string(),
+                    origin_id: "lock-holder-origin".to_string(),
+                    context: resolved.context.clone(),
+                    input: "lock holder".to_string(),
+                    config_snapshot: None,
+                    received_at: None,
+                    response_delivery: crate::runtime::turn::ResponseDelivery::Channel,
+                }),
+            crate::runtime::turn::ScheduleResult::Started(_)
+        ));
+        let session_lock = state
+            .app_state
+            .turn_scheduler
+            .lock_session(resolved.context.scope, chat_id)
+            .await;
+
+        // Act: Web ordinary input must wait for the same lock used by slash.
+        let ordinary_state = state.clone();
+        let ordinary = tokio::spawn(async move {
+            accept_web_input(
+                ordinary_state,
+                SendRequest {
+                    session_key: Some("locked-session".to_string()),
+                    message: "queued".to_string(),
+                    agent_id: Some("default".to_string()),
+                    request_id: Some("queued-request".to_string()),
+                },
+                WEB_ACTOR,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!ordinary.is_finished());
+        drop(session_lock);
+        let ordinary_result = ordinary.await.expect("ordinary admission task");
+        assert_eq!(ordinary_result.expect("ordinary input").status, "queued");
+
+        let slash = accept_web_input(
+            state,
+            SendRequest {
+                session_key: Some("locked-session".to_string()),
+                message: "/new".to_string(),
+                agent_id: Some("default".to_string()),
+                request_id: Some("locked-command".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect_err("slash command must see the admitted Turn");
+
+        // Assert
+        assert_eq!(slash.0, StatusCode::TOO_MANY_REQUESTS);
     }
 }

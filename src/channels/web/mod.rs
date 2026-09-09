@@ -134,21 +134,37 @@ impl RunHub {
         let Some(channel) = guard.get_mut(run_id) else {
             return;
         };
+        if channel.done {
+            return;
+        }
 
-        let evt = RunEvent {
-            id: channel.next_id,
-            event: event.to_string(),
-            data,
-        };
-        channel.next_id = channel.next_id.saturating_add(1);
-        if channel.history.len() >= RUN_HISTORY_LIMIT {
-            let _ = channel.history.pop_front();
+        publish_locked(channel, event, data);
+    }
+
+    /// Publishes a durable terminal result without replacing an existing run.
+    ///
+    /// This is used when a request is re-delivered after the in-memory RunHub
+    /// entry expired or the process restarted. The persisted Turn remains the
+    /// source of truth, so a terminal replay must never leave an empty channel.
+    pub(crate) async fn publish_terminal_if_absent(
+        &self,
+        run_id: &str,
+        owner_actor: String,
+        event: &str,
+        data: String,
+    ) {
+        let (tx, _) = broadcast::channel(512);
+        let mut guard = self.channels.lock().await;
+        let channel = guard.entry(run_id.to_string()).or_insert(RunChannel {
+            sender: tx,
+            history: VecDeque::new(),
+            next_id: 1,
+            done: false,
+            owner_actor,
+        });
+        if !channel.done {
+            publish_locked(channel, event, data);
         }
-        channel.history.push_back(evt.clone());
-        if evt.event == "done" || evt.event == "error" {
-            channel.done = true;
-        }
-        let _ = channel.sender.send(evt);
     }
 
     /// Subscribes to a run and returns any replayable events after `last_event_id`.
@@ -203,6 +219,23 @@ impl RunHub {
             guard.remove(&run_id);
         });
     }
+}
+
+fn publish_locked(channel: &mut RunChannel, event: &str, data: String) {
+    let evt = RunEvent {
+        id: channel.next_id,
+        event: event.to_string(),
+        data,
+    };
+    channel.next_id = channel.next_id.saturating_add(1);
+    if channel.history.len() >= RUN_HISTORY_LIMIT {
+        let _ = channel.history.pop_front();
+    }
+    channel.history.push_back(evt.clone());
+    if evt.event == "done" || evt.event == "error" {
+        channel.done = true;
+    }
+    let _ = channel.sender.send(evt);
 }
 
 /// Normalizes a raw web session identifier into its storage key.

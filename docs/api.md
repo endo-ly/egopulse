@@ -262,7 +262,7 @@ POST /api/send_stream
 - リクエスト: `session_key`（識別キー）と `message`（送信テキスト）。未永続の新規Webセッションでは `agent_id`（作成対象agent）も必須。既存の `chat:{id}` は保存済み `chats.agent_id` を使用する
 - レスポンス: `ok: true`, `run_id`（durable Turn の UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
 
-通常メッセージはWebSocketと同じWeb共通入力を通り、`TurnScheduler` にdurableに投入される。同一sessionはFIFOで直列化され、Tool実行中の入力は既存Turnへdurable stagingされる。`request_id` が同じ再送は同じ `run_id` を返し、Turnを重複生成しない。slash commandはLLM Turnとして投入せず、対象sessionに未完了Turnがある場合は `429` で拒否する。
+通常メッセージはWebSocketと同じWeb共通入力を通り、`TurnScheduler` にdurableに投入される。同一sessionはFIFOで直列化され、Tool実行中の入力は既存Turnへdurable stagingされる。`request_id` が同じで本文も同じ再送は同じ `run_id` を返し、Turnを重複生成しない。`request_id` を別本文で再利用した場合は `409 Conflict` で拒否する。完了済みTurnの再送でも、保存済みの最終応答またはエラーを同じ `run_id` のstreamへreplayする。slash commandはLLM Turnとして投入せず、対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `429` で拒否する。
 
 #### SSE イベント受信
 
@@ -607,12 +607,13 @@ JSON-RPC 風の双方向メッセージング。
   "ok": true,
   "payload": {
     "runId": "uuid",
+    "sessionKey": "main",
     "status": "accepted"
   }
 }
 ```
 
-WebSocket の ordinary message は `requestId` を message identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。別 session は独立して受け付ける。slash command は対象sessionに未完了Turnがある場合だけ `busy` となり、別sessionでは実行できる。
+WebSocket の ordinary message は `requestId` を message identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
 
 `user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
 
@@ -652,6 +653,8 @@ WebSocket の ordinary message は `requestId` を message identity としてRES
   "type": "event",
   "event": "tool_start",
   "payload": {
+    "runId": "uuid",
+    "sessionKey": "main",
     "callId": "call_1",
     "name": "read",
     "input": {"path": "a.txt"}
@@ -664,6 +667,8 @@ WebSocket の ordinary message は `requestId` を message identity としてRES
   "type": "event",
   "event": "tool_result",
   "payload": {
+    "runId": "uuid",
+    "sessionKey": "main",
     "callId": "call_1",
     "name": "read",
     "isError": false,
@@ -714,7 +719,8 @@ WebSocket の ordinary message は `requestId` を message identity としてRES
 | `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
 | `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 | `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
-| `internal` | 429 | 受付処理の内部エラー（同一 `request_key` へ異なる本文の再受付による hash 不一致を含む） |
+| `request_conflict` | 409 | 同一 `request_id` / `request_key` が別本文で再利用された |
+| `internal` | 500 | 受付処理の内部エラー |
 | `internal_error` | 500 | サーバー内部エラー |
 
 ---

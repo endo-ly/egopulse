@@ -36,10 +36,28 @@ impl TurnObserverRegistry {
         }
     }
 
-    pub(crate) fn register(&self, request_key: String) -> TurnObserver {
+    /// Registers an observer only when the request key has no live owner.
+    ///
+    /// The decision and insertion share one lock so a duplicate delivery can
+    /// never replace the observer that owns the original request.
+    pub(crate) fn register_if_absent(&self, request_key: String) -> Option<TurnObserver> {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (completion_tx, completion) = oneshot::channel();
-        self.sinks.lock().expect("turn observer lock").insert(
+        let mut sinks = self.sinks.lock().expect("turn observer lock");
+        if let Some(existing) = sinks.get(&request_key).cloned() {
+            let completion_closed = existing
+                .state
+                .lock()
+                .expect("turn observer state lock")
+                .completion
+                .as_ref()
+                .is_none_or(oneshot::Sender::is_closed);
+            if !existing.events.is_closed() && !completion_closed {
+                return None;
+            }
+            remove_sink_routes(&mut sinks, &existing);
+        }
+        sinks.insert(
             request_key,
             Arc::new(ObserverSink {
                 events: events_tx,
@@ -50,21 +68,7 @@ impl TurnObserverRegistry {
                 initial_events: Mutex::new(HashMap::new()),
             }),
         );
-        TurnObserver { events, completion }
-    }
-
-    pub(crate) fn unregister(&self, request_key: &str) {
-        let sink = self
-            .sinks
-            .lock()
-            .expect("turn observer lock")
-            .remove(request_key);
-        if let Some(sink) = sink {
-            sink.initial_events
-                .lock()
-                .expect("turn observer initial event lock")
-                .remove(request_key);
-        }
+        Some(TurnObserver { events, completion })
     }
 
     pub(crate) fn has_live_observer(&self, request_key: &str) -> bool {
@@ -250,7 +254,9 @@ mod tests {
     async fn transfer_many_keeps_the_live_observer_until_all_turns_finish() {
         // Arrange
         let registry = TurnObserverRegistry::new();
-        let observer = registry.register("parent-request".to_string());
+        let observer = registry
+            .register_if_absent("parent-request".to_string())
+            .expect("observer should be registered");
         let TurnObserver {
             mut events,
             completion,
@@ -276,5 +282,25 @@ mod tests {
         completion.await.expect("completion sender");
         assert!(!registry.has_live_observer("promoted-request-1"));
         assert!(!registry.has_live_observer("promoted-request-2"));
+    }
+
+    #[tokio::test]
+    async fn duplicate_registration_keeps_the_original_observer() {
+        // Arrange
+        let registry = TurnObserverRegistry::new();
+        let mut owner = registry
+            .register_if_absent("request-1".to_string())
+            .expect("owner observer should be registered");
+
+        // Act
+        let duplicate = registry.register_if_absent("request-1".to_string());
+        registry.emit("request-1", AgentEvent::Iteration { iteration: 1 });
+
+        // Assert
+        assert!(duplicate.is_none());
+        assert!(matches!(
+            owner.events.recv().await,
+            Some(AgentEvent::Iteration { iteration: 1 })
+        ));
     }
 }

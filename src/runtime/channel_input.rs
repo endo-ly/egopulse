@@ -208,20 +208,25 @@ pub(crate) async fn submit_observed_agent_turn(
     submit_observed_agent_turn_with_identity(state, context, input)
         .await
         .and_then(|submission| match submission {
-            ObservedTurnSubmission::Created { observer, .. } => Ok(observer),
+            ObservedTurnSubmission::Created {
+                observer: Some(observer),
+                ..
+            } => Ok(observer),
             ObservedTurnSubmission::Existing { .. } => Err(RejectReason::Internal),
+            ObservedTurnSubmission::Created { observer: None, .. } => Err(RejectReason::Internal),
         })
 }
 
 /// A client-owned Turn together with its live observer and durable identity.
 pub(crate) enum ObservedTurnSubmission {
     Created {
-        observer: TurnObserver,
+        observer: Option<TurnObserver>,
         outcome: SubmitOutcome,
         turn_id: String,
     },
     Existing {
-        turn_id: String,
+        run: Box<crate::storage::TurnRun>,
+        observer: Option<TurnObserver>,
     },
 }
 
@@ -247,7 +252,7 @@ pub(crate) async fn submit_observed_agent_turn_with_identity(
     match accept_scheduled_turn(state, scheduled).await {
         Ok(AcceptedScheduledTurn::Created(scheduled)) => {
             let turn_id = scheduled.turn_id.clone();
-            let observer = state.turn_observers.register(request_key);
+            let observer = state.turn_observers.register_if_absent(request_key);
             let outcome = schedule_and_spawn(state, *scheduled);
             Ok(ObservedTurnSubmission::Created {
                 observer,
@@ -255,14 +260,13 @@ pub(crate) async fn submit_observed_agent_turn_with_identity(
                 turn_id,
             })
         }
-        Ok(AcceptedScheduledTurn::Existing(turn_id)) => {
-            state.turn_observers.unregister(&request_key);
-            Ok(ObservedTurnSubmission::Existing { turn_id })
+        Ok(AcceptedScheduledTurn::Existing(run)) => {
+            let observer = (!run.state.is_terminal())
+                .then(|| state.turn_observers.register_if_absent(request_key))
+                .flatten();
+            Ok(ObservedTurnSubmission::Existing { run, observer })
         }
-        Err(reason) => {
-            state.turn_observers.unregister(&request_key);
-            Err(reason)
-        }
+        Err(reason) => Err(reason),
     }
 }
 
@@ -330,24 +334,6 @@ pub(crate) async fn session_has_unfinished_turn(
     })
     .await
     .map_err(EgoPulseError::from)
-}
-
-/// Finds the durable Turn for an idempotent request key, if it was accepted.
-pub(crate) async fn find_turn_id_by_request_key(
-    state: &Arc<AppState>,
-    context: &SurfaceContext,
-) -> Result<Option<String>, EgoPulseError> {
-    if context.request_key.is_empty() {
-        return Ok(None);
-    }
-    let chat_id = resolve_chat_id(&state.turn_dependencies(), context).await?;
-    let request_key = context.request_key.clone();
-    Ok(call_blocking(state.db_for(context.scope), move |db| {
-        db.get_turn_run_by_request_key(chat_id, &request_key)
-    })
-    .await
-    .map_err(EgoPulseError::from)?
-    .map(|run| run.turn_id))
 }
 
 /// Submits an agent turn and starts execution immediately when the session is idle.
@@ -448,6 +434,10 @@ pub(crate) async fn accept_scheduled_turn(
                     metrics::inc_turn_queue_rejections("global_queue_full");
                     RejectReason::GlobalQueueFull
                 }
+                crate::error::EgoPulseError::Storage(crate::error::StorageError::Conflict(_)) => {
+                    metrics::inc_turn_queue_rejections("request_conflict");
+                    RejectReason::RequestConflict
+                }
                 _ => {
                     tracing::warn!(error = %error, "durable accept failed; rejecting turn");
                     metrics::inc_turn_queue_rejections(RejectReason::Internal.as_str());
@@ -464,7 +454,7 @@ pub(crate) async fn accept_scheduled_turn(
         // execution. Release this reservation; the existing owner holds its own.
         crate::storage::AcceptOutcome::Existing(run) => {
             state.turn_tracker.release(&origin_id);
-            return Ok(AcceptedScheduledTurn::Existing(run.turn_id));
+            return Ok(AcceptedScheduledTurn::Existing(Box::new(run)));
         }
     };
     // Stamp authoritative ids from the DB row; it is the source of truth for
@@ -480,7 +470,7 @@ pub(crate) async fn accept_scheduled_turn(
 
 pub(crate) enum AcceptedScheduledTurn {
     Created(Box<ScheduledTurn>),
-    Existing(String),
+    Existing(Box<crate::storage::TurnRun>),
 }
 
 /// Re-enqueues an already-durably-accepted turn (used by the turn dispatcher
