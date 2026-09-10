@@ -238,7 +238,7 @@ GET /api/history?session_key=main&limit=100
 
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 
-メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。
+メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。
 
 エントリの並び順は次の 2 層で決まる:
 
@@ -575,7 +575,7 @@ JSON-RPC 風の双方向メッセージング。
     "protocol": 1,
     "server": { "version": "0.1.0", "connId": "uuid" },
     "features": {
-      "methods": ["connect", "chat.send"],
+      "methods": ["connect", "chat.send", "run.subscribe"],
       "events": ["connect.challenge", "chat", "tool_start", "tool_result", "user_input"]
     }
   }
@@ -646,6 +646,48 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 | `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する |
 
 `chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
+
+`chat` イベントの `seq` はrun内で単調増加するRunHubのイベントIDである（転送がスキップしたイベントで歯抜けになることがある）。クライアントは受信した最大の `seq` をrunごとに記録し、再購読時の `lastSeq` として使う。
+
+#### 実行中runの再購読
+
+接続が切れた際も実行中のrunは処理を続ける。再接続後、クライアントは未完了のrunに対して `run.subscribe` を送り、途中からイベントを再開できる：
+
+```json
+{
+  "type": "req",
+  "id": "3",
+  "method": "run.subscribe",
+  "params": {
+    "runId": "uuid",
+    "lastSeq": 12
+  }
+}
+```
+
+##### 成功レスポンス
+
+```json
+{
+  "type": "res",
+  "id": "3",
+  "ok": true,
+  "payload": {
+    "runId": "uuid",
+    "replayed": 3,
+    "replayTruncated": false,
+    "done": false
+  }
+}
+```
+
+`lastSeq` より後の保持済みイベントがリプレイされ、以降はliveイベントへ追従する。最大 512 イベント、完了後 5 分TTL。
+
+- 転送されるイベントの `sessionKey` は、run作成時にサーバーがRunHubへ登録したcanonicalキー（`chat:{id}`）。通常のエージェントTurnとスラッシュコマンドのどちらのrunも同じ契約で再購読でき、クライアントが送信時に使った一時キーが転送に持ち込まれることはない
+- `replayed`: この要求でリプレイされたイベント数。同一接続ですでに転送中のrun（`chat.send` 起点）を指定した場合は二重転送を避けるため `0` になる
+- `replayTruncated`: リプレイバッファが `lastSeq` 以降の全イベントを保持できていない（512件のTTL退避で欠落がある）場合に `true`。リプレイだけでは途切れのないトランスクリプトを復元できないため、クライアントは凍結したdraftを破棄し、永続化済み履歴から再構築する（live購読は継続する）
+- `done`: 購読時点でrunが完了済みかどうか
+- runが保持期間切れ・プロセス再起動などでRunHubから見つからない場合は `run_not_found` エラーを返す。クライアントは永続化済み履歴 (`GET /api/history`) から再構築する
 
 #### ツールイベント受信
 

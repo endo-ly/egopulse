@@ -4,6 +4,7 @@ import {
   reduceChatEvent,
   reduceDiscardOptimisticUserMessage,
   reduceOptimisticUserMessage,
+  reduceRunAccepted,
   reduceUserInput,
   reduceToolResult,
   reduceToolStart,
@@ -45,7 +46,6 @@ type ServerFrame = ResponseFrame | EventFrame;
 
 interface ChatAckPayload {
   runId?: string;
-  sessionKey?: string;
 }
 
 interface UncertainSend {
@@ -60,7 +60,11 @@ interface PendingSend {
   reject: (error: Error) => void;
   draftId: string;
   durableRequestId: string;
+  // The session and agent at the time the send was issued. The user may
+  // switch to another session before the ack arrives, so per-run state must
+  // not depend on what the transport happens to show at that moment.
   sessionKey: string;
+  agentId: string;
   text: string;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -68,6 +72,17 @@ interface PendingSend {
 interface RoutedEventPayload {
   runId?: unknown;
   sessionKey?: unknown;
+}
+
+/// Per-run tracking for runs accepted from this transport. Lives until the
+/// run terminates; independent of which session is currently displayed.
+interface RunTracking {
+  // The (possibly pre-canonical) session label the send was issued with.
+  sessionKey: string;
+  agentId: string;
+  // Last gateway seq applied; frames at or below it are replays the client
+  // already applied, so they are dropped instead of appended twice.
+  lastSeq: number;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1_000;
@@ -95,6 +110,8 @@ export function useChatTransport({
   const connectRejectRef = useRef<((error: Error) => void) | null>(null);
   const sessionKeyRef = useRef(sessionKey);
   sessionKeyRef.current = sessionKey;
+  const agentIdRef = useRef(agentId);
+  agentIdRef.current = agentId;
   const onSessionResolvedRef = useRef(onSessionResolved);
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -103,9 +120,12 @@ export function useChatTransport({
   // logical send and remain stable only while its current draft is uncertain.
   const pendingSendsRef = useRef(new Map<string, PendingSend>());
   const uncertainSendRef = useRef<UncertainSend | null>(null);
-  // Maps a server run to the original session used by this transport when the
-  // server canonicalizes a newly-created session.
-  const runSessionKeysRef = useRef(new Map<string, string>());
+  // Runs accepted by this transport, until they terminate. After every
+  // reconnect they are resubscribed (run.subscribe) so streaming continues
+  // where the dropped socket left it.
+  const runsRef = useRef(new Map<string, RunTracking>());
+  // RPC ids of pending run.subscribe requests, to interpret their responses.
+  const resubscribeRpcsRef = useRef(new Map<string, string>());
   // Set when a live socket drops unexpectedly so the next open resyncs.
   const disruptedRef = useRef(false);
   // Tracks whether the current socket ever reached "open" so an unexpected
@@ -185,6 +205,29 @@ export function useChatTransport({
     [clearReconnectTimer, rejectAllPendingSends],
   );
 
+  // Re-attaches this socket to runs accepted before the connection dropped.
+  // The server replays everything after the client's last applied seq, so
+  // streaming resumes without a gap or duplicates.
+  const resubscribeInFlightRuns = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const [runId, tracking] of runsRef.current) {
+      const rpcId = crypto.randomUUID();
+      resubscribeRpcsRef.current.set(rpcId, runId);
+      ws.send(
+        JSON.stringify({
+          type: "req",
+          id: rpcId,
+          method: "run.subscribe",
+          params: {
+            runId,
+            lastSeq: tracking.lastSeq,
+          },
+        }),
+      );
+    }
+  }, []);
+
   const handleMessage = useCallback(
     (raw: string) => {
       let parsed: ServerFrame;
@@ -208,6 +251,7 @@ export function useChatTransport({
       if (parsed.type === "res" && parsed.id === "connect") {
         if (parsed.ok) {
           connectResolveRef.current?.();
+          resubscribeInFlightRuns();
         } else {
           const message = parsed.error?.message ?? "gateway connection rejected";
           const error = parsed.error?.code === "unauthorized"
@@ -228,14 +272,68 @@ export function useChatTransport({
       }
 
       if (parsed.type === "res" && parsed.id !== "connect") {
+        const resubscribedRunId = resubscribeRpcsRef.current.get(parsed.id);
+        if (resubscribedRunId !== undefined) {
+          resubscribeRpcsRef.current.delete(parsed.id);
+          if (!parsed.ok) {
+            // The run is gone (TTL expiry, restart): its events will never
+            // arrive, so drop the frozen live transcript and per-run seq
+            // state, then reconcile from persisted history.
+            runsRef.current.delete(resubscribedRunId);
+            setState((prev) => ({
+              ...prev,
+              messages: prev.messages.filter(
+                (message) =>
+                  message.id !== `draft:${resubscribedRunId}` &&
+                  !message.id.startsWith(`draft:${resubscribedRunId}:`),
+              ),
+            }));
+            invalidateQueries("sessions");
+            invalidateQueries("history");
+          } else {
+            const result = parsed.payload as {
+              replayTruncated?: boolean;
+            } | null;
+            if (result?.replayTruncated) {
+              // The replay buffer already evicted events the client applied,
+              // so the resumed stream starts mid-run and would render a
+              // half transcript. Drop the drafts and rebuild from history;
+              // the live subscription stays attached and fills forward.
+              setState((prev) => ({
+                ...prev,
+                messages: prev.messages.filter(
+                  (message) =>
+                    message.id !== `draft:${resubscribedRunId}` &&
+                    !message.id.startsWith(`draft:${resubscribedRunId}:`),
+                ),
+              }));
+              invalidateQueries("sessions");
+              invalidateQueries("history");
+            }
+          }
+          return;
+        }
         // The ack settles the sendMessage promise; failures surface there
         // so the composer can keep the text.
         const pending = pendingSendsRef.current.get(parsed.id);
         if (parsed.ok && parsed.payload) {
-          const ack = parsed.payload as ChatAckPayload;
-          if (ack.runId && ack.sessionKey) {
-            if (pending) {
-              runSessionKeysRef.current.set(ack.runId, pending.sessionKey);
+          const { runId } = parsed.payload as ChatAckPayload;
+          if (runId && pending) {
+            runsRef.current.set(runId, {
+              sessionKey: pending.sessionKey,
+              agentId: pending.agentId,
+              lastSeq: 0,
+            });
+            // Show the assistant's turn has started only in the session that
+            // issued the send: the user may have switched away while the ack
+            // was in flight, and that session must not inherit the draft.
+            if (sessionKeyRef.current === pending.sessionKey) {
+              setState((prev) =>
+                reduceRunAccepted(prev, {
+                  runId,
+                  agentId: pending.agentId,
+                }),
+              );
             }
           }
         } else if (!parsed.ok && pending) {
@@ -250,14 +348,33 @@ export function useChatTransport({
 
       if (parsed.type === "event" && parsed.event === "chat" && parsed.payload) {
         const event = parsed.payload as ChatEventPayload;
-        if (!belongsToCurrentSession(event, sessionKeyRef.current, runSessionKeysRef.current)) {
+        if (!belongsToCurrentSession(event, sessionKeyRef.current, runsRef.current)) {
           return;
         }
-        setState((prev) => reduceChatEvent(prev, event));
+        // Replayed frames at or below the last applied seq are already in the
+        // transcript; applying them again would duplicate streamed text.
+        const tracking = runsRef.current.get(event.runId);
+        if (tracking) {
+          if (event.seq <= tracking.lastSeq) {
+            return;
+          }
+          tracking.lastSeq = event.seq;
+        }
+        // Stamp the transcript with the agent of the send, not the one
+        // currently selected: an agent switch mid-run must not re-attribute
+        // the messages that are still streaming in.
+        setState((prev) =>
+          reduceChatEvent(prev, event, tracking?.agentId ?? agentIdRef.current),
+        );
         if (event.state === "done") {
+          // The server reports the run's canonical session; switch the UI
+          // over only when the run still belongs to the session the user is
+          // looking at (i.e. this transport sent it and they never left).
           if (
             event.sessionKey &&
             event.sessionKey !== sessionKeyRef.current &&
+            tracking &&
+            tracking.sessionKey === sessionKeyRef.current &&
             onSessionResolvedRef.current
           ) {
             onSessionResolvedRef.current(event.sessionKey);
@@ -266,14 +383,14 @@ export function useChatTransport({
           invalidateQueries("history");
           if (event.terminal !== false) {
             onDone?.();
-            runSessionKeysRef.current.delete(event.runId);
+            runsRef.current.delete(event.runId);
           }
         } else if (event.state === "error") {
           // A failed turn still persisted the user message; refetch it.
           invalidateQueries("sessions");
           invalidateQueries("history");
           if (event.terminal !== false) {
-            runSessionKeysRef.current.delete(event.runId);
+            runsRef.current.delete(event.runId);
           }
         }
         return;
@@ -281,7 +398,7 @@ export function useChatTransport({
 
       if (parsed.type === "event" && parsed.event === "tool_start" && parsed.payload) {
         const payload = parsed.payload as RoutedEventPayload;
-        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runSessionKeysRef.current)) {
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runsRef.current)) {
           return;
         }
         setState((prev) => reduceToolStart(prev, parsed.payload as ToolStartPayload));
@@ -290,7 +407,7 @@ export function useChatTransport({
 
       if (parsed.type === "event" && parsed.event === "tool_result" && parsed.payload) {
         const payload = parsed.payload as RoutedEventPayload;
-        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runSessionKeysRef.current)) {
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runsRef.current)) {
           return;
         }
         setState((prev) => reduceToolResult(prev, parsed.payload as ToolResultPayload));
@@ -299,13 +416,13 @@ export function useChatTransport({
 
       if (parsed.type === "event" && parsed.event === "user_input" && parsed.payload) {
         const payload = parsed.payload as RoutedEventPayload;
-        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runSessionKeysRef.current)) {
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runsRef.current)) {
           return;
         }
         setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
       }
     },
-    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend],
+    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend, resubscribeInFlightRuns],
   );
 
   const connect = useCallback(
@@ -383,6 +500,23 @@ export function useChatTransport({
   }, [connect]);
   scheduleReconnectRef.current = scheduleReconnect;
 
+  // A backgrounded mobile browser kills the socket and the backoff timer may
+  // not fire until long after the user returns. Regaining visibility
+  // reconnects immediately (skipping the remaining backoff) so run events
+  // are missed for seconds rather than tens of seconds.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") return;
+      if (wsRef.current || connectPromiseRef.current) return;
+      if (intentionalCloseRef.current) return;
+      clearReconnectTimer();
+      reconnectAttemptRef.current = 0;
+      void connect({ background: true }).catch(() => {});
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [connect, clearReconnectTimer]);
+
   const disconnect = useCallback(() => {
     intentionalCloseRef.current = true;
     clearReconnectTimer();
@@ -446,6 +580,7 @@ export function useChatTransport({
           draftId,
           durableRequestId,
           sessionKey,
+          agentId,
           text,
           timer,
         });
@@ -483,11 +618,9 @@ export function useChatTransport({
 function belongsToCurrentSession(
   payload: RoutedEventPayload,
   currentSessionKey: string,
-  runSessionKeys: Map<string, string>,
+  runs: Map<string, RunTracking>,
 ): boolean {
   if (payload.sessionKey === currentSessionKey) return true;
-  return (
-    typeof payload.runId === "string" &&
-    runSessionKeys.get(payload.runId) === currentSessionKey
-  );
+  const runId = typeof payload.runId === "string" ? payload.runId : null;
+  return runId !== null && runs.get(runId)?.sessionKey === currentSessionKey;
 }

@@ -38,6 +38,10 @@ export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
     message.sender_kind === "assistant"
       ? agentAvatars?.[message.sender_id]
       : undefined;
+  // An accepted run shows an empty assistant draft until the first delta
+  // lands; render it as a typing indicator instead of an empty bubble.
+  const showThinking =
+    isDraft && message.sender_kind === "assistant" && message.content === "";
 
   return (
     <div className={cls}>
@@ -64,10 +68,18 @@ export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
       </div>
       <div className="message-body">
         {message.sender_kind === "assistant" ? (
-          <>
-            <MarkdownRenderer content={message.content} />
-            {isDraft && <span className="streaming-cursor" />}
-          </>
+          showThinking ? (
+            <span className="thinking-dots" aria-label="assistant is responding">
+              <span />
+              <span />
+              <span />
+            </span>
+          ) : (
+            <>
+              <MarkdownRenderer content={message.content} />
+              {isDraft && <span className="streaming-cursor" />}
+            </>
+          )
         ) : (
           <>
             {message.content}

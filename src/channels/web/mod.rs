@@ -90,6 +90,10 @@ struct RunChannel {
     next_id: u64,
     done: bool,
     owner_actor: String,
+    // The canonical session the run belongs to, stamped on every forwarded
+    // event. Normal turns and slash commands register it here at creation,
+    // so resubscription never depends on client-supplied labels.
+    session_key: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,7 +104,7 @@ pub(crate) enum RunLookupError {
 }
 
 impl RunHub {
-    pub(crate) async fn create(&self, run_id: &str, owner_actor: String) {
+    pub(crate) async fn create(&self, run_id: &str, owner_actor: String, session_key: String) {
         let (tx, _) = broadcast::channel(512);
         let mut guard = self.channels.lock().await;
         guard.insert(
@@ -111,6 +115,7 @@ impl RunHub {
                 next_id: 1,
                 done: false,
                 owner_actor,
+                session_key,
             },
         );
     }
@@ -118,16 +123,24 @@ impl RunHub {
     /// Creates a run channel without replacing one that is already being
     /// observed. Durable Turn ids are reused as Web run ids for idempotent
     /// requests and Tool follow-ups.
-    pub(crate) async fn create_if_absent(&self, run_id: &str, owner_actor: String) {
+    pub(crate) async fn create_if_absent(
+        &self,
+        run_id: &str,
+        owner_actor: String,
+        session_key: String,
+    ) {
         let (tx, _) = broadcast::channel(512);
         let mut guard = self.channels.lock().await;
-        guard.entry(run_id.to_string()).or_insert(RunChannel {
-            sender: tx,
-            history: VecDeque::new(),
-            next_id: 1,
-            done: false,
-            owner_actor,
-        });
+        guard
+            .entry(run_id.to_string())
+            .or_insert_with(|| RunChannel {
+                sender: tx,
+                history: VecDeque::new(),
+                next_id: 1,
+                done: false,
+                owner_actor,
+                session_key,
+            });
     }
 
     pub(crate) async fn publish(&self, run_id: &str, event: &str, data: String) {
@@ -179,18 +192,22 @@ impl RunHub {
         &self,
         run_id: &str,
         owner_actor: String,
+        session_key: String,
         event: &str,
         data: String,
     ) {
         let (tx, _) = broadcast::channel(512);
         let mut guard = self.channels.lock().await;
-        let channel = guard.entry(run_id.to_string()).or_insert(RunChannel {
-            sender: tx,
-            history: VecDeque::new(),
-            next_id: 1,
-            done: false,
-            owner_actor,
-        });
+        let channel = guard
+            .entry(run_id.to_string())
+            .or_insert_with(|| RunChannel {
+                sender: tx,
+                history: VecDeque::new(),
+                next_id: 1,
+                done: false,
+                owner_actor,
+                session_key,
+            });
         if !channel.done {
             publish_locked(channel, event, data, true);
         }
@@ -210,6 +227,7 @@ impl RunHub {
             bool,
             bool,
             Option<u64>,
+            String,
         ),
         RunLookupError,
     > {
@@ -237,6 +255,7 @@ impl RunHub {
             channel.done,
             replay_truncated,
             oldest_event_id,
+            channel.session_key.clone(),
         ))
     }
 

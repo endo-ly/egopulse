@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
 use crate::agent_loop::message_format::is_tool_preview_message;
-use crate::storage::{SenderKind, StoredMessage, ToolCall, call_blocking};
+use crate::storage::{SenderKind, StoredMessage, ToolCall, ToolState, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
 
@@ -194,26 +194,41 @@ pub(super) async fn get_history(
 
 /// Builds the `message_kind: "tool_call"` JSON entry for a persisted tool
 /// call, decoding its structured input/output payload for the WebUI card.
+///
+/// The card status follows the ledger `state`, not the presence of an output:
+/// failed and uncertain calls carry no output by design, so deriving `pending`
+/// from a missing output would freeze them as running forever.
 fn tool_call_entry(tool_call: &ToolCall) -> serde_json::Value {
     let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
         .unwrap_or(serde_json::Value::Null);
-    let (status, result) = match tool_call.tool_output.as_ref() {
-        Some(output) => {
+    let (status, result) = match (&tool_call.state, tool_call.tool_output.as_ref()) {
+        // The ledger state is the source of truth for the card status; the
+        // output only carries the result body.
+        (ToolState::Succeeded, Some(output)) => {
             let parsed = serde_json::from_str::<serde_json::Value>(output)
                 .unwrap_or(serde_json::Value::Null);
-            let status = parsed
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("success")
-                .to_string();
             let result = parsed
                 .get("result")
                 .and_then(|r| r.as_str())
                 .map(String::from)
                 .unwrap_or_else(|| output.to_string());
-            (status, result)
+            ("success".to_string(), result)
         }
-        None => ("pending".to_string(), String::new()),
+        (ToolState::Succeeded, None) => ("success".to_string(), String::new()),
+        (ToolState::Failed, _) => {
+            let result = tool_call.error_message.clone().unwrap_or_else(|| {
+                tool_call
+                    .error_kind
+                    .clone()
+                    .unwrap_or_else(|| "tool execution failed".to_string())
+            });
+            ("error".to_string(), result)
+        }
+        (ToolState::Uncertain, _) => (
+            "error".to_string(),
+            "interrupted before the result was recorded".to_string(),
+        ),
+        (ToolState::Pending | ToolState::Running, _) => ("pending".to_string(), String::new()),
     };
     serde_json::json!({
         "id": format!("tool:{}", tool_call.id),
@@ -439,6 +454,139 @@ mod tests {
         assert_eq!(content["status"], "success");
         assert_eq!(content["result"], "file contents");
         assert_eq!(content["input"]["path"], "a.txt");
+    }
+
+    #[tokio::test]
+    async fn api_history_marks_failed_and_uncertain_tool_calls() {
+        // Arrange: calls that ended without an output — a recorded failure and
+        // one left uncertain by an interruption — must surface as error cards,
+        // never as perpetually running ones.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-failed:agent:lyre", "lyre");
+        let assistant_msg = StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "working [tool_call] shell".to_string(),
+        );
+        db.store_message_only(&assistant_msg)
+            .expect("store assistant message");
+
+        db.insert_tool_call_for_test(
+            "call-failed",
+            chat_id,
+            &assistant_msg.id,
+            "shell",
+            r#"{"command":"exit 1"}"#,
+            None,
+            "2024-01-01T00:00:01Z",
+        )
+        .expect("store failed tool call");
+        db.insert_tool_call_for_test(
+            "call-uncertain",
+            chat_id,
+            &assistant_msg.id,
+            "read",
+            r#"{"path":"b.txt"}"#,
+            None,
+            "2024-01-01T00:00:02Z",
+        )
+        .expect("store uncertain tool call");
+
+        let mark = |id: &str, sql: &str| {
+            db.get_conn()
+                .expect("conn")
+                .execute(sql, rusqlite::params![id])
+                .expect("mark tool call");
+        };
+        mark(
+            "call-failed",
+            "UPDATE tool_calls SET state = 'failed', error_kind = 'exec_error', \
+             error_message = 'command exited with code 1' WHERE id = ?1",
+        );
+        mark(
+            "call-uncertain",
+            "UPDATE tool_calls SET state = 'uncertain' WHERE id = ?1",
+        );
+
+        // Act
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let messages = result.0["messages"].as_array().expect("messages array");
+
+        // Assert
+        let content_for = |id: &str| {
+            let entry = messages
+                .iter()
+                .find(|m| m["id"] == format!("tool:{id}"))
+                .expect("tool entry present");
+            serde_json::from_str::<serde_json::Value>(
+                entry["content"].as_str().expect("content string"),
+            )
+            .expect("content json")
+        };
+
+        let failed = content_for("call-failed");
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["result"], "command exited with code 1");
+
+        let uncertain = content_for("call-uncertain");
+        assert_eq!(uncertain["status"], "error");
+        assert_eq!(
+            uncertain["result"],
+            "interrupted before the result was recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_history_trusts_ledger_state_over_output_status() {
+        // The ledger state is the source of truth for the card status: even
+        // if a succeeded row's stored output claims a different status (a
+        // malformed payload), the card stays success.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-status:agent:lyre", "lyre");
+        let assistant_msg = StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "reading [tool_call] read".to_string(),
+        );
+        db.store_message_only(&assistant_msg)
+            .expect("store assistant message");
+        db.insert_tool_call_for_test(
+            "call-1",
+            chat_id,
+            &assistant_msg.id,
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"file contents","status":"error"}"#),
+            "2024-01-01T00:00:01Z",
+        )
+        .expect("store tool call");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let messages = result.0["messages"].as_array().expect("messages array");
+        let tool_message = messages
+            .iter()
+            .find(|m| m["message_kind"] == "tool_call")
+            .expect("tool message present");
+        let content = serde_json::from_str::<serde_json::Value>(
+            tool_message["content"].as_str().expect("content string"),
+        )
+        .expect("content json");
+        assert_eq!(content["status"], "success");
+        assert_eq!(content["result"], "file contents");
     }
 
     #[tokio::test]

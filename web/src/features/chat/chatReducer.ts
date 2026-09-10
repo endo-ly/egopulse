@@ -66,8 +66,7 @@ export function reduceOptimisticUserMessage(
 export function reduceDiscardOptimisticUserMessage(
   state: ChatState,
   requestId: string,
-): ChatState {
-  const id = optimisticUserMessageId(requestId);
+): ChatState {  const id = optimisticUserMessageId(requestId);
   if (!state.messages.some((m) => m.id === id)) return state;
   return {
     ...state,
@@ -75,7 +74,46 @@ export function reduceDiscardOptimisticUserMessage(
   };
 }
 
-export function reduceChatEvent(state: ChatState, event: ChatEventPayload): ChatState {
+export interface RunAcceptedPayload {
+  runId: string;
+  agentId: string;
+}
+
+/**
+ * Shows an empty assistant draft as soon as the server accepts the run, so
+ * the user sees the assistant's turn begin before the first delta lands.
+ */
+export function reduceRunAccepted(
+  state: ChatState,
+  payload: RunAcceptedPayload,
+): ChatState {
+  const draftId = `draft:${payload.runId}`;
+  if (state.messages.some((message) => message.id === draftId)) return state;
+  return {
+    ...state,
+    messages: [
+      ...state.messages,
+      {
+        id: draftId,
+        sender_id: payload.agentId,
+        sender_kind: "assistant" as const,
+        content: "",
+        timestamp: new Date().toISOString(),
+        message_kind: "message",
+      },
+    ],
+  };
+}
+
+/**
+ * Applies a streaming chat event. `agentId` — the session's agent — stamps the
+ * assistant sender so live bubbles resolve the same avatar as persisted ones.
+ */
+export function reduceChatEvent(
+  state: ChatState,
+  event: ChatEventPayload,
+  agentId: string,
+): ChatState {
   const draftId = `draft:${event.runId}`;
 
   switch (event.state) {
@@ -96,7 +134,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           ...messages,
           {
             id: draftId,
-            sender_id: "assistant",
+            sender_id: agentId,
             sender_kind: "assistant" as const,
             content: chunk,
             timestamp: new Date().toISOString(),
@@ -114,10 +152,17 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
       let messages = state.messages;
       const existing = messages.find((m) => m.id === draftId);
       if (existing) {
+        if (!finalText && !existing.content) {
+          // An accepted run finished without ever producing text: no
+          // persisted answer will back the placeholder, so drop it instead
+          // of leaving an empty bubble.
+          messages = messages.filter((m) => m.id !== draftId);
+          return { ...state, messages, error: null };
+        }
         const sealedId = sealedAssistantDraftId(messages, draftId);
         messages = messages.map((m) =>
           m.id === draftId
-            ? { ...m, id: sealedId, content: finalText || m.content }
+            ? { ...m, id: sealedId, content: finalText || m.content, sender_id: agentId }
             : m,
         );
       } else if (finalText) {
@@ -126,7 +171,7 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
           ...messages,
           {
             id: sealedId,
-            sender_id: "assistant",
+            sender_id: agentId,
             sender_kind: "assistant" as const,
             content: finalText,
             timestamp: new Date().toISOString(),
@@ -138,7 +183,23 @@ export function reduceChatEvent(state: ChatState, event: ChatEventPayload): Chat
     }
 
     case "error": {
-      return { ...state, runId: event.runId, error: event.errorMessage ?? "unknown error" };
+      // A terminal error ends the run's transcript. An empty placeholder
+      // would linger forever, and a partial draft would keep the streaming
+      // cursor blinking, so empty drafts are dropped and partial ones are
+      // sealed; the generated text itself is kept.
+      const existing = state.messages.find((m) => m.id === draftId);
+      let messages = state.messages;
+      if (existing && event.terminal !== false) {
+        if (existing.content === "") {
+          messages = messages.filter((m) => m.id !== draftId);
+        } else {
+          const sealedId = sealedAssistantDraftId(messages, draftId);
+          messages = messages.map((m) =>
+            m.id === draftId ? { ...m, id: sealedId, sender_id: agentId } : m,
+          );
+        }
+      }
+      return { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" };
     }
   }
 }
