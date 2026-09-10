@@ -20,6 +20,8 @@ use uuid::Uuid;
 use super::auth;
 use super::stream::{SendRequest, accept_web_input};
 use super::{RunEvent, RunLookupError, WEB_ACTOR, WebState};
+use crate::error::StorageError;
+use crate::storage::call_blocking;
 
 #[derive(Deserialize)]
 struct DeltaData {
@@ -115,9 +117,6 @@ struct ChatSendParams {
 #[serde(rename_all = "camelCase")]
 struct RunSubscribeParams {
     run_id: String,
-    /// Session label used to route forwarded events; the actor check on the
-    /// run channel is the security boundary, not this label.
-    session_key: String,
     /// Last gateway `seq` the client already applied; replay starts after it.
     last_seq: Option<u64>,
 }
@@ -129,6 +128,10 @@ struct RunSubscribePayload {
     /// Number of replayed events actually forwarded by this request. Zero
     /// when the run was already being forwarded on this connection.
     replayed: usize,
+    /// True when the replay buffer no longer holds every event after the
+    /// client's `lastSeq` (TTL eviction). The resumed stream then starts
+    /// mid-run, so the client must reconcile the transcript from history.
+    replay_truncated: bool,
     done: bool,
 }
 
@@ -498,7 +501,30 @@ async fn handle_run_subscribe(
         }
     };
 
-    let (rx, replay, done, _, _) = match state
+    // The run's session is owned by the server and resolved from the durable
+    // turn, never from a client-supplied label: a reconnecting client may only
+    // know the pre-canonical session key it originally sent chat.send with.
+    let session_key = {
+        let db = Arc::clone(&state.app_state.db);
+        let run_id = payload.run_id.clone();
+        match call_blocking(db, move |db| db.get_turn_run(&run_id)).await {
+            Ok(turn) => format!("chat:{}", turn.chat_id),
+            Err(StorageError::NotFound(_)) => {
+                return send_error(
+                    context.tx,
+                    id,
+                    "run_not_found",
+                    "run is gone or not replayable".to_string(),
+                )
+                .is_err();
+            }
+            Err(error) => {
+                return send_error(context.tx, id, "internal_error", error.to_string()).is_err();
+            }
+        }
+    };
+
+    let (rx, replay, done, replay_truncated, _) = match state
         .run_hub
         .subscribe_with_replay(&payload.run_id, payload.last_seq, WEB_ACTOR, false)
         .await
@@ -536,6 +562,7 @@ async fn handle_run_subscribe(
         RunSubscribePayload {
             run_id: payload.run_id.clone(),
             replayed,
+            replay_truncated,
             done,
         },
     )
@@ -552,7 +579,6 @@ async fn handle_run_subscribe(
     let forwarded_runs = Arc::clone(context.forwarded_runs);
     let tx = context.tx.clone();
     let run_id = payload.run_id;
-    let session_key = payload.session_key;
     tokio::spawn(async move {
         let _registration = ForwardedRunRegistration {
             run_id: run_id.clone(),
@@ -863,6 +889,7 @@ mod tests {
     use super::*;
     use axum::extract::ws::Message;
 
+    use crate::channels::web::RUN_HISTORY_LIMIT;
     use crate::channels::web::RunHub;
     use crate::channels::web::stream::resolve_send_request;
     use crate::error::LlmError;
@@ -874,6 +901,22 @@ mod tests {
         while let Ok(msg) = rx.try_recv() {
             if let Message::Text(text) = msg {
                 result.push(text.to_string());
+            }
+        }
+        result
+    }
+
+    /// Collects up to `limit` text frames without draining the channel.
+    fn collect_text_messages_with_limit(
+        rx: &mut mpsc::UnboundedReceiver<Message>,
+        limit: usize,
+    ) -> Vec<String> {
+        let mut result = Vec::new();
+        while result.len() < limit {
+            match rx.try_recv() {
+                Ok(Message::Text(text)) => result.push(text.to_string()),
+                Ok(_) => continue,
+                Err(_) => break,
             }
         }
         result
@@ -926,6 +969,22 @@ mod tests {
             run_hub: RunHub::default(),
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Seeds the durable turn a web run id maps to, so `run.subscribe` can
+    /// resolve the run's canonical session.
+    fn insert_turn_run_for_test(state: &WebState, turn_id: &str, chat_id: i64) {
+        state
+            .app_state
+            .db
+            .get_conn()
+            .expect("conn")
+            .execute(
+                "INSERT INTO turn_runs (turn_id, chat_id, request_key, state, accepted_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'completed', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+                rusqlite::params![turn_id, chat_id, format!("web:req-{turn_id}")],
+            )
+            .expect("insert turn run");
     }
 
     #[test]
@@ -1625,6 +1684,12 @@ mod tests {
         // Arrange: a run with two persisted events, already terminal.
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:resubscribe", None, "web", "default")
+            .expect("create chat");
+        insert_turn_run_for_test(&state, "resubscribe-run", chat_id);
         state
             .run_hub
             .create("resubscribe-run", WEB_ACTOR.to_string())
@@ -1663,14 +1728,15 @@ mod tests {
             "resubscribe-1",
             serde_json::json!({
                 "runId": "resubscribe-run",
-                "sessionKey": "sess-1",
                 "lastSeq": 1
             }),
         )
         .await;
 
-        // Assert: ack reports exactly the replayed remainder. The forwarder
-        // runs on a spawned task; yield until it flushes the replay.
+        // Assert: ack reports exactly the replayed remainder, and the
+        // forwarded events carry the canonical session resolved from the
+        // durable turn — not a client-supplied label. The forwarder runs on
+        // a spawned task; yield until it flushes the replay.
         assert!(!stopped);
         let messages = loop {
             tokio::task::yield_now().await;
@@ -1686,12 +1752,18 @@ mod tests {
         assert_eq!(ack["ok"], true);
         assert_eq!(ack["payload"]["runId"], "resubscribe-run");
         assert_eq!(ack["payload"]["replayed"], 1);
+        assert_eq!(ack["payload"]["replayTruncated"], false);
         assert_eq!(ack["payload"]["done"], true);
 
         let done: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
         assert_eq!(done["event"], "chat");
         assert_eq!(done["payload"]["seq"], 2);
         assert_eq!(done["payload"]["state"], "done");
+        assert_eq!(
+            done["payload"]["sessionKey"],
+            format!("chat:{chat_id}"),
+            "forwarded events carry the canonical session"
+        );
         assert_eq!(
             done["payload"]["message"]["content"][0]["text"],
             "Hello world"
@@ -1720,7 +1792,6 @@ mod tests {
             "resubscribe-missing",
             serde_json::json!({
                 "runId": "gone-run",
-                "sessionKey": "sess-1",
                 "lastSeq": 7
             }),
         )
@@ -1741,6 +1812,12 @@ mod tests {
         // Arrange: a forwarding task already streams this run (chat.send path).
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:dup", None, "web", "default")
+            .expect("create chat");
+        insert_turn_run_for_test(&state, "already-forwarded", chat_id);
         state
             .run_hub
             .create("already-forwarded", WEB_ACTOR.to_string())
@@ -1775,7 +1852,6 @@ mod tests {
             "resubscribe-dup",
             serde_json::json!({
                 "runId": "already-forwarded",
-                "sessionKey": "sess-1",
                 "lastSeq": 1
             }),
         )
@@ -1790,5 +1866,69 @@ mod tests {
         assert_eq!(parsed["ok"], true);
         // The ack must not claim a replay that will never arrive.
         assert_eq!(parsed["payload"]["replayed"], 0);
+    }
+
+    #[tokio::test]
+    async fn ws_run_subscribe_reports_replay_truncation() {
+        // Arrange: the replay buffer only keeps the last RUN_HISTORY_LIMIT
+        // events, so a client holding an older seq cannot recover a gapless
+        // transcript from the replay alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:truncated", None, "web", "default")
+            .expect("create chat");
+        insert_turn_run_for_test(&state, "truncated-run", chat_id);
+        state
+            .run_hub
+            .create("truncated-run", WEB_ACTOR.to_string())
+            .await;
+        for seq in 1..=RUN_HISTORY_LIMIT + 2 {
+            state
+                .run_hub
+                .publish(
+                    "truncated-run",
+                    "delta",
+                    format!(r#"{{"delta":"chunk-{seq}"}}"#),
+                )
+                .await;
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+
+        // Act: the client's last applied seq (1) was already evicted from
+        // the replay buffer, which now starts at event 3.
+        let stopped = handle_run_subscribe(
+            &state,
+            context,
+            "resubscribe-truncated",
+            serde_json::json!({
+                "runId": "truncated-run",
+                "lastSeq": 1
+            }),
+        )
+        .await;
+
+        // Assert: the ack flags the gap so the client reconciles from
+        // history instead of trusting the resumed stream. The ack is sent
+        // before the forwarder starts, so it is the first buffered frame.
+        assert!(!stopped);
+        let messages = collect_text_messages_with_limit(&mut rx, 1);
+        assert_eq!(messages.len(), 1, "ack arrives before the replay");
+        drop(rx);
+        let ack: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(ack["type"], "res");
+        assert_eq!(ack["ok"], true);
+        assert_eq!(ack["payload"]["replayTruncated"], true);
     }
 }
