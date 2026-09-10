@@ -99,6 +99,7 @@ coderabbit --prompt-only -t committed --base main
 
 | トピック | ファイル |
 |---|---|
+| インストール手順 | [install.md](./docs/install.md) |
 | アーキテクチャ概要 | [architecture.md](./docs/architecture.md) |
 | コマンド仕様 | [commands.md](./docs/commands.md) |
 | 設定仕様 | [config.md](./docs/config.md) |
@@ -118,7 +119,7 @@ coderabbit --prompt-only -t committed --base main
 
 - GitHub Flow: ブランチ `<type>/<desc>`
 - コミット: Conventional Commits（英語）
-- ワークフロー: `ci.yml`(テスト), `release.yml`(リリース)
+- ワークフロー: `ci.yml`(テスト), `release.yml`(リリース), `docs.yml`(ドキュメントサイトのビルド・Pagesデプロイ)
 - ブレインストーミングや壁打ち系など、**計画なし**で進めた実装: mainブランチで作業してよい
 - Issue, Planなど、**計画あり**で進めた実装: Git Worktreeを作成しその中で作業する（`worktree-create` skill使用）
 - PR description は日本語。該当Issueがある場合は `Close #XX` 明記

@@ -5,6 +5,11 @@
 # Node
 web/node_modules/
 web/dist/
+site/node_modules/
+site/dist/
+site/.astro/
+# Astro content straight from docs/ + docs-meta.json (index.mdx is hand-written)
+site/src/content/docs/*.md
 
 # OS
 .DS_Store
