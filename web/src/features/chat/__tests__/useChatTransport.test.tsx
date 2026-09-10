@@ -806,6 +806,57 @@ describe("useChatTransport reconnect", () => {
     expect(invalidateQueries).toHaveBeenCalledWith("history");
   });
 
+  it("chat_transport_stamps_streamed_messages_with_the_agent_of_the_send", async () => {
+    const { result, ws, rerender } = await connectOpen({ sessionKey: "s1" });
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a" },
+      });
+      await pending;
+    });
+
+    // The user switches the selected agent while the run is streaming.
+    act(() => {
+      rerender({
+        sessionKey: "s1",
+        agentId: "lyre",
+        authToken: "token",
+        onAuthRequired: vi.fn(),
+        onError: vi.fn(),
+        onSessionResolved: undefined,
+      });
+    });
+
+    // Act: the run's delta arrives after the switch.
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+        },
+      });
+    });
+
+    // Assert: the streamed message is attributed to the sending agent, not
+    // the one selected at event time.
+    expect(
+      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+    ).toMatchObject({ sender_id: "default" });
+  });
+
   it("chat_transport_resubscribes_to_inflight_run_after_reconnect", async () => {
     const { result, ws } = await connectOpen();
 

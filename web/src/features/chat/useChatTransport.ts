@@ -360,7 +360,12 @@ export function useChatTransport({
           }
           tracking.lastSeq = event.seq;
         }
-        setState((prev) => reduceChatEvent(prev, event, agentIdRef.current));
+        // Stamp the transcript with the agent of the send, not the one
+        // currently selected: an agent switch mid-run must not re-attribute
+        // the messages that are still streaming in.
+        setState((prev) =>
+          reduceChatEvent(prev, event, tracking?.agentId ?? agentIdRef.current),
+        );
         if (event.state === "done") {
           // The server reports the run's canonical session; switch the UI
           // over only when the run still belongs to the session the user is
