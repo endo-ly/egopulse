@@ -1,0 +1,33 @@
+---
+title: EgoPulse
+description: 自分専用の AI エージェントランタイム
+template: splash
+hero:
+  title: EgoPulse
+  tagline: 自分専用の AI エージェントランタイム。TUI / Web UI / Discord / Telegram を単一バイナリで動かす。
+  actions:
+    - text: インストール
+      link: install/
+      icon: rocket
+      variant: primary
+    - text: 仕組みを読む
+      link: architecture/
+      icon: document
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="はじめに" icon="rocket">
+    [インストール](install/)と[コマンド仕様](commands/)から始める。
+  </Card>
+
+  <Card title="運用する" icon="setting">
+    [設定仕様](config/)、[チャネル仕様](channels/)、[デプロイ運用](deploy/)。
+  </Card>
+
+  <Card title="仕組みを知る" icon="document">
+    [全体設計](architecture/)、[セッションライフサイクル](session-lifecycle/)、[HTTP API](api/)。
+  </Card>
+</CardGrid>

@@ -1,0 +1,70 @@
+{
+  "api.md": {
+    "title": "EgoPulse HTTP API",
+    "description": "WebUI と外部 voice client が使用する REST API、および WebSocket の仕様。"
+  },
+  "architecture.md": {
+    "title": "EgoPulse アーキテクチャ",
+    "description": "システム全体のコンポーネント構成、データフロー、レイヤー構造を記述する。"
+  },
+  "channels.md": {
+    "title": "EgoPulse チャネル仕様",
+    "description": "Web / Discord / Telegram / Voice / TUI / CLI の各チャネルの接続方式、メッセージフロー、制約を記述する。"
+  },
+  "commands.md": {
+    "title": "EgoPulse コマンド仕様",
+    "description": "CLI サブコマンドとチャットスラッシュコマンドの完全仕様。"
+  },
+  "config.md": {
+    "title": "EgoPulse 設定仕様",
+    "description": "全設定フィールドの型・制約・デフォルト値の完全リファレンス。"
+  },
+  "db.md": {
+    "title": "EgoPulse DB Schema",
+    "description": "SQLite データベースのスキーマ・テーブル定義・マイグレーション機構。"
+  },
+  "deploy.md": {
+    "title": "EgoPulse Deploy",
+    "description": "Linux サーバー上で EgoPulse を systemd サービスとして常駐化する手順。"
+  },
+  "directory.md": {
+    "title": "EgoPulse ディレクトリ構成",
+    "description": "`~/.egopulse/` 以下のディレクトリ・ファイル配置仕様。"
+  },
+  "install.md": {
+    "title": "EgoPulse をインストールする",
+    "description": "EgoPulse のインストール手順。ワンライナーインストール、手動ダウンロード、更新方法。"
+  },
+  "mcp.md": {
+    "title": "EgoPulse MCP",
+    "description": "MCP (Model Context Protocol) の設定・接続・ツール動的公開の仕様。静的 built-in tool は [tools.md](./tools.md) を参照。"
+  },
+  "openai-codex.md": {
+    "title": "OpenAI Codex Provider",
+    "description": "`openai-codex` provider は OpenAI 公式 `/v1/responses` ではなく、"
+  },
+  "pulse.md": {
+    "title": "EgoPulse Pulse 仕様",
+    "description": "Pulse（注意活性化機構）の仕様。時間・外界・記憶からの signal を「いま意識へ上げるべきもの」として選び、必要な agent を短く活性化する。"
+  },
+  "security.md": {
+    "title": "EgoPulse セキュリティガード",
+    "description": "LLM エージェントによるシークレット窃取を防ぐ多層防御。"
+  },
+  "session-lifecycle.md": {
+    "title": "EgoPulse Session Lifecycle",
+    "description": "会話セッションの永続化・復元・圧縮（compaction）のアルゴリズム仕様。"
+  },
+  "sleep.md": {
+    "title": "EgoPulse Sleep Batch",
+    "description": "セッションの長期記憶昇格処理（Sleep Batch）の仕様。"
+  },
+  "system-prompt.md": {
+    "title": "System Prompt 構築仕様",
+    "description": "LLM に送信される system prompt の構築方法を定義する。"
+  },
+  "tools.md": {
+    "title": "EgoPulse Built-in Tools",
+    "description": "全 built-in tools の入力・挙動・エラーを記述したリファレンス。"
+  }
+}

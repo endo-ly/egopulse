@@ -1,0 +1,269 @@
+/* ============================================================
+   EgoPulse Docs — Technical Editorial
+   紙白の地にインクの文字、アクセントは朱色 1 色のみ。
+   個性は IBM Plex の書体と罫線で組み、装飾は足さない。
+   ============================================================ */
+
+@import "@fontsource/noto-sans-jp/400.css";
+@import "@fontsource/noto-sans-jp/500.css";
+@import "@fontsource/noto-sans-jp/700.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+/* ---- Tokens ---- */
+
+:root {
+  --ep-font-sans:
+    "Noto Sans JP", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+  --ep-font-mono:
+    "IBM Plex Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+
+  --ep-accent: #0e7490;
+  --ep-ink: #211e1b;
+  --ep-border-header: #d6d0c6;
+
+  --sl-border-radius: 6px;
+  --sl-content-width: 52rem;
+
+  --sl-color-bg: #faf9f7;
+  --sl-color-bg-nav: #faf9f7;
+  --sl-color-bg-sidebar: #faf9f7;
+  --sl-color-bg-inline-code: #f0efeb;
+  --sl-color-accent: #0e7490;
+  --sl-color-accent-high: #155e75;
+  --sl-color-accent-low: rgba(14, 116, 144, 0.08);
+  --sl-color-text-accent: #155e75;
+  --sl-color-text-invert: #faf9f7;
+  --sl-color-hairline: var(--ep-border-header);
+  --sl-color-hairline-light: #e6e1d8;
+  --sl-color-hairline-shade: var(--ep-border-header);
+
+  --sl-color-gray-1: #33302c;
+  --sl-color-gray-2: #4f4b45;
+  --sl-color-gray-3: #67625a;
+}
+
+[data-theme="dark"] {
+  --ep-accent: #00d4ff;
+  --ep-ink: #eae5df;
+  --ep-border-header: rgba(214, 205, 195, 0.32);
+
+  --sl-color-bg: #161514;
+  --sl-color-bg-nav: #161514;
+  --sl-color-bg-sidebar: #161514;
+  --sl-color-bg-inline-code: #211f1d;
+  --sl-color-accent: #00d4ff;
+  --sl-color-accent-high: #67e8f6;
+  --sl-color-accent-low: rgba(0, 212, 255, 0.12);
+  --sl-color-text-accent: #22d3ee;
+  --sl-color-text-invert: #161514;
+  --sl-color-hairline: var(--ep-border-header);
+  --sl-color-hairline-light: rgba(214, 205, 195, 0.24);
+  --sl-color-hairline-shade: var(--ep-border-header);
+
+  --sl-color-gray-1: #d8d2ca;
+  --sl-color-gray-2: #b7b0a7;
+  --sl-color-gray-3: #968f86;
+}
+
+/* ---- Typography ---- */
+
+body {
+  font-family: var(--ep-font-sans);
+  color: var(--ep-ink);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--ep-font-mono);
+}
+
+.sl-markdown-content {
+  font-size: 1rem;
+  line-height: 1.85;
+}
+
+/* ---- Header ---- */
+
+.header {
+  background-color: var(--sl-color-bg);
+}
+
+
+.site-title {
+  font-weight: 700;
+  color: var(--sl-color-text-1);
+}
+
+/* ---- Sidebar（罫線ベース。角丸ピル・色面は使わない）---- */
+
+
+.sidebar-content a {
+  border-radius: 0;
+}
+
+.sidebar-content a:hover,
+.sidebar-content a:focus-visible {
+  background-color: transparent;
+}
+
+.sidebar-content [aria-current="page"],
+.sidebar-content [aria-current="page"]:hover,
+.sidebar-content [aria-current="page"]:focus {
+  background-color: transparent;
+  color: var(--sl-color-text-accent);
+  font-weight: 700;
+}
+
+:focus-visible {
+  outline: 1.5px solid var(--sl-color-accent-high);
+  outline-offset: -1.5px;
+}
+
+/* ---- Hero（左寄せ・罫線で締める）---- */
+
+.hero {
+  text-align: left;
+  padding-block: clamp(3.5rem, 9vh, 5.5rem) clamp(2.5rem, 6vh, 3.5rem);
+}
+
+.hero .stack {
+  margin-inline: 0;
+}
+
+.hero h1 {
+  max-width: 22em;
+  font-size: clamp(2rem, 5vw, 2.75rem);
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+}
+
+.hero h1::after {
+  content: "";
+  display: block;
+  width: 3rem;
+  height: 3px;
+  margin-top: 1.75rem;
+  background-color: var(--ep-accent);
+}
+
+.hero .tagline {
+  margin-top: 1.25rem;
+  max-width: 34em;
+  line-height: 1.9;
+  color: var(--sl-color-gray-2);
+}
+
+.hero .actions {
+  justify-content: flex-start;
+  margin-top: 2rem;
+  gap: 0.75rem;
+}
+
+/* ---- Buttons ---- */
+
+.sl-link-button {
+  border-radius: var(--sl-border-radius);
+  font-weight: 600;
+}
+
+.sl-link-button.primary {
+  background-color: var(--ep-accent);
+  border-color: var(--ep-accent);
+  color: var(--sl-color-text-invert);
+}
+
+.sl-link-button.primary:hover {
+  background-color: var(--sl-color-accent-high);
+  border-color: var(--sl-color-accent-high);
+  color: var(--sl-color-text-invert);
+}
+
+.sl-link-button.secondary {
+  border-color: var(--sl-color-hairline);
+  color: var(--sl-color-text-1);
+}
+
+.sl-link-button.secondary:hover {
+  border-color: var(--sl-color-hairline-light);
+  background-color: transparent;
+  color: var(--sl-color-text-1);
+}
+
+/* ---- Tables (booktabs style) ---- */
+
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  border-bottom: 1px solid var(--sl-color-hairline);
+}
+
+.sl-markdown-content thead th:not(:where(.not-content *)) {
+  border-top: 1px solid var(--sl-color-hairline);
+  border-bottom: 2px solid var(--sl-color-gray-2);
+  font-weight: 600;
+}
+
+/* ---- Asides ---- */
+
+.starlight-aside--note,
+.starlight-aside--tip {
+  --sl-color-asides-text-accent: var(--ep-accent);
+  --sl-color-asides-border: var(--ep-accent);
+}
+
+/* ---- Code blocks ---- */
+
+.expressive-code {
+  font-size: 0.875rem;
+}
+
+/* ---- Pagination（罫線の下に前後ページ。箱は作らない）---- */
+
+.pagination-links {
+  justify-content: space-between;
+  gap: 1.5rem;
+}
+
+.pagination-links a,
+.pagination-links a:hover {
+  border: 0;
+  background-color: transparent;
+  padding-inline: 0;
+  color: var(--sl-color-gray-3);
+}
+
+.pagination-links a > span {
+  font-size: 0.8125rem;
+  letter-spacing: 0.02em;
+}
+
+.pagination-links a .link-title {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 1rem;
+  font-weight: 500;
+  letter-spacing: normal;
+  color: var(--sl-color-text-1);
+}
+
+.pagination-links a:hover .link-title {
+  color: var(--sl-color-text-accent);
+}
+
+/* ---- Page title（タイトル直下の罫線は入れない）---- */
+
+.content-panel + .content-panel {
+  border-top: 0;
+}

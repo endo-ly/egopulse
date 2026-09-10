@@ -65,6 +65,7 @@ See [config.md](./docs/config.md) for details.
 
 | Topic | Document |
 |---|---|
+| Installation | [install.md](./docs/install.md) |
 | Architecture overview | [architecture.md](./docs/architecture.md) |
 | Command reference | [commands.md](./docs/commands.md) |
 | Configuration reference | [config.md](./docs/config.md) |
