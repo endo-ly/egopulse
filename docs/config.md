@@ -843,7 +843,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 ## 12. ConfigManager と immutable Snapshot
 
-`ConfigManager` は validated `Config` を `Arc<ConfigSnapshot>` として保持し、更新時の永続化・交換・通知を直列化する。Turn は開始時に取得した snapshot を完了まで保持するため、設定更新の途中で世代が混在しない。
+`ConfigManager` は validated `Config` を `Arc<ConfigSnapshot>` として保持する。インメモリ snapshot の交換と通知は直列化され、設定ソースの読み書きはプロセス内およびファイルのロックで保護される。Turn は開始時に取得した snapshot を完了まで保持するため、設定更新の途中で世代が混在しない。
 
 ### 12.1 ConfigSnapshot
 
@@ -861,8 +861,9 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 1. `expected_fingerprint` と現在 snapshot の fingerprint を比較する。
 2. 候補を検証し、再起動必須フィールドの変更を拒否する。
-3. 設定 YAML と SecretRef（値は `.env`）を安全に永続化する。
-4. 新しい snapshot を交換し、`revision` / `fingerprint` と watch 通知を公開する。
+3. 設定ソースの現在 fingerprint をロック下で確認する。
+4. 設定 YAML と SecretRef（値は `.env`）を同じロック下で安全に永続化する。
+5. 新しい snapshot を交換し、`revision` / `fingerprint` と watch 通知を公開する。
 
 永続化または検証に失敗した場合は snapshot を交換しない。`revision` は成功した交換でのみ進み、同一 fingerprint の更新は no-op になる。
 

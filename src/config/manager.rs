@@ -235,7 +235,9 @@ impl ConfigManager {
             (current, path)
         };
 
-        let persisted_fingerprint = source_fingerprint(&path)?;
+        let persisted_fingerprint = super::persist::with_config_lock(&path, || {
+            source_fingerprint(&path).map_err(EgoPulseError::from)
+        })?;
         if persisted_fingerprint != current.fingerprint {
             return Err(ConfigError::ConfigConflict {
                 expected: expected_fingerprint
