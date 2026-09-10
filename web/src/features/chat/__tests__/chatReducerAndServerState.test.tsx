@@ -4,6 +4,7 @@ import {
   reduceChatEvent,
   initialChatState,
   reduceOptimisticUserMessage,
+  reduceRunAccepted,
   reduceToolStart,
   reduceToolResult,
   reduceUserInput,
@@ -82,6 +83,127 @@ describe("chatReducer", () => {
     const sealed = state.messages.find((m) => m.id === "draft:run-no-delta:done");
     expect(sealed).toBeTruthy();
     expect(sealed?.sender_id).toBe("lyre");
+  });
+
+  it("run_accepted_shows_an_empty_draft_until_the_first_delta", () => {
+    // Arrange
+    let state = initialChatState();
+
+    // Act
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+
+    // Assert: one empty placeholder, stamped with the agent id.
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      id: "draft:run-1",
+      sender_id: "lyre",
+      sender_kind: "assistant",
+      content: "",
+    });
+
+    // Act: the first delta fills the placeholder instead of adding a bubble.
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+    }, "lyre");
+
+    // Assert
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      id: "draft:run-1",
+      content: "Hello",
+    });
+  });
+
+  it("run_accepted_done_without_text_drops_the_placeholder", () => {
+    // Arrange: the run completed without ever producing a delta.
+    let state = initialChatState();
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "done",
+    }, "lyre");
+
+    // Assert: no empty bubble lingers.
+    expect(state.messages).toHaveLength(0);
+  });
+
+  it("run_accepted_done_with_text_seals_the_placeholder", () => {
+    // Arrange
+    let state = initialChatState();
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "Final" }] },
+    }, "lyre");
+
+    // Assert
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      id: "draft:run-1:done",
+      sender_id: "lyre",
+      content: "Final",
+    });
+  });
+
+  it("run_accepted_terminal_error_drops_the_placeholder", () => {
+    // Arrange
+    let state = initialChatState();
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "error",
+      terminal: true,
+      errorMessage: "boom",
+    }, "lyre");
+
+    // Assert
+    expect(state.messages).toHaveLength(0);
+    expect(state.error).toBe("boom");
+  });
+
+  it("run_accepted_partial_delta_survives_a_terminal_error", () => {
+    // Arrange: the run streamed before failing; the partial text stays.
+    let state = initialChatState();
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+    }, "lyre");
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "error",
+      terminal: true,
+      errorMessage: "boom",
+    }, "lyre");
+
+    // Assert
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({ id: "draft:run-1", content: "partial" });
   });
 
   it("tool_start_and_result_inject_tool_messages", () => {

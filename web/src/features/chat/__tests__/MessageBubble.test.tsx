@@ -48,6 +48,25 @@ describe("MessageBubble", () => {
     expect(cursor).toBeTruthy();
   });
 
+  it("accepted_run_renders_thinking_dots_for_empty_draft", () => {
+    // Arrange: the run is accepted but no delta has landed yet.
+    const { container } = render(
+      <MessageBubble message={msg({ id: "draft:run-1", content: "" })} />,
+    );
+
+    // Assert: a typing indicator instead of an empty bubble or a cursor.
+    expect(container.querySelector(".thinking-dots")).toBeTruthy();
+    expect(container.querySelector(".streaming-cursor")).toBeNull();
+  });
+
+  it("thinking_dots_do_not_render_for_text_drafts", () => {
+    const { container } = render(
+      <MessageBubble message={msg({ id: "draft:run-1", content: "partial" })} />,
+    );
+    expect(container.querySelector(".thinking-dots")).toBeNull();
+    expect(container.querySelector(".streaming-cursor")).toBeTruthy();
+  });
+
   it("streaming_indicator_removed_on_done", () => {
     const { container } = render(
       <MessageBubble message={msg({ id: "draft:abc:done", content: "final" })} />,

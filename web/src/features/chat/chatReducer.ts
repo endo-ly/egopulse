@@ -66,12 +66,42 @@ export function reduceOptimisticUserMessage(
 export function reduceDiscardOptimisticUserMessage(
   state: ChatState,
   requestId: string,
-): ChatState {
-  const id = optimisticUserMessageId(requestId);
+): ChatState {  const id = optimisticUserMessageId(requestId);
   if (!state.messages.some((m) => m.id === id)) return state;
   return {
     ...state,
     messages: state.messages.filter((m) => m.id !== id),
+  };
+}
+
+export interface RunAcceptedPayload {
+  runId: string;
+  agentId: string;
+}
+
+/**
+ * Shows an empty assistant draft as soon as the server accepts the run, so
+ * the user sees the assistant's turn begin before the first delta lands.
+ */
+export function reduceRunAccepted(
+  state: ChatState,
+  payload: RunAcceptedPayload,
+): ChatState {
+  const draftId = `draft:${payload.runId}`;
+  if (state.messages.some((message) => message.id === draftId)) return state;
+  return {
+    ...state,
+    messages: [
+      ...state.messages,
+      {
+        id: draftId,
+        sender_id: payload.agentId,
+        sender_kind: "assistant" as const,
+        content: "",
+        timestamp: new Date().toISOString(),
+        message_kind: "message",
+      },
+    ],
   };
 }
 
@@ -122,6 +152,13 @@ export function reduceChatEvent(
       let messages = state.messages;
       const existing = messages.find((m) => m.id === draftId);
       if (existing) {
+        if (!finalText && !existing.content) {
+          // An accepted run finished without ever producing text: no
+          // persisted answer will back the placeholder, so drop it instead
+          // of leaving an empty bubble.
+          messages = messages.filter((m) => m.id !== draftId);
+          return { ...state, messages, error: null };
+        }
         const sealedId = sealedAssistantDraftId(messages, draftId);
         messages = messages.map((m) =>
           m.id === draftId
@@ -146,7 +183,14 @@ export function reduceChatEvent(
     }
 
     case "error": {
-      return { ...state, runId: event.runId, error: event.errorMessage ?? "unknown error" };
+      // A terminal error means no later delta will complete the run's
+      // transcript; an empty placeholder would linger forever, so drop it.
+      const existing = state.messages.find((m) => m.id === draftId);
+      const messages =
+        existing && existing.content === "" && event.terminal !== false
+          ? state.messages.filter((m) => m.id !== draftId)
+          : state.messages;
+      return { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" };
     }
   }
 }

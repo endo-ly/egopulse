@@ -4,6 +4,7 @@ import {
   reduceChatEvent,
   reduceDiscardOptimisticUserMessage,
   reduceOptimisticUserMessage,
+  reduceRunAccepted,
   reduceUserInput,
   reduceToolResult,
   reduceToolStart,
@@ -290,12 +291,20 @@ export function useChatTransport({
         // so the composer can keep the text.
         const pending = pendingSendsRef.current.get(parsed.id);
         if (parsed.ok && parsed.payload) {
-          const ack = parsed.payload as ChatAckPayload;
-          if (ack.runId && ack.sessionKey) {
+          const { runId, sessionKey } = parsed.payload as ChatAckPayload;
+          if (runId && sessionKey) {
             if (pending) {
-              runSessionKeysRef.current.set(ack.runId, pending.sessionKey);
+              runSessionKeysRef.current.set(runId, pending.sessionKey);
+              inFlightRunsRef.current.add(runId);
+              // The run is accepted: show the assistant's turn has started
+              // even before the first delta lands.
+              setState((prev) =>
+                reduceRunAccepted(prev, {
+                  runId,
+                  agentId: agentIdRef.current,
+                }),
+              );
             }
-            inFlightRunsRef.current.add(ack.runId);
           }
         } else if (!parsed.ok && pending) {
           uncertainSendRef.current = null;

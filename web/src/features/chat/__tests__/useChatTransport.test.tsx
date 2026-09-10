@@ -556,6 +556,56 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
 
+  it("chat_transport_shows_thinking_draft_on_ack", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const rpcId = lastSentChat(ws).id;
+
+    // Act: the server accepts the run.
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: rpcId,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "s1" },
+      });
+      await pending;
+    });
+
+    // Assert: an empty assistant draft (the typing indicator) is visible
+    // before any delta arrives.
+    expect(
+      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+    ).toMatchObject({ sender_kind: "assistant", sender_id: "default", content: "" });
+
+    // The first delta fills the placeholder instead of adding a bubble.
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+        },
+      });
+    });
+    expect(
+      result.current.state.messages.filter((m) =>
+        m.id.startsWith("draft:run-a"),
+      ),
+    ).toHaveLength(1);
+    expect(
+      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+    ).toMatchObject({ content: "Hi" });
+  });
+
   it("chat_transport_resubscribes_to_inflight_run_after_reconnect", async () => {
     const { result, ws } = await connectOpen();
 
