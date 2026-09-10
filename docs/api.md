@@ -683,11 +683,11 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 
 `lastSeq` より後の保持済みイベントがリプレイされ、以降はliveイベントへ追従する。最大 512 イベント、完了後 5 分TTL。
 
-- 転送されるイベントの `sessionKey` は、durable turnから解決されたcanonicalキー（`chat:{id}`）。クライアントが送信時に使った一時キーが転送に持ち込まれることはない
+- 転送されるイベントの `sessionKey` は、run作成時にサーバーがRunHubへ登録したcanonicalキー（`chat:{id}`）。通常のエージェントTurnとスラッシュコマンドのどちらのrunも同じ契約で再購読でき、クライアントが送信時に使った一時キーが転送に持ち込まれることはない
 - `replayed`: この要求でリプレイされたイベント数。同一接続ですでに転送中のrun（`chat.send` 起点）を指定した場合は二重転送を避けるため `0` になる
 - `replayTruncated`: リプレイバッファが `lastSeq` 以降の全イベントを保持できていない（512件のTTL退避で欠落がある）場合に `true`。リプレイだけでは途切れのないトランスクリプトを復元できないため、クライアントは凍結したdraftを破棄し、永続化済み履歴から再構築する（live購読は継続する）
 - `done`: 購読時点でrunが完了済みかどうか
-- runが保持期間切れ・プロセス再起動などで見つからない場合や、runに対応するdurable turnが存在しない場合は `run_not_found` エラーを返す。クライアントは永続化済み履歴 (`GET /api/history`) から再構築する
+- runが保持期間切れ・プロセス再起動などでRunHubから見つからない場合は `run_not_found` エラーを返す。クライアントは永続化済み履歴 (`GET /api/history`) から再構築する
 
 #### ツールイベント受信
 

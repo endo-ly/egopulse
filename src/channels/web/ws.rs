@@ -20,8 +20,6 @@ use uuid::Uuid;
 use super::auth;
 use super::stream::{SendRequest, accept_web_input};
 use super::{RunEvent, RunLookupError, WEB_ACTOR, WebState};
-use crate::error::StorageError;
-use crate::storage::call_blocking;
 
 #[derive(Deserialize)]
 struct DeltaData {
@@ -501,30 +499,10 @@ async fn handle_run_subscribe(
         }
     };
 
-    // The run's session is owned by the server and resolved from the durable
-    // turn, never from a client-supplied label: a reconnecting client may only
-    // know the pre-canonical session key it originally sent chat.send with.
-    let session_key = {
-        let db = Arc::clone(&state.app_state.db);
-        let run_id = payload.run_id.clone();
-        match call_blocking(db, move |db| db.get_turn_run(&run_id)).await {
-            Ok(turn) => format!("chat:{}", turn.chat_id),
-            Err(StorageError::NotFound(_)) => {
-                return send_error(
-                    context.tx,
-                    id,
-                    "run_not_found",
-                    "run is gone or not replayable".to_string(),
-                )
-                .is_err();
-            }
-            Err(error) => {
-                return send_error(context.tx, id, "internal_error", error.to_string()).is_err();
-            }
-        }
-    };
-
-    let (rx, replay, done, replay_truncated, _) = match state
+    // The run's session is owned by the server: the RunHub entry was created
+    // with the canonical session key (normal turns and slash commands alike),
+    // so a reconnecting client's stale label never leaks into the forwarding.
+    let (rx, replay, done, replay_truncated, _, session_key) = match state
         .run_hub
         .subscribe_with_replay(&payload.run_id, payload.last_seq, WEB_ACTOR, false)
         .await
@@ -622,7 +600,7 @@ async fn forward_chat_stream(
         run_id: run_id.clone(),
         forwarded_runs,
     };
-    let Ok((rx, replay, done, _, _)) = state
+    let Ok((rx, replay, done, _, _, _)) = state
         .run_hub
         .subscribe_with_replay(&run_id, last_event_id, WEB_ACTOR, false)
         .await
@@ -971,22 +949,6 @@ mod tests {
         }
     }
 
-    /// Seeds the durable turn a web run id maps to, so `run.subscribe` can
-    /// resolve the run's canonical session.
-    fn insert_turn_run_for_test(state: &WebState, turn_id: &str, chat_id: i64) {
-        state
-            .app_state
-            .db
-            .get_conn()
-            .expect("conn")
-            .execute(
-                "INSERT INTO turn_runs (turn_id, chat_id, request_key, state, accepted_at, updated_at)
-                 VALUES (?1, ?2, ?3, 'completed', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
-                rusqlite::params![turn_id, chat_id, format!("web:req-{turn_id}")],
-            )
-            .expect("insert turn run");
-    }
-
     #[test]
     fn ws_chat_event_includes_session_key() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -1246,7 +1208,7 @@ mod tests {
         let state = test_web_state(&dir);
         state
             .run_hub
-            .create("shared-replay", WEB_ACTOR.to_string())
+            .create("shared-replay", WEB_ACTOR.to_string(), "chat:9".to_string())
             .await;
         state
             .run_hub
@@ -1681,18 +1643,17 @@ mod tests {
 
     #[tokio::test]
     async fn ws_run_subscribe_replays_after_last_seq_and_reports_done() {
-        // Arrange: a run with two persisted events, already terminal.
+        // Arrange: a run with two persisted events, already terminal. The
+        // session comes from the run's hub entry, not from any durable turn.
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
-        let chat_id = state
-            .app_state
-            .db
-            .resolve_or_create_chat_id("web", "web:resubscribe", None, "web", "default")
-            .expect("create chat");
-        insert_turn_run_for_test(&state, "resubscribe-run", chat_id);
         state
             .run_hub
-            .create("resubscribe-run", WEB_ACTOR.to_string())
+            .create(
+                "resubscribe-run",
+                WEB_ACTOR.to_string(),
+                "chat:42".to_string(),
+            )
             .await;
         state
             .run_hub
@@ -1760,13 +1721,82 @@ mod tests {
         assert_eq!(done["payload"]["seq"], 2);
         assert_eq!(done["payload"]["state"], "done");
         assert_eq!(
-            done["payload"]["sessionKey"],
-            format!("chat:{chat_id}"),
+            done["payload"]["sessionKey"], "chat:42",
             "forwarded events carry the canonical session"
         );
         assert_eq!(
             done["payload"]["message"]["content"][0]["text"],
             "Hello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_run_subscribe_replays_a_slash_command_run_after_reconnect() {
+        // Arrange: a slash command run lives only in the RunHub (no durable
+        // turn backs it). The client received the ack, the socket dropped,
+        // and it resubscribes on reconnect.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+        state
+            .run_hub
+            .create("slash-run", WEB_ACTOR.to_string(), "chat:7".to_string())
+            .await;
+        state
+            .run_hub
+            .publish(
+                "slash-run",
+                "done",
+                r#"{"response":"/status result"}"#.to_string(),
+            )
+            .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+        let context = SocketRequestContext {
+            tx: &tx,
+            connected: &connected,
+            conn_id: "test-conn",
+            forwarded_runs: &forwarded_runs,
+        };
+
+        // Act
+        let stopped = handle_run_subscribe(
+            &state,
+            context,
+            "resubscribe-slash",
+            serde_json::json!({
+                "runId": "slash-run",
+                "lastSeq": null
+            }),
+        )
+        .await;
+
+        // Assert: the response the client missed is replayed under the
+        // canonical session even though no turn was ever persisted.
+        assert!(!stopped);
+        let messages = loop {
+            tokio::task::yield_now().await;
+            let messages = collect_text_messages(&mut rx);
+            if messages.len() >= 2 {
+                break messages;
+            }
+        };
+        assert_eq!(messages.len(), 2, "ack plus the replayed done event");
+        let ack: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(ack["type"], "res");
+        assert_eq!(ack["ok"], true);
+        assert_eq!(ack["payload"]["runId"], "slash-run");
+        assert_eq!(ack["payload"]["replayed"], 1);
+        assert_eq!(ack["payload"]["done"], true);
+
+        let done: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(done["event"], "chat");
+        assert_eq!(done["payload"]["state"], "done");
+        assert_eq!(done["payload"]["sessionKey"], "chat:7");
+        assert_eq!(
+            done["payload"]["message"]["content"][0]["text"],
+            "/status result"
         );
     }
 
@@ -1812,15 +1842,13 @@ mod tests {
         // Arrange: a forwarding task already streams this run (chat.send path).
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
-        let chat_id = state
-            .app_state
-            .db
-            .resolve_or_create_chat_id("web", "web:dup", None, "web", "default")
-            .expect("create chat");
-        insert_turn_run_for_test(&state, "already-forwarded", chat_id);
         state
             .run_hub
-            .create("already-forwarded", WEB_ACTOR.to_string())
+            .create(
+                "already-forwarded",
+                WEB_ACTOR.to_string(),
+                "chat:42".to_string(),
+            )
             .await;
         state
             .run_hub
@@ -1875,15 +1903,13 @@ mod tests {
         // transcript from the replay alone.
         let dir = tempfile::tempdir().expect("tempdir");
         let state = test_web_state(&dir);
-        let chat_id = state
-            .app_state
-            .db
-            .resolve_or_create_chat_id("web", "web:truncated", None, "web", "default")
-            .expect("create chat");
-        insert_turn_run_for_test(&state, "truncated-run", chat_id);
         state
             .run_hub
-            .create("truncated-run", WEB_ACTOR.to_string())
+            .create(
+                "truncated-run",
+                WEB_ACTOR.to_string(),
+                "chat:42".to_string(),
+            )
             .await;
         for seq in 1..=RUN_HISTORY_LIMIT + 2 {
             state

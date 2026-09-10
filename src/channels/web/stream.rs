@@ -148,7 +148,7 @@ pub(super) async fn api_stream(
     State(state): State<WebState>,
     Query(query): Query<StreamQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let (mut rx, replay, done, replay_truncated, oldest_event_id) = match state
+    let (mut rx, replay, done, replay_truncated, oldest_event_id, _) = match state
         .run_hub
         .subscribe_with_replay(&query.run_id, query.last_event_id, WEB_ACTOR, false)
         .await
@@ -523,7 +523,7 @@ pub(super) async fn accept_web_input(
             };
             state
                 .run_hub
-                .create_if_absent(&turn_id, actor.to_string())
+                .create_if_absent(&turn_id, actor.to_string(), session_key.clone())
                 .await;
             if let Some(observer) = observer {
                 spawn_observed_run_publisher(state.clone(), observer, turn_id.clone());
@@ -580,7 +580,11 @@ async fn accept_existing_web_run(
     } else {
         state
             .run_hub
-            .create_if_absent(&run.turn_id, actor.to_string())
+            .create_if_absent(
+                &run.turn_id,
+                actor.to_string(),
+                format!("chat:{}", run.chat_id),
+            )
             .await;
         if let Some(observer) = observer {
             let latest = load_turn_run(state, scope, &run.turn_id).await?;
@@ -655,7 +659,13 @@ async fn publish_terminal_web_run(
     };
     state
         .run_hub
-        .publish_terminal_if_absent(&run.turn_id, actor.to_string(), event, data)
+        .publish_terminal_if_absent(
+            &run.turn_id,
+            actor.to_string(),
+            format!("chat:{}", run.chat_id),
+            event,
+            data,
+        )
         .await;
     state
         .run_hub
@@ -672,7 +682,10 @@ async fn execute_web_slash_command(
     actor: &str,
 ) -> Result<AcceptedWebInput, (StatusCode, String)> {
     let run_id = Uuid::new_v4().to_string();
-    state.run_hub.create(&run_id, actor.to_string()).await;
+    state
+        .run_hub
+        .create(&run_id, actor.to_string(), session_key.clone())
+        .await;
     match crate::slash_commands::process_slash_command(
         &state.app_state,
         &context,
@@ -990,7 +1003,8 @@ mod tests {
     #[tokio::test]
     async fn stream_event_data_is_ws_compatible() {
         let hub = super::super::RunHub::default();
-        hub.create("test-run", "test-actor".to_string()).await;
+        hub.create("test-run", "test-actor".to_string(), "chat:1".to_string())
+            .await;
 
         let done_data = serde_json::to_string(&DonePayload {
             response: "final".to_string(),
@@ -998,7 +1012,7 @@ mod tests {
         .unwrap();
         hub.publish("test-run", "done", done_data).await;
 
-        let (_rx, replay, done, _, _) = hub
+        let (_rx, replay, done, _, _, _) = hub
             .subscribe_with_replay("test-run", None, "test-actor", false)
             .await
             .unwrap();
@@ -1023,7 +1037,8 @@ mod tests {
     async fn web_run_keeps_parent_error_nonterminal_for_staged_follow_up() {
         // Arrange
         let hub = super::super::RunHub::default();
-        hub.create("shared-run", WEB_ACTOR.to_string()).await;
+        hub.create("shared-run", WEB_ACTOR.to_string(), "chat:2".to_string())
+            .await;
 
         // Act
         hub.publish_agent_error(
@@ -1046,7 +1061,7 @@ mod tests {
         .await;
 
         // Assert
-        let (_rx, replay, done, _, _) = hub
+        let (_rx, replay, done, _, _, _) = hub
             .subscribe_with_replay("shared-run", None, WEB_ACTOR, false)
             .await
             .expect("subscribe shared run");
@@ -1066,7 +1081,12 @@ mod tests {
     async fn web_run_stays_open_until_all_follow_up_results_are_terminal() {
         // Arrange
         let hub = super::super::RunHub::default();
-        hub.create("multi-follow-up", WEB_ACTOR.to_string()).await;
+        hub.create(
+            "multi-follow-up",
+            WEB_ACTOR.to_string(),
+            "chat:3".to_string(),
+        )
+        .await;
 
         // Act
         hub.publish_agent_response(
@@ -1089,7 +1109,7 @@ mod tests {
         .await;
 
         // Assert
-        let (_rx, replay, done, _, _) = hub
+        let (_rx, replay, done, _, _, _) = hub
             .subscribe_with_replay("multi-follow-up", None, WEB_ACTOR, false)
             .await
             .expect("subscribe multi-follow-up run");
@@ -1309,7 +1329,7 @@ mod tests {
         // Assert
         assert_eq!(replay.started.run_id, run_id);
         assert_eq!(replay.status, "completed");
-        let (_rx, events, done, _, _) = state
+        let (_rx, events, done, _, _, _) = state
             .run_hub
             .subscribe_with_replay(&run_id, None, WEB_ACTOR, false)
             .await
@@ -1405,7 +1425,7 @@ mod tests {
 
         // Assert
         assert_eq!(replay.status, "completed");
-        let (_rx, events, done, _, _) = state
+        let (_rx, events, done, _, _, _) = state
             .run_hub
             .subscribe_with_replay(&replay.started.run_id, None, WEB_ACTOR, false)
             .await
