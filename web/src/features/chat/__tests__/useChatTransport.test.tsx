@@ -47,16 +47,23 @@ class FakeWebSocket {
   }
 }
 
-function setup() {
-  return renderHook(() =>
-    useChatTransport({
-      sessionKey: "s1",
-      agentId: "default",
-      authToken: "token",
-      onAuthRequired: vi.fn(),
-      onError: vi.fn(),
-    }),
-  );
+function setup(
+  options: {
+    sessionKey?: string;
+    onSessionResolved?: (sessionKey: string) => void;
+  } = {},
+) {
+  const initialProps = {
+    sessionKey: options.sessionKey ?? "s1",
+    agentId: "default",
+    authToken: "token",
+    onAuthRequired: vi.fn(),
+    onError: vi.fn(),
+    onSessionResolved: options.onSessionResolved,
+  };
+  return renderHook((props) => useChatTransport(props ?? initialProps), {
+    initialProps,
+  });
 }
 
 describe("useChatTransport reconnect", () => {
@@ -158,8 +165,10 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
-  async function connectOpen() {
-    const { result } = setup();
+  async function connectOpen(
+    options?: Parameters<typeof setup>[0],
+  ) {
+    const { result, rerender } = setup(options);
     act(() => {
       void result.current.connect();
     });
@@ -168,7 +177,7 @@ describe("useChatTransport reconnect", () => {
     act(() => ws.receive({ type: "event", event: "connect.challenge" }));
     act(() => ws.receive({ type: "res", id: "connect", ok: true }));
     expect(result.current.connectionState).toBe("open");
-    return { result, ws };
+    return { result, ws, rerender };
   }
 
   function lastSentChat(ws: FakeWebSocket): {
@@ -606,6 +615,197 @@ describe("useChatTransport reconnect", () => {
     ).toMatchObject({ content: "Hi" });
   });
 
+  it("chat_transport_ack_from_a_left_session_does_not_pollute_the_active_one", async () => {
+    const onSessionResolved = vi.fn();
+    const { result, ws, rerender } = await connectOpen({
+      onSessionResolved,
+    });
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const rpcId = lastSentChat(ws).id;
+
+    // The user leaves for session s2 before the ack arrives; the displayed
+    // transcript resets.
+    act(() => {
+      rerender({
+        sessionKey: "s2",
+        agentId: "default",
+        authToken: "token",
+        onAuthRequired: vi.fn(),
+        onError: vi.fn(),
+        onSessionResolved,
+      });
+    });
+    expect(result.current.state.messages).toHaveLength(0);
+
+    // Act: session s1's ack and events arrive while s2 is displayed.
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: rpcId,
+        ok: true,
+        payload: { runId: "run-a" },
+      });
+      await pending;
+    });
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 1,
+          state: "delta",
+          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+        },
+      });
+    });
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 2,
+          state: "done",
+          terminal: true,
+          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+        },
+      });
+    });
+
+    // Assert: session s2 shows nothing from s1's send, and the canonical
+    // session of s1's run never switches the displayed session.
+    expect(result.current.state.messages).toHaveLength(0);
+    expect(onSessionResolved).not.toHaveBeenCalled();
+  });
+
+  it("chat_transport_resolves_the_canonical_session_on_done_after_reconnect", async () => {
+    const onSessionResolved = vi.fn();
+    const { result, ws } = await connectOpen({
+      // A send from a fresh (not yet persisted) session; the server will
+      // canonicalize it to chat:42 once the run is accepted.
+      sessionKey: "web:new-chat",
+      onSessionResolved,
+    });
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a" },
+      });
+      await pending;
+    });
+
+    // The socket drops and reconnects; the run is resubscribed.
+    act(() => ws.close());
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    const retry = FakeWebSocket.instances[1];
+    act(() => retry.simulateOpen());
+    act(() => retry.receive({ type: "event", event: "connect.challenge" }));
+    act(() => retry.receive({ type: "res", id: "connect", ok: true }));
+    const subscription = retry.sent
+      .map((sent) => JSON.parse(sent) as {
+        method?: string;
+        id: string;
+      })
+      .find((frame) => frame.method === "run.subscribe");
+    expect(subscription).toBeTruthy();
+    act(() => {
+      retry.receive({
+        type: "res",
+        id: subscription!.id,
+        ok: true,
+        payload: { runId: "run-a", replayed: 0, replayTruncated: false, done: false },
+      });
+    });
+
+    // Act: the replayed done carries the canonical session key.
+    act(() => {
+      retry.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 2,
+          state: "done",
+          terminal: true,
+          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+        },
+      });
+    });
+
+    // Assert: the displayed session follows the run's canonical session.
+    expect(onSessionResolved).toHaveBeenCalledWith("chat:42");
+  });
+
+  it("chat_transport_rebuilds_from_history_when_replay_is_truncated", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a" },
+      });
+      await pending;
+    });
+    expect(
+      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+    ).toBeTruthy();
+
+    // The socket drops and reconnects; the run is resubscribed.
+    act(() => ws.close());
+    await act(async () => {
+      vi.advanceTimersByTime(1_000);
+    });
+    const retry = FakeWebSocket.instances[1];
+    act(() => retry.simulateOpen());
+    act(() => retry.receive({ type: "event", event: "connect.challenge" }));
+    act(() => retry.receive({ type: "res", id: "connect", ok: true }));
+    const subscription = retry.sent
+      .map((sent) => JSON.parse(sent) as { method?: string; id: string })
+      .find((frame) => frame.method === "run.subscribe");
+    expect(subscription).toBeTruthy();
+
+    // Act: the ack reports that the replay buffer cannot bridge the gap.
+    act(() => {
+      retry.receive({
+        type: "res",
+        id: subscription!.id,
+        ok: true,
+        payload: { runId: "run-a", replayed: 3, replayTruncated: true, done: false },
+      });
+    });
+
+    // Assert: the frozen draft is dropped and history is refetched instead
+    // of trusting a stream that starts mid-run.
+    expect(
+      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+    ).toBeUndefined();
+    expect(invalidateQueries).toHaveBeenCalledWith("sessions");
+    expect(invalidateQueries).toHaveBeenCalledWith("history");
+  });
+
   it("chat_transport_resubscribes_to_inflight_run_after_reconnect", async () => {
     const { result, ws } = await connectOpen();
 
@@ -651,13 +851,12 @@ describe("useChatTransport reconnect", () => {
     const frames = retry.sent.map((sent) => JSON.parse(sent) as {
       method?: string;
       id: string;
-      params?: { runId: string; sessionKey: string; lastSeq: number };
+      params?: { runId: string; lastSeq: number };
     });
     const subscription = frames.find((frame) => frame.method === "run.subscribe");
     expect(subscription).toBeTruthy();
     expect(subscription?.params).toEqual({
       runId: "run-a",
-      sessionKey: "s1",
       lastSeq: 1,
     });
 
