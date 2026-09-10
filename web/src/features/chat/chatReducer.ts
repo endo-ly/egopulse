@@ -183,13 +183,22 @@ export function reduceChatEvent(
     }
 
     case "error": {
-      // A terminal error means no later delta will complete the run's
-      // transcript; an empty placeholder would linger forever, so drop it.
+      // A terminal error ends the run's transcript. An empty placeholder
+      // would linger forever, and a partial draft would keep the streaming
+      // cursor blinking, so empty drafts are dropped and partial ones are
+      // sealed; the generated text itself is kept.
       const existing = state.messages.find((m) => m.id === draftId);
-      const messages =
-        existing && existing.content === "" && event.terminal !== false
-          ? state.messages.filter((m) => m.id !== draftId)
-          : state.messages;
+      let messages = state.messages;
+      if (existing && event.terminal !== false) {
+        if (existing.content === "") {
+          messages = messages.filter((m) => m.id !== draftId);
+        } else {
+          const sealedId = sealedAssistantDraftId(messages, draftId);
+          messages = messages.map((m) =>
+            m.id === draftId ? { ...m, id: sealedId, sender_id: agentId } : m,
+          );
+        }
+      }
       return { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" };
     }
   }

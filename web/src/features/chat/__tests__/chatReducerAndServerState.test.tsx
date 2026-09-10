@@ -201,9 +201,14 @@ describe("chatReducer", () => {
       errorMessage: "boom",
     }, "lyre");
 
-    // Assert
+    // Assert: the partial text is kept but sealed, so the streaming cursor
+    // stops blinking instead of freezing mid-run.
     expect(state.messages).toHaveLength(1);
-    expect(state.messages[0]).toMatchObject({ id: "draft:run-1", content: "partial" });
+    expect(state.messages[0]).toMatchObject({
+      id: "draft:run-1:done",
+      content: "partial",
+      sender_id: "lyre",
+    });
   });
 
   it("tool_start_and_result_inject_tool_messages", () => {
