@@ -24,7 +24,7 @@ use crate::runtime::turn::SubmitOutcome;
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
 use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
-use crate::storage::{Database, TurnRun, TurnRunState, call_blocking};
+use crate::storage::{TurnRun, TurnRunState, call_blocking};
 
 #[derive(Debug, Serialize)]
 struct StatusPayload {
@@ -360,47 +360,6 @@ fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -
     )
 }
 
-/// Resolves the persisted message ids a terminal error adopts.
-///
-/// Reads the failed Turn's own `turn_runs` row: a committed `input_message_id`
-/// adopts the optimistic user bubble, a persisted `final_message_id` (failure
-/// after the final write) adopts the sealed assistant draft. Tool previews
-/// and result summaries are intentionally excluded — the history projection
-/// hides them and Tool Cards are keyed by `call_id`.
-///
-/// Session resolution is unnecessary: `turn_id` is the global primary key
-/// of `turn_runs`, so the failed Turn is found directly even after staged
-/// follow-up promotion moved the interaction onto a new Turn. (Terminal
-/// responses carry their stamps in the event itself and need no lookup.)
-///
-/// A missing row means the Turn never persisted anything to adopt — that is
-/// a legitimate unknown, reported quietly at debug level. Any other lookup
-/// failure is logged as an error: unlike a legitimate unknown, a failed
-/// lookup leaves live entries the next history refetch cannot converge by
-/// id, so it must stay operator-visible instead of silently degrading.
-async fn turn_persisted_ids(db: &Arc<Database>, turn_id: &str) -> (Option<String>, Option<String>) {
-    let db = Arc::clone(db);
-    let owned_turn_id = turn_id.to_string();
-    match call_blocking(db, move |db| db.get_turn_run(&owned_turn_id)).await {
-        Ok(run) => (run.input_message_id, run.final_message_id),
-        Err(crate::error::StorageError::NotFound(_)) => {
-            tracing::debug!(
-                turn_id = %turn_id,
-                "terminal web error references a turn without persisted state"
-            );
-            (None, None)
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                turn_id = %turn_id,
-                "terminal web error cannot resolve persisted message ids"
-            );
-            (None, None)
-        }
-    }
-}
-
 pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: AgentEvent) {
     let run_hub = &state.run_hub;
     match event {
@@ -513,12 +472,14 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 .await;
         }
         AgentEvent::Error {
-            turn_id,
+            turn_id: _,
+            user_message_id,
+            assistant_message_id,
             message,
             terminal,
         } => {
-            let (user_message_id, assistant_message_id) =
-                turn_persisted_ids(&state.app_state.db, &turn_id).await;
+            // Stamps travel with the event (resolved by the runtime at
+            // emission), so delivery performs no lookup and cannot fail it.
             run_hub
                 .publish_agent_error(
                     run_id,
@@ -1318,11 +1279,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_without_final_message_reports_user_id_only() {
+    async fn error_forwards_event_carried_stamps_without_lookup() {
         use super::AgentEvent;
 
-        // Arrange: the turn failed after streaming partial output, before any
-        // final message was persisted.
+        // Arrange: a failed turn that persisted its input but no final
+        // message. No turn row exists here at all: the event's stamps are
+        // authoritative, so delivery must not depend on a lookup.
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state_with_agents(&dir);
         let chat_id = web_state
@@ -1330,14 +1292,6 @@ mod tests {
             .db
             .resolve_or_create_chat_id("web", "web:partial", None, "web", "default")
             .expect("chat");
-        let turn_id = seed_turn_with_stamps(
-            &web_state.app_state.db,
-            chat_id,
-            "partial-turn",
-            true,
-            false,
-        );
-        let input_id = crate::agent_loop::turn::turn_input_message_id(&turn_id);
         web_state
             .run_hub
             .create(
@@ -1352,7 +1306,9 @@ mod tests {
             &web_state,
             "partial-run",
             AgentEvent::Error {
-                turn_id: turn_id.clone(),
+                turn_id: "no-such-turn".to_string(),
+                user_message_id: Some("turn:partial:input".to_string()),
+                assistant_message_id: None,
                 message: "upstream failed".to_string(),
                 terminal: true,
             },
@@ -1371,7 +1327,10 @@ mod tests {
             .find(|event| event.event == "error")
             .expect("error event");
         let data: serde_json::Value = serde_json::from_str(&error.data).expect("json");
-        assert_eq!(data["user_message_id"], serde_json::json!(input_id));
+        assert_eq!(
+            data["user_message_id"],
+            serde_json::json!("turn:partial:input")
+        );
         assert!(data["assistant_message_id"].is_null());
     }
 

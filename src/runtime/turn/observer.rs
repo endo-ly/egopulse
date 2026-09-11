@@ -36,6 +36,26 @@ struct PendingFinalResponse {
     text: String,
 }
 
+/// Persisted message ids of a finishing Turn, forwarded on the Error event
+/// so channels adopt live entries exactly like a terminal response.
+pub(crate) struct TurnMessageStamps {
+    pub(crate) user_message_id: Option<String>,
+    pub(crate) assistant_message_id: Option<String>,
+}
+
+/// How a Turn finished, as reported to the observer.
+pub(crate) enum TurnOutcome {
+    /// The Turn produced its final response: the pending FinalResponse is
+    /// forwarded with the stamps it already carries.
+    Completed,
+    /// The Turn failed: the stamps of its persisted messages travel on the
+    /// Error event so channels need no lookup of their own.
+    Failed {
+        message: String,
+        stamps: TurnMessageStamps,
+    },
+}
+
 /// Routes runtime-owned turn output to a client without owning the turn.
 pub(crate) struct TurnObserverRegistry {
     sinks: Mutex<HashMap<String, Arc<ObserverSink>>>,
@@ -222,7 +242,7 @@ impl TurnObserverRegistry {
         }
     }
 
-    pub(crate) fn finish(&self, request_key: &str, turn_id: &str, result: Result<(), String>) {
+    pub(crate) fn finish(&self, request_key: &str, turn_id: &str, outcome: TurnOutcome) {
         let mut sinks = self.sinks.lock().expect("turn observer lock");
         let Some(sink) = sinks.get(request_key).cloned() else {
             return;
@@ -235,11 +255,12 @@ impl TurnObserverRegistry {
         let (terminal, final_response, completion) = {
             let mut state = sink.state.lock().expect("turn observer state lock");
             let terminal = state.pending_turns == 1;
-            let final_response = if result.is_ok() {
-                state.pending_final_response.take()
-            } else {
-                state.pending_final_response.take();
-                None
+            let final_response = match outcome {
+                TurnOutcome::Completed => state.pending_final_response.take(),
+                TurnOutcome::Failed { .. } => {
+                    state.pending_final_response.take();
+                    None
+                }
             };
             state.pending_turns = state
                 .pending_turns
@@ -257,8 +278,8 @@ impl TurnObserverRegistry {
         }
         drop(sinks);
 
-        match result {
-            Ok(()) => {
+        match outcome {
+            TurnOutcome::Completed => {
                 if let Some(final_response) = final_response {
                     let _ = sink.events.send(AgentEvent::FinalResponse {
                         turn_id: final_response.turn_id,
@@ -269,9 +290,11 @@ impl TurnObserverRegistry {
                     });
                 }
             }
-            Err(message) => {
+            TurnOutcome::Failed { message, stamps } => {
                 let _ = sink.events.send(AgentEvent::Error {
                     turn_id: turn_id.to_string(),
+                    user_message_id: stamps.user_message_id,
+                    assistant_message_id: stamps.assistant_message_id,
                     message,
                     terminal,
                 });
@@ -303,6 +326,16 @@ impl Default for TurnObserverRegistry {
 mod tests {
     use super::*;
 
+    fn stamps(
+        user_message_id: Option<&str>,
+        assistant_message_id: Option<&str>,
+    ) -> TurnMessageStamps {
+        TurnMessageStamps {
+            user_message_id: user_message_id.map(str::to_string),
+            assistant_message_id: assistant_message_id.map(str::to_string),
+        }
+    }
+
     #[tokio::test]
     async fn transfer_many_keeps_the_live_observer_until_all_turns_finish() {
         // Arrange
@@ -324,8 +357,8 @@ mod tests {
             ]
         ));
         registry.emit("promoted-request-1", AgentEvent::Iteration { iteration: 1 });
-        registry.finish("promoted-request-1", "turn-1", Ok(()));
-        registry.finish("promoted-request-2", "turn-2", Ok(()));
+        registry.finish("promoted-request-1", "turn-1", TurnOutcome::Completed);
+        registry.finish("promoted-request-2", "turn-2", TurnOutcome::Completed);
 
         // Assert
         assert!(matches!(
@@ -364,7 +397,7 @@ mod tests {
                 terminal: false,
             },
         );
-        registry.finish("follow-up-a", "turn-a", Ok(()));
+        registry.finish("follow-up-a", "turn-a", TurnOutcome::Completed);
         registry.emit(
             "follow-up-b",
             AgentEvent::FinalResponse {
@@ -375,7 +408,7 @@ mod tests {
                 terminal: false,
             },
         );
-        registry.finish("follow-up-b", "turn-b", Ok(()));
+        registry.finish("follow-up-b", "turn-b", TurnOutcome::Completed);
 
         // Assert
         assert!(matches!(
@@ -429,7 +462,10 @@ mod tests {
         registry.finish(
             "follow-up-a",
             "turn-a",
-            Err("follow-up A failed".to_string()),
+            TurnOutcome::Failed {
+                message: "follow-up A failed".to_string(),
+                stamps: stamps(Some("input-a"), None),
+            },
         );
         registry.emit(
             "follow-up-b",
@@ -441,16 +477,21 @@ mod tests {
                 terminal: false,
             },
         );
-        registry.finish("follow-up-b", "turn-b", Ok(()));
+        registry.finish("follow-up-b", "turn-b", TurnOutcome::Completed);
 
         // Assert
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::Error {
                 turn_id,
+                user_message_id,
+                assistant_message_id,
                 message,
                 terminal: false
-            }) if message == "follow-up A failed" && turn_id == "turn-a"
+            }) if message == "follow-up A failed"
+                && turn_id == "turn-a"
+                && user_message_id.as_deref() == Some("input-a")
+                && assistant_message_id.is_none()
         ));
         assert!(matches!(
             events.recv().await,

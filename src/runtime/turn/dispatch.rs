@@ -6,7 +6,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use super::scheduler;
-use super::{ResponseDelivery, ScheduledTurn, ToolProgressCoordinator, deserialize_scheduled_turn};
+use super::{
+    ResponseDelivery, ScheduledTurn, ToolProgressCoordinator, TurnMessageStamps, TurnOutcome,
+    deserialize_scheduled_turn,
+};
 use crate::agent_loop::{resume_input_committed_turn, resume_tools_completed_turn};
 use crate::config::manager::ConfigSnapshot;
 use crate::conversation::{ConversationScope, SurfaceContext};
@@ -609,8 +612,9 @@ pub(crate) fn execute_scheduled_turn(
                     finish_observer(
                         state,
                         &prepared.turn,
-                        Err("durable turn was not found".to_string()),
-                    );
+                        "durable turn was not found".to_string(),
+                    )
+                    .await;
                     return;
                 }
                 None
@@ -619,8 +623,9 @@ pub(crate) fn execute_scheduled_turn(
                 finish_observer(
                     state,
                     &prepared.turn,
-                    Err(EgoPulseError::ShutdownRequested.user_message()),
-                );
+                    EgoPulseError::ShutdownRequested.user_message(),
+                )
+                .await;
                 return;
             }
         };
@@ -634,8 +639,9 @@ pub(crate) fn execute_scheduled_turn(
             finish_observer(
                 state,
                 &prepared.turn,
-                Err("turn rejected by runtime stop condition".to_string()),
-            );
+                "turn rejected by runtime stop condition".to_string(),
+            )
+            .await;
             return;
         }
 
@@ -672,8 +678,9 @@ async fn prepare_scheduled_turn(
         finish_observer(
             state,
             &turn,
-            Err(EgoPulseError::ShutdownRequested.user_message()),
-        );
+            EgoPulseError::ShutdownRequested.user_message(),
+        )
+        .await;
         return None;
     }
 
@@ -697,11 +704,7 @@ async fn prepare_scheduled_turn(
         {
             Ok(()) => {
                 state.turn_tracker.release(&origin_id);
-                finish_observer(
-                    state,
-                    &turn,
-                    Err("turn chain already terminated".to_string()),
-                );
+                finish_observer(state, &turn, "turn chain already terminated".to_string()).await;
                 drain_next_queued_turn(state, &session_key).await;
             }
             Err(error) => {
@@ -970,7 +973,7 @@ async fn execute_and_publish_scheduled_turn(
             if let Some(observer_key) = observer_key {
                 state
                     .turn_observers
-                    .finish(observer_key, &turn.turn_id, Ok(()));
+                    .finish(observer_key, &turn.turn_id, TurnOutcome::Completed);
             } else if let Some(adapter) = adapter.as_ref() {
                 if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
                     tracing::warn!(
@@ -1050,17 +1053,20 @@ async fn execute_and_publish_scheduled_turn(
                         "keeping client observer for terminal staged follow-up"
                     );
                     if let Some(observer_key) = observer_key {
+                        let stamps = turn_message_stamps(state, turn).await;
                         state.turn_observers.emit(
                             observer_key,
                             crate::agent_loop::event::AgentEvent::Error {
                                 turn_id: turn.turn_id.clone(),
+                                user_message_id: stamps.user_message_id,
+                                assistant_message_id: stamps.assistant_message_id,
                                 message: error_message,
                                 terminal: false,
                             },
                         );
                     }
                 } else {
-                    finish_observer(state, turn, Err(error_message));
+                    finish_observer(state, turn, error_message).await;
                 }
             } else {
                 send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
@@ -1246,11 +1252,54 @@ async fn execute_turn_with_progress_and_snapshot(
     result
 }
 
-fn finish_observer(state: &AppState, turn: &ScheduledTurn, result: Result<(), String>) {
+async fn finish_observer(state: &AppState, turn: &ScheduledTurn, message: String) {
     if let Some(request_key) = observer_key(turn) {
-        state
-            .turn_observers
-            .finish(request_key, &turn.turn_id, result);
+        let stamps = turn_message_stamps(state, turn).await;
+        state.turn_observers.finish(
+            request_key,
+            &turn.turn_id,
+            TurnOutcome::Failed { message, stamps },
+        );
+    }
+}
+
+/// Resolves the persisted message ids a failed turn's error event adopts, so
+/// channels need no lookup of their own. A missing row is a legitimate
+/// unknown — the turn never persisted anything to adopt. Any other failure
+/// is logged: unlike a legitimate unknown, a failed lookup leaves live
+/// entries the next history refetch cannot converge by id.
+async fn turn_message_stamps(state: &AppState, turn: &ScheduledTurn) -> TurnMessageStamps {
+    let turn_id = turn.turn_id.clone();
+    match call_blocking(state.db_for(turn.context.scope), move |db| {
+        db.get_turn_run(&turn_id)
+    })
+    .await
+    {
+        Ok(run) => TurnMessageStamps {
+            user_message_id: run.input_message_id,
+            assistant_message_id: run.final_message_id,
+        },
+        Err(crate::error::StorageError::NotFound(_)) => {
+            tracing::debug!(
+                turn_id = %turn.turn_id,
+                "failed turn has no persisted state to adopt"
+            );
+            TurnMessageStamps {
+                user_message_id: None,
+                assistant_message_id: None,
+            }
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                turn_id = %turn.turn_id,
+                "failed turn cannot resolve persisted message ids"
+            );
+            TurnMessageStamps {
+                user_message_id: None,
+                assistant_message_id: None,
+            }
+        }
     }
 }
 
@@ -1330,7 +1379,7 @@ mod tests {
     enum DeliveredEvent {
         Input(String, String, Option<String>),
         Response(String, bool, String, Option<String>, Option<String>),
-        Error(String, bool, String),
+        Error(String, bool, String, Option<String>, Option<String>),
     }
 
     async fn run_terminal_staged_follow_up_case(
@@ -1486,9 +1535,16 @@ mod tests {
                     message,
                     terminal,
                     turn_id,
-                    ..
+                    user_message_id,
+                    assistant_message_id,
                 } => {
-                    delivered.push(DeliveredEvent::Error(message, terminal, turn_id));
+                    delivered.push(DeliveredEvent::Error(
+                        message,
+                        terminal,
+                        turn_id,
+                        user_message_id,
+                        assistant_message_id,
+                    ));
                 }
                 _ => {}
             }
@@ -2543,7 +2599,7 @@ mod tests {
             assert_eq!(
                 events[0],
                 DeliveredEvent::Input(
-                    first_input,
+                    first_input.clone(),
                     "recovered follow-up 1".to_string(),
                     Some("staged-follow-up-1".to_string()),
                 )
@@ -2551,7 +2607,7 @@ mod tests {
             assert_eq!(
                 events[2],
                 DeliveredEvent::Input(
-                    second_input,
+                    second_input.clone(),
                     "recovered follow-up 2".to_string(),
                     Some("staged-follow-up-2".to_string()),
                 )
@@ -2577,13 +2633,21 @@ mod tests {
                         Some(format!("turn:{}:final", child_ids[0]).as_str())
                     );
                 }
-                (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
+                (
+                    false,
+                    DeliveredEvent::Error(message, terminal, turn_id, user_id, assistant_id),
+                ) => {
                     assert!(message.contains("follow-up 0 failed"));
                     assert!(
                         !terminal,
                         "the first child error must not end the interaction"
                     );
                     assert_eq!(turn_id, &child_ids[0]);
+                    // The failed child persisted its input before the model
+                    // step, so its error event carries the input id the
+                    // client adopts; no final message exists.
+                    assert_eq!(user_id.as_deref(), Some(first_input.as_str()));
+                    assert!(assistant_id.is_none());
                 }
                 (succeeds, event) => {
                     panic!("unexpected first child outcome: succeeds={succeeds}, event={event:?}")
@@ -2608,10 +2672,15 @@ mod tests {
                         Some(format!("turn:{}:final", child_ids[1]).as_str())
                     );
                 }
-                (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
+                (
+                    false,
+                    DeliveredEvent::Error(message, terminal, turn_id, user_id, assistant_id),
+                ) => {
                     assert!(message.contains("follow-up 1 failed"));
                     assert!(terminal, "the last child error must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
+                    assert_eq!(user_id.as_deref(), Some(second_input.as_str()));
+                    assert!(assistant_id.is_none());
                 }
                 (succeeds, event) => {
                     panic!("unexpected second child outcome: succeeds={succeeds}, event={event:?}")

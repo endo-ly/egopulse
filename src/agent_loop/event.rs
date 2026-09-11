@@ -70,9 +70,14 @@ pub(crate) enum AgentEvent {
     /// Error occurred. `terminal` is false when the shared interaction still
     /// owns a staged follow-up that will continue on the same observer.
     /// `turn_id` identifies the durable Turn that failed, for the same
-    /// reason as [`AgentEvent::FinalResponse`].
+    /// reason as [`AgentEvent::FinalResponse`]. The stamps carry the failed
+    /// Turn's persisted message ids (input committed before the failure,
+    /// final only when the failure happened after its write), so channels
+    /// adopt live entries exactly like a successful terminal response.
     Error {
         turn_id: String,
+        user_message_id: Option<String>,
+        assistant_message_id: Option<String>,
         message: String,
         terminal: bool,
     },

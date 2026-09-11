@@ -11,6 +11,7 @@ import {
   reduceToolStart,
   reduceToolResult,
   reduceUserInput,
+  reduceAdoptUserMessage,
   type ChatEventPayload,
 } from "../chatReducer";
 
@@ -598,6 +599,84 @@ describe("chatReducer", () => {
     expect(state.messages.find((m) => m.id === "draft:run-1")).toBeUndefined();
   });
 
+  it("tool_start_without_narration_drops_the_empty_placeholder", () => {
+    // Arrange: the accepted run created the empty typing placeholder, but
+    // the model called a tool before emitting any narration.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "read" });
+    state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
+    state = reduceRunAccepted(state, { runId: "run-1", agentId: "lyre" });
+
+    // Act: the persisted preview is a bare tool call, which history hides.
+    state = reduceToolStart(state, {
+      runId: "run-1",
+      callId: "call-1",
+      name: "read",
+      input: { path: "a.txt" },
+      assistantMessageId: "preview-bare",
+    });
+
+    // Assert: the hidden preview was not adopted; the placeholder is gone.
+    expect(state.messages.map((m) => m.id)).toEqual(["local:req-1", "tool:call-1"]);
+
+    // Act: the final answer streams after the tool result and completes.
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
+    }, "lyre");
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 3,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "answer" }] },
+      userMessageId: "turn:run-1:input",
+      assistantMessageId: "turn:run-1:final",
+    }, "lyre");
+
+    // Assert: the answer sits after the tool card; the merge with history
+    // (which hides the bare preview) has no leftover bubble.
+    expect(state.messages.map((m) => m.id)).toEqual([
+      "turn:run-1:input",
+      "tool:call-1",
+      "turn:run-1:final",
+    ]);
+    const history: ChatMessage[] = [
+      {
+        id: "turn:run-1:input",
+        sender_id: "user",
+        sender_kind: "user",
+        content: "read",
+        timestamp: "2026-09-10T15:00:00Z",
+        message_kind: "message",
+      },
+      {
+        id: "tool:call-1",
+        sender_id: "lyre",
+        sender_kind: "tool",
+        content: "{}",
+        timestamp: "2026-09-10T15:00:01Z",
+        message_kind: "tool_call",
+      },
+      {
+        id: "turn:run-1:final",
+        sender_id: "lyre",
+        sender_kind: "assistant",
+        content: "answer",
+        timestamp: "2026-09-10T15:00:02Z",
+        message_kind: "message",
+      },
+    ];
+    expect(mergeChatMessages(history, state.messages).map((m) => m.id)).toEqual([
+      "turn:run-1:input",
+      "tool:call-1",
+      "turn:run-1:final",
+    ]);
+  });
+
   it("user_input_links_commits_to_sends_by_request_id", () => {
     // Arrange: two identical follow-ups sent while the tool phase runs.
     // Content alone cannot tell them apart; the linked request id can, even
@@ -652,6 +731,27 @@ describe("chatReducer", () => {
 
     // Assert: send order decides.
     expect(state.messages.map((m) => m.id)).toEqual(["local:req-2", "web:first"]);
+  });
+
+  it("user_input_with_a_link_never_falls_back_to_another_request", () => {
+    // Arrange: req-3 of the same run is still in flight while req-2's
+    // bubble is already gone (e.g. adopted by an earlier echo).
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-3", text: "keep" });
+    state = reduceTagLocalRun(state, { requestId: "req-3", runId: "run-1" });
+
+    // Act: a commit linked to req-2 arrives with no matching local bubble.
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-2",
+      messageId: "web:two",
+      senderId: "web-user",
+      text: "two",
+      timestamp: "2026-09-10T15:00:02Z",
+    });
+
+    // Assert: a linked commit consumes by identity only; req-3 survives.
+    expect(state.messages.map((m) => m.id)).toEqual(["local:req-3", "web:two"]);
   });
 
   it("user_input_never_consumes_another_run_bubble", () => {
@@ -851,6 +951,59 @@ describe("chatReducer", () => {
       "turn:turn-a:final",
       "turn:turn-b:input",
       "turn:turn-b:final",
+    ]);
+  });
+
+  it("done_never_steals_the_next_follow_up_when_its_input_already_exists", () => {
+    // Arrange: two staged follow-ups transferred to child turns A and B.
+    // A's initial event already replaced local:req-2 with its input id, so
+    // only B's optimistic bubble remains when A finishes.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "two" });
+    state = reduceTagLocalRun(state, { requestId: "req-2", runId: "run-1" });
+    state = reduceOptimisticUserMessage(state, { requestId: "req-3", text: "three" });
+    state = reduceTagLocalRun(state, { requestId: "req-3", runId: "run-1" });
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-2",
+      messageId: "turn:A:input",
+      senderId: "web-user",
+      text: "two",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
+
+    // Act: child A's done reports the id that is already in live state.
+    state = reduceAdoptUserMessage(state, {
+      runId: "run-1",
+      userMessageId: "turn:A:input",
+      assistantMessageId: null,
+    });
+
+    // Assert: B's optimistic bubble survives for B's own commit.
+    expect(state.messages.map((m) => m.id)).toEqual([
+      "local:req-3",
+      "turn:A:input",
+    ]);
+
+    // Act: child B starts and finishes on the same run.
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-3",
+      messageId: "turn:B:input",
+      senderId: "web-user",
+      text: "three",
+      timestamp: "2026-09-10T15:00:02Z",
+    });
+    state = reduceAdoptUserMessage(state, {
+      runId: "run-1",
+      userMessageId: "turn:B:input",
+      assistantMessageId: null,
+    });
+
+    // Assert: each child kept exactly its own input; no bubble was stolen.
+    expect(state.messages.map((m) => m.id)).toEqual([
+      "turn:A:input",
+      "turn:B:input",
     ]);
   });
 

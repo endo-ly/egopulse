@@ -106,6 +106,9 @@ export function reduceAdoptUserMessage(
 ): ChatState {
   const adopted = ids.userMessageId;
   if (adopted === null) return state;
+  // Already present (a child Turn's initial user_input echoed the id before
+  // its done): never steal the next optimistic bubble of the same run.
+  if (state.messages.some((message) => message.id === adopted)) return state;
   const index = state.messages.findIndex(
     (message) =>
       message.id.startsWith("local:") &&
@@ -408,25 +411,23 @@ export function reduceUserInput(
   }
 
   // The committed follow-up supersedes exactly one optimistic bubble. A
-  // linked request id matches by identity, so identical texts can never
-  // consume each other and arrival order does not matter. Unlinked commits
-  // fall back to the oldest bubble of this run: the server commits
-  // follow-ups in send order. Bubbles from other runs never qualify.
+  // linked request id matches by identity only: when that bubble is already
+  // gone, the commit has nothing to consume and never steals another
+  // send's bubble, so identical texts can never consume each other and
+  // arrival order does not matter. Unlinked commits fall back to the oldest
+  // bubble of this run: the server commits follow-ups in send order.
+  // Bubbles from other runs never qualify.
   const requestId = payload.requestId ?? null;
   let withoutLocal = state.messages;
-  const exactIndex =
-    requestId === null
-      ? -1
-      : withoutLocal.findIndex(
-          (message) => message.id === `local:${requestId}`,
-        );
   const localIndex =
-    exactIndex >= 0
-      ? exactIndex
-      : withoutLocal.findIndex(
+    requestId === null
+      ? withoutLocal.findIndex(
           (message) =>
             message.id.startsWith("local:") &&
             (message.runId === undefined || message.runId === payload.runId),
+        )
+      : withoutLocal.findIndex(
+          (message) => message.id === `local:${requestId}`,
         );
   if (localIndex >= 0) {
     withoutLocal = [
@@ -507,6 +508,9 @@ export function reduceToolStart(
   // assistant message id: adopt it onto the newest unadopted assistant
   // entry (the streaming draft, else the latest sealed segment) so every
   // narration segment maps 1:1 and later deltas start a fresh draft.
+  // An empty entry carries no narration: the row behind it is a bare tool
+  // preview that history never shows, so it is dropped instead of adopted —
+  // an adopted empty bubble could never converge by id and would linger.
   const draftId = `draft:${payload.runId}`;
   let messages = state.messages;
   const parentId =
@@ -518,9 +522,7 @@ export function reduceToolStart(
       (message) => message.id === draftId,
     );
     if (streamingIndex >= 0) {
-      messages = messages.map((message, current) =>
-        current === streamingIndex ? { ...message, id: parentId } : message,
-      );
+      messages = adoptOrDrop(messages, streamingIndex, parentId);
     } else {
       for (let current = messages.length - 1; current >= 0; current--) {
         const id = messages[current].id;
@@ -528,9 +530,7 @@ export function reduceToolStart(
           (id === draftId || id.startsWith(`${draftId}:`)) &&
           id.includes(":done")
         ) {
-          messages = messages.map((message, index) =>
-            index === current ? { ...message, id: parentId } : message,
-          );
+          messages = adoptOrDrop(messages, current, parentId);
           break;
         }
       }
@@ -549,6 +549,20 @@ export function reduceToolStart(
     message_kind: "tool_call",
   };
   return { ...state, messages: upsertToolMessage(messages, message) };
+}
+
+/** Renames a non-empty narration entry to its persisted id; empty placeholders are dropped. */
+function adoptOrDrop(
+  messages: ChatMessage[],
+  index: number,
+  adoptedId: string,
+): ChatMessage[] {
+  if (messages[index].content === "") {
+    return messages.filter((_, current) => current !== index);
+  }
+  return messages.map((message, current) =>
+    current === index ? { ...message, id: adoptedId } : message,
+  );
 }
 
 export function reduceToolResult(
