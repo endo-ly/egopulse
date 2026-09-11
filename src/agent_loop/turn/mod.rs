@@ -360,28 +360,49 @@ impl TurnExecutor<'_> {
             )
             .await?;
             let turn = match acceptance {
-                TurnAcceptance::Completed { turn_id, text } => {
+                TurnAcceptance::Completed {
+                    turn_id,
+                    user_message_id,
+                    assistant_message_id,
+                    text,
+                } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
+                        user_message_id,
+                        assistant_message_id,
                         text: text.clone(),
                         terminal: false,
                     });
                     return Ok(text);
                 }
-                TurnAcceptance::Terminated { turn_id, text } => {
+                TurnAcceptance::Terminated {
+                    turn_id,
+                    user_message_id,
+                    assistant_message_id,
+                    text,
+                } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
+                        user_message_id,
+                        assistant_message_id,
                         text: text.clone(),
                         terminal: false,
                     });
                     return Ok(text);
                 }
-                TurnAcceptance::InProgress { turn_id, text } => {
+                TurnAcceptance::InProgress {
+                    turn_id,
+                    user_message_id,
+                    assistant_message_id,
+                    text,
+                } => {
                     // 同一 request_key の Turn は既に別 executor が所有している。
                     // 二重実行を避けるため新規 executor を起動しないが、この重複
                     // リクエスト自体は呼び出し元へ明確に終端させ、イベントも発する。
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
+                        user_message_id,
+                        assistant_message_id,
                         text: text.clone(),
                         terminal: false,
                     });

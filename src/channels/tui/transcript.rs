@@ -424,6 +424,7 @@ mod tests {
 
         // Act
         transcript.apply_turn_event(TurnEvent::UserInputInjected {
+            request_id: None,
             message_id: "tui:follow-up".to_string(),
             sender_id: "user-b".to_string(),
             text: "follow-up".to_string(),

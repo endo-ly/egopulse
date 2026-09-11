@@ -14,13 +14,28 @@ pub(crate) enum TurnAcceptance {
     /// A fresh `accepted` Turn created by this call; the caller owns execution.
     Proceed(Box<TurnRun>),
     /// The Turn was already `completed`; replay its saved final response.
-    /// `turn_id` is the existing durable Turn so event consumers can resolve
-    /// its persisted message ids.
-    Completed { turn_id: String, text: String },
+    /// Stamps come from the existing durable row so event consumers resolve
+    /// the same ids the first execution reported.
+    Completed {
+        turn_id: String,
+        user_message_id: Option<String>,
+        assistant_message_id: Option<String>,
+        text: String,
+    },
     /// The Turn already exists and is non-terminal; another executor owns it.
-    InProgress { turn_id: String, text: String },
+    InProgress {
+        turn_id: String,
+        user_message_id: Option<String>,
+        assistant_message_id: Option<String>,
+        text: String,
+    },
     /// The Turn already terminated in a non-success state.
-    Terminated { turn_id: String, text: String },
+    Terminated {
+        turn_id: String,
+        user_message_id: Option<String>,
+        assistant_message_id: Option<String>,
+        text: String,
+    },
 }
 
 pub(super) struct TurnAcceptanceRequest<'a> {
@@ -119,17 +134,23 @@ impl<'a> TurnLifecycle<'a> {
                     })?;
                     Ok(TurnAcceptance::Completed {
                         turn_id: run.turn_id.clone(),
+                        user_message_id: run.input_message_id.clone(),
+                        assistant_message_id: run.final_message_id.clone(),
                         text: content,
                     })
                 }
                 other if other.is_terminal() => Ok(TurnAcceptance::Terminated {
                     turn_id: run.turn_id.clone(),
+                    user_message_id: run.input_message_id.clone(),
+                    assistant_message_id: run.final_message_id.clone(),
                     text: format!(
                         "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
                     ),
                 }),
                 _ => Ok(TurnAcceptance::InProgress {
                     turn_id: run.turn_id.clone(),
+                    user_message_id: run.input_message_id.clone(),
+                    assistant_message_id: run.final_message_id.clone(),
                     text: "このリクエストはすでに処理中です。".to_string(),
                 }),
             },

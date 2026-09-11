@@ -150,6 +150,7 @@ pub(crate) enum TurnEvent {
         call_id: String,
     },
     UserInputInjected {
+        request_id: Option<String>,
         message_id: String,
         sender_id: String,
         text: String,

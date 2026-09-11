@@ -13,8 +13,8 @@ pub(in crate::runtime) use dispatch::{
 pub(crate) use observer::{TurnObserver, TurnObserverRegistry};
 pub(crate) use progress::ToolProgressCoordinator;
 pub(crate) use scheduled::{
-    ResponseDelivery, ScheduledTurn, canonical_request_hash, deserialize_scheduled_turn,
-    serialize_scheduled_turn,
+    ResponseDelivery, ScheduledTurn, canonical_request_hash, client_request_id,
+    deserialize_scheduled_turn, serialize_scheduled_turn,
 };
 pub(crate) use scheduler::{
     ActiveTurnTracker, RejectReason, ScheduleResult, StopReason, SubmitOutcome, TurnScheduler,

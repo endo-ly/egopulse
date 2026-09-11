@@ -286,7 +286,7 @@ GET /api/stream?run_id=550e8400-e29b-41d4-a716-446655440000&last_event_id=0
 | `replay_meta` | 再接続時の truncated / complete 情報 |
 | `status` | 実行状態の変化（`started`, `completed`, `error`） |
 | `iteration` | エージェントループのイテレーション番号 |
-| `tool_start` | ツール実行開始。ツール名と入力パラメータを含む |
+| `tool_start` | ツール実行開始。ツール名と入力パラメータ、発行元assistantメッセージの永続IDを含む |
 | `tool_result` | ツール実行完了。出力と成否を含む |
 | `delta` | LLM からのストリーミングテキスト差分 |
 | `done` | 最終応答。完全なアシスタントメッセージ |
@@ -615,7 +615,7 @@ JSON-RPC 風の双方向メッセージング。
 
 WebSocket の ordinary message は `requestId` を durable request identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。`req.id` はWebSocketの1回のRPC attemptとresponse照合だけに使うため、ACK不明後のretryでは新しい `req.id` と同じ `requestId` を組み合わせる。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。複数Turnのinteractionでは個別の `done` / `error` が `terminal: false` で流れ、最後のTurnだけが `terminal: true` になる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
 
-`user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
+`user_input` event の payload は `requestId`（commitに対応する送信のclient request id。staged keyが名前空間規約に従わない場合は `null`）、`messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、`requestId` が指す楽観メッセージ（`local:{requestId}`）を確定IDへ置換する（`requestId` がない場合のみ同一runの最古バブルをFIFOで消費）。Tool Result の後に user message を表示する。
 
 #### チャットイベント受信
 
@@ -642,10 +642,10 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
-| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。`userMessageId` はそのTurnのinputメッセージID、`assistantMessageId` はfinalメッセージID（いずれも対象がない場合は `null`） |
-| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。`userMessageId` / `assistantMessageId` は `done` と同じ意味。final未永続化の失敗では `assistantMessageId` が `null` になり、クライアントは partial表示を保持する |
+| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。`userMessageId` はそのTurnのinputメッセージID、`assistantMessageId` はfinalメッセージID（いずれも対象がない場合は `null`）。IDはイベント発行時に確定済みのため、配信時の追加解決は不要で失敗しない |
+| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。`userMessageId` / `assistantMessageId` は `done` と同じ意味だが、発行Turnの行を参照するため取得はベストエフォート。final未永続化の失敗では `assistantMessageId` が `null` になり、クライアントは partial表示を保持する。行自体が存在しない場合（Turn未実行の却下など）は正当な不明として扱い、DB障害時のみエラーログを残す |
 
-クライアントは live 表示（楽観メッセージ・ドラフト）を `done` / `error` の `userMessageId` / `assistantMessageId` で確定IDへ置換し、履歴とはID一致でのみ突き合わせる。内容比較はしない（永続化時に要約・整形されるため一致しない場合がある）。報告されるのはinput/finalの stamp のみで、Tool preview・result summaryは対象外（履歴投影に現れず、Tool Cardは `call_id` で突き合わせる）。IDが `null`（Turnを持たないslash command等）の場合はlive表示を維持し、後続の履歴refetchで収束する。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のIDを解決するため、親TurnのIDが子Turnに再送されることはない。子Turn開始時の `user_input` イベントは子の確定input IDを運び、楽観メッセージを先行して置換する。
+クライアントは live 表示（楽観メッセージ・ドラフト）を `done` / `error` の `userMessageId` / `assistantMessageId` で確定IDへ置換し、履歴とはID一致でのみ突き合わせる。内容比較はしない（永続化時に要約・整形されるため一致しない場合がある）。報告されるのはinput/finalの stamp のみで、Tool preview・result summaryは対象外（履歴投影に現れず、Tool Cardは `call_id` で突き合わせる）。各 narration セグメントは `tool_start` の `assistantMessageId`（そのTool Callを発行したassistantメッセージの永続ID）で即時確定し、最終回答だけが `done` の `assistantMessageId` を採用する。`user_input` は `requestId` で送信と1対1に対応付け（`local:{requestId}` を直接消費し、同文連投を取り違えない。`requestId` がない場合のみ同一runの最古バブルをFIFOで消費）。IDが `null`（Turnを持たないslash command等）の場合はlive表示を維持し、後続の履歴refetchで収束する。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のstampを運ぶため、親TurnのIDが子Turnに再送されることはない。子Turn開始時の `user_input` イベントは子の確定input IDを運び、楽観メッセージを先行して置換する。
 
 `chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
 
@@ -704,7 +704,8 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
     "sessionKey": "main",
     "callId": "call_1",
     "name": "read",
-    "input": {"path": "a.txt"}
+    "input": {"path": "a.txt"},
+    "assistantMessageId": "uuid-of-narration"
   }
 }
 ```
@@ -727,7 +728,7 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 
 | イベント | 説明 |
 |---------|------|
-| `tool_start` | ツール実行開始。`callId`, `name`, `input` を含む |
+| `tool_start` | ツール実行開始。`callId`, `name`, `input` に加え、そのTool Callを発行したassistantメッセージの永続ID `assistantMessageId` を含む。クライアントはその時点の narration draftをこのIDへ即時確定する |
 | `tool_result` | ツール実行完了。`callId`, `name`, `isError`, `preview`, `durationMs` を含む。同じ `callId` の `tool_start` を更新する |
 
 `preview` はツール出力の先頭（最大 200 文字）。完全な出力は履歴取得時に `tool_calls` テーブルから復元される。

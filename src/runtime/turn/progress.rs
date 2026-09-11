@@ -449,6 +449,7 @@ mod tests {
             name: name.to_string(),
             input: serde_json::Value::Null,
             call_id: call_id.to_string(),
+            assistant_message_id: "parent-assistant".to_string(),
         }
     }
 
@@ -502,6 +503,8 @@ mod tests {
         tx.send(tool_start("read", "read")).unwrap();
         tx.send(AgentEvent::FinalResponse {
             turn_id: "turn-test".to_string(),
+            user_message_id: None,
+            assistant_message_id: None,
             text: "done".to_string(),
             terminal: false,
         })
@@ -646,6 +649,7 @@ mod tests {
             name: "bash".to_string(),
             input: serde_json::json!({ "command": secret_input }),
             call_id: "bash".to_string(),
+            assistant_message_id: "parent-assistant".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -903,6 +907,8 @@ mod tests {
         .unwrap();
         tx.send(AgentEvent::FinalResponse {
             turn_id: "turn-test".to_string(),
+            user_message_id: None,
+            assistant_message_id: None,
             text: "完了した結果をお伝えします".to_string(),
             terminal: false,
         })

@@ -21,6 +21,12 @@ pub(crate) enum AgentEvent {
         input: serde_json::Value,
         /// LLM-issued tool call id. Disambiguates concurrent same-name tools.
         call_id: String,
+        /// Persisted id of the assistant message that issued this tool call
+        /// (the narration segment streamed so far). Lets clients adopt the
+        /// live draft onto the persisted row immediately, so every narration
+        /// segment maps 1:1 and the terminal final id can only match the
+        /// last segment.
+        assistant_message_id: String,
     },
     /// Tool execution completed.
     ToolResult {
@@ -33,7 +39,11 @@ pub(crate) enum AgentEvent {
     },
     /// A human message accepted during the Tool phase and committed after its
     /// Tool Results. The event is emitted only after the database commit.
+    /// `request_id` links the commit to the exact client send
+    /// (`local:{request_id}`) even when several identical texts are in
+    /// flight; `None` when the staged key carries no client request id.
     UserInputInjected {
+        request_id: Option<String>,
         message_id: String,
         sender_id: String,
         text: String,
@@ -43,9 +53,17 @@ pub(crate) enum AgentEvent {
     /// interaction lifecycle for client-owned delivery. `turn_id` is the
     /// durable Turn that produced the response; one client interaction can
     /// span several Turns (staged follow-up promotion), so publishers must
-    /// resolve persisted ids through this id, not the interaction id.
+    /// route and resolve through this id, not the interaction id. The
+    /// message ids travel in the event itself (resolved authoritatively at
+    /// emission), so terminal delivery needs no further lookup.
     FinalResponse {
         turn_id: String,
+        /// Persisted id of the Turn's input message, if the Turn committed
+        /// one. Adopts the optimistic user bubble.
+        user_message_id: Option<String>,
+        /// Persisted id of the Turn's final message, if the Turn persisted
+        /// one. Adopts the sealed assistant draft.
+        assistant_message_id: Option<String>,
         text: String,
         terminal: bool,
     },

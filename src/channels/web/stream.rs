@@ -37,6 +37,8 @@ struct ToolStartPayload {
     call_id: String,
     name: String,
     input: serde_json::Value,
+    /// Persisted id of the assistant message that issued this tool call.
+    assistant_message_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +82,9 @@ struct ErrorPayload {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UserInputPayload {
+    /// Client-issued request id behind the commit, when the staged key
+    /// carries one. Lets the client consume exactly its optimistic bubble.
+    request_id: Option<String>,
     message_id: String,
     sender_id: String,
     text: String,
@@ -355,32 +360,41 @@ fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -
     )
 }
 
-/// Resolves the persisted message ids a terminal event adopts.
+/// Resolves the persisted message ids a terminal error adopts.
 ///
-/// Reads the emitting Turn's own `turn_runs` row: `input_message_id` adopts
-/// the optimistic user bubble, `final_message_id` adopts the sealed
-/// assistant draft. Tool previews and result summaries share the Turn but
-/// are intentionally excluded — the history projection hides them and Tool
-/// Cards are keyed by `call_id`, so adopting them would point live entries
-/// at rows history never shows.
+/// Reads the failed Turn's own `turn_runs` row: a committed `input_message_id`
+/// adopts the optimistic user bubble, a persisted `final_message_id` (failure
+/// after the final write) adopts the sealed assistant draft. Tool previews
+/// and result summaries are intentionally excluded — the history projection
+/// hides them and Tool Cards are keyed by `call_id`.
 ///
 /// Session resolution is unnecessary: `turn_id` is the global primary key
-/// of `turn_runs`, so the emitting Turn is found directly even after staged
-/// follow-up promotion moved the interaction onto a new Turn.
+/// of `turn_runs`, so the failed Turn is found directly even after staged
+/// follow-up promotion moved the interaction onto a new Turn. (Terminal
+/// responses carry their stamps in the event itself and need no lookup.)
 ///
-/// A missing row or a failed lookup degrades to unknown ids and is logged:
-/// the response text itself is still delivered and the transcript converges
-/// on the next history refetch.
+/// A missing row means the Turn never persisted anything to adopt — that is
+/// a legitimate unknown, reported quietly at debug level. Any other lookup
+/// failure is logged as an error: unlike a legitimate unknown, a failed
+/// lookup leaves live entries the next history refetch cannot converge by
+/// id, so it must stay operator-visible instead of silently degrading.
 async fn turn_persisted_ids(db: &Arc<Database>, turn_id: &str) -> (Option<String>, Option<String>) {
     let db = Arc::clone(db);
     let owned_turn_id = turn_id.to_string();
     match call_blocking(db, move |db| db.get_turn_run(&owned_turn_id)).await {
         Ok(run) => (run.input_message_id, run.final_message_id),
+        Err(crate::error::StorageError::NotFound(_)) => {
+            tracing::debug!(
+                turn_id = %turn_id,
+                "terminal web error references a turn without persisted state"
+            );
+            (None, None)
+        }
         Err(error) => {
             tracing::error!(
                 %error,
                 turn_id = %turn_id,
-                "terminal web event cannot resolve persisted message ids"
+                "terminal web error cannot resolve persisted message ids"
             );
             (None, None)
         }
@@ -415,6 +429,7 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
             call_id,
             name,
             input,
+            assistant_message_id,
         } => {
             run_hub
                 .publish(
@@ -424,6 +439,7 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                         call_id,
                         name,
                         input,
+                        assistant_message_id,
                     })
                     .unwrap_or_default(),
                 )
@@ -452,6 +468,7 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 .await;
         }
         AgentEvent::UserInputInjected {
+            request_id,
             message_id,
             sender_id,
             text,
@@ -462,6 +479,7 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                     run_id,
                     "user_input",
                     serde_json::to_string(&UserInputPayload {
+                        request_id,
                         message_id,
                         sender_id,
                         text,
@@ -472,12 +490,15 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 .await;
         }
         AgentEvent::FinalResponse {
-            turn_id,
+            turn_id: _,
+            user_message_id,
+            assistant_message_id,
             text,
             terminal,
         } => {
-            let (user_message_id, assistant_message_id) =
-                turn_persisted_ids(&state.app_state.db, &turn_id).await;
+            // Stamps arrive authoritatively in the event (resolved at
+            // emission from the persisted row or the just-written message),
+            // so delivery performs no lookup and cannot fail it.
             run_hub
                 .publish_agent_response(
                     run_id,
@@ -1075,12 +1096,14 @@ mod tests {
             call_id: "call_1".to_string(),
             name: "read".to_string(),
             input: serde_json::json!({"path": "a.txt"}),
+            assistant_message_id: "assistant-1".to_string(),
         })
         .unwrap();
         let tool_start_parsed: serde_json::Value = serde_json::from_str(&tool_start_json).unwrap();
         assert_eq!(tool_start_parsed["callId"], "call_1");
         assert_eq!(tool_start_parsed["name"], "read");
         assert_eq!(tool_start_parsed["input"]["path"], "a.txt");
+        assert_eq!(tool_start_parsed["assistantMessageId"], "assistant-1");
 
         let tool_result_json = serde_json::to_string(&ToolResultPayload {
             call_id: "call_1".to_string(),
@@ -1137,13 +1160,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_response_publish_carries_only_input_and_final_ids() {
+    async fn final_response_forwards_event_carried_stamps_without_lookup() {
         use super::AgentEvent;
 
         // Arrange: a tool turn whose persisted rows include the call preview
-        // and the result summary alongside input and final. Only the stamped
-        // input/final ids may reach the client: the previews never appear in
-        // history, so adopting them would strand live entries.
+        // and the result summary alongside input and final. The event already
+        // carries the authoritative stamps, so delivery consults neither the
+        // messages table nor turn_runs.
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state_with_agents(&dir);
         let chat_id = web_state
@@ -1181,13 +1204,37 @@ mod tests {
             "tool-run",
             AgentEvent::FinalResponse {
                 turn_id: turn_id.clone(),
+                user_message_id: Some(input_id.clone()),
+                assistant_message_id: Some(final_id.clone()),
+                text: "done".to_string(),
+                terminal: true,
+            },
+        )
+        .await;
+        // A done for a turn with no database state at all still delivers:
+        // terminal responses never depend on a lookup.
+        web_state
+            .run_hub
+            .create(
+                "unknown-run",
+                "actor".to_string(),
+                format!("chat:{chat_id}"),
+            )
+            .await;
+        publish_agent_event(
+            &web_state,
+            "unknown-run",
+            AgentEvent::FinalResponse {
+                turn_id: "no-such-turn".to_string(),
+                user_message_id: Some("orphan-input".to_string()),
+                assistant_message_id: None,
                 text: "done".to_string(),
                 terminal: true,
             },
         )
         .await;
 
-        // Assert: previews excluded by construction, stamps adopted exactly.
+        // Assert: stamps forwarded exactly, previews excluded by construction.
         let (_rx, replay, _, _, _, _) = web_state
             .run_hub
             .subscribe_with_replay("tool-run", None, "actor", false)
@@ -1200,15 +1247,28 @@ mod tests {
         let data: serde_json::Value = serde_json::from_str(&done.data).expect("json");
         assert_eq!(data["user_message_id"], serde_json::json!(input_id));
         assert_eq!(data["assistant_message_id"], serde_json::json!(final_id));
+        let (_rx, replay, _, _, _, _) = web_state
+            .run_hub
+            .subscribe_with_replay("unknown-run", None, "actor", false)
+            .await
+            .expect("subscribe");
+        let done = replay
+            .iter()
+            .find(|event| event.event == "done")
+            .expect("done event");
+        let data: serde_json::Value = serde_json::from_str(&done.data).expect("json");
+        assert_eq!(data["user_message_id"], serde_json::json!("orphan-input"));
+        assert!(data["assistant_message_id"].is_null());
     }
 
     #[tokio::test]
-    async fn staged_follow_up_done_resolves_the_child_turn_not_the_parent() {
+    async fn staged_follow_up_done_carries_the_child_turn_stamps() {
         use super::AgentEvent;
 
         // Arrange: parent turn A finished, child turn B was promoted for the
-        // follow-up. Both dones travel the same web run; each must resolve
-        // its own Turn's stamps.
+        // follow-up. Both dones travel the same web run; each event carries
+        // its own Turn's stamps, so the parent's ids can never leak into the
+        // child's delivery.
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state_with_agents(&dir);
         let chat_id = web_state
@@ -1233,6 +1293,8 @@ mod tests {
             "shared-run",
             AgentEvent::FinalResponse {
                 turn_id: child_id.clone(),
+                user_message_id: Some(child_input.clone()),
+                assistant_message_id: Some(child_final.clone()),
                 text: "continued".to_string(),
                 terminal: true,
             },

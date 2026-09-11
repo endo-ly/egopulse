@@ -60,6 +60,8 @@ describe("chatReducer", () => {
         role: "assistant",
         content: [{ type: "text", text: "Hello world" }],
       },
+      userMessageId: null,
+      assistantMessageId: null,
     };
     state = reduceChatEvent(state, done, "lyre");
 
@@ -80,6 +82,8 @@ describe("chatReducer", () => {
       seq: 1,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "final" }] },
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert
@@ -133,6 +137,8 @@ describe("chatReducer", () => {
       sessionKey: "main",
       seq: 1,
       state: "done",
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert: no empty bubble lingers.
@@ -151,6 +157,8 @@ describe("chatReducer", () => {
       seq: 1,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "Final" }] },
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert
@@ -175,6 +183,8 @@ describe("chatReducer", () => {
       state: "error",
       terminal: true,
       errorMessage: "boom",
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert
@@ -202,6 +212,8 @@ describe("chatReducer", () => {
       state: "error",
       terminal: true,
       errorMessage: "boom",
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert: the partial text is kept but sealed, so the streaming cursor
@@ -218,9 +230,11 @@ describe("chatReducer", () => {
     let state = initialChatState();
 
     state = reduceToolStart(state, {
+      runId: "run-1",
       callId: "call-1",
       name: "read",
       input: { path: "a.txt" },
+      assistantMessageId: "preview-1",
     });
     const pending = state.messages.find((m) => m.id === "tool:call-1");
     expect(pending?.sender_kind).toBe("tool");
@@ -250,9 +264,11 @@ describe("chatReducer", () => {
   it("user_input_events_append_the_committed_follow_up_once", () => {
     let state = initialChatState();
     state = reduceToolStart(state, {
+      runId: "run-1",
       callId: "call-1",
       name: "read",
       input: { path: "a.txt" },
+      assistantMessageId: "preview-1",
     });
     state = reduceToolResult(state, {
       callId: "call-1",
@@ -263,6 +279,8 @@ describe("chatReducer", () => {
     });
 
     const payload = {
+      runId: "run-1",
+      requestId: null,
       messageId: "web:follow-up",
       senderId: "web-user",
       text: "follow-up",
@@ -295,6 +313,8 @@ describe("chatReducer", () => {
 
     // Act: the server echo supersedes the optimistic copy.
     state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-1",
       messageId: "web:msg-1",
       senderId: "web-user",
       text: "hi",
@@ -310,6 +330,8 @@ describe("chatReducer", () => {
     // Arrange: an older identical message is already displayed.
     let state = initialChatState();
     state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: null,
       messageId: "web:old",
       senderId: "web-user",
       text: "hi",
@@ -319,6 +341,8 @@ describe("chatReducer", () => {
     // Act: echo for the older message must not consume the fresh local.
     state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "hi" });
     state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: null,
       messageId: "web:old",
       senderId: "web-user",
       text: "hi",
@@ -351,6 +375,8 @@ describe("chatReducer", () => {
       seq: 2,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert: both stay; the merge drops them once fresh history lands.
@@ -361,8 +387,9 @@ describe("chatReducer", () => {
   });
 
   it("done_adopts_only_input_and_final_ids_around_tool_use", () => {
-    // Arrange: a tool turn. The live transcript holds the optimistic user
-    // bubble, the tool card and the streaming draft.
+    // Arrange: a tool turn with a follow-up injected mid-run. The live
+    // transcript holds the optimistic user bubble, the streaming narration,
+    // the tool card, the follow-up bubble and the final draft.
     let state = initialChatState();
     state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "read the note" });
     state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
@@ -371,13 +398,21 @@ describe("chatReducer", () => {
       sessionKey: "main",
       seq: 1,
       state: "delta",
-      message: { role: "assistant", content: [{ type: "text", text: "checking" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "確認します" }] },
     }, "lyre");
+    // The tool phase persists the narration first: the draft adopts the
+    // issuing assistant message id immediately, so later segments cannot
+    // steal the final id.
     state = reduceToolStart(state, {
+      runId: "run-1",
       callId: "call-1",
       name: "read",
       input: { path: "note.txt" },
+      assistantMessageId: "preview-1",
     });
+    expect(state.messages.find((m) => m.id === "preview-1")?.content).toBe(
+      "確認します",
+    );
     state = reduceToolResult(state, {
       callId: "call-1",
       name: "read",
@@ -385,40 +420,47 @@ describe("chatReducer", () => {
       preview: "file contents",
       durationMs: 10,
     });
+    state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "これも見て" });
+    state = reduceTagLocalRun(state, { requestId: "req-2", runId: "run-1" });
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-2",
+      messageId: "web:followup-1",
+      senderId: "web-user",
+      text: "これも見て",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
     state = reduceChatEvent(state, {
       runId: "run-1",
       sessionKey: "main",
       seq: 4,
       state: "delta",
-      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "確認できました" }] },
     }, "lyre");
 
-    // Act: done reports ONLY the turn's input/final stamps. Tool previews
-    // and result summaries share the turn in storage but never appear in
-    // history, so adopting them would strand live entries.
+    // Act: done reports ONLY the turn's input/final stamps.
     state = reduceChatEvent(state, {
       runId: "run-1",
       sessionKey: "main",
       seq: 5,
       state: "done",
-      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "確認できました" }] },
       userMessageId: "turn:run-1:input",
       assistantMessageId: "turn:run-1:final",
     }, "lyre");
 
-    // Assert: user bubble and draft carry persisted ids, tool card untouched,
-    // no live leftovers.
-    const ids = state.messages.map((m) => m.id);
-    expect(ids).toContain("turn:run-1:input");
-    expect(ids).toContain("turn:run-1:final");
-    expect(ids).toContain("tool:call-1");
-    expect(ids.some((id) => id.startsWith("draft:") || id.startsWith("local:"))).toBe(
-      false,
-    );
+    // Assert: every live entry carries a persisted id; the final id sits on
+    // the last segment, never on the earlier narration.
+    expect(state.messages.map((m) => m.id)).toEqual([
+      "turn:run-1:input",
+      "preview-1",
+      "tool:call-1",
+      "web:followup-1",
+      "turn:run-1:final",
+    ]);
 
-    // Assert: merging with the persisted history converges exactly. Bare
-    // previews are excluded from history while a narrated one is kept; the
-    // adopted live entries drop by id instead of duplicating.
+    // Assert: merging with the persisted history converges exactly — the
+    // final answer appears once, not twice.
     const history: ChatMessage[] = [
       {
         id: "turn:run-1:input",
@@ -429,10 +471,10 @@ describe("chatReducer", () => {
         message_kind: "message",
       },
       {
-        id: "narrated-preview",
+        id: "preview-1",
         sender_id: "lyre",
         sender_kind: "assistant",
-        content: "読みますね [tool_call] read",
+        content: "確認します [tool_call] read",
         timestamp: "2026-09-10T15:00:01Z",
         message_kind: "message",
       },
@@ -445,18 +487,27 @@ describe("chatReducer", () => {
         message_kind: "tool_call",
       },
       {
+        id: "web:followup-1",
+        sender_id: "web-user",
+        sender_kind: "user",
+        content: "これも見て",
+        timestamp: "2026-09-10T15:00:03Z",
+        message_kind: "message",
+      },
+      {
         id: "turn:run-1:final",
         sender_id: "lyre",
         sender_kind: "assistant",
-        content: "done",
-        timestamp: "2026-09-10T15:00:03Z",
+        content: "確認できました",
+        timestamp: "2026-09-10T15:00:04Z",
         message_kind: "message",
       },
     ];
     expect(mergeChatMessages(history, state.messages).map((m) => m.id)).toEqual([
       "turn:run-1:input",
-      "narrated-preview",
+      "preview-1",
       "tool:call-1",
+      "web:followup-1",
       "turn:run-1:final",
     ]);
   });
@@ -482,6 +533,192 @@ describe("chatReducer", () => {
       "draft:run-1:done",
       "local:req-1",
     ]);
+  });
+
+  it("tool_start_adopts_the_streaming_narration_immediately", () => {
+    // Arrange: narration streamed, then the tool phase persists it.
+    let state = initialChatState();
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "checking" }] },
+    }, "lyre");
+
+    // Act: the first tool call adopts the draft onto the persisted preview.
+    state = reduceToolStart(state, {
+      runId: "run-1",
+      callId: "call-1",
+      name: "read",
+      input: { path: "a.txt" },
+      assistantMessageId: "preview-1",
+    });
+
+    // Assert: the narration converged; post-tool deltas start a fresh draft.
+    expect(state.messages.find((m) => m.id === "preview-1")?.content).toBe(
+      "checking",
+    );
+
+    // Act: a concurrent second call in the same phase finds no live draft
+    // (no deltas streamed between the two calls), so nothing is adopted.
+    state = reduceToolStart(state, {
+      runId: "run-1",
+      callId: "call-2",
+      name: "read",
+      input: { path: "b.txt" },
+      assistantMessageId: "preview-1",
+    });
+
+    // Assert: no duplicate adoption, both cards present.
+    expect(state.messages.filter((m) => m.id === "preview-1")).toHaveLength(1);
+    expect(state.messages.map((m) => m.id)).toContain("tool:call-2");
+
+    // Act: the next phase streams new narration and persists it under a new
+    // id; the fresh draft adopts exactly that id.
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 3,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "phase2" }] },
+    }, "lyre");
+    state = reduceToolStart(state, {
+      runId: "run-1",
+      callId: "call-3",
+      name: "read",
+      input: { path: "c.txt" },
+      assistantMessageId: "preview-2",
+    });
+
+    // Assert
+    expect(state.messages.find((m) => m.id === "preview-2")?.content).toBe(
+      "phase2",
+    );
+    expect(state.messages.find((m) => m.id === "draft:run-1")).toBeUndefined();
+  });
+
+  it("user_input_links_commits_to_sends_by_request_id", () => {
+    // Arrange: two identical follow-ups sent while the tool phase runs.
+    // Content alone cannot tell them apart; the linked request id can, even
+    // when commits arrive out of send order.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "確認して" });
+    state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
+    state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "確認して" });
+    state = reduceTagLocalRun(state, { requestId: "req-2", runId: "run-1" });
+
+    // Act: the second commit arrives first; exact linkage still claims the
+    // right bubble and leaves the earlier send untouched.
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-2",
+      messageId: "web:second",
+      senderId: "web-user",
+      text: "確認して",
+      timestamp: "2026-09-10T15:00:02Z",
+    });
+    expect(state.messages.map((m) => m.id)).toEqual(["local:req-1", "web:second"]);
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-1",
+      messageId: "web:first",
+      senderId: "web-user",
+      text: "確認して",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
+
+    // Assert: each commit claimed exactly its own bubble.
+    expect(state.messages.map((m) => m.id)).toEqual(["web:second", "web:first"]);
+  });
+
+  it("user_input_without_link_falls_back_to_run_fifo", () => {
+    // Arrange: two identical bubbles, commits without request linkage.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "確認して" });
+    state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
+    state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "確認して" });
+    state = reduceTagLocalRun(state, { requestId: "req-2", runId: "run-1" });
+
+    // Act
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: null,
+      messageId: "web:first",
+      senderId: "web-user",
+      text: "確認して",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
+
+    // Assert: send order decides.
+    expect(state.messages.map((m) => m.id)).toEqual(["local:req-2", "web:first"]);
+  });
+
+  it("user_input_never_consumes_another_run_bubble", () => {
+    // Arrange: a bubble tagged with a newer run while an older run's commit
+    // arrives late.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-9", text: "later" });
+    state = reduceTagLocalRun(state, { requestId: "req-9", runId: "run-9" });
+
+    // Act
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "other-req",
+      messageId: "web:stale",
+      senderId: "web-user",
+      text: "unrelated",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
+
+    // Assert: the foreign bubble survives; the commit is appended.
+    expect(state.messages.map((m) => m.id)).toEqual(["local:req-9", "web:stale"]);
+  });
+
+  it("assistant_adoption_prefers_the_last_sealed_segment", () => {
+    // Arrange: two sealed segments with no recorded ids (e.g. tool events
+    // missed). Only the trailing one can be the final answer.
+    let state = initialChatState();
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "old" }] },
+    }, "lyre");
+    state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: null,
+      messageId: "web:follow-up",
+      senderId: "web-user",
+      text: "go on",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "new" }] },
+    }, "lyre");
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 3,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "new" }] },
+      userMessageId: null,
+      assistantMessageId: "turn:run-1:final",
+    }, "lyre");
+
+    // Assert: the final id sits on the last segment; the earlier one stays
+    // sealed instead of stealing it.
+    const ids = state.messages.map((m) => m.id);
+    expect(ids).toContain("turn:run-1:final");
+    expect(ids.filter((id) => id.includes(":done"))).toHaveLength(1);
+    expect(
+      state.messages.find((m) => m.id === "turn:run-1:final")?.content,
+    ).toBe("new");
   });
 
   it("terminal_error_with_user_id_only_keeps_the_partial_answer", () => {
@@ -573,6 +810,8 @@ describe("chatReducer", () => {
     state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "follow-up" });
     state = reduceTagLocalRun(state, { requestId: "req-2", runId: "run-1" });
     state = reduceUserInput(state, {
+      runId: "run-1",
+      requestId: "req-2",
       messageId: "turn:turn-b:input",
       senderId: "web-user",
       text: "follow-up",
@@ -625,9 +864,11 @@ describe("chatReducer", () => {
       message: { role: "assistant", content: [{ type: "text", text: "before" }] },
     }, "lyre");
     state = reduceToolStart(state, {
+      runId: "run-segments",
       callId: "call-segments",
       name: "read",
       input: { path: "config" },
+      assistantMessageId: "preview-seg",
     });
     state = reduceToolResult(state, {
       callId: "call-segments",
@@ -638,6 +879,8 @@ describe("chatReducer", () => {
     });
 
     state = reduceUserInput(state, {
+      runId: "run-segments",
+      requestId: null,
       messageId: "web:segment-follow-up",
       senderId: "web-user",
       text: "also check config",
@@ -656,6 +899,8 @@ describe("chatReducer", () => {
       seq: 3,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "after" }] },
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     expect(state.messages.map((message) => message.content)).toEqual([

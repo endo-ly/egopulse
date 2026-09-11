@@ -205,6 +205,10 @@ async fn promote_terminal_staged_messages(
                         state.turn_observers.queue_initial_event(
                             message.id.clone(),
                             crate::agent_loop::event::AgentEvent::UserInputInjected {
+                                request_id: crate::runtime::turn::client_request_id(
+                                    &turn.context.channel,
+                                    &message.id,
+                                ),
                                 message_id: predicted_input_id,
                                 sender_id: message.sender_id.clone(),
                                 text: message.content.clone(),
@@ -1324,8 +1328,8 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum DeliveredEvent {
-        Input(String, String),
-        Response(String, bool, String),
+        Input(String, String, Option<String>),
+        Response(String, bool, String, Option<String>, Option<String>),
         Error(String, bool, String),
     }
 
@@ -1410,7 +1414,7 @@ mod tests {
                 )?;
                 db.stage_tool_followup(
                     chat_id,
-                    "staged-follow-up-1",
+                    "cli:staged-follow-up-1",
                     "staged-follow-up-hash-1",
                     "user-b",
                     "recovered follow-up 1",
@@ -1418,7 +1422,7 @@ mod tests {
                 )?;
                 db.stage_tool_followup(
                     chat_id,
-                    "staged-follow-up-2",
+                    "cli:staged-follow-up-2",
                     "staged-follow-up-hash-2",
                     "user-c",
                     "recovered follow-up 2",
@@ -1455,19 +1459,28 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             match event {
                 crate::agent_loop::event::AgentEvent::UserInputInjected {
+                    request_id,
                     message_id,
                     text,
                     ..
                 } => {
-                    delivered.push(DeliveredEvent::Input(message_id, text));
+                    delivered.push(DeliveredEvent::Input(message_id, text, request_id));
                 }
                 crate::agent_loop::event::AgentEvent::FinalResponse {
                     text,
                     terminal,
                     turn_id,
+                    user_message_id,
+                    assistant_message_id,
                     ..
                 } => {
-                    delivered.push(DeliveredEvent::Response(text, terminal, turn_id));
+                    delivered.push(DeliveredEvent::Response(
+                        text,
+                        terminal,
+                        turn_id,
+                        user_message_id,
+                        assistant_message_id,
+                    ));
                 }
                 crate::agent_loop::event::AgentEvent::Error {
                     message,
@@ -1485,7 +1498,7 @@ mod tests {
             2,
             "first_succeeds={first_succeeds}, second_succeeds={second_succeeds}, events={delivered:?}"
         );
-        let child_ids = ["staged-follow-up-1", "staged-follow-up-2"]
+        let child_ids = ["cli:staged-follow-up-1", "cli:staged-follow-up-2"]
             .iter()
             .map(|request_key| {
                 state
@@ -2529,17 +2542,40 @@ mod tests {
             let second_input = crate::agent_loop::turn::turn_input_message_id(&child_ids[1]);
             assert_eq!(
                 events[0],
-                DeliveredEvent::Input(first_input, "recovered follow-up 1".to_string())
+                DeliveredEvent::Input(
+                    first_input,
+                    "recovered follow-up 1".to_string(),
+                    Some("staged-follow-up-1".to_string()),
+                )
             );
             assert_eq!(
                 events[2],
-                DeliveredEvent::Input(second_input, "recovered follow-up 2".to_string())
+                DeliveredEvent::Input(
+                    second_input,
+                    "recovered follow-up 2".to_string(),
+                    Some("staged-follow-up-2".to_string()),
+                )
             );
             match (first_succeeds, &events[1]) {
-                (true, DeliveredEvent::Response(text, terminal, turn_id)) => {
+                (
+                    true,
+                    DeliveredEvent::Response(text, terminal, turn_id, user_id, assistant_id),
+                ) => {
                     assert_eq!(text, "ok");
                     assert!(!terminal, "the first child must not end the interaction");
                     assert_eq!(turn_id, &child_ids[0]);
+                    // The child reports its own stamps in the event: the
+                    // publisher never re-resolves them.
+                    assert_eq!(
+                        user_id.as_deref(),
+                        Some(
+                            crate::agent_loop::turn::turn_input_message_id(&child_ids[0]).as_str()
+                        )
+                    );
+                    assert_eq!(
+                        assistant_id.as_deref(),
+                        Some(format!("turn:{}:final", child_ids[0]).as_str())
+                    );
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
                     assert!(message.contains("follow-up 0 failed"));
@@ -2554,10 +2590,23 @@ mod tests {
                 }
             }
             match (second_succeeds, &events[3]) {
-                (true, DeliveredEvent::Response(text, terminal, turn_id)) => {
+                (
+                    true,
+                    DeliveredEvent::Response(text, terminal, turn_id, user_id, assistant_id),
+                ) => {
                     assert_eq!(text, "ok");
                     assert!(terminal, "the last child must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
+                    assert_eq!(
+                        user_id.as_deref(),
+                        Some(
+                            crate::agent_loop::turn::turn_input_message_id(&child_ids[1]).as_str()
+                        )
+                    );
+                    assert_eq!(
+                        assistant_id.as_deref(),
+                        Some(format!("turn:{}:final", child_ids[1]).as_str())
+                    );
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
                     assert!(message.contains("follow-up 1 failed"));

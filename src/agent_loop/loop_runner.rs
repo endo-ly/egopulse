@@ -293,6 +293,7 @@ impl<'a> AgentLoop<'a> {
         tool_calls: Vec<ToolCall>,
     ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
         let start_emitter = self.on_event.clone();
+        let parent_message_id = assistant_message_id.to_string();
         let result_emitter = self.on_event.clone();
         let hooks = ToolExecutionHooks {
             on_start: Some(Arc::new(move |tool_call: &ToolCall| {
@@ -300,6 +301,7 @@ impl<'a> AgentLoop<'a> {
                     call_id: tool_call.id.clone(),
                     name: tool_call.name.clone(),
                     input: tool_call.arguments.clone(),
+                    assistant_message_id: parent_message_id.clone(),
                 });
             })),
             on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {

@@ -382,6 +382,7 @@ fn map_agent_event(event: AgentEvent) -> TurnEvent {
             name,
             input,
             call_id,
+            ..
         } => TurnEvent::ToolStart {
             name,
             input,
@@ -401,11 +402,13 @@ fn map_agent_event(event: AgentEvent) -> TurnEvent {
             call_id,
         },
         AgentEvent::UserInputInjected {
+            request_id,
             message_id,
             sender_id,
             text,
             timestamp,
         } => TurnEvent::UserInputInjected {
+            request_id,
             message_id,
             sender_id,
             text,

@@ -161,6 +161,13 @@ impl<'a> TurnPersistence<'a> {
 
         on_event.emit(AgentEvent::FinalResponse {
             turn_id: self.turn_id.clone(),
+            // Both ids are authoritative here: the input row was committed
+            // with the deterministic helper id before the loop ran, and the
+            // final row was just persisted above under `final_message_id`.
+            user_message_id: Some(crate::agent_loop::turn::turn_input_message_id(
+                &self.turn_id,
+            )),
+            assistant_message_id: Some(final_message_id.to_string()),
             text: final_content.clone(),
             terminal: false,
         });
@@ -310,6 +317,10 @@ impl<'a> TurnPersistence<'a> {
                 Ok(committed) => {
                     for message in &committed.messages {
                         on_event.emit(AgentEvent::UserInputInjected {
+                            request_id: crate::runtime::turn::client_request_id(
+                                &self.context.channel,
+                                &message.id,
+                            ),
                             message_id: message.id.clone(),
                             sender_id: message.sender_id.clone(),
                             text: message.content.clone(),

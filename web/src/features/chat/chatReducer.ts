@@ -1,31 +1,35 @@
 import type { ChatMessage } from "../../shared/api/types";
 
-export interface ChatEventPayload {
+interface ChatEventBase {
   runId: string;
   sessionKey: string;
   seq: number;
-  state: "delta" | "done" | "error";
   terminal?: boolean;
   message?: {
     role: string;
     content: Array<{ type: string; text: string }>;
   };
   errorMessage?: string;
-  /**
-   * Persisted id of the emitting Turn's input message. Present on terminal
-   * events; adopts the oldest optimistic user bubble of this run. `null`
-   * when the run has no Turn (slash commands) or the lookup failed: live
-   * entries are kept and history converges on refetch.
-   */
-  userMessageId?: string | null;
-  /**
-   * Persisted id of the emitting Turn's final message. Present on terminal
-   * events; adopts this run's sealed assistant draft. `null` when the Turn
-   * produced no final message: a sealed partial draft is kept as-is, never
-   * dropped.
-   */
-  assistantMessageId?: string | null;
 }
+
+export type ChatEventPayload =
+  | (ChatEventBase & { state: "delta" })
+  | (ChatEventBase & {
+      state: "done" | "error";
+      /**
+       * Persisted id of the emitting Turn's input message. Adopts the
+       * oldest optimistic user bubble of this run. `null` when the run has
+       * no Turn (slash commands): live entries are kept and history
+       * converges on refetch.
+       */
+      userMessageId: string | null;
+      /**
+       * Persisted id of the emitting Turn's final message. Adopts this
+       * run's sealed assistant draft. `null` when the Turn produced no
+       * final message: a sealed partial draft is kept as-is, never dropped.
+       */
+      assistantMessageId: string | null;
+    });
 
 export interface ChatState {
   messages: ChatMessage[];
@@ -121,6 +125,10 @@ export function reduceAdoptUserMessage(
  * draft, so the history merge drops it by id. Tool previews and result
  * summaries are never adopted: the server only reports the final id.
  * A `null` id keeps the sealed partial draft untouched.
+ *
+ * When several sealed segments exist, the last one wins: earlier segments
+ * were adopted at their ToolStart, so the trailing sealed entry is the
+ * true final answer.
  */
 export function reduceAdoptAssistantMessage(
   state: ChatState,
@@ -128,12 +136,17 @@ export function reduceAdoptAssistantMessage(
 ): ChatState {
   const adopted = ids.assistantMessageId;
   if (adopted === null) return state;
-  const index = state.messages.findIndex(
-    (message) =>
-      (message.id === `draft:${ids.runId}` ||
-        message.id.startsWith(`draft:${ids.runId}:`)) &&
-      message.id.includes(":done"),
-  );
+  const draftId = `draft:${ids.runId}`;
+  let index = -1;
+  for (let current = 0; current < state.messages.length; current++) {
+    const id = state.messages[current].id;
+    if (
+      (id === draftId || id.startsWith(`${draftId}:`)) &&
+      id.includes(":done")
+    ) {
+      index = current;
+    }
+  }
   if (index < 0) return state;
   return {
     ...state,
@@ -351,9 +364,16 @@ export function parseStatusEvent(payload: StatusEventPayload): string | null {
 }
 
 export interface ToolStartPayload {
+  runId: string;
   callId: string;
   name: string;
   input?: unknown;
+  /**
+   * Persisted id of the assistant message that issued this tool call (the
+   * narration segment streamed so far). Injected by the gateway alongside
+   * `runId`.
+   */
+  assistantMessageId: string;
 }
 
 export interface ToolResultPayload {
@@ -365,6 +385,14 @@ export interface ToolResultPayload {
 }
 
 export interface UserInputPayload {
+  runId: string;
+  /**
+   * Client-issued request id behind the commit, when the staged key carries
+   * one. Identifies the exact optimistic bubble (`local:{requestId}`) even
+   * when several identical texts are in flight. `null` falls back to
+   * run-scoped FIFO.
+   */
+  requestId: string | null;
   messageId: string;
   senderId: string;
   text: string;
@@ -379,14 +407,27 @@ export function reduceUserInput(
     return state;
   }
 
-  // The server echo supersedes one optimistic message with the same text.
+  // The committed follow-up supersedes exactly one optimistic bubble. A
+  // linked request id matches by identity, so identical texts can never
+  // consume each other and arrival order does not matter. Unlinked commits
+  // fall back to the oldest bubble of this run: the server commits
+  // follow-ups in send order. Bubbles from other runs never qualify.
+  const requestId = payload.requestId ?? null;
   let withoutLocal = state.messages;
-  const localIndex = withoutLocal.findIndex(
-    (message) =>
-      message.sender_kind === "user" &&
-      message.content === payload.text &&
-      message.id.startsWith("local:"),
-  );
+  const exactIndex =
+    requestId === null
+      ? -1
+      : withoutLocal.findIndex(
+          (message) => message.id === `local:${requestId}`,
+        );
+  const localIndex =
+    exactIndex >= 0
+      ? exactIndex
+      : withoutLocal.findIndex(
+          (message) =>
+            message.id.startsWith("local:") &&
+            (message.runId === undefined || message.runId === payload.runId),
+        );
   if (localIndex >= 0) {
     withoutLocal = [
       ...withoutLocal.slice(0, localIndex),
@@ -462,6 +503,39 @@ export function reduceToolStart(
   state: ChatState,
   payload: ToolStartPayload,
 ): ChatState {
+  // The narration streamed so far is now persisted under the issuing
+  // assistant message id: adopt it onto the newest unadopted assistant
+  // entry (the streaming draft, else the latest sealed segment) so every
+  // narration segment maps 1:1 and later deltas start a fresh draft.
+  const draftId = `draft:${payload.runId}`;
+  let messages = state.messages;
+  const parentId =
+    typeof payload.assistantMessageId === "string"
+      ? payload.assistantMessageId
+      : null;
+  if (parentId !== null) {
+    const streamingIndex = messages.findIndex(
+      (message) => message.id === draftId,
+    );
+    if (streamingIndex >= 0) {
+      messages = messages.map((message, current) =>
+        current === streamingIndex ? { ...message, id: parentId } : message,
+      );
+    } else {
+      for (let current = messages.length - 1; current >= 0; current--) {
+        const id = messages[current].id;
+        if (
+          (id === draftId || id.startsWith(`${draftId}:`)) &&
+          id.includes(":done")
+        ) {
+          messages = messages.map((message, index) =>
+            index === current ? { ...message, id: parentId } : message,
+          );
+          break;
+        }
+      }
+    }
+  }
   const message: ChatMessage = {
     id: toolMessageId(payload.callId),
     sender_id: "assistant",
@@ -474,7 +548,7 @@ export function reduceToolStart(
     timestamp: new Date().toISOString(),
     message_kind: "tool_call",
   };
-  return { ...state, messages: upsertToolMessage(state.messages, message) };
+  return { ...state, messages: upsertToolMessage(messages, message) };
 }
 
 export function reduceToolResult(
