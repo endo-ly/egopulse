@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { renderHook, act } from "@testing-library/react";
+import type { ChatMessage } from "../../../shared/api/types";
 import {
+  mergeChatMessages,
   reduceChatEvent,
   initialChatState,
   reduceOptimisticUserMessage,
   reduceRunAccepted,
+  reduceTagLocalRun,
   reduceToolStart,
   reduceToolResult,
   reduceUserInput,
@@ -357,6 +360,61 @@ describe("chatReducer", () => {
     ]);
   });
 
+  it("done_adopts_reported_ids_for_run_entries", () => {
+    // Arrange: optimistic local tagged at ack, streaming draft, then done
+    // reports the persisted ids (reworded preview included).
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "hi" });
+    state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "Reading notes" }] },
+    }, "lyre");
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "all done" }] },
+      userMessageIds: ["turn:run-1:input"],
+      assistantMessageIds: ["turn:run-1:preview", "turn:run-1:final"],
+    }, "lyre");
+
+    // Assert: live entries carry persisted ids, so the merge drops them.
+    const ids = state.messages.map((m) => m.id);
+    expect(ids).toContain("turn:run-1:input");
+    expect(ids).toContain("turn:run-1:preview");
+    expect(ids.some((id) => id.startsWith("draft:") || id.startsWith("local:"))).toBe(
+      false,
+    );
+  });
+
+  it("done_without_ids_keeps_live_entries", () => {
+    // Arrange: legacy server or slash command reports no persisted ids.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "hi" });
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
+    }, "lyre");
+
+    // Assert
+    expect(state.messages.map((m) => m.id).sort()).toEqual([
+      "draft:run-1:done",
+      "local:req-1",
+    ]);
+  });
+
   it("separates_assistant_stream_segments_around_injected_user_input", () => {
     let state = initialChatState();
     state = reduceChatEvent(state, {
@@ -468,5 +526,57 @@ describe("useServerState cache", () => {
     });
 
     unmount();
+  });
+});
+
+describe("mergeChatMessages", () => {
+  function msg(overrides: Partial<ChatMessage>): ChatMessage {
+    return {
+      id: "db-1",
+      sender_id: "lyre",
+      sender_kind: "assistant",
+      content: "hello",
+      timestamp: "2026-01-01T12:00:00Z",
+      message_kind: "message",
+      ...overrides,
+    };
+  }
+
+  it("returns_history_unchanged_without_live_messages", () => {
+    const history = [msg({})];
+    expect(mergeChatMessages(history, [])).toEqual(history);
+  });
+
+  it("drops_live_entries_with_persisted_ids", () => {
+    // Arrange: adopted locals, echoes and tool cards share history ids.
+    const history = [
+      msg({ id: "turn:t1:input", sender_kind: "user", content: "hi" }),
+      msg({ id: "tool:call-1", message_kind: "tool_call", content: "{}" }),
+    ];
+    const live = [
+      msg({ id: "turn:t1:input", sender_kind: "user", content: "hi" }),
+      msg({ id: "tool:call-1", message_kind: "tool_call", content: "{}" }),
+    ];
+
+    // Act
+    const merged = mergeChatMessages(history, live);
+
+    // Assert
+    expect(merged.map((m) => m.id)).toEqual(["turn:t1:input", "tool:call-1"]);
+  });
+
+  it("keeps_streaming_drafts_and_unknown_entries", () => {
+    // Arrange
+    const history = [msg({ id: "db-1", content: "old" })];
+    const live = [
+      msg({ id: "draft:run-2", content: "old and more" }),
+      msg({ id: "web:echo-1", sender_kind: "user", content: "hi" }),
+    ];
+
+    // Act
+    const merged = mergeChatMessages(history, live);
+
+    // Assert
+    expect(merged.map((m) => m.id)).toEqual(["db-1", "draft:run-2", "web:echo-1"]);
   });
 });

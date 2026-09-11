@@ -213,6 +213,17 @@ fn logical_session_thread(
 // Messages
 // ---------------------------------------------------------------------------
 
+/// Identity of one persisted chat message for transcript reconciliation.
+///
+/// Lets the WebUI replace its live entries with the persisted rows of a
+/// finished Turn by id instead of matching by content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnMessageIdentity {
+    pub id: String,
+    pub sender_kind: SenderKind,
+    pub message_kind: MessageKind,
+}
+
 impl Database {
     pub(crate) fn get_recent_messages(
         &self,
@@ -251,6 +262,31 @@ impl Database {
         stmt.query_map(params![chat_id], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Returns committed user/assistant message ids for one Turn in commit order.
+    pub(crate) fn get_turn_message_identities(
+        &self,
+        chat_id: i64,
+        turn_id: &str,
+    ) -> Result<Vec<TurnMessageIdentity>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, sender_kind, message_kind
+             FROM messages
+             WHERE chat_id = ?1 AND turn_id = ?2 AND seq IS NOT NULL
+               AND sender_kind IN ('user', 'assistant')
+             ORDER BY seq ASC",
+        )?;
+        stmt.query_map(params![chat_id, turn_id], |row| {
+            Ok(TurnMessageIdentity {
+                id: row.get(0)?,
+                sender_kind: parse_row_enum!(row, 1, SenderKind)?,
+                message_kind: parse_row_enum!(row, 2, MessageKind)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
     }
 
     /// Loads the `content` column of a single message by its id.
@@ -2249,6 +2285,45 @@ mod tests {
         let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
         assert_eq!(msgs[0].sender_id, "user:cli:alice");
         assert_eq!(msgs[0].sender_kind, SenderKind::User);
+    }
+
+    #[test]
+    fn get_turn_message_identities_returns_committed_user_and_assistant_ids_in_order() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:turn-ids", None, "web", "default")
+            .expect("create chat");
+        let conn = db.get_conn().expect("pool");
+        for (id, kind, seq, turn) in [
+            ("u1", "user", 1, "turn-a"),
+            ("a1", "assistant", 2, "turn-a"),
+            ("staged", "user", 0, "turn-a"),
+            ("other", "assistant", 3, "turn-b"),
+            ("tool", "tool", 4, "turn-a"),
+        ] {
+            let seq_value: Option<i64> = if id == "staged" { None } else { Some(seq) };
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq, turn_id)
+                 VALUES (?1, ?2, 'x', 'c', ?3, '2026-09-10T15:00:00Z', 'message', ?4, ?5)",
+                rusqlite::params![id, chat_id, kind, seq_value, turn],
+            )
+            .expect("insert");
+        }
+        drop(conn);
+
+        // Act
+        let ids = db
+            .get_turn_message_identities(chat_id, "turn-a")
+            .expect("identities");
+
+        // Assert: staged (no seq) and tool rows excluded, commit order kept.
+        assert_eq!(
+            ids.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["u1", "a1"]
+        );
+        assert_eq!(ids[0].sender_kind, SenderKind::User);
+        assert_eq!(ids[1].sender_kind, SenderKind::Assistant);
     }
 
     #[test]

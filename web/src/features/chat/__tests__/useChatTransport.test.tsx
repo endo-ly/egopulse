@@ -222,6 +222,31 @@ describe("useChatTransport reconnect", () => {
     ).toBe(true);
   });
 
+  it("chat_transport_tags_optimistic_message_with_run_on_ack", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const chatFrame = lastSentChat(ws);
+    const durableRequestId = chatFrame.params.requestId;
+
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: chatFrame.id,
+        ok: true,
+        payload: { runId: "run-tag", sessionKey: "s1" },
+      });
+      await pending;
+    });
+
+    expect(
+      result.current.state.messages.find((m) => m.id === `local:${durableRequestId}`),
+    ).toMatchObject({ runId: "run-tag" });
+  });
+
   it("chat_transport_routes_events_to_the_current_session", async () => {
     const { result, ws } = await connectOpen();
 

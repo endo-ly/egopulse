@@ -23,8 +23,10 @@ use crate::runtime::turn::SubmitOutcome;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
-use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
-use crate::storage::{TurnRun, TurnRunState, call_blocking};
+use super::{
+    RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_external_chat_id, web_session_key,
+};
+use crate::storage::{Database, SenderKind, TurnRun, TurnRunState, call_blocking};
 
 #[derive(Debug, Serialize)]
 struct StatusPayload {
@@ -52,6 +54,10 @@ struct ToolResultPayload {
 #[derive(Debug, Serialize)]
 struct DonePayload {
     response: String,
+    /// Persisted user message ids for the Turn, in commit order.
+    user_message_ids: Vec<String>,
+    /// Persisted assistant message ids for the Turn, in commit order.
+    assistant_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +68,10 @@ struct DeltaPayload {
 #[derive(Debug, Serialize)]
 struct ErrorPayload {
     error: String,
+    /// Persisted user message ids for the Turn, in commit order.
+    user_message_ids: Vec<String>,
+    /// Persisted assistant message ids for the Turn, in commit order.
+    assistant_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,7 +352,49 @@ fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -
     )
 }
 
-pub(super) async fn publish_agent_event(run_hub: &super::RunHub, run_id: &str, event: AgentEvent) {
+/// Loads persisted user/assistant message ids for a finished Turn.
+///
+/// Returns empty lists when the session cannot be resolved (e.g.
+/// slash-command runs without a Turn); callers then keep live entries.
+async fn turn_message_ids_for_session(
+    db: &Arc<Database>,
+    session_key: &str,
+    turn_id: &str,
+) -> (Vec<String>, Vec<String>) {
+    let db = Arc::clone(db);
+    let session_key = session_key.to_string();
+    let turn_id = turn_id.to_string();
+    let rows = call_blocking(db, move |db| {
+        let chat_id = match parse_chat_id_from_session_key(&session_key) {
+            Some(id) => id,
+            None => {
+                let external = web_external_chat_id(&web_session_key(&session_key));
+                db.resolve_chat_id("web", &external)?.unwrap_or(-1)
+            }
+        };
+        db.get_turn_message_identities(chat_id, &turn_id)
+    })
+    .await
+    .unwrap_or_default();
+    let mut user_ids = Vec::new();
+    let mut assistant_ids = Vec::new();
+    for row in rows {
+        if row.sender_kind == SenderKind::User {
+            user_ids.push(row.id);
+        } else {
+            assistant_ids.push(row.id);
+        }
+    }
+    (user_ids, assistant_ids)
+}
+
+pub(super) async fn publish_agent_event(
+    state: &WebState,
+    session_key: &str,
+    run_id: &str,
+    event: AgentEvent,
+) {
+    let run_hub = &state.run_hub;
     match event {
         AgentEvent::Iteration { iteration } => {
             run_hub
@@ -426,19 +478,33 @@ pub(super) async fn publish_agent_event(run_hub: &super::RunHub, run_id: &str, e
                 .await;
         }
         AgentEvent::FinalResponse { text, terminal } => {
+            let (user_message_ids, assistant_message_ids) =
+                turn_message_ids_for_session(&state.app_state.db, session_key, run_id).await;
             run_hub
                 .publish_agent_response(
                     run_id,
-                    serde_json::to_string(&DonePayload { response: text }).unwrap_or_default(),
+                    serde_json::to_string(&DonePayload {
+                        response: text,
+                        user_message_ids,
+                        assistant_message_ids,
+                    })
+                    .unwrap_or_default(),
                     terminal,
                 )
                 .await;
         }
         AgentEvent::Error { message, terminal } => {
+            let (user_message_ids, assistant_message_ids) =
+                turn_message_ids_for_session(&state.app_state.db, session_key, run_id).await;
             run_hub
                 .publish_agent_error(
                     run_id,
-                    serde_json::to_string(&ErrorPayload { error: message }).unwrap_or_default(),
+                    serde_json::to_string(&ErrorPayload {
+                        error: message,
+                        user_message_ids,
+                        assistant_message_ids,
+                    })
+                    .unwrap_or_default(),
                     terminal,
                 )
                 .await;
@@ -526,7 +592,12 @@ pub(super) async fn accept_web_input(
                 .create_if_absent(&turn_id, actor.to_string(), session_key.clone())
                 .await;
             if let Some(observer) = observer {
-                spawn_observed_run_publisher(state.clone(), observer, turn_id.clone());
+                spawn_observed_run_publisher(
+                    state.clone(),
+                    observer,
+                    turn_id.clone(),
+                    session_key.clone(),
+                );
             }
             Ok(AcceptedWebInput {
                 started: StartedRun {
@@ -592,7 +663,12 @@ async fn accept_existing_web_run(
                 drop(observer);
                 publish_terminal_web_run(state, scope, &latest, actor).await?
             } else {
-                spawn_observed_run_publisher(state.clone(), observer, run.turn_id.clone());
+                spawn_observed_run_publisher(
+                    state.clone(),
+                    observer,
+                    run.turn_id.clone(),
+                    session_key.clone(),
+                );
                 "queued"
             }
         } else {
@@ -614,6 +690,28 @@ async fn publish_terminal_web_run(
     run: &TurnRun,
     actor: &str,
 ) -> Result<&'static str, (StatusCode, String)> {
+    let turn_id = run.turn_id.clone();
+    let chat_id = run.chat_id;
+    let (user_message_ids, assistant_message_ids) = {
+        let db = state.app_state.db_for(scope);
+        call_blocking(db, move |db| {
+            db.get_turn_message_identities(chat_id, &turn_id)
+        })
+        .await
+        .map(|rows| {
+            let mut user_ids = Vec::new();
+            let mut assistant_ids = Vec::new();
+            for row in rows {
+                if row.sender_kind == SenderKind::User {
+                    user_ids.push(row.id);
+                } else {
+                    assistant_ids.push(row.id);
+                }
+            }
+            (user_ids, assistant_ids)
+        })
+        .unwrap_or_default()
+    };
     let (event, data, status) = match run.state {
         TurnRunState::Completed => {
             let final_message_id = run.final_message_id.clone().ok_or_else(|| {
@@ -635,7 +733,12 @@ async fn publish_terminal_web_run(
             })?;
             (
                 "done",
-                serde_json::to_string(&DonePayload { response }).unwrap_or_default(),
+                serde_json::to_string(&DonePayload {
+                    response,
+                    user_message_ids,
+                    assistant_message_ids,
+                })
+                .unwrap_or_default(),
                 "completed",
             )
         }
@@ -646,6 +749,8 @@ async fn publish_terminal_web_run(
                     .error_message
                     .clone()
                     .unwrap_or_else(|| format!("turn ended in state {}", run.state)),
+                user_message_ids,
+                assistant_message_ids,
             })
             .unwrap_or_default(),
             "failed",
@@ -700,7 +805,12 @@ async fn execute_web_slash_command(
                 .publish(
                     &run_id,
                     "done",
-                    serde_json::to_string(&DonePayload { response }).unwrap_or_default(),
+                    serde_json::to_string(&DonePayload {
+                        response,
+                        user_message_ids: Vec::new(),
+                        assistant_message_ids: Vec::new(),
+                    })
+                    .unwrap_or_default(),
                 )
                 .await;
         }
@@ -710,7 +820,12 @@ async fn execute_web_slash_command(
                 .publish(
                     &run_id,
                     "error",
-                    serde_json::to_string(&ErrorPayload { error }).unwrap_or_default(),
+                    serde_json::to_string(&ErrorPayload {
+                        error,
+                        user_message_ids: Vec::new(),
+                        assistant_message_ids: Vec::new(),
+                    })
+                    .unwrap_or_default(),
                 )
                 .await;
         }
@@ -733,6 +848,7 @@ fn spawn_observed_run_publisher(
     state: WebState,
     observer: crate::runtime::turn::TurnObserver,
     run_id: String,
+    session_key: String,
 ) {
     tokio::spawn(async move {
         let crate::runtime::turn::TurnObserver {
@@ -743,11 +859,11 @@ fn spawn_observed_run_publisher(
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
-                    publish_agent_event(&state.run_hub, &run_id, event).await;
+                    publish_agent_event(&state, &session_key, &run_id, event).await;
                 }
                 _ = &mut completion => {
                     while let Ok(event) = events.try_recv() {
-                        publish_agent_event(&state.run_hub, &run_id, event).await;
+                        publish_agent_event(&state, &session_key, &run_id, event).await;
                     }
                     break;
                 }
@@ -953,13 +1069,25 @@ mod tests {
     fn stream_event_format_matches() {
         let done_json = serde_json::to_string(&DonePayload {
             response: "hello".to_string(),
+            user_message_ids: vec!["turn:t1:input".to_string()],
+            assistant_message_ids: vec!["turn:t1:final".to_string()],
         })
         .unwrap();
         let done_parsed: serde_json::Value = serde_json::from_str(&done_json).unwrap();
         assert_eq!(done_parsed["response"], "hello");
+        assert_eq!(
+            done_parsed["user_message_ids"],
+            serde_json::json!(["turn:t1:input"])
+        );
+        assert_eq!(
+            done_parsed["assistant_message_ids"],
+            serde_json::json!(["turn:t1:final"])
+        );
 
         let error_json = serde_json::to_string(&ErrorPayload {
             error: "oops".to_string(),
+            user_message_ids: vec![],
+            assistant_message_ids: vec![],
         })
         .unwrap();
         let error_parsed: serde_json::Value = serde_json::from_str(&error_json).unwrap();
@@ -1008,6 +1136,8 @@ mod tests {
 
         let done_data = serde_json::to_string(&DonePayload {
             response: "final".to_string(),
+            user_message_ids: Vec::new(),
+            assistant_message_ids: Vec::new(),
         })
         .unwrap();
         hub.publish("test-run", "done", done_data).await;
@@ -1027,10 +1157,76 @@ mod tests {
 
         let error_data = serde_json::to_string(&ErrorPayload {
             error: "fail".to_string(),
+            user_message_ids: Vec::new(),
+            assistant_message_ids: Vec::new(),
         })
         .unwrap();
         let parsed_error: serde_json::Value = serde_json::from_str(&error_data).unwrap();
         assert_eq!(parsed_error["error"], "fail");
+    }
+
+    #[tokio::test]
+    async fn final_response_publish_carries_turn_message_ids() {
+        use super::AgentEvent;
+
+        // Arrange: one committed user row and final row for turn t9.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state_with_agents(&dir);
+        let chat_id = web_state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:ids", None, "web", "default")
+            .expect("chat");
+        let conn = web_state.app_state.db.get_conn().expect("pool");
+        for (id, kind, seq) in [
+            ("turn:t9:input", "user", 1),
+            ("turn:t9:final", "assistant", 2),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq, turn_id)
+                 VALUES (?1, ?2, 'x', 'c', ?3, '2026-09-10T15:00:00Z', 'message', ?4, 't9')",
+                rusqlite::params![id, chat_id, kind, seq],
+            )
+            .expect("insert");
+        }
+        drop(conn);
+        let session_key = format!("chat:{chat_id}");
+        web_state
+            .run_hub
+            .create("t9", "actor".to_string(), session_key.clone())
+            .await;
+
+        // Act
+        publish_agent_event(
+            &web_state,
+            &session_key,
+            "t9",
+            AgentEvent::FinalResponse {
+                text: "done".to_string(),
+                terminal: true,
+            },
+        )
+        .await;
+
+        // Assert
+        let (_rx, replay, _, _, _, _) = web_state
+            .run_hub
+            .subscribe_with_replay("t9", None, "actor", false)
+            .await
+            .expect("subscribe");
+        let done = replay
+            .iter()
+            .find(|event| event.event == "done")
+            .expect("done event");
+        let data: serde_json::Value = serde_json::from_str(&done.data).expect("json");
+        assert_eq!(
+            data["user_message_ids"],
+            serde_json::json!(["turn:t9:input"])
+        );
+        assert_eq!(
+            data["assistant_message_ids"],
+            serde_json::json!(["turn:t9:final"])
+        );
     }
 
     #[tokio::test]
@@ -1337,7 +1533,10 @@ mod tests {
         assert!(done);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "done");
-        assert_eq!(events[0].data, r#"{"response":"saved response"}"#);
+        assert_eq!(
+            events[0].data,
+            r#"{"response":"saved response","user_message_ids":[],"assistant_message_ids":["web:completed-response"]}"#
+        );
     }
 
     #[tokio::test]
@@ -1433,7 +1632,10 @@ mod tests {
         assert!(done);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "done");
-        assert_eq!(events[0].data, r#"{"response":"saved after race"}"#);
+        assert_eq!(
+            events[0].data,
+            r#"{"response":"saved after race","user_message_ids":[],"assistant_message_ids":["web:recovery-race-response"]}"#
+        );
     }
 
     #[tokio::test]

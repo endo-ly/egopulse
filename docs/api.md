@@ -642,8 +642,10 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
-| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
-| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する |
+| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。`userMessageIds` / `assistantMessageIds` にそのTurnで永続化されたメッセージIDが入る（commit順） |
+| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。永続化済みがあれば `done` と同じく `userMessageIds` / `assistantMessageIds` が入る |
+
+クライアントは live 表示（楽観メッセージ・ドラフト）を `done` / `error` の `userMessageIds` / `assistantMessageIds` で確定IDへ置換し、履歴とはID一致でのみ突き合わせる。内容比較はしない（永続化時に要約・整形されるため一致しない場合がある）。ID列が空（slash command・旧サーバー）の場合は従来通りlive表示を維持する。
 
 `chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
 

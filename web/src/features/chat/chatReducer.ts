@@ -11,6 +11,10 @@ export interface ChatEventPayload {
     content: Array<{ type: string; text: string }>;
   };
   errorMessage?: string;
+  /** Persisted user message ids for the run, in commit order. */
+  userMessageIds?: string[];
+  /** Persisted assistant message ids for the run, in commit order. */
+  assistantMessageIds?: string[];
 }
 
 export interface ChatState {
@@ -21,13 +25,6 @@ export interface ChatState {
 
 export function initialChatState(): ChatState {
   return { messages: [], runId: null, error: null };
-}
-
-/** Client-side ids (`draft:` streaming, `local:` optimistic, `tool:` cards). */
-export function isLiveMessageId(id: string): boolean {
-  return (
-    id.startsWith("draft:") || id.startsWith("local:") || id.startsWith("tool:")
-  );
 }
 
 function optimisticUserMessageId(requestId: string): string {
@@ -60,6 +57,69 @@ export function reduceOptimisticUserMessage(
       },
     ],
   };
+}
+
+/** Tags the optimistic message with its accepted run for later adoption. */
+export function reduceTagLocalRun(
+  state: ChatState,
+  message: { requestId: string; runId: string },
+): ChatState {
+  const id = optimisticUserMessageId(message.requestId);
+  if (!state.messages.some((m) => m.id === id)) return state;
+  return {
+    ...state,
+    messages: state.messages.map((m) =>
+      m.id === id ? { ...m, runId: message.runId } : m,
+    ),
+  };
+}
+
+export interface RunMessageIds {
+  runId: string;
+  userMessageIds?: string[];
+  assistantMessageIds?: string[];
+}
+
+/**
+ * Replaces a finished run's live entries with their persisted ids so the
+ * history merge drops them by id. Runs without reported ids (slash commands,
+ * older servers) keep live entries (legacy display). Surplus live entries
+ * are dropped rather than duplicated: history is the source of truth and a
+ * later refetch restores anything dropped early.
+ */
+export function reduceAdoptRunMessageIds(
+  state: ChatState,
+  ids: RunMessageIds,
+): ChatState {
+  const users = [...(ids.userMessageIds ?? [])];
+  const assistants = [...(ids.assistantMessageIds ?? [])];
+  if (users.length === 0 && assistants.length === 0) return state;
+  let changed = false;
+  const messages: ChatMessage[] = [];
+  for (const message of state.messages) {
+    const isRunDraft =
+      message.id === `draft:${ids.runId}` ||
+      message.id.startsWith(`draft:${ids.runId}:`);
+    if (isRunDraft && message.id.includes(":done")) {
+      const next = assistants.shift();
+      if (next === undefined) continue;
+      changed = true;
+      messages.push({ ...message, id: next });
+      continue;
+    }
+    if (
+      message.id.startsWith("local:") &&
+      (message.runId === undefined || message.runId === ids.runId)
+    ) {
+      const next = users.shift();
+      if (next === undefined) continue;
+      changed = true;
+      messages.push({ ...message, id: next });
+      continue;
+    }
+    messages.push(message);
+  }
+  return changed ? { ...state, messages } : state;
 }
 
 /** Withdraws the optimistic message, e.g. when sending failed. */
@@ -147,8 +207,6 @@ export function reduceChatEvent(
 
     case "done": {
       const finalText = extractText(event);
-      // Locals stay until history actually delivers their copy; the merge
-      // reconciles them against newly arrived entries.
       let messages = state.messages;
       const existing = messages.find((m) => m.id === draftId);
       if (existing) {
@@ -157,14 +215,14 @@ export function reduceChatEvent(
           // persisted answer will back the placeholder, so drop it instead
           // of leaving an empty bubble.
           messages = messages.filter((m) => m.id !== draftId);
-          return { ...state, messages, error: null };
+        } else {
+          const sealedId = sealedAssistantDraftId(messages, draftId);
+          messages = messages.map((m) =>
+            m.id === draftId
+              ? { ...m, id: sealedId, content: finalText || m.content, sender_id: agentId }
+              : m,
+          );
         }
-        const sealedId = sealedAssistantDraftId(messages, draftId);
-        messages = messages.map((m) =>
-          m.id === draftId
-            ? { ...m, id: sealedId, content: finalText || m.content, sender_id: agentId }
-            : m,
-        );
       } else if (finalText) {
         const sealedId = sealedAssistantDraftId(messages, draftId);
         messages = [
@@ -179,7 +237,14 @@ export function reduceChatEvent(
           },
         ];
       }
-      return { ...state, messages, error: null };
+      return reduceAdoptRunMessageIds(
+        { ...state, messages },
+        {
+          runId: event.runId,
+          userMessageIds: event.userMessageIds,
+          assistantMessageIds: event.assistantMessageIds,
+        },
+      );
     }
 
     case "error": {
@@ -199,7 +264,14 @@ export function reduceChatEvent(
           );
         }
       }
-      return { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" };
+      return reduceAdoptRunMessageIds(
+        { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" },
+        {
+          runId: event.runId,
+          userMessageIds: event.userMessageIds,
+          assistantMessageIds: event.assistantMessageIds,
+        },
+      );
     }
   }
 }
@@ -221,6 +293,22 @@ function sealedAssistantDraftId(messages: ChatMessage[], draftId: string): strin
     segment += 1;
   }
   return `${draftId}:segment:${segment}:done`;
+}
+
+/**
+ * Joins persisted history with live transport messages.
+ *
+ * Live entries carry either persisted ids (adopted from terminal events or
+ * the server echo) or client-side streaming ids (`draft:`); history always
+ * wins on id equality, so a finished run converges to the persisted rows.
+ */
+export function mergeChatMessages(
+  history: ChatMessage[],
+  live: ChatMessage[],
+): ChatMessage[] {
+  if (live.length === 0) return history;
+  const historyIds = new Set(history.map((message) => message.id));
+  return [...history, ...live.filter((message) => !historyIds.has(message.id))];
 }
 
 export interface StatusEventPayload {

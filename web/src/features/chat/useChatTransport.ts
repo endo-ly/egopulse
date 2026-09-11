@@ -6,6 +6,7 @@ import {
   reduceOptimisticUserMessage,
   reduceRunAccepted,
   reduceUserInput,
+  reduceTagLocalRun,
   reduceToolResult,
   reduceToolStart,
   type ChatEventPayload,
@@ -324,6 +325,14 @@ export function useChatTransport({
               agentId: pending.agentId,
               lastSeq: 0,
             });
+            // Link the optimistic message to its run so terminal events
+            // adopt exactly this entry even after session switches.
+            setState((prev) =>
+              reduceTagLocalRun(prev, {
+                requestId: pending.durableRequestId,
+                runId,
+              }),
+            );
             // Show the assistant's turn has started only in the session that
             // issued the send: the user may have switched away while the ack
             // was in flight, and that session must not inherit the draft.
