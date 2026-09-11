@@ -642,10 +642,10 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message` を含む |
-| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。`userMessageIds` / `assistantMessageIds` にそのTurnで永続化されたメッセージIDが入る（commit順） |
-| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。永続化済みがあれば `done` と同じく `userMessageIds` / `assistantMessageIds` が入る |
+| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。`userMessageId` はそのTurnのinputメッセージID、`assistantMessageId` はfinalメッセージID（いずれも対象がない場合は `null`） |
+| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。`userMessageId` / `assistantMessageId` は `done` と同じ意味。final未永続化の失敗では `assistantMessageId` が `null` になり、クライアントは partial表示を保持する |
 
-クライアントは live 表示（楽観メッセージ・ドラフト）を `done` / `error` の `userMessageIds` / `assistantMessageIds` で確定IDへ置換し、履歴とはID一致でのみ突き合わせる。内容比較はしない（永続化時に要約・整形されるため一致しない場合がある）。ID列が空（slash command・旧サーバー）の場合は従来通りlive表示を維持する。
+クライアントは live 表示（楽観メッセージ・ドラフト）を `done` / `error` の `userMessageId` / `assistantMessageId` で確定IDへ置換し、履歴とはID一致でのみ突き合わせる。内容比較はしない（永続化時に要約・整形されるため一致しない場合がある）。報告されるのはinput/finalの stamp のみで、Tool preview・result summaryは対象外（履歴投影に現れず、Tool Cardは `call_id` で突き合わせる）。IDが `null`（Turnを持たないslash command等）の場合はlive表示を維持し、後続の履歴refetchで収束する。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のIDを解決するため、親TurnのIDが子Turnに再送されることはない。子Turn開始時の `user_input` イベントは子の確定input IDを運び、楽観メッセージを先行して置換する。
 
 `chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
 

@@ -11,10 +11,20 @@ export interface ChatEventPayload {
     content: Array<{ type: string; text: string }>;
   };
   errorMessage?: string;
-  /** Persisted user message ids for the run, in commit order. */
-  userMessageIds?: string[];
-  /** Persisted assistant message ids for the run, in commit order. */
-  assistantMessageIds?: string[];
+  /**
+   * Persisted id of the emitting Turn's input message. Present on terminal
+   * events; adopts the oldest optimistic user bubble of this run. `null`
+   * when the run has no Turn (slash commands) or the lookup failed: live
+   * entries are kept and history converges on refetch.
+   */
+  userMessageId?: string | null;
+  /**
+   * Persisted id of the emitting Turn's final message. Present on terminal
+   * events; adopts this run's sealed assistant draft. `null` when the Turn
+   * produced no final message: a sealed partial draft is kept as-is, never
+   * dropped.
+   */
+  assistantMessageId?: string | null;
 }
 
 export interface ChatState {
@@ -74,52 +84,63 @@ export function reduceTagLocalRun(
   };
 }
 
-export interface RunMessageIds {
+export interface RunMessageIdAdoption {
   runId: string;
-  userMessageIds?: string[];
-  assistantMessageIds?: string[];
+  userMessageId: string | null;
+  assistantMessageId: string | null;
 }
 
 /**
- * Replaces a finished run's live entries with their persisted ids so the
- * history merge drops them by id. Runs without reported ids (slash commands,
- * older servers) keep live entries (legacy display). Surplus live entries
- * are dropped rather than duplicated: history is the source of truth and a
- * later refetch restores anything dropped early.
+ * Adopts the run's persisted input id onto the oldest optimistic user
+ * bubble of this run, so the history merge drops it by id. Only bubbles
+ * tagged with this run (or never tagged) qualify: ids unknown to the
+ * server (`null`) or belonging to another run never steal entries.
  */
-export function reduceAdoptRunMessageIds(
+export function reduceAdoptUserMessage(
   state: ChatState,
-  ids: RunMessageIds,
+  ids: RunMessageIdAdoption,
 ): ChatState {
-  const users = [...(ids.userMessageIds ?? [])];
-  const assistants = [...(ids.assistantMessageIds ?? [])];
-  if (users.length === 0 && assistants.length === 0) return state;
-  let changed = false;
-  const messages: ChatMessage[] = [];
-  for (const message of state.messages) {
-    const isRunDraft =
-      message.id === `draft:${ids.runId}` ||
-      message.id.startsWith(`draft:${ids.runId}:`);
-    if (isRunDraft && message.id.includes(":done")) {
-      const next = assistants.shift();
-      if (next === undefined) continue;
-      changed = true;
-      messages.push({ ...message, id: next });
-      continue;
-    }
-    if (
+  const adopted = ids.userMessageId;
+  if (adopted === null) return state;
+  const index = state.messages.findIndex(
+    (message) =>
       message.id.startsWith("local:") &&
-      (message.runId === undefined || message.runId === ids.runId)
-    ) {
-      const next = users.shift();
-      if (next === undefined) continue;
-      changed = true;
-      messages.push({ ...message, id: next });
-      continue;
-    }
-    messages.push(message);
-  }
-  return changed ? { ...state, messages } : state;
+      (message.runId === undefined || message.runId === ids.runId),
+  );
+  if (index < 0) return state;
+  return {
+    ...state,
+    messages: state.messages.map((message, current) =>
+      current === index ? { ...message, id: adopted } : message,
+    ),
+  };
+}
+
+/**
+ * Adopts the run's persisted final id onto this run's sealed assistant
+ * draft, so the history merge drops it by id. Tool previews and result
+ * summaries are never adopted: the server only reports the final id.
+ * A `null` id keeps the sealed partial draft untouched.
+ */
+export function reduceAdoptAssistantMessage(
+  state: ChatState,
+  ids: RunMessageIdAdoption,
+): ChatState {
+  const adopted = ids.assistantMessageId;
+  if (adopted === null) return state;
+  const index = state.messages.findIndex(
+    (message) =>
+      (message.id === `draft:${ids.runId}` ||
+        message.id.startsWith(`draft:${ids.runId}:`)) &&
+      message.id.includes(":done"),
+  );
+  if (index < 0) return state;
+  return {
+    ...state,
+    messages: state.messages.map((message, current) =>
+      current === index ? { ...message, id: adopted } : message,
+    ),
+  };
 }
 
 /** Withdraws the optimistic message, e.g. when sending failed. */
@@ -237,13 +258,14 @@ export function reduceChatEvent(
           },
         ];
       }
-      return reduceAdoptRunMessageIds(
-        { ...state, messages },
-        {
-          runId: event.runId,
-          userMessageIds: event.userMessageIds,
-          assistantMessageIds: event.assistantMessageIds,
-        },
+      const ids: RunMessageIdAdoption = {
+        runId: event.runId,
+        userMessageId: event.userMessageId ?? null,
+        assistantMessageId: event.assistantMessageId ?? null,
+      };
+      return reduceAdoptAssistantMessage(
+        reduceAdoptUserMessage({ ...state, messages }, ids),
+        ids,
       );
     }
 
@@ -264,13 +286,21 @@ export function reduceChatEvent(
           );
         }
       }
-      return reduceAdoptRunMessageIds(
-        { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" },
-        {
-          runId: event.runId,
-          userMessageIds: event.userMessageIds,
-          assistantMessageIds: event.assistantMessageIds,
-        },
+      // A failed turn still persisted the user message, so adopt it. The
+      // assistant draft adopts the final id only when the Turn persisted
+      // one (failure after the final write); otherwise the sealed partial
+      // output is kept instead of dropped.
+      const ids: RunMessageIdAdoption = {
+        runId: event.runId,
+        userMessageId: event.userMessageId ?? null,
+        assistantMessageId: event.assistantMessageId ?? null,
+      };
+      return reduceAdoptAssistantMessage(
+        reduceAdoptUserMessage(
+          { ...state, runId: event.runId, messages, error: event.errorMessage ?? "unknown error" },
+          ids,
+        ),
+        ids,
       );
     }
   }

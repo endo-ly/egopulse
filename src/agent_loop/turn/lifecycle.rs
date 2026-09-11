@@ -14,11 +14,13 @@ pub(crate) enum TurnAcceptance {
     /// A fresh `accepted` Turn created by this call; the caller owns execution.
     Proceed(Box<TurnRun>),
     /// The Turn was already `completed`; replay its saved final response.
-    Completed(String),
+    /// `turn_id` is the existing durable Turn so event consumers can resolve
+    /// its persisted message ids.
+    Completed { turn_id: String, text: String },
     /// The Turn already exists and is non-terminal; another executor owns it.
-    InProgress(String),
+    InProgress { turn_id: String, text: String },
     /// The Turn already terminated in a non-success state.
-    Terminated(String),
+    Terminated { turn_id: String, text: String },
 }
 
 pub(super) struct TurnAcceptanceRequest<'a> {
@@ -115,14 +117,21 @@ impl<'a> TurnLifecycle<'a> {
                             "completed turn_run final message is missing".to_string(),
                         )
                     })?;
-                    Ok(TurnAcceptance::Completed(content))
+                    Ok(TurnAcceptance::Completed {
+                        turn_id: run.turn_id.clone(),
+                        text: content,
+                    })
                 }
-                other if other.is_terminal() => Ok(TurnAcceptance::Terminated(format!(
-                    "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
-                ))),
-                _ => Ok(TurnAcceptance::InProgress(
-                    "このリクエストはすでに処理中です。".to_string(),
-                )),
+                other if other.is_terminal() => Ok(TurnAcceptance::Terminated {
+                    turn_id: run.turn_id.clone(),
+                    text: format!(
+                        "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
+                    ),
+                }),
+                _ => Ok(TurnAcceptance::InProgress {
+                    turn_id: run.turn_id.clone(),
+                    text: "このリクエストはすでに処理中です。".to_string(),
+                }),
             },
         }
     }

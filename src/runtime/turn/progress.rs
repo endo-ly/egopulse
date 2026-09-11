@@ -501,6 +501,7 @@ mod tests {
         // Act: send events then close the stream
         tx.send(tool_start("read", "read")).unwrap();
         tx.send(AgentEvent::FinalResponse {
+            turn_id: "turn-test".to_string(),
             text: "done".to_string(),
             terminal: false,
         })
@@ -901,6 +902,7 @@ mod tests {
         })
         .unwrap();
         tx.send(AgentEvent::FinalResponse {
+            turn_id: "turn-test".to_string(),
             text: "完了した結果をお伝えします".to_string(),
             terminal: false,
         })

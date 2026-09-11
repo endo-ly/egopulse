@@ -22,7 +22,16 @@ struct ObserverSink {
 struct ObserverState {
     completion: Option<oneshot::Sender<()>>,
     pending_turns: usize,
-    pending_final_response: Option<String>,
+    pending_final_response: Option<PendingFinalResponse>,
+}
+
+/// A FinalResponse held back until its Turn finishes, so the shared
+/// interaction can compute `terminal` across staged follow-up Turns. The
+/// producing Turn's id travels with the text so publishers resolve persisted
+/// ids against the Turn that actually wrote them.
+struct PendingFinalResponse {
+    turn_id: String,
+    text: String,
 }
 
 /// Routes runtime-owned turn output to a client without owning the turn.
@@ -187,11 +196,11 @@ impl TurnObserverRegistry {
         let Some(sink) = sinks.get(request_key).cloned() else {
             return;
         };
-        if let AgentEvent::FinalResponse { text, .. } = event {
+        if let AgentEvent::FinalResponse { turn_id, text, .. } = event {
             sink.state
                 .lock()
                 .expect("turn observer state lock")
-                .pending_final_response = Some(text);
+                .pending_final_response = Some(PendingFinalResponse { turn_id, text });
             return;
         }
         if sink.events.send(event).is_err() {
@@ -199,7 +208,7 @@ impl TurnObserverRegistry {
         }
     }
 
-    pub(crate) fn finish(&self, request_key: &str, result: Result<(), String>) {
+    pub(crate) fn finish(&self, request_key: &str, turn_id: &str, result: Result<(), String>) {
         let mut sinks = self.sinks.lock().expect("turn observer lock");
         let Some(sink) = sinks.get(request_key).cloned() else {
             return;
@@ -236,14 +245,20 @@ impl TurnObserverRegistry {
 
         match result {
             Ok(()) => {
-                if let Some(text) = final_response {
-                    let _ = sink
-                        .events
-                        .send(AgentEvent::FinalResponse { text, terminal });
+                if let Some(final_response) = final_response {
+                    let _ = sink.events.send(AgentEvent::FinalResponse {
+                        turn_id: final_response.turn_id,
+                        text: final_response.text,
+                        terminal,
+                    });
                 }
             }
             Err(message) => {
-                let _ = sink.events.send(AgentEvent::Error { message, terminal });
+                let _ = sink.events.send(AgentEvent::Error {
+                    turn_id: turn_id.to_string(),
+                    message,
+                    terminal,
+                });
             }
         }
         if let Some(sender) = completion {
@@ -293,8 +308,8 @@ mod tests {
             ]
         ));
         registry.emit("promoted-request-1", AgentEvent::Iteration { iteration: 1 });
-        registry.finish("promoted-request-1", Ok(()));
-        registry.finish("promoted-request-2", Ok(()));
+        registry.finish("promoted-request-1", "turn-1", Ok(()));
+        registry.finish("promoted-request-2", "turn-2", Ok(()));
 
         // Assert
         assert!(matches!(
@@ -326,34 +341,38 @@ mod tests {
         registry.emit(
             "follow-up-a",
             AgentEvent::FinalResponse {
+                turn_id: "turn-a".to_string(),
                 text: "response A".to_string(),
                 terminal: false,
             },
         );
-        registry.finish("follow-up-a", Ok(()));
+        registry.finish("follow-up-a", "turn-a", Ok(()));
         registry.emit(
             "follow-up-b",
             AgentEvent::FinalResponse {
+                turn_id: "turn-b".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
             },
         );
-        registry.finish("follow-up-b", Ok(()));
+        registry.finish("follow-up-b", "turn-b", Ok(()));
 
         // Assert
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
+                turn_id,
                 text,
                 terminal: false
-            }) if text == "response A"
+            }) if text == "response A" && turn_id == "turn-a"
         ));
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
+                turn_id,
                 text,
                 terminal: true
-            }) if text == "response B"
+            }) if text == "response B" && turn_id == "turn-b"
         ));
         completion.await.expect("completion sender");
     }
@@ -375,29 +394,36 @@ mod tests {
         ));
 
         // Act
-        registry.finish("follow-up-a", Err("follow-up A failed".to_string()));
+        registry.finish(
+            "follow-up-a",
+            "turn-a",
+            Err("follow-up A failed".to_string()),
+        );
         registry.emit(
             "follow-up-b",
             AgentEvent::FinalResponse {
+                turn_id: "turn-b".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
             },
         );
-        registry.finish("follow-up-b", Ok(()));
+        registry.finish("follow-up-b", "turn-b", Ok(()));
 
         // Assert
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::Error {
+                turn_id,
                 message,
                 terminal: false
-            }) if message == "follow-up A failed"
+            }) if message == "follow-up A failed" && turn_id == "turn-a"
         ));
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
                 text,
-                terminal: true
+                terminal: true,
+                ..
             }) if text == "response B"
         ));
         completion.await.expect("completion sender");

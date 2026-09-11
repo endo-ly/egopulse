@@ -360,38 +360,105 @@ describe("chatReducer", () => {
     ]);
   });
 
-  it("done_adopts_reported_ids_for_run_entries", () => {
-    // Arrange: optimistic local tagged at ack, streaming draft, then done
-    // reports the persisted ids (reworded preview included).
+  it("done_adopts_only_input_and_final_ids_around_tool_use", () => {
+    // Arrange: a tool turn. The live transcript holds the optimistic user
+    // bubble, the tool card and the streaming draft.
     let state = initialChatState();
-    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "hi" });
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "read the note" });
     state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
     state = reduceChatEvent(state, {
       runId: "run-1",
       sessionKey: "main",
       seq: 1,
       state: "delta",
-      message: { role: "assistant", content: [{ type: "text", text: "Reading notes" }] },
+      message: { role: "assistant", content: [{ type: "text", text: "checking" }] },
     }, "lyre");
-
-    // Act
+    state = reduceToolStart(state, {
+      callId: "call-1",
+      name: "read",
+      input: { path: "note.txt" },
+    });
+    state = reduceToolResult(state, {
+      callId: "call-1",
+      name: "read",
+      isError: false,
+      preview: "file contents",
+      durationMs: 10,
+    });
     state = reduceChatEvent(state, {
       runId: "run-1",
       sessionKey: "main",
-      seq: 2,
-      state: "done",
-      message: { role: "assistant", content: [{ type: "text", text: "all done" }] },
-      userMessageIds: ["turn:run-1:input"],
-      assistantMessageIds: ["turn:run-1:preview", "turn:run-1:final"],
+      seq: 4,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
     }, "lyre");
 
-    // Assert: live entries carry persisted ids, so the merge drops them.
+    // Act: done reports ONLY the turn's input/final stamps. Tool previews
+    // and result summaries share the turn in storage but never appear in
+    // history, so adopting them would strand live entries.
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 5,
+      state: "done",
+      message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+      userMessageId: "turn:run-1:input",
+      assistantMessageId: "turn:run-1:final",
+    }, "lyre");
+
+    // Assert: user bubble and draft carry persisted ids, tool card untouched,
+    // no live leftovers.
     const ids = state.messages.map((m) => m.id);
     expect(ids).toContain("turn:run-1:input");
-    expect(ids).toContain("turn:run-1:preview");
+    expect(ids).toContain("turn:run-1:final");
+    expect(ids).toContain("tool:call-1");
     expect(ids.some((id) => id.startsWith("draft:") || id.startsWith("local:"))).toBe(
       false,
     );
+
+    // Assert: merging with the persisted history converges exactly. Bare
+    // previews are excluded from history while a narrated one is kept; the
+    // adopted live entries drop by id instead of duplicating.
+    const history: ChatMessage[] = [
+      {
+        id: "turn:run-1:input",
+        sender_id: "user",
+        sender_kind: "user",
+        content: "read the note",
+        timestamp: "2026-09-10T15:00:00Z",
+        message_kind: "message",
+      },
+      {
+        id: "narrated-preview",
+        sender_id: "lyre",
+        sender_kind: "assistant",
+        content: "読みますね [tool_call] read",
+        timestamp: "2026-09-10T15:00:01Z",
+        message_kind: "message",
+      },
+      {
+        id: "tool:call-1",
+        sender_id: "lyre",
+        sender_kind: "tool",
+        content: "{}",
+        timestamp: "2026-09-10T15:00:02Z",
+        message_kind: "tool_call",
+      },
+      {
+        id: "turn:run-1:final",
+        sender_id: "lyre",
+        sender_kind: "assistant",
+        content: "done",
+        timestamp: "2026-09-10T15:00:03Z",
+        message_kind: "message",
+      },
+    ];
+    expect(mergeChatMessages(history, state.messages).map((m) => m.id)).toEqual([
+      "turn:run-1:input",
+      "narrated-preview",
+      "tool:call-1",
+      "turn:run-1:final",
+    ]);
   });
 
   it("done_without_ids_keeps_live_entries", () => {
@@ -406,12 +473,145 @@ describe("chatReducer", () => {
       seq: 1,
       state: "done",
       message: { role: "assistant", content: [{ type: "text", text: "yo" }] },
+      userMessageId: null,
+      assistantMessageId: null,
     }, "lyre");
 
     // Assert
     expect(state.messages.map((m) => m.id).sort()).toEqual([
       "draft:run-1:done",
       "local:req-1",
+    ]);
+  });
+
+  it("terminal_error_with_user_id_only_keeps_the_partial_answer", () => {
+    // Arrange: the turn persisted its input, streamed a partial answer,
+    // then failed before any final message existed. This is the exact
+    // payload shape the backend sends on streaming failure.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "hi" });
+    state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "途中まで生成" }] },
+    }, "lyre");
+
+    // Act
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "error",
+      terminal: true,
+      errorMessage: "boom",
+      userMessageId: "turn:run-1:input",
+      assistantMessageId: null,
+    }, "lyre");
+
+    // Assert: the user bubble adopts its id while the partial draft is
+    // sealed and kept, not dropped.
+    expect(state.messages.map((m) => m.id).sort()).toEqual([
+      "draft:run-1:done",
+      "turn:run-1:input",
+    ]);
+    expect(state.messages.find((m) => m.id === "draft:run-1:done")?.content).toBe(
+      "途中まで生成",
+    );
+
+    // Assert: a history refetch carrying only the persisted input keeps
+    // both rows with no duplication.
+    const history: ChatMessage[] = [
+      {
+        id: "turn:run-1:input",
+        sender_id: "user",
+        sender_kind: "user",
+        content: "hi",
+        timestamp: "2026-09-10T15:00:00Z",
+        message_kind: "message",
+      },
+    ];
+    expect(mergeChatMessages(history, state.messages).map((m) => m.id)).toEqual([
+      "turn:run-1:input",
+      "draft:run-1:done",
+    ]);
+  });
+
+  it("staged_follow_up_dones_adopt_per_turn_ids_on_one_run", () => {
+    // Arrange: the first send completes as a non-terminal parent turn, then
+    // a follow-up is promoted to a child turn on the same web run. Each
+    // done resolves its own turn's stamps.
+    let state = initialChatState();
+    state = reduceOptimisticUserMessage(state, { requestId: "req-1", text: "first" });
+    state = reduceTagLocalRun(state, { requestId: "req-1", runId: "run-1" });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 1,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "answer-a" }] },
+    }, "lyre");
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 2,
+      state: "done",
+      terminal: false,
+      message: { role: "assistant", content: [{ type: "text", text: "answer-a" }] },
+      userMessageId: "turn:turn-a:input",
+      assistantMessageId: "turn:turn-a:final",
+    }, "lyre");
+    expect(state.messages.map((m) => m.id)).toEqual([
+      "turn:turn-a:input",
+      "turn:turn-a:final",
+    ]);
+
+    // Act: the follow-up send is claimed by the child's initial event,
+    // which carries the child's future input id (not the staged row id).
+    state = reduceOptimisticUserMessage(state, { requestId: "req-2", text: "follow-up" });
+    state = reduceTagLocalRun(state, { requestId: "req-2", runId: "run-1" });
+    state = reduceUserInput(state, {
+      messageId: "turn:turn-b:input",
+      senderId: "web-user",
+      text: "follow-up",
+      timestamp: "2026-09-10T15:00:01Z",
+    });
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 3,
+      state: "delta",
+      message: { role: "assistant", content: [{ type: "text", text: "answer-b" }] },
+    }, "lyre");
+    state = reduceChatEvent(state, {
+      runId: "run-1",
+      sessionKey: "main",
+      seq: 4,
+      state: "done",
+      terminal: true,
+      message: { role: "assistant", content: [{ type: "text", text: "answer-b" }] },
+      userMessageId: "turn:turn-b:input",
+      assistantMessageId: "turn:turn-b:final",
+    }, "lyre");
+
+    // Assert: each turn adopted exactly its own ids; the parent's ids were
+    // never applied to the child's entries.
+    expect(state.messages.map((m) => m.id)).toEqual([
+      "turn:turn-a:input",
+      "turn:turn-a:final",
+      "turn:turn-b:input",
+      "turn:turn-b:final",
+    ]);
+
+    // Assert: merging with the persisted history converges with no dup.
+    const history: ChatMessage[] = state.messages.map((m) => ({ ...m }));
+    expect(mergeChatMessages(history, state.messages).map((m) => m.id)).toEqual([
+      "turn:turn-a:input",
+      "turn:turn-a:final",
+      "turn:turn-b:input",
+      "turn:turn-b:final",
     ]);
   });
 

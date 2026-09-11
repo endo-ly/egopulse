@@ -38,6 +38,17 @@ enum ResumeMode {
 /// Maximum number of Channel Log events to inject as Shared Room Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
 
+/// Derives the deterministic user input message id for a durable Turn.
+///
+/// The id is a pure function of the authoritative (DB-stamped) turn id so a
+/// re-acceptance of the same Turn never creates a duplicate user message,
+/// and so staged follow-up promotion can predict the child Turn's input id
+/// for its initial event before the child persists anything. Every producer
+/// of Turn input ids must go through this helper.
+pub(crate) fn turn_input_message_id(turn_id: &str) -> String {
+    format!("turn:{turn_id}:input")
+}
+
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
     state: &'a TurnDependencies,
@@ -349,29 +360,32 @@ impl TurnExecutor<'_> {
             )
             .await?;
             let turn = match acceptance {
-                TurnAcceptance::Completed(saved) => {
+                TurnAcceptance::Completed { turn_id, text } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
-                        text: saved.clone(),
+                        turn_id,
+                        text: text.clone(),
                         terminal: false,
                     });
-                    return Ok(saved);
+                    return Ok(text);
                 }
-                TurnAcceptance::Terminated(message) => {
+                TurnAcceptance::Terminated { turn_id, text } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
-                        text: message.clone(),
+                        turn_id,
+                        text: text.clone(),
                         terminal: false,
                     });
-                    return Ok(message);
+                    return Ok(text);
                 }
-                TurnAcceptance::InProgress(message) => {
+                TurnAcceptance::InProgress { turn_id, text } => {
                     // 同一 request_key の Turn は既に別 executor が所有している。
                     // 二重実行を避けるため新規 executor を起動しないが、この重複
                     // リクエスト自体は呼び出し元へ明確に終端させ、イベントも発する。
                     self.on_event.emit(AgentEvent::FinalResponse {
-                        text: message.clone(),
+                        turn_id,
+                        text: text.clone(),
                         terminal: false,
                     });
-                    return Ok(message);
+                    return Ok(text);
                 }
                 TurnAcceptance::Proceed(run) => *run,
             };
@@ -635,10 +649,9 @@ impl TurnExecutor<'_> {
         let tool_defs = self.state.tools.definitions_async().await;
         let tools_json = serde_json::to_string(&tool_defs).ok();
 
-        // Deterministic input message id so a re-acceptance of the same Turn
-        // never creates a duplicate user message (INSERT OR IGNORE is a no-op
-        // when the row already exists with identical content).
-        let input_message_id = format!("turn:{turn_id}:input");
+        // The deterministic helper keeps promotion-time prediction and the
+        // persisted row identical by construction.
+        let input_message_id = turn_input_message_id(turn_id);
 
         Ok(PreparedTurn {
             turn_id: turn_id.to_string(),

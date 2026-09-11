@@ -160,6 +160,7 @@ impl<'a> TurnPersistence<'a> {
         .await?;
 
         on_event.emit(AgentEvent::FinalResponse {
+            turn_id: self.turn_id.clone(),
             text: final_content.clone(),
             terminal: false,
         });

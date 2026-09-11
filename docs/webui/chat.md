@@ -298,7 +298,7 @@ UI 側は、選択中の read-only セッションの sessionKey と一致する
 2. ユーザーメッセージを in-memory に楽観追加（`local:{durableRequestId}`）
 3. WS `chat.send` を送信し、受諾 ack（`res` ok）を待つ。WebSocketのRPC IDはattemptごとに発行し、durable request IDは同じdraftのACK不明時の明示的なretryでだけ再利用する。受諾で Composer をクリアし、拒否・タイムアウト（15秒）では文面を保持したままエラーを表示する。draftを編集した場合やsessionを切り替えた場合は新しいdurable request IDを使う
 4. WS 上でトークン刻みの delta を受信 → ドラフトメッセージへ追記
-5. WS 上で done を受信 → `userMessageIds` / `assistantMessageIds` でlive表示を確定IDへ置換（内容比較なし）。ID列が空の場合は従来通りlive表示を維持
+5. WS 上で done を受信 → 発行Turnの `userMessageId`（input）/ `assistantMessageId`（final）でlive表示を確定IDへ置換（内容比較なし、Tool previewは対象外）。IDが `null` の場合はlive表示を維持し、履歴refetchで収束
 6. セッション一覧と履歴を refetch。表示は履歴と live のマージ（`mergeChatMessages`）で、ID 一致は履歴優先、未確定のストリーミング中ドラフトのみ保持
 7. WS が意図せず切断→再接続した場合はセッション一覧と履歴を refetch して追いつく（進行中ターンの購読は復活しないため、ストリーミング途中の描画は復元されない）
 

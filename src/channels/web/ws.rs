@@ -26,22 +26,18 @@ struct DeltaData {
     delta: String,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct DoneData {
     response: Option<String>,
-    #[serde(default)]
-    user_message_ids: Vec<String>,
-    #[serde(default)]
-    assistant_message_ids: Vec<String>,
+    user_message_id: Option<String>,
+    assistant_message_id: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 struct ErrorData {
     error: Option<String>,
-    #[serde(default)]
-    user_message_ids: Vec<String>,
-    #[serde(default)]
-    assistant_message_ids: Vec<String>,
+    user_message_id: Option<String>,
+    assistant_message_id: Option<String>,
 }
 
 const PROTOCOL_VERSION: u64 = 1;
@@ -180,10 +176,8 @@ struct GatewayChatEvent {
     message: Option<GatewayChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_message: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    user_message_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    assistant_message_ids: Vec<String>,
+    user_message_id: Option<String>,
+    assistant_message_id: Option<String>,
     terminal: bool,
 }
 
@@ -710,14 +704,24 @@ fn forward_run_event(
                     }],
                 }),
                 error_message: None,
-                user_message_ids: Vec::new(),
-                assistant_message_ids: Vec::new(),
+                user_message_id: None,
+                assistant_message_id: None,
                 terminal: event.terminal,
             };
             send_event(tx, "chat", gateway_event).is_err()
         }
         "done" => {
-            let data = serde_json::from_str::<DoneData>(&event.data).unwrap_or_default();
+            let data = match serde_json::from_str::<DoneData>(&event.data) {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::error!(%error, run_id, "done event carries malformed data");
+                    DoneData {
+                        response: None,
+                        user_message_id: None,
+                        assistant_message_id: None,
+                    }
+                }
+            };
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
@@ -734,8 +738,8 @@ fn forward_run_event(
                     }
                 }),
                 error_message: None,
-                user_message_ids: data.user_message_ids,
-                assistant_message_ids: data.assistant_message_ids,
+                user_message_id: data.user_message_id,
+                assistant_message_id: data.assistant_message_id,
                 terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
@@ -744,7 +748,17 @@ fn forward_run_event(
             event.terminal
         }
         "error" => {
-            let data = serde_json::from_str::<ErrorData>(&event.data).unwrap_or_default();
+            let data = match serde_json::from_str::<ErrorData>(&event.data) {
+                Ok(data) => data,
+                Err(error) => {
+                    tracing::error!(%error, run_id, "error event carries malformed data");
+                    ErrorData {
+                        error: None,
+                        user_message_id: None,
+                        assistant_message_id: None,
+                    }
+                }
+            };
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
@@ -752,8 +766,8 @@ fn forward_run_event(
                 state: "error",
                 message: None,
                 error_message: Some(data.error.unwrap_or_else(|| "stream error".to_string())),
-                user_message_ids: data.user_message_ids,
-                assistant_message_ids: data.assistant_message_ids,
+                user_message_id: data.user_message_id,
+                assistant_message_id: data.assistant_message_id,
                 terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
@@ -1102,7 +1116,7 @@ mod tests {
         let done_event = RunEvent {
             id: 11,
             event: "done".to_string(),
-            data: r#"{"response":"final answer","user_message_ids":["turn:t1:input"],"assistant_message_ids":["turn:t1:final"]}"#.to_string(),
+            data: r#"{"response":"final answer","user_message_id":"turn:t1:input","assistant_message_id":"turn:t1:final"}"#.to_string(),
             terminal: true,
         };
 
@@ -1115,14 +1129,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         let payload = &parsed["payload"];
         assert_eq!(payload["state"], "done");
-        assert_eq!(
-            payload["userMessageIds"],
-            serde_json::json!(["turn:t1:input"])
-        );
-        assert_eq!(
-            payload["assistantMessageIds"],
-            serde_json::json!(["turn:t1:final"])
-        );
+        assert_eq!(payload["userMessageId"], "turn:t1:input");
+        assert_eq!(payload["assistantMessageId"], "turn:t1:final");
     }
 
     #[test]
@@ -1132,7 +1140,8 @@ mod tests {
         let done_event = RunEvent {
             id: 1,
             event: "done".to_string(),
-            data: r#"{"response":""}"#.to_string(),
+            data: r#"{"response":"","user_message_id":null,"assistant_message_id":null}"#
+                .to_string(),
             terminal: true,
         };
 

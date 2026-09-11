@@ -40,11 +40,24 @@ pub(crate) enum AgentEvent {
         timestamp: String,
     },
     /// Final response. `terminal` is determined by the shared observer
-    /// interaction lifecycle for client-owned delivery.
-    FinalResponse { text: String, terminal: bool },
+    /// interaction lifecycle for client-owned delivery. `turn_id` is the
+    /// durable Turn that produced the response; one client interaction can
+    /// span several Turns (staged follow-up promotion), so publishers must
+    /// resolve persisted ids through this id, not the interaction id.
+    FinalResponse {
+        turn_id: String,
+        text: String,
+        terminal: bool,
+    },
     /// Error occurred. `terminal` is false when the shared interaction still
     /// owns a staged follow-up that will continue on the same observer.
-    Error { message: String, terminal: bool },
+    /// `turn_id` identifies the durable Turn that failed, for the same
+    /// reason as [`AgentEvent::FinalResponse`].
+    Error {
+        turn_id: String,
+        message: String,
+        terminal: bool,
+    },
 }
 
 /// Type-erased callback for agent lifecycle events.
