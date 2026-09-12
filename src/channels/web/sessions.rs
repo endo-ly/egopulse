@@ -161,6 +161,9 @@ pub(super) async fn get_history(
     // their slot still places the cards. A narration-bearing preview keeps
     // only its narration: the tool calls render as structured cards, and the
     // narration is the same text the client streamed live under this id.
+    // The strip applies only when tool calls are actually attached to the
+    // message: an ordinary answer that merely mentions the `[tool_call]`
+    // format must pass through untouched.
     let mut sorted_messages: Vec<&StoredMessage> = messages.iter().collect();
     sorted_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
@@ -169,7 +172,9 @@ pub(super) async fn get_history(
         let skip_preview = message.sender_kind == SenderKind::Assistant
             && is_tool_preview_message(&message.content);
         if !skip_preview {
-            let content = if message.sender_kind == SenderKind::Assistant {
+            let has_tool_calls = message.sender_kind == SenderKind::Assistant
+                && tools_by_message.contains_key(message.id.as_str());
+            let content = if has_tool_calls {
                 tool_preview_narration(&message.content)
             } else {
                 message.content.as_str()
@@ -629,12 +634,24 @@ mod tests {
         // A tool_call preview that leads with agent narration stays, but
         // only as its narration: the calls render as structured cards, and
         // the narration matches what the client streamed live.
-        db.store_message_only(&StoredMessage::assistant(
+        let narration_msg = StoredMessage::assistant(
             chat_id,
             "lyre".to_string(),
             "読みますね [tool_call] read".to_string(),
-        ))
-        .expect("store tool_call narration");
+        );
+        let narration_id = narration_msg.id.clone();
+        db.store_message_only(&narration_msg)
+            .expect("store tool_call narration");
+        db.insert_tool_call_for_test(
+            "call-narration",
+            chat_id,
+            &narration_id,
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"file contents","status":"success"}"#),
+            "2026-09-12T00:00:01Z",
+        )
+        .expect("store narration tool call");
 
         // A plain assistant message stays.
         db.store_message_only(&StoredMessage::assistant(
@@ -659,11 +676,58 @@ mod tests {
 
         assert_eq!(
             messages.len(),
-            2,
-            "only narration + plain message remain: {contents:?}"
+            3,
+            "narration + plain message + the narration tool card: {contents:?}"
         );
         assert!(contents.contains(&"読みますね"));
         assert!(contents.contains(&"hello there"));
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["message_kind"] == "tool_call" && m["id"] == "tool:call-narration"),
+            "the narration tool call still renders as a card: {contents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_history_leaves_unrelated_tool_call_mentions_untouched() {
+        // An ordinary answer that merely mentions the `[tool_call]` format —
+        // without ever issuing a tool call — must survive the refetch
+        // verbatim. The narration strip applies only to messages that
+        // actually own tool calls.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-mention:agent:lyre", "lyre");
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "内部形式は [tool_call] read のようになります".to_string(),
+        ))
+        .expect("store mentioning assistant");
+        db.store_message_only(&StoredMessage::user(
+            chat_id,
+            "user:web".to_string(),
+            "メモ: [tool_call] write を試す".to_string(),
+        ))
+        .expect("store mentioning user");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let body = result.0;
+        let messages = body["messages"].as_array().expect("messages array");
+
+        let contents: Vec<&str> = messages
+            .iter()
+            .map(|m| m["content"].as_str().expect("content string"))
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert!(contents.contains(&"内部形式は [tool_call] read のようになります"));
+        assert!(contents.contains(&"メモ: [tool_call] write を試す"));
     }
 
     #[tokio::test]

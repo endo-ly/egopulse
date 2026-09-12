@@ -164,7 +164,7 @@ impl<'a> TurnPersistence<'a> {
             // The final row was just persisted above under
             // `final_message_id`, which is also the id the response
             // streamed under — delivery adopts nothing.
-            assistant_message_id: Some(final_message_id.to_string()),
+            assistant_message_id: final_message_id.to_string(),
             text: final_content.clone(),
             terminal: false,
         });
@@ -350,14 +350,16 @@ impl<'a> TurnPersistence<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent_loop::event::{AgentEvent, EventEmitter};
     use crate::agent_loop::process_turn;
     use crate::agent_loop::test_support::{
         RecordingProvider, build_state_with_provider, cli_context,
     };
-    use crate::conversation::SurfaceContext;
-    use crate::llm::{MessagesResponse, ToolCall};
+    use crate::agent_loop::turn::lifecycle::TurnLifecycle;
+    use crate::conversation::{ConversationScope, SurfaceContext};
+    use crate::llm::{Message, MessagesResponse, ToolCall};
     use crate::runtime::AppState;
-    use crate::storage::call_blocking;
+    use crate::storage::{AcceptTurnParams, StoredMessage, TurnRunState, call_blocking};
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -482,5 +484,138 @@ mod tests {
             rows.iter().any(|link| link.id == parents[0]),
             "parent_message_id must reference a persisted assistant message"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn final_persist_then_completion_failure_keeps_one_stable_id() {
+        // Arrange: a turn whose input is committed under the canonical
+        // request key, then whose final row is persisted under the streamed
+        // iteration id — exactly what the loop reports live.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(vec![], vec![]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = context_with_request_key("final-failure", "cli:final-failure:1");
+        let runtime = state.turn_dependencies();
+        let chat_id = crate::agent_loop::resolve_chat_id(&runtime, &context)
+            .await
+            .expect("chat id");
+        let turn_id = call_blocking(Arc::clone(&state.db), move |db| {
+            match db.accept_or_get_turn(AcceptTurnParams {
+                chat_id,
+                request_key: "cli:final-failure:1",
+                config_revision: 1,
+                config_fingerprint: Some("fingerprint"),
+                request_payload_hash: "payload",
+                origin_id: None,
+                scheduled_request_json: None,
+            })? {
+                crate::storage::AcceptOutcome::Created(run) => {
+                    Ok::<String, crate::error::StorageError>(run.turn_id)
+                }
+                crate::storage::AcceptOutcome::Existing(_) => Err(
+                    crate::error::StorageError::Conflict("expected a fresh turn".to_string()),
+                ),
+            }
+        })
+        .await
+        .expect("accept turn");
+        let revision = call_blocking(Arc::clone(&state.db), {
+            let turn_id = turn_id.clone();
+            move |db| {
+                let mut input =
+                    StoredMessage::user(chat_id, "local_user".to_string(), "do it".to_string());
+                input.id = "cli:final-failure:1".to_string();
+                input.turn_id = Some(turn_id.clone());
+                input.timestamp = "2026-09-12T00:00:00Z".to_string();
+                db.commit_turn_input_with_conversation(&input, "[]", None, &turn_id, 1, None)
+            }
+        })
+        .await
+        .expect("commit input");
+        let final_id = format!("turn:{turn_id}:assistant:1");
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+        let persistence = super::TurnPersistence::new(&runtime, &context, chat_id, &turn_id);
+        persistence
+            .persist_final(
+                &final_id,
+                Arc::new(vec![
+                    Message::text("user", "do it"),
+                    Message::text("assistant", "done"),
+                ]),
+                Some(revision),
+                &EventEmitter::new(move |event| {
+                    event_log.lock().expect("events").push(event);
+                }),
+                ("done".to_string(), None),
+            )
+            .await
+            .expect("persist final");
+
+        // Act: the turn leaves the completable state before complete() runs,
+        // so completion conflicts and the failure is recorded — while the
+        // final row already exists under the streamed id.
+        call_blocking(Arc::clone(&state.db), {
+            let turn_id = turn_id.clone();
+            move |db| db.fail_turn(&turn_id, TurnRunState::Failed, "test", "boom")
+        })
+        .await
+        .expect("fail turn");
+        let lifecycle = TurnLifecycle::new(&runtime, ConversationScope::Normal, &turn_id, "");
+        lifecycle
+            .complete(&final_id)
+            .await
+            .expect_err("complete must conflict after failure");
+
+        // Assert: the FinalResponse named the streamed id before completion
+        // failed — the live transcript and the durable row agree already.
+        {
+            let events = events.lock().expect("events");
+            assert!(
+                matches!(
+                    &events[..],
+                    [AgentEvent::FinalResponse {
+                        assistant_message_id,
+                        text,
+                        ..
+                    }] if assistant_message_id == &final_id && text == "done"
+                ),
+                "final event must name the streamed id: {events:?}"
+            );
+        }
+
+        // Assert: the failed turn keeps exactly one final row under the
+        // streamed id. A history refetch returns it under the same id the
+        // live transcript already shows, so the merge converges instead of
+        // duplicating — and the failed completion stamped nothing else.
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("history");
+        let finals: Vec<_> = history
+            .iter()
+            .filter(|message| message.id == final_id)
+            .collect();
+        assert_eq!(finals.len(), 1, "one final row: {history:?}");
+        assert_eq!(finals[0].content, "done");
+        assert!(
+            history
+                .iter()
+                .any(|message| message.id == "cli:final-failure:1"),
+            "input keeps the request key: {history:?}"
+        );
+        let run = call_blocking(Arc::clone(&state.db), {
+            let turn_id = turn_id.clone();
+            move |db| db.get_turn_run(&turn_id)
+        })
+        .await
+        .expect("turn row");
+        assert_eq!(run.state, TurnRunState::Failed);
+        assert_eq!(run.final_message_id, None);
     }
 }

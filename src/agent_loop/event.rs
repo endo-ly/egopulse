@@ -59,11 +59,12 @@ pub(crate) enum AgentEvent {
     /// durable Turn that produced the response; one client interaction can
     /// span several Turns (staged follow-up promotion). `assistant_message_id`
     /// is the stable id the response streamed under. Duplicate-delivery
-    /// notices (no persisted final) carry the origin-assigned notice id, so
-    /// every FinalResponse names its message and channels invent none.
+    /// notices (no persisted final) carry the origin-assigned notice id.
+    /// Every FinalResponse names its message: a response without an
+    /// identity is unrepresentable by construction.
     FinalResponse {
         turn_id: String,
-        assistant_message_id: Option<String>,
+        assistant_message_id: String,
         text: String,
         terminal: bool,
     },

@@ -931,7 +931,7 @@ mod tests {
 
     fn collect_loop_events(
         events: &Arc<std::sync::Mutex<Vec<AgentEvent>>>,
-    ) -> (Vec<(String, String)>, Vec<String>, Option<String>) {
+    ) -> (Vec<(String, String)>, Vec<String>, String) {
         let events = events.lock().expect("events");
         let deltas: Vec<(String, String)> = events
             .iter()
@@ -947,14 +947,17 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let final_id = events.iter().find_map(|event| match event {
-            AgentEvent::FinalResponse {
-                assistant_message_id,
-                ..
-            } => Some(assistant_message_id.clone()),
-            _ => None,
-        });
-        (deltas, discarded, final_id.flatten())
+        let final_id = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::FinalResponse {
+                    assistant_message_id,
+                    ..
+                } => Some(assistant_message_id.clone()),
+                _ => None,
+            })
+            .expect("final response names its message");
+        (deltas, discarded, final_id)
     }
 
     async fn chat_and_turn_ids(
@@ -1029,7 +1032,6 @@ mod tests {
         assert!(second_id.ends_with(":assistant:2"), "id was {second_id}");
         assert_ne!(first_id, second_id);
         assert_eq!(discarded, vec![first_id.clone()]);
-        let final_id = final_id.expect("final id");
         assert_eq!(final_id, second_id);
 
         let (chat_id, turn_id, stored_final_id) =
@@ -1105,7 +1107,7 @@ mod tests {
         assert!(deltas[0].0.ends_with(":assistant:1"));
         assert!(deltas[1].0.ends_with(":assistant:2"));
         assert_eq!(discarded, vec![deltas[0].0.clone()]);
-        assert_eq!(final_id.as_deref(), Some(deltas[1].0.as_str()));
+        assert_eq!(final_id, deltas[1].0);
     }
 
     #[tokio::test]
@@ -1162,7 +1164,7 @@ mod tests {
         let final_live_id = deltas[1].0.clone();
         assert!(narration_id.ends_with(":assistant:1"));
         assert!(final_live_id.ends_with(":assistant:2"));
-        assert_eq!(final_id.as_deref(), Some(final_live_id.as_str()));
+        assert_eq!(final_id, final_live_id);
 
         let (chat_id, turn_id, stored_final_id) = chat_and_turn_ids(&state, "iteration-ids").await;
         assert_eq!(stored_final_id.as_deref(), Some(final_live_id.as_str()));

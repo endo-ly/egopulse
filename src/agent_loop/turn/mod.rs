@@ -391,7 +391,7 @@ impl TurnExecutor<'_> {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id: turn_id.clone(),
                         assistant_message_id: assistant_message_id
-                            .or_else(|| Some(notice_message_id(&turn_id))),
+                            .unwrap_or_else(|| notice_message_id(&turn_id)),
                         text: text.clone(),
                         terminal: false,
                     });
@@ -408,7 +408,7 @@ impl TurnExecutor<'_> {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id: turn_id.clone(),
                         assistant_message_id: assistant_message_id
-                            .or_else(|| Some(notice_message_id(&turn_id))),
+                            .unwrap_or_else(|| notice_message_id(&turn_id)),
                         text: text.clone(),
                         terminal: false,
                     });

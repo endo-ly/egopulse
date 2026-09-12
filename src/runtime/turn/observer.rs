@@ -31,7 +31,7 @@ struct ObserverState {
 /// publishers forward them without further lookup.
 struct PendingFinalResponse {
     turn_id: String,
-    assistant_message_id: Option<String>,
+    assistant_message_id: String,
     text: String,
 }
 
@@ -365,7 +365,7 @@ mod tests {
             "follow-up-a",
             AgentEvent::FinalResponse {
                 turn_id: "turn-a".to_string(),
-                assistant_message_id: Some("turn:turn-a:assistant:2".to_string()),
+                assistant_message_id: "turn:turn-a:assistant:2".to_string(),
                 text: "response A".to_string(),
                 terminal: false,
             },
@@ -375,7 +375,7 @@ mod tests {
             "follow-up-b",
             AgentEvent::FinalResponse {
                 turn_id: "turn-b".to_string(),
-                assistant_message_id: Some("turn:turn-b:assistant:1".to_string()),
+                assistant_message_id: "turn:turn-b:assistant:1".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
             },
@@ -393,7 +393,7 @@ mod tests {
                 ..
             }) if text == "response A"
                 && turn_id == "turn-a"
-                && assistant_message_id.as_deref() == Some("turn:turn-a:assistant:2")
+                && assistant_message_id == "turn:turn-a:assistant:2"
         ));
         assert!(matches!(
             events.recv().await,
@@ -405,7 +405,7 @@ mod tests {
                 ..
             }) if text == "response B"
                 && turn_id == "turn-b"
-                && assistant_message_id.as_deref() == Some("turn:turn-b:assistant:1")
+                && assistant_message_id == "turn:turn-b:assistant:1"
         ));
         completion.await.expect("completion sender");
     }
@@ -438,7 +438,7 @@ mod tests {
             "follow-up-b",
             AgentEvent::FinalResponse {
                 turn_id: "turn-b".to_string(),
-                assistant_message_id: Some("turn:turn-b:assistant:1".to_string()),
+                assistant_message_id: "turn:turn-b:assistant:1".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
             },

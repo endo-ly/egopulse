@@ -57,7 +57,7 @@ struct ToolResultPayload {
 #[serde(rename_all = "camelCase")]
 struct DonePayload {
     response: String,
-    message_id: Option<String>,
+    message_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -681,14 +681,15 @@ async fn publish_terminal_web_run(
     // it under its canonical id from the start.
     let (event, data, status) = match run.state {
         TurnRunState::Completed => {
-            let final_message_id = run.final_message_id.clone().ok_or_else(|| {
+            let message_id = run.final_message_id.clone().ok_or_else(|| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "completed turn has no final response".to_string(),
                 )
             })?;
+            let lookup_id = message_id.clone();
             let response = call_blocking(state.app_state.db_for(scope), move |db| {
-                db.get_message_content(&final_message_id)
+                db.get_message_content(&lookup_id)
             })
             .await
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
@@ -702,7 +703,7 @@ async fn publish_terminal_web_run(
                 "done",
                 serde_json::to_string(&DonePayload {
                     response,
-                    message_id: run.final_message_id.clone(),
+                    message_id,
                 })
                 .unwrap_or_default(),
                 "completed",
@@ -775,7 +776,7 @@ async fn execute_web_slash_command(
                     "done",
                     serde_json::to_string(&DonePayload {
                         response,
-                        message_id: Some(message_id),
+                        message_id,
                     })
                     .unwrap_or_default(),
                 )
@@ -1030,7 +1031,7 @@ mod tests {
     fn stream_event_format_matches() {
         let done_json = serde_json::to_string(&DonePayload {
             response: "hello".to_string(),
-            message_id: Some("turn:t1:assistant:2".to_string()),
+            message_id: "turn:t1:assistant:2".to_string(),
         })
         .unwrap();
         let done_parsed: serde_json::Value = serde_json::from_str(&done_json).unwrap();
@@ -1118,7 +1119,7 @@ mod tests {
 
         let done_data = serde_json::to_string(&DonePayload {
             response: "final".to_string(),
-            message_id: Some("turn:t1:assistant:1".to_string()),
+            message_id: "turn:t1:assistant:1".to_string(),
         })
         .unwrap();
         hub.publish("test-run", "done", done_data).await;
@@ -1169,7 +1170,7 @@ mod tests {
             "tool-run",
             AgentEvent::FinalResponse {
                 turn_id: "turn-tool".to_string(),
-                assistant_message_id: Some("turn:turn-tool:assistant:2".to_string()),
+                assistant_message_id: "turn:turn-tool:assistant:2".to_string(),
                 text: "done".to_string(),
                 terminal: true,
             },
@@ -1220,7 +1221,7 @@ mod tests {
             "shared-run",
             AgentEvent::FinalResponse {
                 turn_id: "turn-child".to_string(),
-                assistant_message_id: Some("turn:turn-child:assistant:1".to_string()),
+                assistant_message_id: "turn:turn-child:assistant:1".to_string(),
                 text: "continued".to_string(),
                 terminal: true,
             },

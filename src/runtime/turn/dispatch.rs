@@ -1320,7 +1320,7 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum DeliveredEvent {
         Input(String, String),
-        Response(String, bool, String, Option<String>),
+        Response(String, bool, String, String),
         Error(String, bool, String),
     }
 
@@ -2547,10 +2547,7 @@ mod tests {
                     assert_eq!(text, "ok");
                     assert!(!terminal, "the first child must not end the interaction");
                     assert_eq!(turn_id, &child_ids[0]);
-                    assert_eq!(
-                        message_id.as_deref(),
-                        Some(format!("turn:{}:assistant:1", child_ids[0]).as_str())
-                    );
+                    assert_eq!(message_id, &format!("turn:{}:assistant:1", child_ids[0]));
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
                     assert!(message.contains("follow-up 0 failed"));
@@ -2569,10 +2566,7 @@ mod tests {
                     assert_eq!(text, "ok");
                     assert!(terminal, "the last child must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
-                    assert_eq!(
-                        message_id.as_deref(),
-                        Some(format!("turn:{}:assistant:1", child_ids[1]).as_str())
-                    );
+                    assert_eq!(message_id, &format!("turn:{}:assistant:1", child_ids[1]));
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
                     assert!(message.contains("follow-up 1 failed"));

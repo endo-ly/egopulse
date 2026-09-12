@@ -14,11 +14,12 @@ pub(crate) enum TurnAcceptance {
     /// A fresh `accepted` Turn created by this call; the caller owns execution.
     Proceed(Box<TurnRun>),
     /// The Turn was already `completed`; replay its saved final response.
-    /// The final id comes from the existing durable row so event consumers
-    /// resolve the same id the first execution reported.
+    /// The final id comes from the existing durable row (a completed row
+    /// always names one) so event consumers resolve the same id the first
+    /// execution reported.
     Completed {
         turn_id: String,
-        assistant_message_id: Option<String>,
+        assistant_message_id: String,
         text: String,
     },
     /// The Turn already exists and is non-terminal; another executor owns it.
@@ -120,8 +121,9 @@ impl<'a> TurnLifecycle<'a> {
                             "completed turn_run has no final_message_id".to_string(),
                         )
                     })?;
+                    let lookup_id = final_message_id.clone();
                     let content = call_blocking(runtime.db_for(scope), move |db| {
-                        db.get_message_content(&final_message_id)
+                        db.get_message_content(&lookup_id)
                     })
                     .await?
                     .ok_or_else(|| {
@@ -131,7 +133,7 @@ impl<'a> TurnLifecycle<'a> {
                     })?;
                     Ok(TurnAcceptance::Completed {
                         turn_id: run.turn_id.clone(),
-                        assistant_message_id: run.final_message_id.clone(),
+                        assistant_message_id: final_message_id,
                         text: content,
                     })
                 }
@@ -724,7 +726,7 @@ mod tests {
             AgentEvent::FinalResponse {
                 assistant_message_id,
                 ..
-            } => assistant_message_id.clone(),
+            } => Some(assistant_message_id.clone()),
             _ => None,
         });
         assert_eq!(

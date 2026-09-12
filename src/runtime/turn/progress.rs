@@ -511,7 +511,7 @@ mod tests {
         tx.send(tool_start("read", "read")).unwrap();
         tx.send(AgentEvent::FinalResponse {
             turn_id: "turn-test".to_string(),
-            assistant_message_id: None,
+            assistant_message_id: "turn:turn-test:assistant:1".to_string(),
             text: "done".to_string(),
             terminal: false,
         })
@@ -905,7 +905,7 @@ mod tests {
             .unwrap();
         tx.send(AgentEvent::FinalResponse {
             turn_id: "turn-test".to_string(),
-            assistant_message_id: None,
+            assistant_message_id: "turn:t1:assistant:2".to_string(),
             text: "完了した結果をお伝えします".to_string(),
             terminal: false,
         })
