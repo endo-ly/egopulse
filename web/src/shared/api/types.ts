@@ -22,7 +22,7 @@ export interface ChatMessage {
   content: string;
   timestamp: string;
   message_kind: string;
-  /** Owning run for live optimistic entries; absent on persisted rows. */
+  /** Owning run for live entries (replay-truncated cleanup); absent on persisted rows. */
   runId?: string;
 }
 

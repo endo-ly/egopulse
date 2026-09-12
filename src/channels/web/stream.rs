@@ -37,8 +37,6 @@ struct ToolStartPayload {
     call_id: String,
     name: String,
     input: serde_json::Value,
-    /// Persisted id of the assistant message that issued this tool call.
-    assistant_message_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -51,44 +49,44 @@ struct ToolResultPayload {
     duration_ms: u128,
 }
 
+/// Terminal assistant content. `message_id` is the stable id the response
+/// streamed under — the same id as the persisted final row, or a
+/// run-scoped stable id for responses without a durable Turn (slash
+/// commands), which never rename mid-run.
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DonePayload {
     response: String,
-    /// Persisted id of the emitting Turn's input message. Adopts the
-    /// optimistic user bubble. `None` when the run has no Turn (slash
-    /// commands) or the lookup failed.
-    user_message_id: Option<String>,
-    /// Persisted id of the emitting Turn's final message. Adopts the sealed
-    /// assistant draft. `None` when the Turn produced no final message.
-    assistant_message_id: Option<String>,
+    message_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DeltaPayload {
+    message_id: String,
     delta: String,
 }
 
 #[derive(Debug, Serialize)]
 struct ErrorPayload {
     error: String,
-    /// Same contract as [`DonePayload::user_message_id`].
-    user_message_id: Option<String>,
-    /// Same contract as [`DonePayload::assistant_message_id`]. Stays `None`
-    /// when the Turn failed before persisting a final message, so clients
-    /// keep the sealed partial output instead of dropping it.
-    assistant_message_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UserInputPayload {
-    /// Client-issued request id behind the commit, when the staged key
-    /// carries one. Lets the client consume exactly its optimistic bubble.
-    request_id: Option<String>,
+    /// Canonical client-issued message id, identical to the optimistic entry
+    /// the client already shows: delivery is an upsert, never an adoption.
     message_id: String,
     sender_id: String,
     text: String,
     timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantDiscardedPayload {
+    message_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,9 +104,11 @@ pub(super) struct SendRequest {
     pub message: String,
     /// Agent selected by the WebUI when a new session is created.
     pub agent_id: Option<String>,
-    /// Client-generated request id for deduplication. The same id re-delivered
-    /// after a transient failure maps to the same Turn instead of a duplicate.
-    pub request_id: Option<String>,
+    /// Client-generated canonical message id (`web:<uuid>`). The id is the
+    /// optimistic entry, the Turn's `request_key`, and the persisted
+    /// `messages.id` at once, so a re-delivered send maps to the same Turn
+    /// instead of a duplicate.
+    pub message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -315,20 +315,28 @@ pub(super) async fn resolve_send_request(
         resolve_new_web_session(state, raw_session_key, request.agent_id.as_deref(), actor).await?
     };
 
-    context.request_key = request
-        .request_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-        .map_or_else(
-            || format!("web:{}", Uuid::new_v4()),
-            |id| format!("web:{id}"),
-        );
+    context.request_key = parse_web_message_id(request.message_id.as_deref()).map_err(|()| {
+        (
+            StatusCode::BAD_REQUEST,
+            "messageId is required in web:<uuid> format".to_string(),
+        )
+    })?;
 
     Ok(ResolvedSend {
         message,
         session_key,
         context,
     })
+}
+
+/// Validates a client-issued canonical user message id and returns it as the
+/// Turn's request key. One accepted input is one message end to end, so the
+/// id doubles as the idempotency key; no separate request id exists.
+fn parse_web_message_id(raw: Option<&str>) -> Result<String, ()> {
+    let id = raw.map(str::trim).filter(|id| !id.is_empty()).ok_or(())?;
+    let uuid_part = id.strip_prefix("web:").ok_or(())?;
+    Uuid::parse_str(uuid_part).map_err(|_| ())?;
+    Ok(id.to_string())
 }
 
 fn web_surface_thread_from_external_chat_id(external_chat_id: &str, agent_id: &str) -> String {
@@ -375,12 +383,16 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 )
                 .await;
         }
-        AgentEvent::Delta { text } => {
+        AgentEvent::Delta { message_id, text } => {
             run_hub
                 .publish(
                     run_id,
                     "delta",
-                    serde_json::to_string(&DeltaPayload { delta: text }).unwrap_or_default(),
+                    serde_json::to_string(&DeltaPayload {
+                        message_id,
+                        delta: text,
+                    })
+                    .unwrap_or_default(),
                 )
                 .await;
         }
@@ -388,7 +400,6 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
             call_id,
             name,
             input,
-            assistant_message_id,
         } => {
             run_hub
                 .publish(
@@ -398,7 +409,6 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                         call_id,
                         name,
                         input,
-                        assistant_message_id,
                     })
                     .unwrap_or_default(),
                 )
@@ -427,7 +437,6 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 .await;
         }
         AgentEvent::UserInputInjected {
-            request_id,
             message_id,
             sender_id,
             text,
@@ -438,7 +447,6 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                     run_id,
                     "user_input",
                     serde_json::to_string(&UserInputPayload {
-                        request_id,
                         message_id,
                         sender_id,
                         text,
@@ -448,23 +456,34 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 )
                 .await;
         }
+        AgentEvent::AssistantMessageDiscarded { message_id } => {
+            run_hub
+                .publish(
+                    run_id,
+                    "assistant_discarded",
+                    serde_json::to_string(&AssistantDiscardedPayload { message_id })
+                        .unwrap_or_default(),
+                )
+                .await;
+        }
         AgentEvent::FinalResponse {
-            turn_id: _,
-            user_message_id,
+            turn_id,
             assistant_message_id,
             text,
             terminal,
         } => {
-            // Stamps arrive authoritatively in the event (resolved at
-            // emission from the persisted row or the just-written message),
-            // so delivery performs no lookup and cannot fail it.
+            // The final id is the stable id the response streamed under, so
+            // delivery upserts by id and performs no lookup. A notice without
+            // a persisted final (duplicate delivery) keeps a run-scoped
+            // stable id so the text stays visible instead of being dropped.
+            let message_id = assistant_message_id
+                .or_else(|| (!text.is_empty()).then(|| format!("turn:{turn_id}:notice")));
             run_hub
                 .publish_agent_response(
                     run_id,
                     serde_json::to_string(&DonePayload {
                         response: text,
-                        user_message_id,
-                        assistant_message_id,
+                        message_id,
                     })
                     .unwrap_or_default(),
                     terminal,
@@ -473,22 +492,15 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
         }
         AgentEvent::Error {
             turn_id: _,
-            user_message_id,
-            assistant_message_id,
             message,
             terminal,
         } => {
-            // Stamps travel with the event (resolved by the runtime at
-            // emission), so delivery performs no lookup and cannot fail it.
+            // Partial output keeps the id it streamed under; error delivery
+            // resolves nothing.
             run_hub
                 .publish_agent_error(
                     run_id,
-                    serde_json::to_string(&ErrorPayload {
-                        error: message,
-                        user_message_id,
-                        assistant_message_id,
-                    })
-                    .unwrap_or_default(),
+                    serde_json::to_string(&ErrorPayload { error: message }).unwrap_or_default(),
                     terminal,
                 )
                 .await;
@@ -664,12 +676,10 @@ async fn publish_terminal_web_run(
     run: &TurnRun,
     actor: &str,
 ) -> Result<&'static str, (StatusCode, String)> {
-    // The row in hand is the terminal Turn itself, so its stamped ids are
-    // used directly: no message enumeration, no session lookup. Tool
-    // previews are excluded by construction — only the input/final stamps
-    // travel to the client.
-    let user_message_id = run.input_message_id.clone();
-    let assistant_message_id = run.final_message_id.clone();
+    // The row in hand is the terminal Turn itself. The final id is the
+    // stable id the response streamed under, so replaying it re-announces
+    // the same message id; the input needs no echo because the client showed
+    // it under its canonical id from the start.
     let (event, data, status) = match run.state {
         TurnRunState::Completed => {
             let final_message_id = run.final_message_id.clone().ok_or_else(|| {
@@ -693,8 +703,7 @@ async fn publish_terminal_web_run(
                 "done",
                 serde_json::to_string(&DonePayload {
                     response,
-                    user_message_id,
-                    assistant_message_id,
+                    message_id: run.final_message_id.clone(),
                 })
                 .unwrap_or_default(),
                 "completed",
@@ -707,8 +716,6 @@ async fn publish_terminal_web_run(
                     .error_message
                     .clone()
                     .unwrap_or_else(|| format!("turn ended in state {}", run.state)),
-                user_message_id,
-                assistant_message_id,
             })
             .unwrap_or_default(),
             "failed",
@@ -758,6 +765,10 @@ async fn execute_web_slash_command(
     .await
     {
         crate::slash_commands::SlashCommandOutcome::Respond(response) => {
+            // Slash commands run no durable Turn, so the run-scoped stable
+            // id stands in for a persisted final id. It never renames: the
+            // same payload is replayed verbatim to resubscribers.
+            let message_id = format!("web:slash:{run_id}");
             state
                 .run_hub
                 .publish(
@@ -765,8 +776,7 @@ async fn execute_web_slash_command(
                     "done",
                     serde_json::to_string(&DonePayload {
                         response,
-                        user_message_id: None,
-                        assistant_message_id: None,
+                        message_id: Some(message_id),
                     })
                     .unwrap_or_default(),
                 )
@@ -778,12 +788,7 @@ async fn execute_web_slash_command(
                 .publish(
                     &run_id,
                     "error",
-                    serde_json::to_string(&ErrorPayload {
-                        error,
-                        user_message_id: None,
-                        assistant_message_id: None,
-                    })
-                    .unwrap_or_default(),
+                    serde_json::to_string(&ErrorPayload { error }).unwrap_or_default(),
                 )
                 .await;
         }
@@ -862,7 +867,7 @@ mod tests {
             session_key: Some("new-ace-session".to_string()),
             message: "hello".to_string(),
             agent_id: Some("ace".to_string()),
-            request_id: None,
+            message_id: Some("web:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string()),
         };
 
         // Act
@@ -899,7 +904,7 @@ mod tests {
             session_key: Some("missing-agent-session".to_string()),
             message: "hello".to_string(),
             agent_id: None,
-            request_id: None,
+            message_id: Some("web:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string()),
         };
 
         // Act
@@ -930,7 +935,7 @@ mod tests {
             session_key: Some("unknown-agent-session".to_string()),
             message: "hello".to_string(),
             agent_id: Some("missing".to_string()),
-            request_id: None,
+            message_id: Some("web:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string()),
         };
 
         // Act
@@ -966,7 +971,7 @@ mod tests {
             session_key: Some(format!("chat:{chat_id}")),
             message: "hello".to_string(),
             agent_id: Some("default".to_string()),
-            request_id: None,
+            message_id: Some("web:dddddddd-dddd-dddd-dddd-dddddddddddd".to_string()),
         };
 
         // Act
@@ -1026,25 +1031,28 @@ mod tests {
     fn stream_event_format_matches() {
         let done_json = serde_json::to_string(&DonePayload {
             response: "hello".to_string(),
-            user_message_id: Some("turn:t1:input".to_string()),
-            assistant_message_id: Some("turn:t1:final".to_string()),
+            message_id: Some("turn:t1:assistant:2".to_string()),
         })
         .unwrap();
         let done_parsed: serde_json::Value = serde_json::from_str(&done_json).unwrap();
         assert_eq!(done_parsed["response"], "hello");
-        assert_eq!(done_parsed["user_message_id"], "turn:t1:input");
-        assert_eq!(done_parsed["assistant_message_id"], "turn:t1:final");
+        assert_eq!(done_parsed["messageId"], "turn:t1:assistant:2");
 
         let error_json = serde_json::to_string(&ErrorPayload {
             error: "oops".to_string(),
-            user_message_id: Some("turn:t1:input".to_string()),
-            assistant_message_id: None,
         })
         .unwrap();
         let error_parsed: serde_json::Value = serde_json::from_str(&error_json).unwrap();
         assert_eq!(error_parsed["error"], "oops");
-        assert_eq!(error_parsed["user_message_id"], "turn:t1:input");
-        assert!(error_parsed["assistant_message_id"].is_null());
+
+        let delta_json = serde_json::to_string(&DeltaPayload {
+            message_id: "turn:t1:assistant:1".to_string(),
+            delta: "hi".to_string(),
+        })
+        .unwrap();
+        let delta_parsed: serde_json::Value = serde_json::from_str(&delta_json).unwrap();
+        assert_eq!(delta_parsed["messageId"], "turn:t1:assistant:1");
+        assert_eq!(delta_parsed["delta"], "hi");
 
         let status_json = serde_json::to_string(&StatusPayload {
             message: "running".to_string(),
@@ -1057,14 +1065,13 @@ mod tests {
             call_id: "call_1".to_string(),
             name: "read".to_string(),
             input: serde_json::json!({"path": "a.txt"}),
-            assistant_message_id: "assistant-1".to_string(),
         })
         .unwrap();
         let tool_start_parsed: serde_json::Value = serde_json::from_str(&tool_start_json).unwrap();
         assert_eq!(tool_start_parsed["callId"], "call_1");
         assert_eq!(tool_start_parsed["name"], "read");
         assert_eq!(tool_start_parsed["input"]["path"], "a.txt");
-        assert_eq!(tool_start_parsed["assistantMessageId"], "assistant-1");
+        assert!(tool_start_parsed.get("assistantMessageId").is_none());
 
         let tool_result_json = serde_json::to_string(&ToolResultPayload {
             call_id: "call_1".to_string(),
@@ -1081,6 +1088,27 @@ mod tests {
         assert_eq!(tool_result_parsed["isError"], false);
         assert_eq!(tool_result_parsed["durationMs"], 123);
         assert_eq!(tool_result_parsed["preview"], "done");
+
+        let user_input_json = serde_json::to_string(&UserInputPayload {
+            message_id: "web:11111111-1111-1111-1111-111111111111".to_string(),
+            sender_id: "web-user".to_string(),
+            text: "follow-up".to_string(),
+            timestamp: "2026-09-12T00:00:00Z".to_string(),
+        })
+        .unwrap();
+        let user_input_parsed: serde_json::Value = serde_json::from_str(&user_input_json).unwrap();
+        assert_eq!(
+            user_input_parsed["messageId"],
+            "web:11111111-1111-1111-1111-111111111111"
+        );
+        assert!(user_input_parsed.get("requestId").is_none());
+
+        let discarded_json = serde_json::to_string(&AssistantDiscardedPayload {
+            message_id: "turn:t1:assistant:1".to_string(),
+        })
+        .unwrap();
+        let discarded_parsed: serde_json::Value = serde_json::from_str(&discarded_json).unwrap();
+        assert_eq!(discarded_parsed["messageId"], "turn:t1:assistant:1");
     }
 
     #[tokio::test]
@@ -1091,8 +1119,7 @@ mod tests {
 
         let done_data = serde_json::to_string(&DonePayload {
             response: "final".to_string(),
-            user_message_id: None,
-            assistant_message_id: None,
+            message_id: Some("turn:t1:assistant:1".to_string()),
         })
         .unwrap();
         hub.publish("test-run", "done", done_data).await;
@@ -1109,11 +1136,10 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&event.data).unwrap();
         assert_eq!(parsed["response"], "final");
+        assert_eq!(parsed["messageId"], "turn:t1:assistant:1");
 
         let error_data = serde_json::to_string(&ErrorPayload {
             error: "fail".to_string(),
-            user_message_id: None,
-            assistant_message_id: None,
         })
         .unwrap();
         let parsed_error: serde_json::Value = serde_json::from_str(&error_data).unwrap();
@@ -1121,13 +1147,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn final_response_forwards_event_carried_stamps_without_lookup() {
+    async fn final_response_forwards_the_stable_final_id() {
         use super::AgentEvent;
 
-        // Arrange: a tool turn whose persisted rows include the call preview
-        // and the result summary alongside input and final. The event already
-        // carries the authoritative stamps, so delivery consults neither the
-        // messages table nor turn_runs.
+        // Arrange: the final id is the stable id the response streamed
+        // under, so delivery forwards it verbatim and consults no storage.
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state_with_agents(&dir);
         let chat_id = web_state
@@ -1135,25 +1159,6 @@ mod tests {
             .db
             .resolve_or_create_chat_id("web", "web:ids", None, "web", "default")
             .expect("chat");
-        let turn_id =
-            seed_turn_with_stamps(&web_state.app_state.db, chat_id, "tool-turn", true, true);
-        let input_id = crate::agent_loop::turn::turn_input_message_id(&turn_id);
-        let final_id = format!("turn:{turn_id}:final");
-        let conn = web_state.app_state.db.get_conn().expect("pool");
-        for (id, content, seq) in [
-            (input_id.as_str(), "read the note", 1),
-            ("tool:call-1", "[tool_call] read", 2),
-            ("tool:result-1", "[tool_result]: file contents", 3),
-            (final_id.as_str(), "done", 4),
-        ] {
-            conn.execute(
-                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq, turn_id)
-                 VALUES (?1, ?2, 'x', ?3, 'assistant', '2026-09-10T15:00:00Z', 'message', ?4, ?5)",
-                rusqlite::params![id, chat_id, content, seq, turn_id],
-            )
-            .expect("insert");
-        }
-        drop(conn);
         web_state
             .run_hub
             .create("tool-run", "actor".to_string(), format!("chat:{chat_id}"))
@@ -1164,38 +1169,15 @@ mod tests {
             &web_state,
             "tool-run",
             AgentEvent::FinalResponse {
-                turn_id: turn_id.clone(),
-                user_message_id: Some(input_id.clone()),
-                assistant_message_id: Some(final_id.clone()),
-                text: "done".to_string(),
-                terminal: true,
-            },
-        )
-        .await;
-        // A done for a turn with no database state at all still delivers:
-        // terminal responses never depend on a lookup.
-        web_state
-            .run_hub
-            .create(
-                "unknown-run",
-                "actor".to_string(),
-                format!("chat:{chat_id}"),
-            )
-            .await;
-        publish_agent_event(
-            &web_state,
-            "unknown-run",
-            AgentEvent::FinalResponse {
-                turn_id: "no-such-turn".to_string(),
-                user_message_id: Some("orphan-input".to_string()),
-                assistant_message_id: None,
+                turn_id: "turn-tool".to_string(),
+                assistant_message_id: Some("turn:turn-tool:assistant:2".to_string()),
                 text: "done".to_string(),
                 terminal: true,
             },
         )
         .await;
 
-        // Assert: stamps forwarded exactly, previews excluded by construction.
+        // Assert: the stable final id travels untouched.
         let (_rx, replay, _, _, _, _) = web_state
             .run_hub
             .subscribe_with_replay("tool-run", None, "actor", false)
@@ -1206,30 +1188,21 @@ mod tests {
             .find(|event| event.event == "done")
             .expect("done event");
         let data: serde_json::Value = serde_json::from_str(&done.data).expect("json");
-        assert_eq!(data["user_message_id"], serde_json::json!(input_id));
-        assert_eq!(data["assistant_message_id"], serde_json::json!(final_id));
-        let (_rx, replay, _, _, _, _) = web_state
-            .run_hub
-            .subscribe_with_replay("unknown-run", None, "actor", false)
-            .await
-            .expect("subscribe");
-        let done = replay
-            .iter()
-            .find(|event| event.event == "done")
-            .expect("done event");
-        let data: serde_json::Value = serde_json::from_str(&done.data).expect("json");
-        assert_eq!(data["user_message_id"], serde_json::json!("orphan-input"));
-        assert!(data["assistant_message_id"].is_null());
+        assert_eq!(data["response"], serde_json::json!("done"));
+        assert_eq!(
+            data["messageId"],
+            serde_json::json!("turn:turn-tool:assistant:2")
+        );
     }
 
     #[tokio::test]
-    async fn staged_follow_up_done_carries_the_child_turn_stamps() {
+    async fn staged_follow_up_done_carries_the_child_turn_final_id() {
         use super::AgentEvent;
 
         // Arrange: parent turn A finished, child turn B was promoted for the
         // follow-up. Both dones travel the same web run; each event carries
-        // its own Turn's stamps, so the parent's ids can never leak into the
-        // child's delivery.
+        // its own Turn's final id, so the parent's id can never leak into
+        // the child's delivery.
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state_with_agents(&dir);
         let chat_id = web_state
@@ -1237,12 +1210,6 @@ mod tests {
             .db
             .resolve_or_create_chat_id("web", "web:staged", None, "web", "default")
             .expect("chat");
-        let parent_id =
-            seed_turn_with_stamps(&web_state.app_state.db, chat_id, "parent-turn", true, true);
-        let child_id =
-            seed_turn_with_stamps(&web_state.app_state.db, chat_id, "child-turn", true, true);
-        let child_input = crate::agent_loop::turn::turn_input_message_id(&child_id);
-        let child_final = format!("turn:{child_id}:final");
         web_state
             .run_hub
             .create("shared-run", "actor".to_string(), format!("chat:{chat_id}"))
@@ -1253,16 +1220,15 @@ mod tests {
             &web_state,
             "shared-run",
             AgentEvent::FinalResponse {
-                turn_id: child_id.clone(),
-                user_message_id: Some(child_input.clone()),
-                assistant_message_id: Some(child_final.clone()),
+                turn_id: "turn-child".to_string(),
+                assistant_message_id: Some("turn:turn-child:assistant:1".to_string()),
                 text: "continued".to_string(),
                 terminal: true,
             },
         )
         .await;
 
-        // Assert: the child's stamps, never the parent's.
+        // Assert: the child's final id, never the parent's.
         let (_rx, replay, _, _, _, _) = web_state
             .run_hub
             .subscribe_with_replay("shared-run", None, "actor", false)
@@ -1273,18 +1239,18 @@ mod tests {
             .find(|event| event.event == "done")
             .expect("done event");
         let data: serde_json::Value = serde_json::from_str(&done.data).expect("json");
-        assert_eq!(data["user_message_id"], serde_json::json!(child_input));
-        assert_eq!(data["assistant_message_id"], serde_json::json!(child_final));
-        assert_ne!(child_id, parent_id);
+        assert_eq!(
+            data["messageId"],
+            serde_json::json!("turn:turn-child:assistant:1")
+        );
     }
 
     #[tokio::test]
-    async fn error_forwards_event_carried_stamps_without_lookup() {
+    async fn error_carries_no_message_identity() {
         use super::AgentEvent;
 
-        // Arrange: a failed turn that persisted its input but no final
-        // message. No turn row exists here at all: the event's stamps are
-        // authoritative, so delivery must not depend on a lookup.
+        // Arrange: a failed turn. Partial output keeps the id it streamed
+        // under, so the error event resolves nothing and carries no ids.
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state_with_agents(&dir);
         let chat_id = web_state
@@ -1307,16 +1273,13 @@ mod tests {
             "partial-run",
             AgentEvent::Error {
                 turn_id: "no-such-turn".to_string(),
-                user_message_id: Some("turn:partial:input".to_string()),
-                assistant_message_id: None,
                 message: "upstream failed".to_string(),
                 terminal: true,
             },
         )
         .await;
 
-        // Assert: the client adopts the user bubble but keeps the sealed
-        // partial draft (no assistant id to adopt).
+        // Assert: error text only — no adoption targets.
         let (_rx, replay, _, _, _, _) = web_state
             .run_hub
             .subscribe_with_replay("partial-run", None, "actor", false)
@@ -1327,47 +1290,83 @@ mod tests {
             .find(|event| event.event == "error")
             .expect("error event");
         let data: serde_json::Value = serde_json::from_str(&error.data).expect("json");
-        assert_eq!(
-            data["user_message_id"],
-            serde_json::json!("turn:partial:input")
-        );
-        assert!(data["assistant_message_id"].is_null());
+        assert_eq!(data["error"], serde_json::json!("upstream failed"));
+        assert!(data.get("user_message_id").is_none());
+        assert!(data.get("assistant_message_id").is_none());
+        assert!(data.get("userMessageId").is_none());
+        assert!(data.get("assistantMessageId").is_none());
     }
 
-    /// Accepts a fresh Turn and stamps its input/final message ids the way
-    /// the Turn pipeline does, returning the durable turn id.
-    fn seed_turn_with_stamps(
-        db: &crate::storage::Database,
-        chat_id: i64,
-        request_key: &str,
-        with_input: bool,
-        with_final: bool,
-    ) -> String {
-        let turn_id = match db
-            .accept_or_get_turn(crate::storage::AcceptTurnParams {
-                chat_id,
-                request_key,
-                config_revision: 1,
-                config_fingerprint: Some("fingerprint"),
-                request_payload_hash: "payload",
-                origin_id: Some("origin"),
-                scheduled_request_json: None,
-            })
-            .expect("accept turn")
-        {
-            crate::storage::AcceptOutcome::Created(run) => run.turn_id,
-            crate::storage::AcceptOutcome::Existing(_) => panic!("expected a fresh turn"),
-        };
-        let input_stamp =
-            with_input.then(|| crate::agent_loop::turn::turn_input_message_id(&turn_id));
-        let final_stamp = with_final.then(|| format!("turn:{turn_id}:final"));
-        let conn = db.get_conn().expect("pool");
-        conn.execute(
-            "UPDATE turn_runs SET input_message_id = ?1, final_message_id = ?2 WHERE turn_id = ?3",
-            rusqlite::params![input_stamp, final_stamp, turn_id],
+    #[tokio::test]
+    async fn user_input_and_discard_events_carry_stable_ids() {
+        use super::AgentEvent;
+
+        // Arrange: a staged follow-up commit and a retry discard travel the
+        // same run. Both name stable message ids, so the client upserts and
+        // deletes by id.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state_with_agents(&dir);
+        let chat_id = web_state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:followup", None, "web", "default")
+            .expect("chat");
+        web_state
+            .run_hub
+            .create(
+                "followup-run",
+                "actor".to_string(),
+                format!("chat:{chat_id}"),
+            )
+            .await;
+
+        // Act
+        publish_agent_event(
+            &web_state,
+            "followup-run",
+            AgentEvent::UserInputInjected {
+                message_id: "web:11111111-1111-1111-1111-111111111111".to_string(),
+                sender_id: "web-user".to_string(),
+                text: "and one more thing".to_string(),
+                timestamp: "2026-09-12T00:00:00Z".to_string(),
+            },
         )
-        .expect("stamp turn");
-        turn_id
+        .await;
+        publish_agent_event(
+            &web_state,
+            "followup-run",
+            AgentEvent::AssistantMessageDiscarded {
+                message_id: "turn:t1:assistant:1".to_string(),
+            },
+        )
+        .await;
+
+        // Assert
+        let (_rx, replay, _, _, _, _) = web_state
+            .run_hub
+            .subscribe_with_replay("followup-run", None, "actor", false)
+            .await
+            .expect("subscribe");
+        let input = replay
+            .iter()
+            .find(|event| event.event == "user_input")
+            .expect("user_input event");
+        let input_data: serde_json::Value = serde_json::from_str(&input.data).expect("json");
+        assert_eq!(
+            input_data["messageId"],
+            serde_json::json!("web:11111111-1111-1111-1111-111111111111")
+        );
+        assert!(input_data.get("requestId").is_none());
+        let discarded = replay
+            .iter()
+            .find(|event| event.event == "assistant_discarded")
+            .expect("assistant_discarded event");
+        let discarded_data: serde_json::Value =
+            serde_json::from_str(&discarded.data).expect("json");
+        assert_eq!(
+            discarded_data["messageId"],
+            serde_json::json!("turn:t1:assistant:1")
+        );
     }
 
     #[tokio::test]
@@ -1483,7 +1482,7 @@ mod tests {
                 session_key: Some("fifo-session".to_string()),
                 message: "active".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("active".to_string()),
+                message_id: Some("web:11111111-1111-1111-1111-111111111111".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1511,7 +1510,7 @@ mod tests {
                 session_key: Some("fifo-session".to_string()),
                 message: "first".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("first".to_string()),
+                message_id: Some("web:22222222-2222-2222-2222-222222222222".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1523,7 +1522,7 @@ mod tests {
                 session_key: Some("fifo-session".to_string()),
                 message: "first".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("first".to_string()),
+                message_id: Some("web:22222222-2222-2222-2222-222222222222".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1535,7 +1534,7 @@ mod tests {
                 session_key: Some("fifo-session".to_string()),
                 message: "second".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("second".to_string()),
+                message_id: Some("web:33333333-3333-3333-3333-333333333333".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1555,7 +1554,7 @@ mod tests {
                 session_key: Some("fifo-session".to_string()),
                 message: "different payload".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("first".to_string()),
+                message_id: Some("web:22222222-2222-2222-2222-222222222222".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1567,7 +1566,7 @@ mod tests {
             session_key: Some("fifo-session".to_string()),
             message: "concurrent".to_string(),
             agent_id: Some("default".to_string()),
-            request_id: Some("concurrent".to_string()),
+            message_id: Some("web:44444444-4444-4444-4444-444444444444".to_string()),
         };
         let (left, right) = tokio::join!(
             accept_web_input(state.clone(), concurrent_request.clone(), WEB_ACTOR),
@@ -1583,7 +1582,7 @@ mod tests {
             state
                 .app_state
                 .turn_observers
-                .has_live_observer("web:concurrent")
+                .has_live_observer("web:44444444-4444-4444-4444-444444444444")
         );
         assert_eq!(state.app_state.db.count_durable_pending().unwrap(), 3);
     }
@@ -1599,7 +1598,7 @@ mod tests {
                 session_key: Some("completed-session".to_string()),
                 message: "hello".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("completed-request".to_string()),
+                message_id: Some("web:55555555-5555-5555-5555-555555555555".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1615,7 +1614,7 @@ mod tests {
             .db
             .accept_or_get_turn(crate::storage::AcceptTurnParams {
                 chat_id,
-                request_key: "web:completed-request",
+                request_key: "web:55555555-5555-5555-5555-555555555555",
                 config_revision: 1,
                 config_fingerprint: Some("fingerprint"),
                 request_payload_hash: &payload_hash,
@@ -1656,7 +1655,7 @@ mod tests {
                 session_key: Some("completed-session".to_string()),
                 message: "hello".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("completed-request".to_string()),
+                message_id: Some("web:55555555-5555-5555-5555-555555555555".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1676,7 +1675,7 @@ mod tests {
         assert_eq!(events[0].event, "done");
         assert_eq!(
             events[0].data,
-            r#"{"response":"saved response","user_message_id":null,"assistant_message_id":"web:completed-response"}"#
+            r#"{"response":"saved response","messageId":"web:completed-response"}"#
         );
     }
 
@@ -1691,7 +1690,7 @@ mod tests {
                 session_key: Some("recovery-race-session".to_string()),
                 message: "hello".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("recovery-race-request".to_string()),
+                message_id: Some("web:66666666-6666-6666-6666-666666666666".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1707,7 +1706,7 @@ mod tests {
             .db
             .accept_or_get_turn(crate::storage::AcceptTurnParams {
                 chat_id,
-                request_key: "web:recovery-race-request",
+                request_key: "web:66666666-6666-6666-6666-666666666666",
                 config_revision: 1,
                 config_fingerprint: Some("fingerprint"),
                 request_payload_hash: &payload_hash,
@@ -1775,7 +1774,7 @@ mod tests {
         assert_eq!(events[0].event, "done");
         assert_eq!(
             events[0].data,
-            r#"{"response":"saved after race","user_message_id":null,"assistant_message_id":"web:recovery-race-response"}"#
+            r#"{"response":"saved after race","messageId":"web:recovery-race-response"}"#
         );
     }
 
@@ -1830,7 +1829,7 @@ mod tests {
                 session_key: Some("tool-session".to_string()),
                 message: "from rest".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("rest-follow-up".to_string()),
+                message_id: Some("web:77777777-7777-7777-7777-777777777777".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1842,7 +1841,7 @@ mod tests {
                 session_key: Some("tool-session".to_string()),
                 message: "from websocket".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("ws-follow-up".to_string()),
+                message_id: Some("web:88888888-8888-8888-8888-888888888888".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1900,7 +1899,7 @@ mod tests {
                 session_key: Some("busy-session".to_string()),
                 message: "/new".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("busy-command".to_string()),
+                message_id: Some("web:99999999-9999-9999-9999-999999999999".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1912,7 +1911,7 @@ mod tests {
                 session_key: Some("idle-session".to_string()),
                 message: "/status".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("idle-command".to_string()),
+                message_id: Some("web:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1936,7 +1935,7 @@ mod tests {
                 session_key: Some("locked-session".to_string()),
                 message: "queued".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("queued-request".to_string()),
+                message_id: Some("web:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1975,7 +1974,7 @@ mod tests {
                     session_key: Some("locked-session".to_string()),
                     message: "queued".to_string(),
                     agent_id: Some("default".to_string()),
-                    request_id: Some("queued-request".to_string()),
+                    message_id: Some("web:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".to_string()),
                 },
                 WEB_ACTOR,
             )
@@ -1993,7 +1992,7 @@ mod tests {
                 session_key: Some("locked-session".to_string()),
                 message: "/new".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("locked-command".to_string()),
+                message_id: Some("web:cccccccc-cccc-cccc-cccc-cccccccccccc".to_string()),
             },
             WEB_ACTOR,
         )
@@ -2002,5 +2001,78 @@ mod tests {
 
         // Assert
         assert_eq!(slash.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn web_send_requires_a_canonical_message_id() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let request = |message_id: Option<&str>| SendRequest {
+            session_key: Some("validated-session".to_string()),
+            message: "hello".to_string(),
+            agent_id: Some("default".to_string()),
+            message_id: message_id.map(str::to_string),
+        };
+
+        // Act: missing, unprefixed, and non-uuid ids are rejected; the
+        // canonical id is used verbatim as the Turn's request key.
+        for bad in [None, Some(""), Some("no-prefix"), Some("web:not-a-uuid")] {
+            let error = resolve_send_request(&state, &request(bad), WEB_ACTOR)
+                .await
+                .expect_err("message id must be validated");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("messageId"), "unexpected: {}", error.1);
+        }
+        let resolved = resolve_send_request(
+            &state,
+            &request(Some("web:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")),
+            WEB_ACTOR,
+        )
+        .await
+        .expect("canonical id accepted");
+        assert_eq!(
+            resolved.context.request_key,
+            "web:eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_slash_response_carries_a_stable_run_scoped_id() {
+        // Arrange: a slash command runs no durable Turn, so its done names a
+        // run-scoped stable id the client upserts like any assistant message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let accepted = accept_web_input(
+            state.clone(),
+            SendRequest {
+                session_key: Some("slash-session".to_string()),
+                message: "/status".to_string(),
+                agent_id: Some("default".to_string()),
+                message_id: Some("web:ffffffff-ffff-ffff-ffff-ffffffffffff".to_string()),
+            },
+            WEB_ACTOR,
+        )
+        .await
+        .expect("accept slash command");
+        assert_eq!(accepted.status, "accepted");
+
+        // Act
+        let (_rx, events, done, _, _, _) = state
+            .run_hub
+            .subscribe_with_replay(&accepted.started.run_id, None, WEB_ACTOR, false)
+            .await
+            .expect("subscribe slash run");
+
+        // Assert: done names a stable id derived from the run, and replaying
+        // the run re-announces the same id.
+        assert!(done);
+        let done_event = events
+            .iter()
+            .find(|event| event.event == "done")
+            .expect("done event");
+        let data: serde_json::Value = serde_json::from_str(&done_event.data).expect("json");
+        let expected = format!("web:slash:{}", accepted.started.run_id);
+        assert_eq!(data["messageId"], serde_json::json!(expected));
     }
 }

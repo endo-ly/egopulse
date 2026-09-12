@@ -38,15 +38,16 @@ enum ResumeMode {
 /// Maximum number of Channel Log events to inject as Shared Room Context.
 const CHANNEL_CONTEXT_LIMIT: usize = 30;
 
-/// Derives the deterministic user input message id for a durable Turn.
+/// Derives the deterministic assistant message id for one model iteration
+/// of a durable Turn.
 ///
-/// The id is a pure function of the authoritative (DB-stamped) turn id so a
-/// re-acceptance of the same Turn never creates a duplicate user message,
-/// and so staged follow-up promotion can predict the child Turn's input id
-/// for its initial event before the child persists anything. Every producer
-/// of Turn input ids must go through this helper.
-pub(crate) fn turn_input_message_id(turn_id: &str) -> String {
-    format!("turn:{turn_id}:input")
+/// The id is fixed before the model call so the streamed deltas, a tool
+/// preview, and the final row all share one identity from the start. Every
+/// producer of iteration message ids must go through this helper.
+/// Iteration numbers come from the Agent Loop counter, which resumes after
+/// the durable `current_iteration`, so ids stay unique per Turn.
+pub(crate) fn assistant_message_id(turn_id: &str, iteration: usize) -> String {
+    format!("turn:{turn_id}:assistant:{iteration}")
 }
 
 /// RAII guard that decrements the active turn counter on drop.
@@ -362,13 +363,11 @@ impl TurnExecutor<'_> {
             let turn = match acceptance {
                 TurnAcceptance::Completed {
                     turn_id,
-                    user_message_id,
                     assistant_message_id,
                     text,
                 } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
-                        user_message_id,
                         assistant_message_id,
                         text: text.clone(),
                         terminal: false,
@@ -377,13 +376,11 @@ impl TurnExecutor<'_> {
                 }
                 TurnAcceptance::Terminated {
                     turn_id,
-                    user_message_id,
                     assistant_message_id,
                     text,
                 } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
-                        user_message_id,
                         assistant_message_id,
                         text: text.clone(),
                         terminal: false,
@@ -392,7 +389,6 @@ impl TurnExecutor<'_> {
                 }
                 TurnAcceptance::InProgress {
                     turn_id,
-                    user_message_id,
                     assistant_message_id,
                     text,
                 } => {
@@ -401,7 +397,6 @@ impl TurnExecutor<'_> {
                     // リクエスト自体は呼び出し元へ明確に終端させ、イベントも発する。
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
-                        user_message_id,
                         assistant_message_id,
                         text: text.clone(),
                         terminal: false,
@@ -414,7 +409,13 @@ impl TurnExecutor<'_> {
             let result = async {
                 // 段階1: セッションを変更する前に、このターンで使う依存を解決する。
                 let prepared = self
-                    .prepare_turn(user_input, &turn.turn_id, &snapshot, Some(&received_at))
+                    .prepare_turn(
+                        user_input,
+                        &turn.turn_id,
+                        &request_key,
+                        &snapshot,
+                        Some(&received_at),
+                    )
                     .await?;
                 let prompt_ctx = PromptContext {
                     system_prompt: &prepared.system_prompt,
@@ -482,7 +483,13 @@ impl TurnExecutor<'_> {
         let result = async move {
             let chat_id = resolve_chat_id(self.state, self.context).await?;
             let prepared = self
-                .prepare_turn(user_input, &turn_run.turn_id, snapshot, received_at)
+                .prepare_turn(
+                    user_input,
+                    &turn_run.turn_id,
+                    &turn_run.request_key,
+                    snapshot,
+                    received_at,
+                )
                 .await?;
             let prompt_ctx = PromptContext {
                 system_prompt: &prepared.system_prompt,
@@ -612,6 +619,7 @@ impl TurnExecutor<'_> {
         &self,
         user_input: &str,
         turn_id: &str,
+        request_key: &str,
         snapshot: &Arc<crate::config::manager::ConfigSnapshot>,
         received_at: Option<&str>,
     ) -> Result<PreparedTurn, EgoPulseError> {
@@ -670,9 +678,10 @@ impl TurnExecutor<'_> {
         let tool_defs = self.state.tools.definitions_async().await;
         let tools_json = serde_json::to_string(&tool_defs).ok();
 
-        // The deterministic helper keeps promotion-time prediction and the
-        // persisted row identical by construction.
-        let input_message_id = turn_input_message_id(turn_id);
+        // The Turn's input message keeps the canonical request key as its
+        // id, so the persisted row matches the client's optimistic entry by
+        // construction — no adoption, no prediction.
+        let input_message_id = request_key.to_string();
 
         Ok(PreparedTurn {
             turn_id: turn_id.to_string(),
@@ -738,12 +747,11 @@ impl TurnExecutor<'_> {
         prepared: &PreparedTurn,
         result: crate::agent_loop::loop_runner::AgentLoopResult,
     ) -> Result<String, EgoPulseError> {
-        let final_message_id = format!("turn:{}:final", prepared.turn_id);
         let messages = result.messages;
         let response = self
             .persistence(prepared)
             .persist_final(
-                &final_message_id,
+                &result.final_message_id,
                 messages,
                 result.session_revision,
                 &self.on_event,
@@ -752,7 +760,7 @@ impl TurnExecutor<'_> {
             .await?;
         let lifecycle = self.lifecycle(&prepared.turn_id);
         lifecycle.mark_output_published().await;
-        lifecycle.complete(&final_message_id).await?;
+        lifecycle.complete(&result.final_message_id).await?;
         Ok(response)
     }
 }
@@ -931,7 +939,7 @@ mod tests {
             context.surface_user.clone(),
             "original input".to_string(),
         );
-        input_message.id = format!("turn:{}:input", run.turn_id);
+        input_message.id = "recovery-request".to_string();
         input_message.turn_id = Some(run.turn_id.clone());
         input_message.timestamp = "2026-08-29T12:00:00Z".to_string();
         let assistant_tool = crate::llm::Message {
@@ -1198,14 +1206,30 @@ mod tests {
         assert_eq!(reply, "Hello world");
 
         let events = collected.lock().expect("collector");
-        let deltas: Vec<String> = events
+        let deltas: Vec<(String, String)> = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::Delta { text } => Some(text.clone()),
+                AgentEvent::Delta { message_id, text } => Some((message_id.clone(), text.clone())),
                 _ => None,
             })
             .collect();
-        assert_eq!(deltas, vec!["Hello".to_string(), " world".to_string()]);
+        // Both chunks belong to the first (and only) model iteration, so
+        // they share one stable assistant message id.
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>(),
+            vec!["Hello".to_string(), " world".to_string()]
+        );
+        let ids: std::collections::HashSet<&str> =
+            deltas.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids.len(), 1, "all deltas share one message id");
+        let message_id = ids.into_iter().next().expect("delta id");
+        assert!(
+            message_id.starts_with("turn:") && message_id.ends_with(":assistant:1"),
+            "unexpected iteration message id: {message_id}"
+        );
 
         let last = events.last().expect("at least one event");
         assert!(matches!(

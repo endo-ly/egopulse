@@ -123,23 +123,6 @@ pub(crate) fn canonical_request_hash(context: &SurfaceContext, input: &str) -> S
     format!("{:x}", hasher.finalize())
 }
 
-/// Recovers the client-issued request id from a namespaced request key.
-///
-/// Intake request keys use the `{channel}:{unique}` namespace, so stripping
-/// the channel prefix yields the id the client used for its optimistic
-/// entry — for Web, the durable request id behind `local:{request_id}`.
-/// Staged follow-up rows are keyed by that same request key, which lets
-/// `UserInputInjected` link a commit to the exact send even when several
-/// identical texts are in flight. Returns `None` when the key does not
-/// follow the convention; such events fall back to run-scoped FIFO.
-pub(crate) fn client_request_id(channel: &str, request_key: &str) -> Option<String> {
-    request_key
-        .strip_prefix(channel)
-        .and_then(|rest| rest.strip_prefix(':'))
-        .filter(|id| !id.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 /// Durable serialization of a [`ScheduledTurn`] for crash-safe persistence.
 ///
 /// Stored as `turn_runs.scheduled_request_json`. On restart the turn dispatcher
@@ -219,21 +202,6 @@ pub(crate) fn deserialize_scheduled_turn(json: &str) -> Result<ScheduledTurn, Eg
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn client_request_id_strips_the_channel_namespace() {
-        assert_eq!(
-            client_request_id("web", "web:abc-123"),
-            Some("abc-123".to_string())
-        );
-        assert_eq!(
-            client_request_id("discord", "discord:1:2"),
-            Some("1:2".to_string())
-        );
-        assert_eq!(client_request_id("web", "web:"), None);
-        assert_eq!(client_request_id("web", "opaque-key"), None);
-        assert_eq!(client_request_id("web", "other:req"), None);
-    }
 
     #[test]
     fn canonical_request_hash_matches_sorted_key_reference() {

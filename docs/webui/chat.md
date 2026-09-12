@@ -295,13 +295,14 @@ UI 側は、選択中の read-only セッションの sessionKey と一致する
 ### 8.1 メッセージライフサイクル
 
 1. ユーザーが入力・Enter 押下
-2. ユーザーメッセージを in-memory に楽観追加（`local:{durableRequestId}`）
-3. WS `chat.send` を送信し、受諾 ack（`res` ok）を待つ。WebSocketのRPC IDはattemptごとに発行し、durable request IDは同じdraftのACK不明時の明示的なretryでだけ再利用する。受諾で Composer をクリアし、拒否・タイムアウト（15秒）では文面を保持したままエラーを表示する。draftを編集した場合やsessionを切り替えた場合は新しいdurable request IDを使う
-4. WS 上でトークン刻みの delta を受信 → ドラフトメッセージへ追記。Tool Call を発行した時点で、ナレーションがあれば `tool_start` の `assistantMessageId` へドラフトを即時確定し、以降の narration は新しいドラフトへ分ける。ナレーションが空の場合は空プレースホルダを破棄する（bare tool preview は履歴に出ないため）
-5. WS 上で done を受信 → 発行Turnの `userMessageId`（input）/ `assistantMessageId`（final）でlive表示を確定IDへ置換（内容比較なし、Tool previewは対象外。finalは最後のsealedセグメントにのみ適用）。IDが `null` の場合はlive表示を維持し、履歴refetchで収束。input IDが既にlive stateにある場合は次の楽観バブルを奪わない
-6. Tool実行中に送ったfollow-upは `user_input` の `requestId` で対応する楽観バブルを確定IDへ置換（`requestId` がない場合のみ同一runの最古バブルをFIFOで消費。`requestId` があるのに該当バブルがない場合は何も消費しない）
-7. セッション一覧と履歴を refetch。表示は履歴と live のマージ（`mergeChatMessages`）で、ID 一致は履歴優先、未確定のストリーミング中ドラフトのみ保持
-8. WS が意図せず切断→再接続した場合はセッション一覧と履歴を refetch して追いつく（進行中ターンの購読は復活しないため、ストリーミング途中の描画は復元されない）
+2. ユーザーメッセージをcanonical ID（`web:{uuid}`）で in-memory に楽観追加。このIDは送信・Turnの `request_key`・永続化後の `messages.id` と同一
+3. WS `chat.send`（`messageId` 必須）を送信し、受諾 ack（`res` ok）を待つ。WebSocketのRPC IDはattemptごとに発行し、canonical IDは同じdraftのACK不明時の明示的なretryでだけ再利用する。受諾で Composer をクリアし、run ownershipを楽観行へ付与してassistant進捗表示（typing indicator）を出す。拒否・タイムアウト（15秒）では文面を保持したままエラーを表示する。draftを編集した場合やsessionを切り替えた場合は新しいIDを使う
+4. WS 上でトークン刻みの delta を受信 → その安定ID（`turn:{turnId}:assistant:{iteration}`）のメッセージへ追記。Tool Call の前後でIDは変わらず、Tool Cardは `callId` で別行に表示する。ナレーションなしのTool Callでは空バブルを作らずTool Cardだけ表示する
+5. WS 上で done を受信 → 同じ安定IDへ確定内容で更新（authoritative置換）。履歴とはID一致でのみ突き合わせ、内容比較はしない
+6. Tool実行中に送ったfollow-upは `user_input` の `messageId`（送信時と同一ID）でupsertする。昇格した子Turnの初期イベントも同じIDのまま
+7. セッション一覧と履歴を refetch。表示は履歴と live のマージ（`mergeChatMessages`）で、ID 一致は履歴優先、履歴にないliveのみ保持
+8. WS が意図せず切断→再接続した場合は未完了runを `run.subscribe` で再購読し、replayとliveへ追従する。`replayTruncated` の場合はそのrun由来のlive entriesをrun ownershipで破棄し、履歴から再構築する。run自体が消えていた場合（`run_not_found`）も同様に破棄して履歴へフォールバックする
+9. retryで置換されたstream済み応答は `assistant_discarded` で該当IDを削除し、retryは新しいIDでstreamする
 
 ### 8.2 エラー時
 

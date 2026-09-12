@@ -14,25 +14,22 @@ pub(crate) enum TurnAcceptance {
     /// A fresh `accepted` Turn created by this call; the caller owns execution.
     Proceed(Box<TurnRun>),
     /// The Turn was already `completed`; replay its saved final response.
-    /// Stamps come from the existing durable row so event consumers resolve
-    /// the same ids the first execution reported.
+    /// The final id comes from the existing durable row so event consumers
+    /// resolve the same id the first execution reported.
     Completed {
         turn_id: String,
-        user_message_id: Option<String>,
         assistant_message_id: Option<String>,
         text: String,
     },
     /// The Turn already exists and is non-terminal; another executor owns it.
     InProgress {
         turn_id: String,
-        user_message_id: Option<String>,
         assistant_message_id: Option<String>,
         text: String,
     },
     /// The Turn already terminated in a non-success state.
     Terminated {
         turn_id: String,
-        user_message_id: Option<String>,
         assistant_message_id: Option<String>,
         text: String,
     },
@@ -134,14 +131,12 @@ impl<'a> TurnLifecycle<'a> {
                     })?;
                     Ok(TurnAcceptance::Completed {
                         turn_id: run.turn_id.clone(),
-                        user_message_id: run.input_message_id.clone(),
                         assistant_message_id: run.final_message_id.clone(),
                         text: content,
                     })
                 }
                 other if other.is_terminal() => Ok(TurnAcceptance::Terminated {
                     turn_id: run.turn_id.clone(),
-                    user_message_id: run.input_message_id.clone(),
                     assistant_message_id: run.final_message_id.clone(),
                     text: format!(
                         "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
@@ -149,7 +144,6 @@ impl<'a> TurnLifecycle<'a> {
                 }),
                 _ => Ok(TurnAcceptance::InProgress {
                     turn_id: run.turn_id.clone(),
-                    user_message_id: run.input_message_id.clone(),
                     assistant_message_id: run.final_message_id.clone(),
                     text: "このリクエストはすでに処理中です。".to_string(),
                 }),
@@ -414,7 +408,18 @@ async fn validate_resume_target(
         }
     }
 
-    let input_message_id = format!("turn:{turn_id}:input");
+    let Some(input_message_id) = run.input_message_id.clone() else {
+        fail_resume_permanently(
+            runtime,
+            scope,
+            turn_id,
+            "resume target input message missing",
+        )
+        .await;
+        return Err(EgoPulseError::Internal(
+            "resume target input message is missing".to_string(),
+        ));
+    };
     let input_exists = call_blocking(runtime.db_for(scope), {
         let id = input_message_id;
         move |db| db.get_message_content(&id)
@@ -533,7 +538,7 @@ mod tests {
 
         let mut message =
             StoredMessage::user(chat_id, "sender".to_string(), "resume input".to_string());
-        message.id = format!("turn:{turn_id}:input");
+        message.id = context.request_key.clone();
         message.turn_id = Some(turn_id.clone());
         let fingerprint = config_fingerprint.clone();
         call_blocking(state.db_for(context.scope), {

@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::scheduler;
 use super::{
-    ResponseDelivery, ScheduledTurn, ToolProgressCoordinator, TurnMessageStamps, TurnOutcome,
+    ResponseDelivery, ScheduledTurn, ToolProgressCoordinator, TurnOutcome,
     deserialize_scheduled_turn,
 };
 use crate::agent_loop::{resume_input_committed_turn, resume_tools_completed_turn};
@@ -197,22 +197,14 @@ async fn promote_terminal_staged_messages(
                         // start the turn. All staged-row cleanup is complete
                         // before the accepted child is handed to the scheduler.
                         //
-                        // The event carries the child Turn's future input
-                        // message id, predicted through the same deterministic
-                        // helper the Turn will persist with. The staged row id
-                        // never reaches conversation history (the row is
-                        // deleted after promotion), so announcing it would
-                        // leave a live bubble no history row can converge to.
-                        let predicted_input_id =
-                            crate::agent_loop::turn::turn_input_message_id(&turn.turn_id);
+                        // The child persists its input under the staged row's
+                        // id — the canonical client-issued message id — so
+                        // the event announces that same id. No prediction, no
+                        // rename: the optimistic bubble already carries it.
                         state.turn_observers.queue_initial_event(
                             message.id.clone(),
                             crate::agent_loop::event::AgentEvent::UserInputInjected {
-                                request_id: crate::runtime::turn::client_request_id(
-                                    &turn.context.channel,
-                                    &message.id,
-                                ),
-                                message_id: predicted_input_id,
+                                message_id: message.id.clone(),
                                 sender_id: message.sender_id.clone(),
                                 text: message.content.clone(),
                                 timestamp: message.timestamp.clone(),
@@ -613,8 +605,7 @@ pub(crate) fn execute_scheduled_turn(
                         state,
                         &prepared.turn,
                         "durable turn was not found".to_string(),
-                    )
-                    .await;
+                    );
                     return;
                 }
                 None
@@ -624,8 +615,7 @@ pub(crate) fn execute_scheduled_turn(
                     state,
                     &prepared.turn,
                     EgoPulseError::ShutdownRequested.user_message(),
-                )
-                .await;
+                );
                 return;
             }
         };
@@ -640,8 +630,7 @@ pub(crate) fn execute_scheduled_turn(
                 state,
                 &prepared.turn,
                 "turn rejected by runtime stop condition".to_string(),
-            )
-            .await;
+            );
             return;
         }
 
@@ -679,8 +668,7 @@ async fn prepare_scheduled_turn(
             state,
             &turn,
             EgoPulseError::ShutdownRequested.user_message(),
-        )
-        .await;
+        );
         return None;
     }
 
@@ -704,7 +692,7 @@ async fn prepare_scheduled_turn(
         {
             Ok(()) => {
                 state.turn_tracker.release(&origin_id);
-                finish_observer(state, &turn, "turn chain already terminated".to_string()).await;
+                finish_observer(state, &turn, "turn chain already terminated".to_string());
                 drain_next_queued_turn(state, &session_key).await;
             }
             Err(error) => {
@@ -1053,20 +1041,17 @@ async fn execute_and_publish_scheduled_turn(
                         "keeping client observer for terminal staged follow-up"
                     );
                     if let Some(observer_key) = observer_key {
-                        let stamps = turn_message_stamps(state, turn).await;
                         state.turn_observers.emit(
                             observer_key,
                             crate::agent_loop::event::AgentEvent::Error {
                                 turn_id: turn.turn_id.clone(),
-                                user_message_id: stamps.user_message_id,
-                                assistant_message_id: stamps.assistant_message_id,
                                 message: error_message,
                                 terminal: false,
                             },
                         );
                     }
                 } else {
-                    finish_observer(state, turn, error_message).await;
+                    finish_observer(state, turn, error_message);
                 }
             } else {
                 send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
@@ -1252,54 +1237,11 @@ async fn execute_turn_with_progress_and_snapshot(
     result
 }
 
-async fn finish_observer(state: &AppState, turn: &ScheduledTurn, message: String) {
+fn finish_observer(state: &AppState, turn: &ScheduledTurn, message: String) {
     if let Some(request_key) = observer_key(turn) {
-        let stamps = turn_message_stamps(state, turn).await;
-        state.turn_observers.finish(
-            request_key,
-            &turn.turn_id,
-            TurnOutcome::Failed { message, stamps },
-        );
-    }
-}
-
-/// Resolves the persisted message ids a failed turn's error event adopts, so
-/// channels need no lookup of their own. A missing row is a legitimate
-/// unknown — the turn never persisted anything to adopt. Any other failure
-/// is logged: unlike a legitimate unknown, a failed lookup leaves live
-/// entries the next history refetch cannot converge by id.
-async fn turn_message_stamps(state: &AppState, turn: &ScheduledTurn) -> TurnMessageStamps {
-    let turn_id = turn.turn_id.clone();
-    match call_blocking(state.db_for(turn.context.scope), move |db| {
-        db.get_turn_run(&turn_id)
-    })
-    .await
-    {
-        Ok(run) => TurnMessageStamps {
-            user_message_id: run.input_message_id,
-            assistant_message_id: run.final_message_id,
-        },
-        Err(crate::error::StorageError::NotFound(_)) => {
-            tracing::debug!(
-                turn_id = %turn.turn_id,
-                "failed turn has no persisted state to adopt"
-            );
-            TurnMessageStamps {
-                user_message_id: None,
-                assistant_message_id: None,
-            }
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                turn_id = %turn.turn_id,
-                "failed turn cannot resolve persisted message ids"
-            );
-            TurnMessageStamps {
-                user_message_id: None,
-                assistant_message_id: None,
-            }
-        }
+        state
+            .turn_observers
+            .finish(request_key, &turn.turn_id, TurnOutcome::Failed { message });
     }
 }
 
@@ -1377,9 +1319,9 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum DeliveredEvent {
-        Input(String, String, Option<String>),
-        Response(String, bool, String, Option<String>, Option<String>),
-        Error(String, bool, String, Option<String>, Option<String>),
+        Input(String, String),
+        Response(String, bool, String, Option<String>),
+        Error(String, bool, String),
     }
 
     async fn run_terminal_staged_follow_up_case(
@@ -1508,18 +1450,16 @@ mod tests {
         while let Ok(event) = events.try_recv() {
             match event {
                 crate::agent_loop::event::AgentEvent::UserInputInjected {
-                    request_id,
                     message_id,
                     text,
                     ..
                 } => {
-                    delivered.push(DeliveredEvent::Input(message_id, text, request_id));
+                    delivered.push(DeliveredEvent::Input(message_id, text));
                 }
                 crate::agent_loop::event::AgentEvent::FinalResponse {
                     text,
                     terminal,
                     turn_id,
-                    user_message_id,
                     assistant_message_id,
                     ..
                 } => {
@@ -1527,7 +1467,6 @@ mod tests {
                         text,
                         terminal,
                         turn_id,
-                        user_message_id,
                         assistant_message_id,
                     ));
                 }
@@ -1535,16 +1474,9 @@ mod tests {
                     message,
                     terminal,
                     turn_id,
-                    user_message_id,
-                    assistant_message_id,
+                    ..
                 } => {
-                    delivered.push(DeliveredEvent::Error(
-                        message,
-                        terminal,
-                        turn_id,
-                        user_message_id,
-                        assistant_message_id,
-                    ));
+                    delivered.push(DeliveredEvent::Error(message, terminal, turn_id));
                 }
                 _ => {}
             }
@@ -1569,16 +1501,15 @@ mod tests {
                     .expect("child turn id")
             })
             .collect::<Vec<_>>();
-        // The queued initial event predicts each child's input id before the
-        // child persists anything. The prediction must equal the row the
-        // child actually writes, in every outcome combination: children
-        // persist input before the model step, so failed children qualify
-        // too.
-        for (child_id, expected_text) in child_ids
-            .iter()
-            .zip(["recovered follow-up 1", "recovered follow-up 2"])
-        {
-            let predicted = crate::agent_loop::turn::turn_input_message_id(child_id);
+        // Each child persists its input under the staged row's id — the
+        // canonical client-issued message id — so the initial event, the
+        // input stamp, and the persisted row agree by construction in every
+        // outcome combination: children persist input before the model step,
+        // so failed children qualify too.
+        for (child_id, (staged_key, expected_text)) in child_ids.iter().zip([
+            ("cli:staged-follow-up-1", "recovered follow-up 1"),
+            ("cli:staged-follow-up-2", "recovered follow-up 2"),
+        ]) {
             let conn = state.db.get_conn().expect("conn");
             let stamped: Option<String> = conn
                 .query_row(
@@ -1587,15 +1518,15 @@ mod tests {
                     |row| row.get(0),
                 )
                 .expect("input stamp");
-            assert_eq!(stamped.as_deref(), Some(predicted.as_str()));
+            assert_eq!(stamped.as_deref(), Some(staged_key));
             let (persisted_id, persisted_text): (String, String) = conn
                 .query_row(
                     "SELECT id, content FROM messages WHERE id = ?1",
-                    rusqlite::params![predicted],
+                    rusqlite::params![staged_key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .expect("persisted child input");
-            assert_eq!(persisted_id, predicted);
+            assert_eq!(persisted_id, staged_key);
             assert_eq!(persisted_text, expected_text);
         }
         (delivered, child_ids)
@@ -2592,95 +2523,61 @@ mod tests {
             let (events, child_ids) =
                 run_terminal_staged_follow_up_case(first_succeeds, second_succeeds).await;
 
-            // Assert
+            // Assert: the initial events name the staged rows' own ids —
+            // the canonical client message ids — and each Turn reports its
+            // own stable final id. Error events carry no identity: partial
+            // output keeps the id it streamed under.
             assert_eq!(events.len(), 4, "events={events:?}");
-            let first_input = crate::agent_loop::turn::turn_input_message_id(&child_ids[0]);
-            let second_input = crate::agent_loop::turn::turn_input_message_id(&child_ids[1]);
             assert_eq!(
                 events[0],
                 DeliveredEvent::Input(
-                    first_input.clone(),
+                    "cli:staged-follow-up-1".to_string(),
                     "recovered follow-up 1".to_string(),
-                    Some("staged-follow-up-1".to_string()),
                 )
             );
             assert_eq!(
                 events[2],
                 DeliveredEvent::Input(
-                    second_input.clone(),
+                    "cli:staged-follow-up-2".to_string(),
                     "recovered follow-up 2".to_string(),
-                    Some("staged-follow-up-2".to_string()),
                 )
             );
             match (first_succeeds, &events[1]) {
-                (
-                    true,
-                    DeliveredEvent::Response(text, terminal, turn_id, user_id, assistant_id),
-                ) => {
+                (true, DeliveredEvent::Response(text, terminal, turn_id, message_id)) => {
                     assert_eq!(text, "ok");
                     assert!(!terminal, "the first child must not end the interaction");
                     assert_eq!(turn_id, &child_ids[0]);
-                    // The child reports its own stamps in the event: the
-                    // publisher never re-resolves them.
                     assert_eq!(
-                        user_id.as_deref(),
-                        Some(
-                            crate::agent_loop::turn::turn_input_message_id(&child_ids[0]).as_str()
-                        )
-                    );
-                    assert_eq!(
-                        assistant_id.as_deref(),
-                        Some(format!("turn:{}:final", child_ids[0]).as_str())
+                        message_id.as_deref(),
+                        Some(format!("turn:{}:assistant:1", child_ids[0]).as_str())
                     );
                 }
-                (
-                    false,
-                    DeliveredEvent::Error(message, terminal, turn_id, user_id, assistant_id),
-                ) => {
+                (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
                     assert!(message.contains("follow-up 0 failed"));
                     assert!(
                         !terminal,
                         "the first child error must not end the interaction"
                     );
                     assert_eq!(turn_id, &child_ids[0]);
-                    // The failed child persisted its input before the model
-                    // step, so its error event carries the input id the
-                    // client adopts; no final message exists.
-                    assert_eq!(user_id.as_deref(), Some(first_input.as_str()));
-                    assert!(assistant_id.is_none());
                 }
                 (succeeds, event) => {
                     panic!("unexpected first child outcome: succeeds={succeeds}, event={event:?}")
                 }
             }
             match (second_succeeds, &events[3]) {
-                (
-                    true,
-                    DeliveredEvent::Response(text, terminal, turn_id, user_id, assistant_id),
-                ) => {
+                (true, DeliveredEvent::Response(text, terminal, turn_id, message_id)) => {
                     assert_eq!(text, "ok");
                     assert!(terminal, "the last child must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
                     assert_eq!(
-                        user_id.as_deref(),
-                        Some(
-                            crate::agent_loop::turn::turn_input_message_id(&child_ids[1]).as_str()
-                        )
-                    );
-                    assert_eq!(
-                        assistant_id.as_deref(),
-                        Some(format!("turn:{}:final", child_ids[1]).as_str())
+                        message_id.as_deref(),
+                        Some(format!("turn:{}:assistant:1", child_ids[1]).as_str())
                     );
                 }
-                (
-                    false,
-                    DeliveredEvent::Error(message, terminal, turn_id, user_id, assistant_id),
-                ) => {
+                (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
                     assert!(message.contains("follow-up 1 failed"));
                     assert!(terminal, "the last child error must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
-                    assert_eq!(user_id.as_deref(), Some(second_input.as_str()));
-                    assert!(assistant_id.is_none());
                 }
                 (succeeds, event) => {
                     panic!("unexpected second child outcome: succeeds={succeeds}, event={event:?}")
@@ -2856,10 +2753,10 @@ mod tests {
             _ => panic!("expected created"),
         };
 
-        // Drive the turn to input_committed with the deterministic input message
-        // id the resume path validates (`turn:{id}:input`).
+        // Drive the turn to input_committed with the request key as the
+        // input message id, the way the Turn pipeline persists it.
         let mut msg = StoredMessage::user(chat_id, "sender".to_string(), input.clone());
-        msg.id = format!("turn:{turn_id}:input");
+        msg.id = "resume-k".to_string();
         msg.turn_id = Some(turn_id.clone());
         call_blocking(state.db_for(ConversationScope::Normal), {
             let msg = msg.clone();

@@ -377,6 +377,7 @@ export function WebUI() {
       storageKey={selectedSession}
       jumpRequest={messageJump ?? undefined}
       agentAvatars={agentAvatars}
+      waitingForAssistant={transport.state.waitingForAssistant}
     />
   );
 

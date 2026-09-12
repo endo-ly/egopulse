@@ -377,12 +377,11 @@ fn messages_to_entries(messages: &[crate::llm::Message]) -> Vec<TranscriptEntry>
 fn map_agent_event(event: AgentEvent) -> TurnEvent {
     match event {
         AgentEvent::Iteration { iteration } => TurnEvent::Iteration { iteration },
-        AgentEvent::Delta { text } => TurnEvent::Delta { text },
+        AgentEvent::Delta { text, .. } => TurnEvent::Delta { text },
         AgentEvent::ToolStart {
             name,
             input,
             call_id,
-            ..
         } => TurnEvent::ToolStart {
             name,
             input,
@@ -402,18 +401,17 @@ fn map_agent_event(event: AgentEvent) -> TurnEvent {
             call_id,
         },
         AgentEvent::UserInputInjected {
-            request_id,
             message_id,
             sender_id,
             text,
             timestamp,
         } => TurnEvent::UserInputInjected {
-            request_id,
             message_id,
             sender_id,
             text,
             timestamp,
         },
+        AgentEvent::AssistantMessageDiscarded { .. } => TurnEvent::AssistantDiscarded,
         AgentEvent::FinalResponse { text, .. } => TurnEvent::FinalResponse { text },
         AgentEvent::Error { message, .. } => TurnEvent::Error { message },
     }
@@ -642,6 +640,7 @@ mod tests {
     #[test]
     fn maps_internal_agent_event_to_local_event() {
         let event = map_agent_event(AgentEvent::Delta {
+            message_id: "turn:t1:assistant:1".to_string(),
             text: "hello".to_string(),
         });
 
@@ -650,6 +649,13 @@ mod tests {
             TurnEvent::Delta {
                 text: "hello".to_string()
             }
+        );
+
+        assert_eq!(
+            map_agent_event(AgentEvent::AssistantMessageDiscarded {
+                message_id: "turn:t1:assistant:1".to_string(),
+            }),
+            TurnEvent::AssistantDiscarded
         );
     }
 

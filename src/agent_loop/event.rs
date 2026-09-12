@@ -8,25 +8,28 @@ use serde::Serialize;
 use std::sync::Arc;
 
 /// Represents internal events emitted while the agent processes a turn.
+///
+/// Message identity is stable end to end: the user message keeps the
+/// canonical id the client sent (`web:<uuid>`, the Turn's `request_key`),
+/// and every assistant message keeps the deterministic id assigned before
+/// its model iteration (`turn:{turn_id}:assistant:{iteration}`) from the
+/// first streamed delta through tool previews to the persisted final row.
+/// Consumers address messages by these ids only; no event renames them.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AgentEvent {
     /// Iteration counter.
     Iteration { iteration: usize },
-    /// Incremental text chunk from LLM streaming.
-    Delta { text: String },
+    /// Incremental text chunk from LLM streaming. Carries the stable id of
+    /// the assistant message the chunk belongs to; consumers append chunks
+    /// onto that id.
+    Delta { message_id: String, text: String },
     /// Tool execution started.
     ToolStart {
         name: String,
         input: serde_json::Value,
         /// LLM-issued tool call id. Disambiguates concurrent same-name tools.
         call_id: String,
-        /// Persisted id of the assistant message that issued this tool call
-        /// (the narration segment streamed so far). Lets clients adopt the
-        /// live draft onto the persisted row immediately, so every narration
-        /// segment maps 1:1 and the terminal final id can only match the
-        /// last segment.
-        assistant_message_id: String,
     },
     /// Tool execution completed.
     ToolResult {
@@ -39,30 +42,26 @@ pub(crate) enum AgentEvent {
     },
     /// A human message accepted during the Tool phase and committed after its
     /// Tool Results. The event is emitted only after the database commit.
-    /// `request_id` links the commit to the exact client send
-    /// (`local:{request_id}`) even when several identical texts are in
-    /// flight; `None` when the staged key carries no client request id.
+    /// `message_id` is the canonical client-issued id, identical to the
+    /// optimistic entry the client already shows, so delivery is an upsert.
     UserInputInjected {
-        request_id: Option<String>,
         message_id: String,
         sender_id: String,
         text: String,
         timestamp: String,
     },
+    /// A streamed assistant message the loop will not persist: a retry
+    /// supersedes it (declarative-only or malformed response). Consumers
+    /// delete the message with this id; the retry streams under a new id.
+    AssistantMessageDiscarded { message_id: String },
     /// Final response. `terminal` is determined by the shared observer
     /// interaction lifecycle for client-owned delivery. `turn_id` is the
     /// durable Turn that produced the response; one client interaction can
-    /// span several Turns (staged follow-up promotion), so publishers must
-    /// route and resolve through this id, not the interaction id. The
-    /// message ids travel in the event itself (resolved authoritatively at
-    /// emission), so terminal delivery needs no further lookup.
+    /// span several Turns (staged follow-up promotion). `assistant_message_id`
+    /// is the stable id the response streamed under, or `None` when the Turn
+    /// persisted no final message (duplicate-delivery notices).
     FinalResponse {
         turn_id: String,
-        /// Persisted id of the Turn's input message, if the Turn committed
-        /// one. Adopts the optimistic user bubble.
-        user_message_id: Option<String>,
-        /// Persisted id of the Turn's final message, if the Turn persisted
-        /// one. Adopts the sealed assistant draft.
         assistant_message_id: Option<String>,
         text: String,
         terminal: bool,
@@ -70,14 +69,10 @@ pub(crate) enum AgentEvent {
     /// Error occurred. `terminal` is false when the shared interaction still
     /// owns a staged follow-up that will continue on the same observer.
     /// `turn_id` identifies the durable Turn that failed, for the same
-    /// reason as [`AgentEvent::FinalResponse`]. The stamps carry the failed
-    /// Turn's persisted message ids (input committed before the failure,
-    /// final only when the failure happened after its write), so channels
-    /// adopt live entries exactly like a successful terminal response.
+    /// reason as [`AgentEvent::FinalResponse`]. Partial output keeps the id
+    /// it streamed under; no lookup is needed to resolve anything.
     Error {
         turn_id: String,
-        user_message_id: Option<String>,
-        assistant_message_id: Option<String>,
         message: String,
         terminal: bool,
     },

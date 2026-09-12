@@ -22,25 +22,31 @@ use super::stream::{SendRequest, accept_web_input};
 use super::{RunEvent, RunLookupError, WEB_ACTOR, WebState};
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DeltaData {
+    message_id: String,
     delta: String,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct DoneData {
     response: Option<String>,
-    user_message_id: Option<String>,
-    assistant_message_id: Option<String>,
+    message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ErrorData {
     error: Option<String>,
-    user_message_id: Option<String>,
-    assistant_message_id: Option<String>,
 }
 
-const PROTOCOL_VERSION: u64 = 1;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantDiscardedData {
+    message_id: String,
+}
+
+const PROTOCOL_VERSION: u64 = 2;
 const MAX_WS_CONNECTIONS: usize = 64;
 const MAX_WS_TEXT_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,11 +114,12 @@ struct ChatSendParams {
     message: String,
     /// Agent selected by the WebUI when the session key is not yet persisted.
     agent_id: Option<String>,
-    /// Durable request id for deduplication. Mirrors `SendRequest::request_id`
-    /// on the REST path; it is independent from the enclosing frame's RPC id.
-    /// The Web runtime converts it into `context.request_key` so a re-delivered
-    /// `chat.send` maps to the same Turn instead of a duplicate.
-    request_id: Option<String>,
+    /// Canonical client-issued message id (`web:<uuid>`). It is the
+    /// optimistic entry, the Turn's `request_key`, and the persisted
+    /// `messages.id` at once; the Web runtime validates the format and a
+    /// re-delivered `chat.send` maps to the same Turn instead of a
+    /// duplicate. Independent from the enclosing frame's RPC id.
+    message_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,13 +183,12 @@ struct GatewayChatEvent {
     message: Option<GatewayChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_message: Option<String>,
-    user_message_id: Option<String>,
-    assistant_message_id: Option<String>,
     terminal: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct GatewayChatMessage {
+    id: String,
     role: &'static str,
     content: Vec<GatewayChatContent>,
 }
@@ -397,6 +403,7 @@ fn handle_connect(
                     "tool_start",
                     "tool_result",
                     "user_input",
+                    "assistant_discarded",
                 ],
             },
         },
@@ -425,7 +432,7 @@ async fn handle_chat_send(
         session_key: Some(payload.session_key),
         message: payload.message,
         agent_id: payload.agent_id,
-        request_id: payload.request_id,
+        message_id: payload.message_id,
     };
 
     let accepted = match accept_web_input(state.clone(), request, WEB_ACTOR).await {
@@ -697,6 +704,7 @@ fn forward_run_event(
                 seq: event.id,
                 state: "delta",
                 message: Some(GatewayChatMessage {
+                    id: data.message_id,
                     role: "assistant",
                     content: vec![GatewayChatContent {
                         kind: "text",
@@ -704,8 +712,6 @@ fn forward_run_event(
                     }],
                 }),
                 error_message: None,
-                user_message_id: None,
-                assistant_message_id: None,
                 terminal: event.terminal,
             };
             send_event(tx, "chat", gateway_event).is_err()
@@ -717,29 +723,27 @@ fn forward_run_event(
                     tracing::error!(%error, run_id, "done event carries malformed data");
                     DoneData {
                         response: None,
-                        user_message_id: None,
-                        assistant_message_id: None,
+                        message_id: None,
                     }
                 }
+            };
+            // The final id is the stable id the response streamed under, so
+            // the client upserts by id instead of adopting a draft.
+            let message = match (data.message_id, data.response) {
+                (Some(id), Some(text)) if !text.is_empty() => Some(GatewayChatMessage {
+                    id,
+                    role: "assistant",
+                    content: vec![GatewayChatContent { kind: "text", text }],
+                }),
+                _ => None,
             };
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
                 seq: event.id,
                 state: "done",
-                message: data.response.and_then(|text| {
-                    if text.is_empty() {
-                        None
-                    } else {
-                        Some(GatewayChatMessage {
-                            role: "assistant",
-                            content: vec![GatewayChatContent { kind: "text", text }],
-                        })
-                    }
-                }),
+                message,
                 error_message: None,
-                user_message_id: data.user_message_id,
-                assistant_message_id: data.assistant_message_id,
                 terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
@@ -752,11 +756,7 @@ fn forward_run_event(
                 Ok(data) => data,
                 Err(error) => {
                     tracing::error!(%error, run_id, "error event carries malformed data");
-                    ErrorData {
-                        error: None,
-                        user_message_id: None,
-                        assistant_message_id: None,
-                    }
+                    ErrorData { error: None }
                 }
             };
             let gateway_event = GatewayChatEvent {
@@ -766,14 +766,27 @@ fn forward_run_event(
                 state: "error",
                 message: None,
                 error_message: Some(data.error.unwrap_or_else(|| "stream error".to_string())),
-                user_message_id: data.user_message_id,
-                assistant_message_id: data.assistant_message_id,
                 terminal: event.terminal,
             };
             if send_event(tx, "chat", gateway_event).is_err() {
                 return true;
             }
             event.terminal
+        }
+        "assistant_discarded" => {
+            let Ok(data) = serde_json::from_str::<AssistantDiscardedData>(&event.data) else {
+                return false;
+            };
+            send_event(
+                tx,
+                "assistant_discarded",
+                routed_event_payload(
+                    run_id,
+                    session_key,
+                    serde_json::json!({ "messageId": data.message_id }),
+                ),
+            )
+            .is_err()
         }
         "tool_start" => {
             let Ok(payload) = serde_json::from_str::<serde_json::Value>(&event.data) else {
@@ -990,7 +1003,7 @@ mod tests {
         let delta_event = RunEvent {
             id: 1,
             event: "delta".to_string(),
-            data: r#"{"delta":"chunk"}"#.to_string(),
+            data: r#"{"messageId":"turn:t1:assistant:1","delta":"chunk"}"#.to_string(),
             terminal: false,
         };
         forward_run_event(&tx, "run-1", test_session, delta_event);
@@ -998,7 +1011,7 @@ mod tests {
         let done_event = RunEvent {
             id: 2,
             event: "done".to_string(),
-            data: r#"{"response":"final"}"#.to_string(),
+            data: r#"{"response":"final","messageId":"turn:t1:assistant:1"}"#.to_string(),
             terminal: true,
         };
         forward_run_event(&tx, "run-1", test_session, done_event);
@@ -1037,7 +1050,7 @@ mod tests {
         let delta_event = RunEvent {
             id: 1,
             event: "delta".to_string(),
-            data: r#"{"delta":"hello world"}"#.to_string(),
+            data: r#"{"messageId":"turn:t1:assistant:1","delta":"hello world"}"#.to_string(),
             terminal: false,
         };
 
@@ -1056,10 +1069,30 @@ mod tests {
         assert_eq!(payload["sessionKey"], "sess-1");
         assert_eq!(payload["seq"], 1, "seq must mirror the RunHub event id");
         assert_eq!(payload["state"], "delta");
+        assert_eq!(payload["message"]["id"], "turn:t1:assistant:1");
         assert_eq!(payload["message"]["role"], "assistant");
         assert_eq!(payload["message"]["content"][0]["type"], "text");
         assert_eq!(payload["message"]["content"][0]["text"], "hello world");
         assert!(payload.get("errorMessage").is_none());
+    }
+
+    #[test]
+    fn ws_delta_without_message_id_is_skipped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+        // A delta without a stable message id cannot be addressed by the
+        // client, so it is dropped instead of rendered anonymously.
+        let delta_event = RunEvent {
+            id: 1,
+            event: "delta".to_string(),
+            data: r#"{"delta":"orphan"}"#.to_string(),
+            terminal: false,
+        };
+
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", delta_event);
+        assert!(!should_stop);
+        let messages = collect_text_messages(&mut rx);
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -1069,7 +1102,7 @@ mod tests {
         let delta_event = RunEvent {
             id: 1,
             event: "delta".to_string(),
-            data: r#"{"delta":""}"#.to_string(),
+            data: r#"{"messageId":"turn:t1:assistant:1","delta":""}"#.to_string(),
             terminal: false,
         };
 
@@ -1086,7 +1119,7 @@ mod tests {
         let done_event = RunEvent {
             id: 10,
             event: "done".to_string(),
-            data: r#"{"response":"final answer"}"#.to_string(),
+            data: r#"{"response":"final answer","messageId":"turn:t1:assistant:2"}"#.to_string(),
             terminal: true,
         };
 
@@ -1105,18 +1138,19 @@ mod tests {
         assert_eq!(payload["sessionKey"], "sess-done");
         assert_eq!(payload["seq"], 10, "seq must mirror the RunHub event id");
         assert_eq!(payload["state"], "done");
+        assert_eq!(payload["message"]["id"], "turn:t1:assistant:2");
         assert_eq!(payload["message"]["role"], "assistant");
         assert_eq!(payload["message"]["content"][0]["text"], "final answer");
     }
 
     #[test]
-    fn ws_done_event_forwards_persisted_message_ids() {
+    fn ws_done_event_forwards_the_stable_final_id() {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
         let done_event = RunEvent {
             id: 11,
             event: "done".to_string(),
-            data: r#"{"response":"final answer","user_message_id":"turn:t1:input","assistant_message_id":"turn:t1:final"}"#.to_string(),
+            data: r#"{"response":"final answer","messageId":"turn:t1:assistant:2"}"#.to_string(),
             terminal: true,
         };
 
@@ -1129,8 +1163,9 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         let payload = &parsed["payload"];
         assert_eq!(payload["state"], "done");
-        assert_eq!(payload["userMessageId"], "turn:t1:input");
-        assert_eq!(payload["assistantMessageId"], "turn:t1:final");
+        assert_eq!(payload["message"]["id"], "turn:t1:assistant:2");
+        assert!(payload.get("userMessageId").is_none());
+        assert!(payload.get("assistantMessageId").is_none());
     }
 
     #[test]
@@ -1140,8 +1175,7 @@ mod tests {
         let done_event = RunEvent {
             id: 1,
             event: "done".to_string(),
-            data: r#"{"response":"","user_message_id":null,"assistant_message_id":null}"#
-                .to_string(),
+            data: r#"{"response":""}"#.to_string(),
             terminal: true,
         };
 
@@ -1195,7 +1229,8 @@ mod tests {
         let done_event = RunEvent {
             id: 2,
             event: "done".to_string(),
-            data: r#"{"response":"follow-up response"}"#.to_string(),
+            data: r#"{"response":"follow-up response","messageId":"turn:child:assistant:1"}"#
+                .to_string(),
             terminal: true,
         };
         assert!(forward_run_event(&tx, "run-shared", "sess-1", done_event));
@@ -1206,6 +1241,10 @@ mod tests {
         assert_eq!(parent_error["payload"]["terminal"], false);
         let child_done: serde_json::Value = serde_json::from_str(&messages[1]).unwrap();
         assert_eq!(child_done["payload"]["terminal"], true);
+        assert_eq!(
+            child_done["payload"]["message"]["id"],
+            "turn:child:assistant:1"
+        );
         assert_eq!(
             child_done["payload"]["message"]["content"][0]["text"],
             "follow-up response"
@@ -1223,7 +1262,8 @@ mod tests {
             RunEvent {
                 id: 1,
                 event: "done".to_string(),
-                data: r#"{"response":"follow-up A"}"#.to_string(),
+                data: r#"{"response":"follow-up A","messageId":"turn:parent:assistant:2"}"#
+                    .to_string(),
                 terminal: false,
             }
         ));
@@ -1245,7 +1285,8 @@ mod tests {
             RunEvent {
                 id: 3,
                 event: "done".to_string(),
-                data: r#"{"response":"follow-up B"}"#.to_string(),
+                data: r#"{"response":"follow-up B","messageId":"turn:child:assistant:1"}"#
+                    .to_string(),
                 terminal: true,
             }
         ));
@@ -1254,8 +1295,16 @@ mod tests {
         assert_eq!(messages.len(), 3);
         let first_done: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         assert_eq!(first_done["payload"]["terminal"], false);
+        assert_eq!(
+            first_done["payload"]["message"]["id"],
+            "turn:parent:assistant:2"
+        );
         let last_done: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
         assert_eq!(last_done["payload"]["terminal"], true);
+        assert_eq!(
+            last_done["payload"]["message"]["id"],
+            "turn:child:assistant:1"
+        );
     }
 
     #[tokio::test]
@@ -1335,7 +1384,7 @@ mod tests {
             "sessionKey": "main",
             "agentId": "default",
             "message": "hello",
-            "requestId": "durable-request-1"
+            "messageId": "web:11111111-1111-1111-1111-111111111111"
         });
 
         let _ = handle_chat_send(&state, context, "rpc-attempt-1", params).await;
@@ -1354,6 +1403,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ws_chat_send_rejects_a_noncanonical_message_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state(&dir);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let connected = AtomicBool::new(true);
+        let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+
+        // Missing and malformed ids never reach the Turn boundary.
+        for (index, params) in [
+            serde_json::json!({
+                "sessionKey": "main",
+                "agentId": "default",
+                "message": "hello",
+            }),
+            serde_json::json!({
+                "sessionKey": "main",
+                "agentId": "default",
+                "message": "hello",
+                "messageId": "not-a-canonical-id",
+            }),
+            serde_json::json!({
+                "sessionKey": "main",
+                "agentId": "default",
+                "message": "hello",
+                "messageId": "web:not-a-uuid",
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let context = SocketRequestContext {
+                tx: &tx,
+                connected: &connected,
+                conn_id: "test-conn",
+                forwarded_runs: &forwarded_runs,
+            };
+            let _ = handle_chat_send(&state, context, &format!("rpc-bad-{index}"), params).await;
+        }
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 3);
+        for message in &messages {
+            let parsed: serde_json::Value = serde_json::from_str(message).unwrap();
+            assert_eq!(parsed["ok"], false);
+            assert_eq!(parsed["error"]["code"], "invalid_params");
+        }
+    }
+
+    #[tokio::test]
     async fn ws_chat_send_forwards_one_run_once_per_connection() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1365,7 +1464,7 @@ mod tests {
             "sessionKey": "duplicate-forward-session",
             "agentId": "default",
             "message": "hello",
-            "requestId": "duplicate-forward-request"
+            "messageId": "web:22222222-2222-2222-2222-222222222222"
         });
 
         // Act: the second delivery is idempotent and must reuse the same
@@ -1412,7 +1511,7 @@ mod tests {
                 session_key: Some("queued-session".to_string()),
                 message: "active".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("active-request".to_string()),
+                message_id: Some("web:33333333-3333-3333-3333-333333333333".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1458,7 +1557,7 @@ mod tests {
                 "sessionKey": "queued-session",
                 "agentId": "default",
                 "message": "queued message",
-                "requestId": "queued-request"
+                "messageId": "web:44444444-4444-4444-4444-444444444444"
             }),
         )
         .await;
@@ -1532,7 +1631,7 @@ mod tests {
                 session_key: Some("active-follow-up".to_string()),
                 message: "follow-up".to_string(),
                 agent_id: Some("default".to_string()),
-                request_id: Some("follow-up-request".to_string()),
+                message_id: Some("web:55555555-5555-5555-5555-555555555555".to_string()),
             },
             WEB_ACTOR,
         )
@@ -1549,7 +1648,7 @@ mod tests {
                 "sessionKey": "active-follow-up",
                 "agentId": "default",
                 "message": "follow-up",
-                "requestId": "follow-up-request"
+                "messageId": "web:55555555-5555-5555-5555-555555555555"
             }),
         )
         .await;
@@ -1568,7 +1667,7 @@ mod tests {
             .list_staged_user_messages(&turn_id)
             .expect("staged message");
         assert_eq!(staged.len(), 1);
-        assert_eq!(staged[0].id, "web:follow-up-request");
+        assert_eq!(staged[0].id, "web:55555555-5555-5555-5555-555555555555");
         assert_eq!(staged[0].content, "follow-up");
     }
 
@@ -1605,7 +1704,8 @@ mod tests {
             serde_json::json!({
                 "sessionKey": "not-yet-created",
                 "agentId": "default",
-                "message": "follow-up"
+                "message": "follow-up",
+                "messageId": "web:66666666-6666-6666-6666-666666666666"
             }),
         )
         .await;
@@ -1698,6 +1798,27 @@ mod tests {
         assert_eq!(result["payload"]["sessionKey"], "sess-1");
     }
 
+    #[test]
+    fn ws_forwards_assistant_discarded_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let event = RunEvent {
+            id: 3,
+            event: "assistant_discarded".to_string(),
+            data: r#"{"messageId":"turn:t1:assistant:1"}"#.to_string(),
+            terminal: false,
+        };
+
+        assert!(!forward_run_event(&tx, "run-1", "sess-1", event));
+
+        let messages = collect_text_messages(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(parsed["event"], "assistant_discarded");
+        assert_eq!(parsed["payload"]["messageId"], "turn:t1:assistant:1");
+        assert_eq!(parsed["payload"]["runId"], "run-1");
+        assert_eq!(parsed["payload"]["sessionKey"], "sess-1");
+    }
+
     #[tokio::test]
     async fn ws_run_subscribe_replays_after_last_seq_and_reports_done() {
         // Arrange: a run with two persisted events, already terminal. The
@@ -1717,7 +1838,7 @@ mod tests {
             .publish(
                 "resubscribe-run",
                 "delta",
-                r#"{"delta":"Hello"}"#.to_string(),
+                r#"{"messageId":"turn:t9:assistant:1","delta":"Hello"}"#.to_string(),
             )
             .await;
         state
@@ -1725,7 +1846,7 @@ mod tests {
             .publish(
                 "resubscribe-run",
                 "done",
-                r#"{"response":"Hello world"}"#.to_string(),
+                r#"{"response":"Hello world","messageId":"turn:t9:assistant:1"}"#.to_string(),
             )
             .await;
 
@@ -1803,7 +1924,7 @@ mod tests {
             .publish(
                 "slash-run",
                 "done",
-                r#"{"response":"/status result"}"#.to_string(),
+                r#"{"response":"/status result","messageId":"web:slash:slash-run"}"#.to_string(),
             )
             .await;
 
@@ -1855,6 +1976,9 @@ mod tests {
             done["payload"]["message"]["content"][0]["text"],
             "/status result"
         );
+        // The slash stable id survives the replay verbatim: the client
+        // upserts the same message instead of duplicating it.
+        assert_eq!(done["payload"]["message"]["id"], "web:slash:slash-run");
     }
 
     #[tokio::test]

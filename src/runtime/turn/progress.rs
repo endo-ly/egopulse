@@ -133,8 +133,9 @@ impl CoordinatorState {
     /// 終了系（EOF / `FinalResponse`）は [`ToolProgressCoordinator::run`] で処理済み。
     async fn on_event(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Delta { text } => self.pending_narration.push_str(&text),
+            AgentEvent::Delta { text, .. } => self.pending_narration.push_str(&text),
             AgentEvent::Iteration { .. } => self.pending_narration.clear(),
+            AgentEvent::AssistantMessageDiscarded { .. } => self.pending_narration.clear(),
             AgentEvent::ToolStart { name, call_id, .. } => {
                 self.flush_narration();
                 self.log.start(call_id, name);
@@ -449,7 +450,14 @@ mod tests {
             name: name.to_string(),
             input: serde_json::Value::Null,
             call_id: call_id.to_string(),
-            assistant_message_id: "parent-assistant".to_string(),
+        }
+    }
+
+    /// `Delta` chunk helper carrying an explicit stable message id.
+    fn delta(message_id: &str, text: &str) -> AgentEvent {
+        AgentEvent::Delta {
+            message_id: message_id.to_string(),
+            text: text.to_string(),
         }
     }
 
@@ -503,7 +511,6 @@ mod tests {
         tx.send(tool_start("read", "read")).unwrap();
         tx.send(AgentEvent::FinalResponse {
             turn_id: "turn-test".to_string(),
-            user_message_id: None,
             assistant_message_id: None,
             text: "done".to_string(),
             terminal: false,
@@ -649,7 +656,6 @@ mod tests {
             name: "bash".to_string(),
             input: serde_json::json!({ "command": secret_input }),
             call_id: "bash".to_string(),
-            assistant_message_id: "parent-assistant".to_string(),
         })
         .unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
@@ -828,14 +834,8 @@ mod tests {
         );
 
         // Act: Delta chunks stream the narration, then a tool starts.
-        tx.send(AgentEvent::Delta {
-            text: "ファイルを".to_string(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::Delta {
-            text: "確認します".to_string(),
-        })
-        .unwrap();
+        tx.send(delta("turn:t1:assistant:1", "ファイルを")).unwrap();
+        tx.send(delta("turn:t1:assistant:1", "確認します")).unwrap();
         tx.send(tool_start("read", "read")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
@@ -901,13 +901,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin");
-        tx.send(AgentEvent::Delta {
-            text: "完了した結果をお伝えします".to_string(),
-        })
-        .unwrap();
+        tx.send(delta("turn:t1:assistant:2", "完了した結果をお伝えします"))
+            .unwrap();
         tx.send(AgentEvent::FinalResponse {
             turn_id: "turn-test".to_string(),
-            user_message_id: None,
             assistant_message_id: None,
             text: "完了した結果をお伝えします".to_string(),
             terminal: false,
@@ -942,20 +939,16 @@ mod tests {
 
         // Act: iteration 1 (narration + tool + result), then iteration 2 likewise.
         tx.send(AgentEvent::Iteration { iteration: 1 }).unwrap();
-        tx.send(AgentEvent::Delta {
-            text: "まず確認します".to_string(),
-        })
-        .unwrap();
+        tx.send(delta("turn:t1:assistant:1", "まず確認します"))
+            .unwrap();
         tx.send(tool_start("call-1", "read")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
             .expect("begin");
         tx.send(tool_result("call-1", "read", false, 5)).unwrap();
         tx.send(AgentEvent::Iteration { iteration: 2 }).unwrap();
-        tx.send(AgentEvent::Delta {
-            text: "次に実行します".to_string(),
-        })
-        .unwrap();
+        tx.send(delta("turn:t1:assistant:2", "次に実行します"))
+            .unwrap();
         tx.send(tool_start("call-2", "bash")).unwrap();
         drop(tx);
         let () = handle.await.unwrap();
@@ -994,15 +987,10 @@ mod tests {
 
         // Act: iteration 1 narration, then iteration 2 begins and reaches a tool.
         tx.send(AgentEvent::Iteration { iteration: 1 }).unwrap();
-        tx.send(AgentEvent::Delta {
-            text: "破棄されるべき".to_string(),
-        })
-        .unwrap();
+        tx.send(delta("turn:t1:assistant:1", "破棄されるべき"))
+            .unwrap();
         tx.send(AgentEvent::Iteration { iteration: 2 }).unwrap();
-        tx.send(AgentEvent::Delta {
-            text: "残るべき".to_string(),
-        })
-        .unwrap();
+        tx.send(delta("turn:t1:assistant:2", "残るべき")).unwrap();
         tx.send(tool_start("read", "read")).unwrap();
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
@@ -1016,6 +1004,47 @@ mod tests {
         assert!(
             !body.contains("破棄されるべき"),
             "stale narration leaked: {body}"
+        );
+        assert!(
+            body.contains("💬 残るべき"),
+            "fresh narration missing: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_discards_pending_narration_on_retry() {
+        // Arrange: iteration 1 streams a narration, then the loop discards
+        // it via retry and iteration 2 reaches a tool.
+        let (sink, calls, notify) = mock_sink();
+        let (tx, handle) = spawn_coordinator(
+            Some(sink),
+            Duration::from_millis(20),
+            Duration::from_millis(800),
+        );
+
+        // Act
+        tx.send(AgentEvent::Iteration { iteration: 1 }).unwrap();
+        tx.send(delta("turn:t1:assistant:1", "破棄されるべき"))
+            .unwrap();
+        tx.send(AgentEvent::AssistantMessageDiscarded {
+            message_id: "turn:t1:assistant:1".to_string(),
+        })
+        .unwrap();
+        tx.send(AgentEvent::Iteration { iteration: 2 }).unwrap();
+        tx.send(delta("turn:t1:assistant:2", "残るべき")).unwrap();
+        tx.send(tool_start("read", "read")).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), notify.notified())
+            .await
+            .expect("begin");
+        drop(tx);
+        let () = handle.await.unwrap();
+
+        // Assert: only iteration 2's narration survived.
+        let snapshot = calls.lock().unwrap().clone();
+        let body = snapshot.begins.first().expect("begin posted");
+        assert!(
+            !body.contains("破棄されるべき"),
+            "discarded narration leaked: {body}"
         );
         assert!(
             body.contains("💬 残るべき"),

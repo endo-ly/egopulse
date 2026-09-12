@@ -65,4 +65,21 @@ describe("ChatTab", () => {
     expect(rows[1].className).toContain("search-highlight");
     expect(rows[0].className).not.toContain("search-highlight");
   });
+
+  it("waiting_indicator_renders_outside_the_message_list", () => {
+    const withWaiting = render(
+      <ChatTab channel="web" readOnly={false} messages={messages} waitingForAssistant />,
+    );
+    expect(withWaiting.container.querySelector(".thinking-dots")).toBeTruthy();
+    // The indicator is progress UI, not a message: it renders one extra row
+    // without touching the message list itself.
+    expect(
+      withWaiting.container.querySelectorAll(".timeline-messages > *"),
+    ).toHaveLength(3);
+
+    const withoutWaiting = render(
+      <ChatTab channel="web" readOnly={false} messages={messages} />,
+    );
+    expect(withoutWaiting.container.querySelector(".thinking-dots")).toBeNull();
+  });
 });

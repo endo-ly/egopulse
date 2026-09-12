@@ -150,12 +150,14 @@ pub(crate) enum TurnEvent {
         call_id: String,
     },
     UserInputInjected {
-        request_id: Option<String>,
         message_id: String,
         sender_id: String,
         text: String,
         timestamp: String,
     },
+    /// A streamed assistant segment the loop discarded via retry. Consumers
+    /// drop the pending assistant text; the retry streams anew.
+    AssistantDiscarded,
     FinalResponse {
         text: String,
     },

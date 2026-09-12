@@ -1,6 +1,7 @@
 //! Agent Loop policy and model/tool iteration state.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::warn;
 
@@ -66,9 +67,12 @@ impl LoopState {
 }
 
 /// Result returned when the Agent Loop has produced a final response.
+/// `final_message_id` is the stable id the response streamed under; the
+/// caller persists the final row under exactly this id.
 pub(crate) struct AgentLoopResult {
     pub(crate) final_content: String,
     pub(crate) reasoning_content: Option<String>,
+    pub(crate) final_message_id: String,
     pub(crate) messages: Arc<Vec<Message>>,
     pub(crate) session_revision: Option<i64>,
 }
@@ -121,14 +125,26 @@ impl<'a> AgentLoop<'a> {
 
         for iteration in start_iteration..=MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
+            // The assistant message id is fixed before the model call, so
+            // the streamed deltas, a tool preview, and the final row all
+            // share one identity from the start.
+            let message_id =
+                crate::agent_loop::turn::assistant_message_id(&self.prepared.turn_id, iteration);
             let request_messages = request_messages_for_iteration(
                 &mut loop_state,
                 iteration,
                 &self.channel_context_msg,
             );
             let event_emitter = self.on_event.clone();
+            let emitted_id = message_id.clone();
+            let output_published = Arc::new(AtomicBool::new(false));
+            let published_flag = Arc::clone(&output_published);
             let on_delta = move |text: String| {
-                event_emitter.emit(AgentEvent::Delta { text });
+                published_flag.store(true, Ordering::SeqCst);
+                event_emitter.emit(AgentEvent::Delta {
+                    message_id: emitted_id.clone(),
+                    text,
+                });
             };
             let model_runner = ModelRunner::new(ModelStepRequest {
                 state: self.state,
@@ -167,7 +183,17 @@ impl<'a> AgentLoop<'a> {
                         &mut loop_state.declarative_retry_attempted,
                         &loop_state.messages,
                     )? {
-                        LoopAction::Retry(messages) => loop_state.retry_messages = Some(messages),
+                        LoopAction::Retry(messages) => {
+                            // The streamed text will never be persisted; tell
+                            // consumers to drop it so the retry starts clean.
+                            // Iterations that streamed nothing need no event.
+                            if output_published.load(Ordering::SeqCst) {
+                                self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
+                                    message_id: message_id.clone(),
+                                });
+                            }
+                            loop_state.retry_messages = Some(messages);
+                        }
                         LoopAction::Done {
                             final_content,
                             reasoning_content,
@@ -175,6 +201,7 @@ impl<'a> AgentLoop<'a> {
                             return Ok(AgentLoopResult {
                                 final_content,
                                 reasoning_content,
+                                final_message_id: message_id,
                                 messages: loop_state.messages,
                                 session_revision: loop_state.session_revision,
                             });
@@ -190,7 +217,14 @@ impl<'a> AgentLoop<'a> {
                         &mut loop_state.declarative_retry_attempted,
                         &loop_state.messages,
                     )? {
-                        LoopAction::Retry(messages) => loop_state.retry_messages = Some(messages),
+                        LoopAction::Retry(messages) => {
+                            if output_published.load(Ordering::SeqCst) {
+                                self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
+                                    message_id: message_id.clone(),
+                                });
+                            }
+                            loop_state.retry_messages = Some(messages);
+                        }
                         LoopAction::Done {
                             final_content,
                             reasoning_content,
@@ -198,6 +232,7 @@ impl<'a> AgentLoop<'a> {
                             return Ok(AgentLoopResult {
                                 final_content,
                                 reasoning_content,
+                                final_message_id: message_id,
                                 messages: loop_state.messages,
                                 session_revision: loop_state.session_revision,
                             });
@@ -206,7 +241,7 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
                 ModelStep::ToolCalls(assistant_phase) => {
-                    self.execute_tool_phase(&mut loop_state, assistant_phase)
+                    self.execute_tool_phase(&mut loop_state, assistant_phase, &message_id)
                         .await?;
                 }
             }
@@ -241,30 +276,30 @@ impl<'a> AgentLoop<'a> {
         &self,
         loop_state: &mut LoopState,
         assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
+        assistant_message_id: &str,
     ) -> Result<(), EgoPulseError> {
         self.lifecycle.complete_model().await?;
         self.lifecycle.begin_tools().await?;
         self.lifecycle.mark_output_published().await;
 
-        let assistant_message_id = uuid::Uuid::new_v4().to_string();
         let messages = std::mem::replace(&mut loop_state.messages, Arc::new(Vec::new()));
         let messages = Arc::try_unwrap(messages).unwrap_or_else(|messages| (*messages).clone());
         let persisted = self
             .persistence
             .persist_tool_call(
-                &assistant_message_id,
+                assistant_message_id,
                 &assistant_phase,
                 messages,
                 loop_state.session_revision,
             )
             .await?;
         let tool_outcomes = self
-            .execute_tools(&assistant_message_id, assistant_phase.tool_calls)
+            .execute_tools(assistant_message_id, assistant_phase.tool_calls)
             .await?;
         let persisted = self
             .persistence
             .persist_tool_results(
-                &assistant_message_id,
+                assistant_message_id,
                 persisted.messages,
                 build_tool_result_phase(tool_outcomes),
                 Some(persisted.revision),
@@ -293,7 +328,6 @@ impl<'a> AgentLoop<'a> {
         tool_calls: Vec<ToolCall>,
     ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
         let start_emitter = self.on_event.clone();
-        let parent_message_id = assistant_message_id.to_string();
         let result_emitter = self.on_event.clone();
         let hooks = ToolExecutionHooks {
             on_start: Some(Arc::new(move |tool_call: &ToolCall| {
@@ -301,7 +335,6 @@ impl<'a> AgentLoop<'a> {
                     call_id: tool_call.id.clone(),
                     name: tool_call.name.clone(),
                     input: tool_call.arguments.clone(),
-                    assistant_message_id: parent_message_id.clone(),
                 });
             })),
             on_result: Some(Arc::new(move |outcome: &ExecutedToolCall| {
@@ -437,6 +470,7 @@ fn evaluate_malformed_response(
 mod tests {
     use super::*;
     use crate::agent_loop::process_turn;
+    use crate::agent_loop::process_turn_with_events;
     use crate::agent_loop::test_support::{
         RecordingProvider, build_state_with_provider, cli_context,
     };
@@ -446,6 +480,73 @@ mod tests {
     use crate::tools::{Tool, ToolExecutionContext, ToolResult};
     use serial_test::serial;
     use std::sync::Arc;
+
+    /// Provider that streams scripted chunks before returning each response,
+    /// so tests observe the exact deltas the loop publishes per iteration.
+    struct ScriptedStreamingProvider {
+        script: std::sync::Mutex<Vec<(Vec<String>, MessagesResponse)>>,
+    }
+
+    impl ScriptedStreamingProvider {
+        fn new(script: Vec<(Vec<String>, MessagesResponse)>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(script),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for ScriptedStreamingProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let (chunks, response) = self.script.lock().expect("script").remove(0);
+            debug_assert!(chunks.is_empty(), "scripted chunks need streaming");
+            Ok(response)
+        }
+
+        async fn send_message_streaming(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let (chunks, response) = self.script.lock().expect("script").remove(0);
+            for chunk in chunks {
+                on_delta(chunk);
+            }
+            Ok(response)
+        }
+
+        fn provider_name(&self) -> &str {
+            "scripted-streaming"
+        }
+
+        fn model_name(&self) -> &str {
+            "scripted-model"
+        }
+    }
+
+    fn final_response(content: &str) -> MessagesResponse {
+        MessagesResponse {
+            content: content.to_string(),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            usage: None,
+        }
+    }
+
+    fn streamed_final(chunks: &[&str]) -> (Vec<String>, MessagesResponse) {
+        let content = chunks.concat();
+        (
+            chunks.iter().map(ToString::to_string).collect(),
+            final_response(&content),
+        )
+    }
 
     struct BlockingTool {
         started: Arc<std::sync::atomic::AtomicUsize>,
@@ -826,5 +927,263 @@ mod tests {
                 panic!("declarative response should inject a corrective retry")
             }
         }
+    }
+
+    fn collect_loop_events(
+        events: &Arc<std::sync::Mutex<Vec<AgentEvent>>>,
+    ) -> (Vec<(String, String)>, Vec<String>, Option<String>) {
+        let events = events.lock().expect("events");
+        let deltas: Vec<(String, String)> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Delta { message_id, text } => Some((message_id.clone(), text.clone())),
+                _ => None,
+            })
+            .collect();
+        let discarded: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::AssistantMessageDiscarded { message_id } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let final_id = events.iter().find_map(|event| match event {
+            AgentEvent::FinalResponse {
+                assistant_message_id,
+                ..
+            } => Some(assistant_message_id.clone()),
+            _ => None,
+        });
+        (deltas, discarded, final_id.flatten())
+    }
+
+    async fn chat_and_turn_ids(
+        state: &crate::runtime::AppState,
+        session: &str,
+    ) -> (i64, String, Option<String>) {
+        let chat_id = call_blocking(Arc::clone(&state.db), {
+            let session = session.to_string();
+            move |db| {
+                db.resolve_or_create_chat_id(
+                    "cli",
+                    &format!("cli:{session}:agent:default"),
+                    Some(&session),
+                    "cli",
+                    "default",
+                )
+            }
+        })
+        .await
+        .expect("chat id");
+        let (turn_id, final_message_id): (String, Option<String>) =
+            call_blocking(Arc::clone(&state.db), move |db| {
+                let conn = db.get_conn()?;
+                conn.query_row(
+                    "SELECT turn_id, final_message_id FROM turn_runs WHERE chat_id = ?1",
+                    rusqlite::params![chat_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(crate::error::StorageError::from)
+            })
+            .await
+            .expect("turn row");
+        (chat_id, turn_id, final_message_id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn declarative_retry_discards_the_streamed_iteration() {
+        // Arrange: iteration 1 streams a declarative-only reply, iteration 2
+        // answers for real.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = ScriptedStreamingProvider::new(vec![
+            streamed_final(&["Sure, ", "I'll help you with that."]),
+            streamed_final(&["Here is ", "the answer you need."]),
+        ]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let mut context = cli_context("discard-declarative");
+        context.request_key = "cli:discard-declarative:1".to_string();
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+
+        // Act
+        let reply = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "help me",
+            move |event| event_log.lock().expect("events").push(event),
+        )
+        .await
+        .expect("turn succeeds after retry");
+        assert_eq!(reply, "Here is the answer you need.");
+
+        // Assert: iteration 1 streamed under its own id, was discarded, and
+        // never persisted; iteration 2 owns the final id everywhere.
+        let (deltas, discarded, final_id) = collect_loop_events(&events);
+        let first_id = deltas[0].0.clone();
+        let second_id = deltas[2].0.clone();
+        assert!(first_id.ends_with(":assistant:1"), "id was {first_id}");
+        assert!(second_id.ends_with(":assistant:2"), "id was {second_id}");
+        assert_ne!(first_id, second_id);
+        assert_eq!(discarded, vec![first_id.clone()]);
+        let final_id = final_id.expect("final id");
+        assert_eq!(final_id, second_id);
+
+        let (chat_id, turn_id, stored_final_id) =
+            chat_and_turn_ids(&state, "discard-declarative").await;
+        assert_eq!(stored_final_id.as_deref(), Some(final_id.as_str()));
+        assert_eq!(
+            final_id,
+            format!("turn:{turn_id}:assistant:2"),
+            "final row keeps the streamed iteration id"
+        );
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("history");
+        let ids: Vec<&str> = history.iter().map(|message| message.id.as_str()).collect();
+        assert!(
+            ids.contains(&"cli:discard-declarative:1"),
+            "input keeps the request key, not a generated id: {ids:?}"
+        );
+        assert!(
+            ids.contains(&final_id.as_str()),
+            "final row id matches the streamed id: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.ends_with(":assistant:1")),
+            "discarded iteration must not persist: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_tool_reply_retry_discards_the_streamed_iteration() {
+        // Arrange: iteration 1 streams declarative text with an unusable tool
+        // call, iteration 2 answers for real.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let malformed = MessagesResponse {
+            content: "Let me look into that.".to_string(),
+            reasoning_content: None,
+            tool_calls: vec![ToolCall {
+                id: "bad-call".to_string(),
+                name: String::new(),
+                arguments: serde_json::json!({}),
+            }],
+            usage: None,
+        };
+        let provider = ScriptedStreamingProvider::new(vec![
+            (vec!["Let me look into that.".to_string()], malformed),
+            streamed_final(&["Here is the answer."]),
+        ]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("discard-malformed");
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+
+        // Act
+        let reply = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "help me",
+            move |event| event_log.lock().expect("events").push(event),
+        )
+        .await
+        .expect("turn succeeds after retry");
+        assert_eq!(reply, "Here is the answer.");
+
+        // Assert: the streamed-but-unpersistable iteration is discarded by id.
+        let (deltas, discarded, final_id) = collect_loop_events(&events);
+        assert_eq!(deltas.len(), 2);
+        assert!(deltas[0].0.ends_with(":assistant:1"));
+        assert!(deltas[1].0.ends_with(":assistant:2"));
+        assert_eq!(discarded, vec![deltas[0].0.clone()]);
+        assert_eq!(final_id.as_deref(), Some(deltas[1].0.as_str()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tool_narration_and_final_share_their_iteration_ids() {
+        // Arrange: iteration 1 narrates a tool call, iteration 2 finalizes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative_path = format!("tests/{}/notes.txt", uuid::Uuid::new_v4());
+        let provider = ScriptedStreamingProvider::new(vec![
+            (
+                vec!["checking the note".to_string()],
+                MessagesResponse {
+                    content: "checking the note".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-note".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": relative_path}),
+                    }],
+                    usage: None,
+                },
+            ),
+            streamed_final(&["done"]),
+        ]);
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+        let note_path = workspace.join(&relative_path);
+        std::fs::create_dir_all(note_path.parent().expect("parent")).expect("dir");
+        std::fs::write(&note_path, "content").expect("file");
+        let context = cli_context("iteration-ids");
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+
+        // Act
+        let reply = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "read the note",
+            move |event| event_log.lock().expect("events").push(event),
+        )
+        .await
+        .expect("turn");
+        assert_eq!(reply, "done");
+
+        // Assert: narration live id == persisted preview id, and the final
+        // live id == persisted final id == turn_runs.final_message_id.
+        let (deltas, discarded, final_id) = collect_loop_events(&events);
+        assert!(discarded.is_empty());
+        assert_eq!(deltas.len(), 2);
+        let narration_id = deltas[0].0.clone();
+        let final_live_id = deltas[1].0.clone();
+        assert!(narration_id.ends_with(":assistant:1"));
+        assert!(final_live_id.ends_with(":assistant:2"));
+        assert_eq!(final_id.as_deref(), Some(final_live_id.as_str()));
+
+        let (chat_id, turn_id, stored_final_id) = chat_and_turn_ids(&state, "iteration-ids").await;
+        assert_eq!(stored_final_id.as_deref(), Some(final_live_id.as_str()));
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("history");
+        let preview = history
+            .iter()
+            .find(|message| message.id == narration_id)
+            .expect("preview row shares the narration id");
+        assert!(
+            preview.content.contains("checking the note"),
+            "preview keeps the streamed narration: {}",
+            preview.content
+        );
+        assert_eq!(
+            narration_id,
+            format!("turn:{turn_id}:assistant:1"),
+            "tool phase keeps the pre-assigned iteration id"
+        );
     }
 }

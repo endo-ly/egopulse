@@ -27,33 +27,22 @@ struct ObserverState {
 
 /// A FinalResponse held back until its Turn finishes, so the shared
 /// interaction can compute `terminal` across staged follow-up Turns. The
-/// producing Turn's id and persisted message ids travel with the text so
+/// producing Turn's id and final message id travel with the text so
 /// publishers forward them without further lookup.
 struct PendingFinalResponse {
     turn_id: String,
-    user_message_id: Option<String>,
     assistant_message_id: Option<String>,
     text: String,
-}
-
-/// Persisted message ids of a finishing Turn, forwarded on the Error event
-/// so channels adopt live entries exactly like a terminal response.
-pub(crate) struct TurnMessageStamps {
-    pub(crate) user_message_id: Option<String>,
-    pub(crate) assistant_message_id: Option<String>,
 }
 
 /// How a Turn finished, as reported to the observer.
 pub(crate) enum TurnOutcome {
     /// The Turn produced its final response: the pending FinalResponse is
-    /// forwarded with the stamps it already carries.
+    /// forwarded with the id it already carries.
     Completed,
-    /// The Turn failed: the stamps of its persisted messages travel on the
-    /// Error event so channels need no lookup of their own.
-    Failed {
-        message: String,
-        stamps: TurnMessageStamps,
-    },
+    /// The Turn failed: an Error event is emitted. Partial output keeps the
+    /// id it streamed under, so no lookup is needed.
+    Failed { message: String },
 }
 
 /// Routes runtime-owned turn output to a client without owning the turn.
@@ -220,7 +209,6 @@ impl TurnObserverRegistry {
         };
         if let AgentEvent::FinalResponse {
             turn_id,
-            user_message_id,
             assistant_message_id,
             text,
             ..
@@ -231,7 +219,6 @@ impl TurnObserverRegistry {
                 .expect("turn observer state lock")
                 .pending_final_response = Some(PendingFinalResponse {
                 turn_id,
-                user_message_id,
                 assistant_message_id,
                 text,
             });
@@ -283,18 +270,15 @@ impl TurnObserverRegistry {
                 if let Some(final_response) = final_response {
                     let _ = sink.events.send(AgentEvent::FinalResponse {
                         turn_id: final_response.turn_id,
-                        user_message_id: final_response.user_message_id,
                         assistant_message_id: final_response.assistant_message_id,
                         text: final_response.text,
                         terminal,
                     });
                 }
             }
-            TurnOutcome::Failed { message, stamps } => {
+            TurnOutcome::Failed { message } => {
                 let _ = sink.events.send(AgentEvent::Error {
                     turn_id: turn_id.to_string(),
-                    user_message_id: stamps.user_message_id,
-                    assistant_message_id: stamps.assistant_message_id,
                     message,
                     terminal,
                 });
@@ -325,16 +309,6 @@ impl Default for TurnObserverRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn stamps(
-        user_message_id: Option<&str>,
-        assistant_message_id: Option<&str>,
-    ) -> TurnMessageStamps {
-        TurnMessageStamps {
-            user_message_id: user_message_id.map(str::to_string),
-            assistant_message_id: assistant_message_id.map(str::to_string),
-        }
-    }
 
     #[tokio::test]
     async fn transfer_many_keeps_the_live_observer_until_all_turns_finish() {
@@ -391,8 +365,7 @@ mod tests {
             "follow-up-a",
             AgentEvent::FinalResponse {
                 turn_id: "turn-a".to_string(),
-                user_message_id: Some("input-a".to_string()),
-                assistant_message_id: Some("final-a".to_string()),
+                assistant_message_id: Some("turn:turn-a:assistant:2".to_string()),
                 text: "response A".to_string(),
                 terminal: false,
             },
@@ -402,8 +375,7 @@ mod tests {
             "follow-up-b",
             AgentEvent::FinalResponse {
                 turn_id: "turn-b".to_string(),
-                user_message_id: Some("input-b".to_string()),
-                assistant_message_id: Some("final-b".to_string()),
+                assistant_message_id: Some("turn:turn-b:assistant:1".to_string()),
                 text: "response B".to_string(),
                 terminal: false,
             },
@@ -415,29 +387,25 @@ mod tests {
             events.recv().await,
             Some(AgentEvent::FinalResponse {
                 turn_id,
-                user_message_id,
                 assistant_message_id,
                 text,
                 terminal: false,
                 ..
             }) if text == "response A"
                 && turn_id == "turn-a"
-                && user_message_id.as_deref() == Some("input-a")
-                && assistant_message_id.as_deref() == Some("final-a")
+                && assistant_message_id.as_deref() == Some("turn:turn-a:assistant:2")
         ));
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
                 turn_id,
-                user_message_id,
                 assistant_message_id,
                 text,
                 terminal: true,
                 ..
             }) if text == "response B"
                 && turn_id == "turn-b"
-                && user_message_id.as_deref() == Some("input-b")
-                && assistant_message_id.as_deref() == Some("final-b")
+                && assistant_message_id.as_deref() == Some("turn:turn-b:assistant:1")
         ));
         completion.await.expect("completion sender");
     }
@@ -464,15 +432,13 @@ mod tests {
             "turn-a",
             TurnOutcome::Failed {
                 message: "follow-up A failed".to_string(),
-                stamps: stamps(Some("input-a"), None),
             },
         );
         registry.emit(
             "follow-up-b",
             AgentEvent::FinalResponse {
                 turn_id: "turn-b".to_string(),
-                user_message_id: Some("input-b".to_string()),
-                assistant_message_id: Some("final-b".to_string()),
+                assistant_message_id: Some("turn:turn-b:assistant:1".to_string()),
                 text: "response B".to_string(),
                 terminal: false,
             },
@@ -484,14 +450,9 @@ mod tests {
             events.recv().await,
             Some(AgentEvent::Error {
                 turn_id,
-                user_message_id,
-                assistant_message_id,
                 message,
                 terminal: false
-            }) if message == "follow-up A failed"
-                && turn_id == "turn-a"
-                && user_message_id.as_deref() == Some("input-a")
-                && assistant_message_id.is_none()
+            }) if message == "follow-up A failed" && turn_id == "turn-a"
         ));
         assert!(matches!(
             events.recv().await,
