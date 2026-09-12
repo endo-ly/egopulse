@@ -155,25 +155,29 @@ pub(super) async fn get_history(
     }
 
     // Order messages by timestamp and attach each tool card to its parent,
-    // regardless of timestamp skew between the tables. Tool preview messages
+    // regardless of timestamp skew between the tables. Tool preview rows
     // (no-narration `[tool_call]`, `[tool_result]:`, `[tool_error]:`) are
     // hidden — they duplicate the cards or render empty in Markdown — but
-    // their slot still places the cards. A narration-bearing preview keeps
-    // only its narration: the tool calls render as structured cards, and the
-    // narration is the same text the client streamed live under this id.
-    // The strip applies only when tool calls are actually attached to the
-    // message: an ordinary answer that merely mentions the `[tool_call]`
-    // format must pass through untouched.
+    // their slot still places the cards. A preview row is identified by
+    // structure, never by text alone: a bare call preview owns its tool
+    // calls, and a result/error summary points at its parent message. An
+    // ordinary answer that merely starts with the same marker has neither
+    // and must stay visible.
+    // A narration-bearing preview keeps only its narration: the tool calls
+    // render as structured cards, and the narration is the same text the
+    // client streamed live under this id. The strip applies only when tool
+    // calls are actually attached to the message.
     let mut sorted_messages: Vec<&StoredMessage> = messages.iter().collect();
     sorted_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     for message in &sorted_messages {
-        let skip_preview = message.sender_kind == SenderKind::Assistant
-            && is_tool_preview_message(&message.content);
+        let is_assistant = message.sender_kind == SenderKind::Assistant;
+        let has_tool_calls = is_assistant && tools_by_message.contains_key(message.id.as_str());
+        let skip_preview = is_assistant
+            && is_tool_preview_message(&message.content)
+            && (has_tool_calls || message.parent_message_id.is_some());
         if !skip_preview {
-            let has_tool_calls = message.sender_kind == SenderKind::Assistant
-                && tools_by_message.contains_key(message.id.as_str());
             let content = if has_tool_calls {
                 tool_preview_narration(&message.content)
             } else {
@@ -609,27 +613,45 @@ mod tests {
 
         let chat_id = insert_web_chat(&db, "web:session-preview:agent:lyre", "lyre");
 
-        // Tool previews persisted for text-only channels: filtered because
-        // they duplicate the structured tool cards (and the result/error forms
+        // Genuine preview rows are identified by structure, not by text: a
+        // bare call preview owns its tool calls, and result/error summaries
+        // point at their parent message. They are hidden because the
+        // structured tool cards duplicate them (and the result/error forms
         // render empty in Markdown as reference link definitions).
+        let bare_msg =
+            StoredMessage::assistant(chat_id, "lyre".to_string(), "[tool_call] read".to_string());
+        let bare_id = bare_msg.id.clone();
+        db.store_message_only(&bare_msg)
+            .expect("store tool_call preview");
+        db.insert_tool_call_for_test(
+            "call-bare",
+            chat_id,
+            &bare_id,
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"file contents","status":"success"}"#),
+            "2026-09-12T00:00:01Z",
+        )
+        .expect("store bare tool call");
+        for (content, parent) in [
+            ("[tool_result]: file contents", "parent-result"),
+            ("[tool_error]: boom", "parent-error"),
+        ] {
+            let mut summary =
+                StoredMessage::assistant(chat_id, "lyre".to_string(), content.to_string());
+            summary.parent_message_id = Some(parent.to_string());
+            db.store_message_only(&summary).expect("store tool summary");
+        }
+
+        // An orphan bare preview (no tool calls attached, e.g. interrupted
+        // persistence) has no card to duplicate it, so it stays visible
+        // verbatim rather than vanishing.
         db.store_message_only(&StoredMessage::assistant(
             chat_id,
             "lyre".to_string(),
-            "[tool_call] read".to_string(),
+            "[tool_call] write".to_string(),
         ))
-        .expect("store tool_call preview");
-        db.store_message_only(&StoredMessage::assistant(
-            chat_id,
-            "lyre".to_string(),
-            "[tool_result]: file contents".to_string(),
-        ))
-        .expect("store tool_result preview");
-        db.store_message_only(&StoredMessage::assistant(
-            chat_id,
-            "lyre".to_string(),
-            "[tool_error]: boom".to_string(),
-        ))
-        .expect("store tool_error preview");
+        .expect("store orphan preview");
 
         // A tool_call preview that leads with agent narration stays, but
         // only as its narration: the calls render as structured cards, and
@@ -676,9 +698,10 @@ mod tests {
 
         assert_eq!(
             messages.len(),
-            3,
-            "narration + plain message + the narration tool card: {contents:?}"
+            5,
+            "orphan preview + narration + plain + two cards: {contents:?}"
         );
+        assert!(contents.contains(&"[tool_call] write"));
         assert!(contents.contains(&"読みますね"));
         assert!(contents.contains(&"hello there"));
         assert!(
@@ -686,6 +709,12 @@ mod tests {
                 .iter()
                 .any(|m| m["message_kind"] == "tool_call" && m["id"] == "tool:call-narration"),
             "the narration tool call still renders as a card: {contents:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["message_kind"] == "tool_call" && m["id"] == "tool:call-bare"),
+            "the bare preview tool call still renders as a card: {contents:?}"
         );
     }
 
@@ -728,6 +757,47 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert!(contents.contains(&"内部形式は [tool_call] read のようになります"));
         assert!(contents.contains(&"メモ: [tool_call] write を試す"));
+    }
+
+    #[tokio::test]
+    async fn api_history_keeps_ordinary_answers_starting_with_markers() {
+        // An ordinary final answer that merely starts with a preview marker —
+        // without ever issuing a tool call — must stay visible. Preview rows
+        // are identified by structure (attached tool calls, or a parent link
+        // for result summaries), never by text alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+
+        let chat_id = insert_web_chat(&db, "web:session-leading-marker:agent:lyre", "lyre");
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "[tool_call] read は内部で使われる表現です。".to_string(),
+        ))
+        .expect("store leading-marker assistant");
+        db.store_message_only(&StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "[tool_result]: ただの説明文です".to_string(),
+        ))
+        .expect("store leading-marker result-like");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+        let body = result.0;
+        let messages = body["messages"].as_array().expect("messages array");
+
+        let contents: Vec<&str> = messages
+            .iter()
+            .map(|m| m["content"].as_str().expect("content string"))
+            .collect();
+        assert_eq!(messages.len(), 2, "both answers stay: {contents:?}");
+        assert!(contents.contains(&"[tool_call] read は内部で使われる表現です。"));
+        assert!(contents.contains(&"[tool_result]: ただの説明文です"));
     }
 
     #[tokio::test]

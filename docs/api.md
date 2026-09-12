@@ -247,7 +247,7 @@ GET /api/history?session_key=main&limit=100
 
 これにより、`tool_calls` と発行元メッセージ間の timestamp ズレによらずツールカードは親メッセージの直後に固定される。`messages` 同士の順序は timestamp に依存するため、一括永続化パス（Pulse など）では永続化の都度新鮮な timestamp を採番し、保存順と時系列順が一致するよう保証している。いずれの履歴も LLM コンテキストには含まれない。
 
-ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言部分（`{text}`）のみを返却する。これはliveでstreamしたnarrationと同一内容で、同じメッセージIDでmerge収束する。
+ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言部分（`{text}`）のみを返却する。これはliveでstreamしたnarrationと同一内容で、同じメッセージIDでmerge収束する。previewかどうかの判定は本文の接頭辞ではなく構造で行う（bare呼び出しはそのメッセージ自身へのtool_calls紐付き、結果・エラーは `parent_message_id` の有無）。そのためmarkerで始まる通常回答が誤って隠れることはない。
 
 ---
 
