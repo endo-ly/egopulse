@@ -58,8 +58,9 @@ pub(crate) enum AgentEvent {
     /// interaction lifecycle for client-owned delivery. `turn_id` is the
     /// durable Turn that produced the response; one client interaction can
     /// span several Turns (staged follow-up promotion). `assistant_message_id`
-    /// is the stable id the response streamed under, or `None` when the Turn
-    /// persisted no final message (duplicate-delivery notices).
+    /// is the stable id the response streamed under. Duplicate-delivery
+    /// notices (no persisted final) carry the origin-assigned notice id, so
+    /// every FinalResponse names its message and channels invent none.
     FinalResponse {
         turn_id: String,
         assistant_message_id: Option<String>,

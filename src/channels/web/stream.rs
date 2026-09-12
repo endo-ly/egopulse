@@ -108,6 +108,7 @@ pub(super) struct SendRequest {
     /// optimistic entry, the Turn's `request_key`, and the persisted
     /// `messages.id` at once, so a re-delivered send maps to the same Turn
     /// instead of a duplicate.
+    #[serde(rename = "messageId")]
     pub message_id: Option<String>,
 }
 
@@ -467,23 +468,21 @@ pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: A
                 .await;
         }
         AgentEvent::FinalResponse {
-            turn_id,
+            turn_id: _,
             assistant_message_id,
             text,
             terminal,
         } => {
             // The final id is the stable id the response streamed under, so
-            // delivery upserts by id and performs no lookup. A notice without
-            // a persisted final (duplicate delivery) keeps a run-scoped
-            // stable id so the text stays visible instead of being dropped.
-            let message_id = assistant_message_id
-                .or_else(|| (!text.is_empty()).then(|| format!("turn:{turn_id}:notice")));
+            // delivery upserts by id and performs no lookup. Identity always
+            // arrives decided: duplicate-delivery notices already carry their
+            // origin-assigned notice id.
             run_hub
                 .publish_agent_response(
                     run_id,
                     serde_json::to_string(&DonePayload {
                         response: text,
-                        message_id,
+                        message_id: assistant_message_id,
                     })
                     .unwrap_or_default(),
                     terminal,
@@ -2001,6 +2000,42 @@ mod tests {
 
         // Assert
         assert_eq!(slash.0, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn rest_send_stream_accepts_camel_case_message_id_json() {
+        // Arrange: the exact JSON shape a REST client posts. Without the
+        // serde rename, `messageId` would silently bind to nothing and every
+        // REST send would fail intake with 400.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = test_web_state_with_agents(&dir);
+        let request: SendRequest = serde_json::from_str(
+            r#"{"session_key":"json-session","message":"hello","agent_id":"default","messageId":"web:12345678-1234-1234-1234-123456789012"}"#,
+        )
+        .expect("deserialize send request");
+        assert_eq!(
+            request.message_id.as_deref(),
+            Some("web:12345678-1234-1234-1234-123456789012")
+        );
+
+        // Act
+        let accepted = accept_web_input(state.clone(), request, WEB_ACTOR)
+            .await
+            .expect("accept JSON send");
+
+        // Assert: the canonical id flows verbatim into the durable Turn.
+        assert_eq!(accepted.status, "accepted");
+        let row_exists = call_blocking(Arc::clone(&state.app_state.db), move |db| {
+            let count: i64 = db.get_conn()?.query_row(
+                "SELECT COUNT(*) FROM turn_runs WHERE request_key = ?1",
+                rusqlite::params!["web:12345678-1234-1234-1234-123456789012"],
+                |row| row.get(0),
+            )?;
+            Ok::<bool, crate::error::StorageError>(count == 1)
+        })
+        .await
+        .expect("durable row");
+        assert!(row_exists, "one Turn owns the posted message id");
     }
 
     #[tokio::test]

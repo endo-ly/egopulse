@@ -6,7 +6,7 @@ import { ChatTab } from "../features/chat/ChatTab";
 import { SleepBatchPanel } from "../features/sleep/SleepBatchPanel";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
-import { mergeChatMessages } from "../features/chat/chatReducer";
+import { isWaitingForAssistant, mergeChatMessages } from "../features/chat/chatReducer";
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
@@ -377,7 +377,7 @@ export function WebUI() {
       storageKey={selectedSession}
       jumpRequest={messageJump ?? undefined}
       agentAvatars={agentAvatars}
-      waitingForAssistant={transport.state.waitingForAssistant}
+      waitingForAssistant={isWaitingForAssistant(transport.state)}
     />
   );
 

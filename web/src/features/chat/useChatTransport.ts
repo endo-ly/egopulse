@@ -327,7 +327,7 @@ export function useChatTransport({
             // issued the send: the user may have switched away while the ack
             // was in flight, and that session must not inherit the progress.
             if (sessionKeyRef.current === pending.sessionKey) {
-              setState((prev) => reduceRunAccepted(prev));
+              setState((prev) => reduceRunAccepted(prev, runId));
             }
           }
         } else if (!parsed.ok && pending) {

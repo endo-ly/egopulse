@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::agent_loop::message_format::is_tool_preview_message;
+use crate::agent_loop::message_format::{is_tool_preview_message, tool_preview_narration};
 use crate::storage::{SenderKind, StoredMessage, ToolCall, ToolState, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
@@ -158,7 +158,9 @@ pub(super) async fn get_history(
     // regardless of timestamp skew between the tables. Tool preview messages
     // (no-narration `[tool_call]`, `[tool_result]:`, `[tool_error]:`) are
     // hidden — they duplicate the cards or render empty in Markdown — but
-    // their slot still places the cards.
+    // their slot still places the cards. A narration-bearing preview keeps
+    // only its narration: the tool calls render as structured cards, and the
+    // narration is the same text the client streamed live under this id.
     let mut sorted_messages: Vec<&StoredMessage> = messages.iter().collect();
     sorted_messages.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
@@ -167,11 +169,16 @@ pub(super) async fn get_history(
         let skip_preview = message.sender_kind == SenderKind::Assistant
             && is_tool_preview_message(&message.content);
         if !skip_preview {
+            let content = if message.sender_kind == SenderKind::Assistant {
+                tool_preview_narration(&message.content)
+            } else {
+                message.content.as_str()
+            };
             entries.push(serde_json::json!({
                 "id": message.id,
                 "sender_id": message.sender_id,
                 "sender_kind": message.sender_kind.to_string(),
-                "content": message.content,
+                "content": content,
                 "timestamp": message.timestamp,
                 "message_kind": message.message_kind.to_string(),
             }));
@@ -619,7 +626,9 @@ mod tests {
         ))
         .expect("store tool_error preview");
 
-        // A tool_call preview that leads with agent narration stays.
+        // A tool_call preview that leads with agent narration stays, but
+        // only as its narration: the calls render as structured cards, and
+        // the narration matches what the client streamed live.
         db.store_message_only(&StoredMessage::assistant(
             chat_id,
             "lyre".to_string(),
@@ -653,7 +662,7 @@ mod tests {
             2,
             "only narration + plain message remain: {contents:?}"
         );
-        assert!(contents.contains(&"読みますね [tool_call] read"));
+        assert!(contents.contains(&"読みますね"));
         assert!(contents.contains(&"hello there"));
     }
 
@@ -699,7 +708,7 @@ mod tests {
 
         assert_eq!(messages.len(), 3, "user + assistant + tool card");
         assert_eq!(messages[0]["content"], "やって");
-        assert_eq!(messages[1]["content"], "やります [tool_call] read");
+        assert_eq!(messages[1]["content"], "やります");
         assert_eq!(messages[2]["message_kind"], "tool_call");
         assert_eq!(messages[2]["id"], "tool:call-1");
     }

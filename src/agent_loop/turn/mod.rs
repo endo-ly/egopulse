@@ -50,6 +50,15 @@ pub(crate) fn assistant_message_id(turn_id: &str, iteration: usize) -> String {
     format!("turn:{turn_id}:assistant:{iteration}")
 }
 
+/// Derives the stable id for a duplicate-delivery notice of a durable Turn.
+///
+/// Notices are not persisted, but they still need an identity the client can
+/// upsert by — decided here, at the event origin, so channels never invent
+/// message ids. The same Turn always maps to the same notice id.
+pub(crate) fn notice_message_id(turn_id: &str) -> String {
+    format!("turn:{turn_id}:notice")
+}
+
 /// RAII guard that decrements the active turn counter on drop.
 struct ActiveTurnGuard<'a> {
     state: &'a TurnDependencies,
@@ -380,8 +389,9 @@ impl TurnExecutor<'_> {
                     text,
                 } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
-                        turn_id,
-                        assistant_message_id,
+                        turn_id: turn_id.clone(),
+                        assistant_message_id: assistant_message_id
+                            .or_else(|| Some(notice_message_id(&turn_id))),
                         text: text.clone(),
                         terminal: false,
                     });
@@ -396,8 +406,9 @@ impl TurnExecutor<'_> {
                     // 二重実行を避けるため新規 executor を起動しないが、この重複
                     // リクエスト自体は呼び出し元へ明確に終端させ、イベントも発する。
                     self.on_event.emit(AgentEvent::FinalResponse {
-                        turn_id,
-                        assistant_message_id,
+                        turn_id: turn_id.clone(),
+                        assistant_message_id: assistant_message_id
+                            .or_else(|| Some(notice_message_id(&turn_id))),
                         text: text.clone(),
                         terminal: false,
                     });

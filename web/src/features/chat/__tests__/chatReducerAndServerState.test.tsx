@@ -3,6 +3,7 @@ import { renderHook, act } from "@testing-library/react";
 import type { ChatMessage } from "../../../shared/api/types";
 import {
   mergeChatMessages,
+  isWaitingForAssistant,
   reduceAssistantDiscarded,
   reduceChatEvent,
   initialChatState,
@@ -140,7 +141,7 @@ describe("chatReducer assistant identity", () => {
       content: "Hello world",
       runId: "run-1",
     });
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
   });
 
   it("done_upserts_the_same_id_with_authoritative_content", () => {
@@ -188,7 +189,7 @@ describe("chatReducer assistant identity", () => {
       "tool:call-1",
       "tool:call-2",
     ]);
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
   });
 
   it("no_narration_tool_call_creates_no_empty_bubble", () => {
@@ -196,7 +197,7 @@ describe("chatReducer assistant identity", () => {
     // card appears, never an empty assistant bubble.
     let state = initialChatState();
     state = reduceOptimisticUserMessage(state, { messageId: USER_ID, text: "read" });
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-1");
 
     state = reduceToolStart(state, {
       runId: "run-1",
@@ -314,17 +315,17 @@ describe("chatReducer retry and error", () => {
 
   it("discard_keeps_waiting_for_the_retry", () => {
     let state = initialChatState();
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-1");
     state = reduceChatEvent(state, delta("run-1", 1, ASSISTANT_1, "I will check"), "lyre");
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
 
     // The streamed bubble is dropped, but the retry is still on its way.
     state = reduceAssistantDiscarded(state, { runId: "run-1", messageId: ASSISTANT_1 });
     expect(state.messages).toHaveLength(0);
-    expect(state.waitingForAssistant).toBe(true);
+    expect(isWaitingForAssistant(state)).toBe(true);
 
     state = reduceChatEvent(state, delta("run-1", 3, ASSISTANT_2, "done"), "lyre");
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
   });
 
   it("partial_delta_survives_a_terminal_error_unchanged", () => {
@@ -349,7 +350,7 @@ describe("chatReducer retry and error", () => {
     expect(state.messages.map((m) => m.id)).toEqual([USER_ID, ASSISTANT_1]);
     expect(state.messages.find((m) => m.id === ASSISTANT_1)?.content).toBe("途中まで生成");
     expect(state.error).toBe("boom");
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
 
     // A history refetch carrying only the persisted input keeps both rows
     // with no duplication.
@@ -371,10 +372,10 @@ describe("chatReducer retry and error", () => {
 
   it("nonterminal_done_and_error_keep_waiting", () => {
     let state = initialChatState();
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-1");
 
     state = reduceChatEvent(state, done("run-1", 1, ASSISTANT_1, "part", false), "lyre");
-    expect(state.waitingForAssistant).toBe(true);
+    expect(isWaitingForAssistant(state)).toBe(true);
 
     state = reduceChatEvent(
       state,
@@ -388,16 +389,53 @@ describe("chatReducer retry and error", () => {
       },
       "lyre",
     );
-    expect(state.waitingForAssistant).toBe(true);
+    expect(isWaitingForAssistant(state)).toBe(true);
     expect(state.messages.map((m) => m.id)).toEqual([ASSISTANT_1]);
   });
 
   it("terminal_done_clears_waiting", () => {
     let state = initialChatState();
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-1");
 
     state = reduceChatEvent(state, done("run-1", 1, ASSISTANT_1, "done"), "lyre");
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
+  });
+
+  it("waiting_returns_once_content_lands_before_a_nonterminal_done", () => {
+    // The missed case: a delta clears progress, then the parent turn ends
+    // non-terminally while the staged child is still on its way. The run
+    // must await progress again instead of going dark.
+    let state = initialChatState();
+    state = reduceRunAccepted(state, "run-1");
+    state = reduceChatEvent(state, delta("run-1", 1, ASSISTANT_1, "part"), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(false);
+
+    state = reduceChatEvent(state, done("run-1", 2, ASSISTANT_1, "part", false), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(true);
+
+    // The child turn streams under a new message id on the same run.
+    state = reduceChatEvent(state, delta("run-1", 3, ASSISTANT_2, "more"), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(false);
+    state = reduceChatEvent(state, done("run-1", 4, ASSISTANT_2, "more"), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(false);
+  });
+
+  it("waiting_tracks_runs_independently", () => {
+    // Two accepted runs share the session: progress on one must not clear
+    // the other's wait.
+    let state = initialChatState();
+    state = reduceRunAccepted(state, "run-a");
+    state = reduceRunAccepted(state, "run-b");
+    expect(isWaitingForAssistant(state)).toBe(true);
+
+    state = reduceChatEvent(state, delta("run-a", 1, ASSISTANT_1, "a"), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(true);
+
+    state = reduceChatEvent(state, done("run-a", 2, ASSISTANT_1, "a"), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(true);
+
+    state = reduceChatEvent(state, delta("run-b", 1, ASSISTANT_2, "b"), "lyre");
+    expect(isWaitingForAssistant(state)).toBe(false);
   });
 });
 
@@ -480,20 +518,20 @@ describe("chatReducer reconnect", () => {
 
   it("missing_run_drops_entries_and_clears_progress", () => {
     let state = initialChatState();
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-1");
     state = reduceChatEvent(state, delta("run-1", 1, ASSISTANT_1, "part"), "lyre");
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-1");
 
     state = reduceRunMissing(state, "run-1");
 
     expect(state.messages).toHaveLength(0);
-    expect(state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(state)).toBe(false);
   });
 
   it("slash_done_upserts_its_stable_id", () => {
     let state = initialChatState();
     state = reduceOptimisticUserMessage(state, { messageId: USER_ID, text: "/status" });
-    state = reduceRunAccepted(state);
+    state = reduceRunAccepted(state, "run-7");
 
     const slashId = "web:slash:run-7";
     state = reduceChatEvent(state, done("run-7", 1, slashId, "status ok"), "lyre");

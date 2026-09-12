@@ -247,7 +247,7 @@ GET /api/history?session_key=main&limit=100
 
 これにより、`tool_calls` と発行元メッセージ間の timestamp ズレによらずツールカードは親メッセージの直後に固定される。`messages` 同士の順序は timestamp に依存するため、一括永続化パス（Pulse など）では永続化の都度新鮮な timestamp を採番し、保存順と時系列順が一致するよう保証している。いずれの履歴も LLM コンテキストには含まれない。
 
-ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言内容を残すために返却される。
+ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言部分（`{text}`）のみを返却する。これはliveでstreamしたnarrationと同一内容で、同じメッセージIDでmerge収束する。
 
 ---
 
@@ -647,10 +647,10 @@ Message identity は end-to-end で安定している。ユーザーメッセー
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message`（安定IDつき）を含む。同じIDへ追記する |
-| `done` | 1 Turnの完了。`message.id` は応答がstreamした安定IDで、`message` に確定内容を含む（authoritative置換）。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。永続finalを持たない通知（重複受付など）は `turn:{turnId}:notice` というrun内安定IDで届く |
+| `done` | 1 Turnの完了。`message.id` は応答がstreamした安定IDで、`message` に確定内容を含む（authoritative置換）。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。永続finalを持たない通知（重複受付など）はイベント生成側で確定した `turn:{turnId}:notice` という安定IDで届く |
 | `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。partial出力はstreamしたIDのまま残し、ID解決は行わない |
 
-クライアントは live 表示を message ID でupsertし、履歴とはID一致でのみ突き合わせる（history優先）。内容比較はしない（永続化時に要約・整形されるため一致しない場合がある）。Tool preview・result summaryは履歴投影に現れず、Tool Cardは `call_id` で突き合わせる。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のfinal IDを運ぶため、親TurnのIDが子Turnに再送されることはない。
+クライアントは live 表示を message ID でupsertし、履歴とはID一致でのみ突き合わせる（history優先）。内容比較はしない。bareのTool preview・result summaryは履歴投影に現れず、Tool Cardは `call_id` で突き合わせる。narration付きpreviewはnarration部分のみで返却されるため、liveの表示内容と一致する。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のfinal IDを運ぶため、親TurnのIDが子Turnに再送されることはない。
 
 宣言的応答などのretryでstream済み応答を破棄する場合、サーバーは `assistant_discarded` event（`messageId`）を送る。クライアントは該当IDのメッセージを削除するだけで、retryは新しいIDでstreamする。stream後にLLM errorになったpartial出力はlive表示に残してよい。
 

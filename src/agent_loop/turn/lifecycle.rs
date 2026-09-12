@@ -717,6 +717,20 @@ mod tests {
             )),
             "in-progress duplicate must emit a matching FinalResponse event"
         );
+        // The notice names its origin-assigned stable id, so channels can
+        // upsert it without inventing any identity; the same Turn always
+        // maps to the same notice id.
+        let notice_id = events.iter().find_map(|ev| match ev {
+            AgentEvent::FinalResponse {
+                assistant_message_id,
+                ..
+            } => assistant_message_id.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            notice_id.as_deref(),
+            Some(format!("turn:seed-{session}:notice").as_str())
+        );
         assert!(
             provider.seen_messages().is_empty(),
             "duplicate request must not invoke the LLM"

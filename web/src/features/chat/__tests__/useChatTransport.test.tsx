@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, cleanup } from "@testing-library/react";
 import { useChatTransport } from "../useChatTransport";
+import { isWaitingForAssistant } from "../chatReducer";
 import { invalidateQueries } from "../../../shared/hooks/useServerState";
 
 vi.mock("../../../shared/hooks/useServerState", async (importOriginal) => {
@@ -278,7 +279,7 @@ describe("useChatTransport reconnect", () => {
     expect(
       result.current.state.messages.find((m) => m.id === messageId),
     ).toMatchObject({ runId: "run-tag" });
-    expect(result.current.state.waitingForAssistant).toBe(true);
+    expect(isWaitingForAssistant(result.current.state)).toBe(true);
     expect(result.current.state.messages).toHaveLength(1);
   });
 
@@ -421,7 +422,7 @@ describe("useChatTransport reconnect", () => {
       messageId,
       "turn:t1:assistant:1",
     ]);
-    expect(result.current.state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(result.current.state)).toBe(false);
   });
 
   it("chat_transport_removes_discarded_messages_by_id", async () => {
@@ -474,7 +475,7 @@ describe("useChatTransport reconnect", () => {
     expect(
       result.current.state.messages.some((m) => m.id === "turn:t1:assistant:1"),
     ).toBe(false);
-    expect(result.current.state.waitingForAssistant).toBe(true);
+    expect(isWaitingForAssistant(result.current.state)).toBe(true);
   });
 
   it("chat_transport_rejects_send_and_withdraws_text_on_busy", async () => {
@@ -822,7 +823,7 @@ describe("useChatTransport reconnect", () => {
     // progress — and the canonical session of s1's run never switches the
     // displayed session.
     expect(result.current.state.messages).toHaveLength(0);
-    expect(result.current.state.waitingForAssistant).toBe(false);
+    expect(isWaitingForAssistant(result.current.state)).toBe(false);
     expect(onSessionResolved).not.toHaveBeenCalled();
   });
 

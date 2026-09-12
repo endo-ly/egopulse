@@ -30,17 +30,21 @@ export interface ChatState {
   messages: ChatMessage[];
   error: string | null;
   /**
-   * Assistant progress as UI state, never as a fake message: set when the
-   * server accepts a run (or discards a superseded message before its
-   * retry), cleared by the first delta / tool_start / terminal done /
-   * terminal error. A non-terminal done/error keeps it set — the next turn
-   * on the same run is still on its way.
+   * Runs awaiting assistant progress, as UI state — never as fake messages.
+   * A run joins on accept (and on discard / non-terminal terminal events
+   * while the next turn is still on its way) and leaves on its first delta,
+   * tool_start, or terminal done/error.
    */
-  waitingForAssistant: boolean;
+  waitingRuns: string[];
+}
+
+/** Whether any run still awaits assistant progress. */
+export function isWaitingForAssistant(state: ChatState): boolean {
+  return state.waitingRuns.length > 0;
 }
 
 export function initialChatState(): ChatState {
-  return { messages: [], error: null, waitingForAssistant: false };
+  return { messages: [], error: null, waitingRuns: [] };
 }
 
 export interface OptimisticUserMessage {
@@ -100,34 +104,45 @@ export function reduceTagMessageRun(
   };
 }
 
+function addWaitingRun(state: ChatState, runId: string): ChatState {
+  if (state.waitingRuns.includes(runId)) return state;
+  return { ...state, waitingRuns: [...state.waitingRuns, runId] };
+}
+
+function clearWaitingRun(state: ChatState, runId: string): ChatState {
+  if (!state.waitingRuns.includes(runId)) return state;
+  return {
+    ...state,
+    waitingRuns: state.waitingRuns.filter((id) => id !== runId),
+  };
+}
+
 /** The server accepted the run: show assistant progress until content lands. */
-export function reduceRunAccepted(state: ChatState): ChatState {
-  if (state.waitingForAssistant) return state;
-  return { ...state, waitingForAssistant: true };
+export function reduceRunAccepted(state: ChatState, runId: string): ChatState {
+  return addWaitingRun(state, runId);
 }
 
 /**
- * Drops every live entry owned by one run, e.g. after a truncated replay
- * whose evicted prefix the stream can no longer rebuild. The live
- * subscription stays attached and fills forward; history converges by id.
+ * Drops every live entry owned by one run after a truncated replay whose
+ * evicted prefix the stream can no longer rebuild. The run itself is still
+ * in flight, so it stays awaiting progress; the live subscription fills
+ * forward and history converges by id.
  */
 export function reduceDropRunMessages(
   state: ChatState,
   runId: string,
 ): ChatState {
-  if (!state.messages.some((m) => m.runId === runId)) return state;
+  const next = addWaitingRun(state, runId);
+  if (!next.messages.some((m) => m.runId === runId)) return next;
   return {
-    ...state,
-    messages: state.messages.filter((m) => m.runId !== runId),
+    ...next,
+    messages: next.messages.filter((m) => m.runId !== runId),
   };
 }
 
 /** The run is gone (TTL expiry, restart): drop its entries and progress. */
 export function reduceRunMissing(state: ChatState, runId: string): ChatState {
-  return {
-    ...reduceDropRunMessages(state, runId),
-    waitingForAssistant: false,
-  };
+  return clearWaitingRun(reduceDropRunMessages(state, runId), runId);
 }
 
 /**
@@ -163,7 +178,7 @@ export function reduceChatEvent(
               runId: event.runId,
             },
           ];
-      return { ...state, messages, error: null, waitingForAssistant: false };
+      return { ...clearWaitingRun(state, event.runId), messages, error: null };
     }
 
     case "done": {
@@ -192,22 +207,25 @@ export function reduceChatEvent(
               },
             ];
       }
-      return {
-        ...state,
-        messages,
-        waitingForAssistant:
-          event.terminal === false ? state.waitingForAssistant : false,
-      };
+      // A non-terminal done hands the run to its next turn, which is
+      // still on its way: the run stays awaiting progress.
+      const next =
+        event.terminal === false
+          ? addWaitingRun({ ...state, messages }, event.runId)
+          : clearWaitingRun({ ...state, messages }, event.runId);
+      return next;
     }
 
     case "error": {
       // A failed turn resolves nothing: partial output keeps the id it
       // streamed under, and history converges by id on refetch.
+      const next =
+        event.terminal === false
+          ? addWaitingRun(state, event.runId)
+          : clearWaitingRun(state, event.runId);
       return {
-        ...state,
+        ...next,
         error: event.errorMessage ?? "unknown error",
-        waitingForAssistant:
-          event.terminal === false ? state.waitingForAssistant : false,
       };
     }
   }
@@ -366,9 +384,8 @@ export function reduceToolStart(
     runId: payload.runId,
   };
   return {
-    ...state,
+    ...clearWaitingRun(state, payload.runId),
     messages: upsertToolMessage(state.messages, message),
-    waitingForAssistant: false,
   };
 }
 
@@ -408,8 +425,7 @@ export function reduceAssistantDiscarded(
 ): ChatState {
   if (!state.messages.some((m) => m.id === payload.messageId)) return state;
   return {
-    ...state,
+    ...addWaitingRun(state, payload.runId),
     messages: state.messages.filter((m) => m.id !== payload.messageId),
-    waitingForAssistant: true,
   };
 }
