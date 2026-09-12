@@ -31,8 +31,8 @@ struct DeltaData {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DoneData {
-    response: Option<String>,
-    message_id: Option<String>,
+    response: String,
+    message_id: String,
 }
 
 #[derive(Deserialize)]
@@ -717,25 +717,28 @@ fn forward_run_event(
             send_event(tx, "chat", gateway_event).is_err()
         }
         "done" => {
+            // Every legitimate done names its stable message id; a payload
+            // that fails to parse is dropped instead of rendered anonymously.
             let data = match serde_json::from_str::<DoneData>(&event.data) {
                 Ok(data) => data,
                 Err(error) => {
                     tracing::error!(%error, run_id, "done event carries malformed data");
-                    DoneData {
-                        response: None,
-                        message_id: None,
-                    }
+                    return false;
                 }
             };
             // The final id is the stable id the response streamed under, so
             // the client upserts by id instead of adopting a draft.
-            let message = match (data.message_id, data.response) {
-                (Some(id), Some(text)) if !text.is_empty() => Some(GatewayChatMessage {
-                    id,
+            let message = if data.response.is_empty() {
+                None
+            } else {
+                Some(GatewayChatMessage {
+                    id: data.message_id,
                     role: "assistant",
-                    content: vec![GatewayChatContent { kind: "text", text }],
-                }),
-                _ => None,
+                    content: vec![GatewayChatContent {
+                        kind: "text",
+                        text: data.response,
+                    }],
+                })
             };
             let gateway_event = GatewayChatEvent {
                 run_id: run_id.to_string(),
@@ -1175,7 +1178,7 @@ mod tests {
         let done_event = RunEvent {
             id: 1,
             event: "done".to_string(),
-            data: r#"{"response":""}"#.to_string(),
+            data: r#"{"response":"","messageId":"turn:t1:assistant:1"}"#.to_string(),
             terminal: true,
         };
 
@@ -1188,6 +1191,27 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&messages[0]).unwrap();
         let payload = &parsed["payload"];
         assert!(payload.get("message").is_none());
+    }
+
+    #[test]
+    fn ws_malformed_done_is_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+        // A done without its stable message id cannot be addressed by the
+        // client, so it is dropped (and must not terminate the stream)
+        // instead of rendered anonymously.
+        let done_event = RunEvent {
+            id: 1,
+            event: "done".to_string(),
+            data: r#"{"response":"orphan"}"#.to_string(),
+            terminal: true,
+        };
+
+        let should_stop = forward_run_event(&tx, "run-1", "sess-1", done_event);
+        assert!(!should_stop);
+
+        let messages = collect_text_messages(&mut rx);
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -1337,7 +1361,7 @@ mod tests {
             .publish(
                 "shared-replay",
                 "done",
-                r#"{"response":"continued"}"#.to_string(),
+                r#"{"response":"continued","messageId":"turn:child:assistant:1"}"#.to_string(),
             )
             .await;
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -1362,6 +1386,10 @@ mod tests {
         assert_eq!(user_input["event"], "user_input");
         let child_done: serde_json::Value = serde_json::from_str(&messages[2]).unwrap();
         assert_eq!(child_done["payload"]["terminal"], true);
+        assert_eq!(
+            child_done["payload"]["message"]["id"],
+            "turn:child:assistant:1"
+        );
     }
 
     #[tokio::test]

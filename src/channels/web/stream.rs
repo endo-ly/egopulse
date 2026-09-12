@@ -23,7 +23,7 @@ use crate::runtime::turn::SubmitOutcome;
 
 use super::sessions::parse_chat_id_from_session_key;
 use super::sse::AgentEvent;
-use super::{RUN_TTL_SECONDS, RunLookupError, WEB_ACTOR, WebState, web_session_key};
+use super::{RUN_TTL_SECONDS, RunHub, RunLookupError, WEB_ACTOR, WebState, web_session_key};
 use crate::storage::{TurnRun, TurnRunState, call_blocking};
 
 #[derive(Debug, Serialize)]
@@ -369,8 +369,7 @@ fn surface_context_from_chat_info(info: crate::storage::ChatInfo, actor: &str) -
     )
 }
 
-pub(super) async fn publish_agent_event(state: &WebState, run_id: &str, event: AgentEvent) {
-    let run_hub = &state.run_hub;
+pub(super) async fn publish_agent_event(run_hub: &RunHub, run_id: &str, event: AgentEvent) {
     match event {
         AgentEvent::Iteration { iteration } => {
             run_hub
@@ -821,11 +820,11 @@ fn spawn_observed_run_publisher(
             tokio::select! {
                 event = events.recv() => {
                     let Some(event) = event else { break };
-                    publish_agent_event(&state, &run_id, event).await;
+                    publish_agent_event(&state.run_hub, &run_id, event).await;
                 }
                 _ = &mut completion => {
                     while let Ok(event) = events.try_recv() {
-                        publish_agent_event(&state, &run_id, event).await;
+                        publish_agent_event(&state.run_hub, &run_id, event).await;
                     }
                     break;
                 }
@@ -1166,7 +1165,7 @@ mod tests {
 
         // Act
         publish_agent_event(
-            &web_state,
+            &web_state.run_hub,
             "tool-run",
             AgentEvent::FinalResponse {
                 turn_id: "turn-tool".to_string(),
@@ -1217,7 +1216,7 @@ mod tests {
 
         // Act
         publish_agent_event(
-            &web_state,
+            &web_state.run_hub,
             "shared-run",
             AgentEvent::FinalResponse {
                 turn_id: "turn-child".to_string(),
@@ -1269,7 +1268,7 @@ mod tests {
 
         // Act
         publish_agent_event(
-            &web_state,
+            &web_state.run_hub,
             "partial-run",
             AgentEvent::Error {
                 turn_id: "no-such-turn".to_string(),
@@ -1322,7 +1321,7 @@ mod tests {
 
         // Act
         publish_agent_event(
-            &web_state,
+            &web_state.run_hub,
             "followup-run",
             AgentEvent::UserInputInjected {
                 message_id: "web:11111111-1111-1111-1111-111111111111".to_string(),
@@ -1333,7 +1332,7 @@ mod tests {
         )
         .await;
         publish_agent_event(
-            &web_state,
+            &web_state.run_hub,
             "followup-run",
             AgentEvent::AssistantMessageDiscarded {
                 message_id: "turn:t1:assistant:1".to_string(),
