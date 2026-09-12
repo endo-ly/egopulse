@@ -14,11 +14,26 @@ pub(crate) enum TurnAcceptance {
     /// A fresh `accepted` Turn created by this call; the caller owns execution.
     Proceed(Box<TurnRun>),
     /// The Turn was already `completed`; replay its saved final response.
-    Completed(String),
+    /// The final id comes from the existing durable row (a completed row
+    /// always names one) so event consumers resolve the same id the first
+    /// execution reported.
+    Completed {
+        turn_id: String,
+        assistant_message_id: String,
+        text: String,
+    },
     /// The Turn already exists and is non-terminal; another executor owns it.
-    InProgress(String),
+    InProgress {
+        turn_id: String,
+        assistant_message_id: Option<String>,
+        text: String,
+    },
     /// The Turn already terminated in a non-success state.
-    Terminated(String),
+    Terminated {
+        turn_id: String,
+        assistant_message_id: Option<String>,
+        text: String,
+    },
 }
 
 pub(super) struct TurnAcceptanceRequest<'a> {
@@ -106,8 +121,9 @@ impl<'a> TurnLifecycle<'a> {
                             "completed turn_run has no final_message_id".to_string(),
                         )
                     })?;
+                    let lookup_id = final_message_id.clone();
                     let content = call_blocking(runtime.db_for(scope), move |db| {
-                        db.get_message_content(&final_message_id)
+                        db.get_message_content(&lookup_id)
                     })
                     .await?
                     .ok_or_else(|| {
@@ -115,14 +131,24 @@ impl<'a> TurnLifecycle<'a> {
                             "completed turn_run final message is missing".to_string(),
                         )
                     })?;
-                    Ok(TurnAcceptance::Completed(content))
+                    Ok(TurnAcceptance::Completed {
+                        turn_id: run.turn_id.clone(),
+                        assistant_message_id: final_message_id,
+                        text: content,
+                    })
                 }
-                other if other.is_terminal() => Ok(TurnAcceptance::Terminated(format!(
-                    "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
-                ))),
-                _ => Ok(TurnAcceptance::InProgress(
-                    "このリクエストはすでに処理中です。".to_string(),
-                )),
+                other if other.is_terminal() => Ok(TurnAcceptance::Terminated {
+                    turn_id: run.turn_id.clone(),
+                    assistant_message_id: run.final_message_id.clone(),
+                    text: format!(
+                        "このリクエストは以前に処理されましたが、状態が {other} になりました。再度お試しください。"
+                    ),
+                }),
+                _ => Ok(TurnAcceptance::InProgress {
+                    turn_id: run.turn_id.clone(),
+                    assistant_message_id: run.final_message_id.clone(),
+                    text: "このリクエストはすでに処理中です。".to_string(),
+                }),
             },
         }
     }
@@ -384,7 +410,18 @@ async fn validate_resume_target(
         }
     }
 
-    let input_message_id = format!("turn:{turn_id}:input");
+    let Some(input_message_id) = run.input_message_id.clone() else {
+        fail_resume_permanently(
+            runtime,
+            scope,
+            turn_id,
+            "resume target input message missing",
+        )
+        .await;
+        return Err(EgoPulseError::Internal(
+            "resume target input message is missing".to_string(),
+        ));
+    };
     let input_exists = call_blocking(runtime.db_for(scope), {
         let id = input_message_id;
         move |db| db.get_message_content(&id)
@@ -503,7 +540,7 @@ mod tests {
 
         let mut message =
             StoredMessage::user(chat_id, "sender".to_string(), "resume input".to_string());
-        message.id = format!("turn:{turn_id}:input");
+        message.id = context.request_key.clone();
         message.turn_id = Some(turn_id.clone());
         let fingerprint = config_fingerprint.clone();
         call_blocking(state.db_for(context.scope), {
@@ -681,6 +718,20 @@ mod tests {
                 AgentEvent::FinalResponse { text, .. } if text == &reply
             )),
             "in-progress duplicate must emit a matching FinalResponse event"
+        );
+        // The notice names its origin-assigned stable id, so channels can
+        // upsert it without inventing any identity; the same Turn always
+        // maps to the same notice id.
+        let notice_id = events.iter().find_map(|ev| match ev {
+            AgentEvent::FinalResponse {
+                assistant_message_id,
+                ..
+            } => Some(assistant_message_id.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            notice_id.as_deref(),
+            Some(format!("turn:seed-{session}:notice").as_str())
         );
         assert!(
             provider.seen_messages().is_empty(),

@@ -15,6 +15,8 @@ export interface ChatTabProps {
   jumpRequest?: { index: number; seq: number };
   /** agent id → avatar object URL; absent entries fall back to the letter. */
   agentAvatars?: Record<string, string>;
+  /** Assistant progress as UI state: rendered as a typing indicator row. */
+  waitingForAssistant?: boolean;
 }
 
 function parseToolEvent(message: ChatMessage): ToolEventData | null {
@@ -53,6 +55,7 @@ export function ChatTab({
   storageKey,
   jumpRequest,
   agentAvatars,
+  waitingForAssistant = false,
 }: ChatTabProps) {
   return (
     <div className="chat-tab">
@@ -68,6 +71,17 @@ export function ChatTab({
           }
           return <MessageBubble key={m.id} message={m} agentAvatars={agentAvatars} />;
         })}
+        {waitingForAssistant && (
+          <div className="message-row bubble-assistant">
+            <div className="message-body">
+              <span className="thinking-dots" aria-label="assistant is responding">
+                <span />
+                <span />
+                <span />
+              </span>
+            </div>
+          </div>
+        )}
       </Timeline>
       <div className="composer">
         {readOnly ? (

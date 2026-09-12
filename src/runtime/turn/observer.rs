@@ -22,7 +22,27 @@ struct ObserverSink {
 struct ObserverState {
     completion: Option<oneshot::Sender<()>>,
     pending_turns: usize,
-    pending_final_response: Option<String>,
+    pending_final_response: Option<PendingFinalResponse>,
+}
+
+/// A FinalResponse held back until its Turn finishes, so the shared
+/// interaction can compute `terminal` across staged follow-up Turns. The
+/// producing Turn's id and final message id travel with the text so
+/// publishers forward them without further lookup.
+struct PendingFinalResponse {
+    turn_id: String,
+    assistant_message_id: String,
+    text: String,
+}
+
+/// How a Turn finished, as reported to the observer.
+pub(crate) enum TurnOutcome {
+    /// The Turn produced its final response: the pending FinalResponse is
+    /// forwarded with the id it already carries.
+    Completed,
+    /// The Turn failed: an Error event is emitted. Partial output keeps the
+    /// id it streamed under, so no lookup is needed.
+    Failed { message: String },
 }
 
 /// Routes runtime-owned turn output to a client without owning the turn.
@@ -187,11 +207,21 @@ impl TurnObserverRegistry {
         let Some(sink) = sinks.get(request_key).cloned() else {
             return;
         };
-        if let AgentEvent::FinalResponse { text, .. } = event {
+        if let AgentEvent::FinalResponse {
+            turn_id,
+            assistant_message_id,
+            text,
+            ..
+        } = event
+        {
             sink.state
                 .lock()
                 .expect("turn observer state lock")
-                .pending_final_response = Some(text);
+                .pending_final_response = Some(PendingFinalResponse {
+                turn_id,
+                assistant_message_id,
+                text,
+            });
             return;
         }
         if sink.events.send(event).is_err() {
@@ -199,7 +229,7 @@ impl TurnObserverRegistry {
         }
     }
 
-    pub(crate) fn finish(&self, request_key: &str, result: Result<(), String>) {
+    pub(crate) fn finish(&self, request_key: &str, turn_id: &str, outcome: TurnOutcome) {
         let mut sinks = self.sinks.lock().expect("turn observer lock");
         let Some(sink) = sinks.get(request_key).cloned() else {
             return;
@@ -212,11 +242,12 @@ impl TurnObserverRegistry {
         let (terminal, final_response, completion) = {
             let mut state = sink.state.lock().expect("turn observer state lock");
             let terminal = state.pending_turns == 1;
-            let final_response = if result.is_ok() {
-                state.pending_final_response.take()
-            } else {
-                state.pending_final_response.take();
-                None
+            let final_response = match outcome {
+                TurnOutcome::Completed => state.pending_final_response.take(),
+                TurnOutcome::Failed { .. } => {
+                    state.pending_final_response.take();
+                    None
+                }
             };
             state.pending_turns = state
                 .pending_turns
@@ -234,16 +265,23 @@ impl TurnObserverRegistry {
         }
         drop(sinks);
 
-        match result {
-            Ok(()) => {
-                if let Some(text) = final_response {
-                    let _ = sink
-                        .events
-                        .send(AgentEvent::FinalResponse { text, terminal });
+        match outcome {
+            TurnOutcome::Completed => {
+                if let Some(final_response) = final_response {
+                    let _ = sink.events.send(AgentEvent::FinalResponse {
+                        turn_id: final_response.turn_id,
+                        assistant_message_id: final_response.assistant_message_id,
+                        text: final_response.text,
+                        terminal,
+                    });
                 }
             }
-            Err(message) => {
-                let _ = sink.events.send(AgentEvent::Error { message, terminal });
+            TurnOutcome::Failed { message } => {
+                let _ = sink.events.send(AgentEvent::Error {
+                    turn_id: turn_id.to_string(),
+                    message,
+                    terminal,
+                });
             }
         }
         if let Some(sender) = completion {
@@ -293,8 +331,8 @@ mod tests {
             ]
         ));
         registry.emit("promoted-request-1", AgentEvent::Iteration { iteration: 1 });
-        registry.finish("promoted-request-1", Ok(()));
-        registry.finish("promoted-request-2", Ok(()));
+        registry.finish("promoted-request-1", "turn-1", TurnOutcome::Completed);
+        registry.finish("promoted-request-2", "turn-2", TurnOutcome::Completed);
 
         // Assert
         assert!(matches!(
@@ -326,34 +364,48 @@ mod tests {
         registry.emit(
             "follow-up-a",
             AgentEvent::FinalResponse {
+                turn_id: "turn-a".to_string(),
+                assistant_message_id: "turn:turn-a:assistant:2".to_string(),
                 text: "response A".to_string(),
                 terminal: false,
             },
         );
-        registry.finish("follow-up-a", Ok(()));
+        registry.finish("follow-up-a", "turn-a", TurnOutcome::Completed);
         registry.emit(
             "follow-up-b",
             AgentEvent::FinalResponse {
+                turn_id: "turn-b".to_string(),
+                assistant_message_id: "turn:turn-b:assistant:1".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
             },
         );
-        registry.finish("follow-up-b", Ok(()));
+        registry.finish("follow-up-b", "turn-b", TurnOutcome::Completed);
 
         // Assert
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
+                turn_id,
+                assistant_message_id,
                 text,
-                terminal: false
+                terminal: false,
+                ..
             }) if text == "response A"
+                && turn_id == "turn-a"
+                && assistant_message_id == "turn:turn-a:assistant:2"
         ));
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
+                turn_id,
+                assistant_message_id,
                 text,
-                terminal: true
+                terminal: true,
+                ..
             }) if text == "response B"
+                && turn_id == "turn-b"
+                && assistant_message_id == "turn:turn-b:assistant:1"
         ));
         completion.await.expect("completion sender");
     }
@@ -375,29 +427,39 @@ mod tests {
         ));
 
         // Act
-        registry.finish("follow-up-a", Err("follow-up A failed".to_string()));
+        registry.finish(
+            "follow-up-a",
+            "turn-a",
+            TurnOutcome::Failed {
+                message: "follow-up A failed".to_string(),
+            },
+        );
         registry.emit(
             "follow-up-b",
             AgentEvent::FinalResponse {
+                turn_id: "turn-b".to_string(),
+                assistant_message_id: "turn:turn-b:assistant:1".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
             },
         );
-        registry.finish("follow-up-b", Ok(()));
+        registry.finish("follow-up-b", "turn-b", TurnOutcome::Completed);
 
         // Assert
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::Error {
+                turn_id,
                 message,
                 terminal: false
-            }) if message == "follow-up A failed"
+            }) if message == "follow-up A failed" && turn_id == "turn-a"
         ));
         assert!(matches!(
             events.recv().await,
             Some(AgentEvent::FinalResponse {
                 text,
-                terminal: true
+                terminal: true,
+                ..
             }) if text == "response B"
         ));
         completion.await.expect("completion sender");

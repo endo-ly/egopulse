@@ -10,7 +10,7 @@ pub(crate) use dispatch::{execute_observed_turn, execute_scheduled_turn};
 pub(in crate::runtime) use dispatch::{
     recover_durable_state, rehydrate_origin_tracker, spawn_turn_dispatcher,
 };
-pub(crate) use observer::{TurnObserver, TurnObserverRegistry};
+pub(crate) use observer::{TurnObserver, TurnObserverRegistry, TurnOutcome};
 pub(crate) use progress::ToolProgressCoordinator;
 pub(crate) use scheduled::{
     ResponseDelivery, ScheduledTurn, canonical_request_hash, deserialize_scheduled_turn,

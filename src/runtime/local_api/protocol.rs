@@ -155,6 +155,9 @@ pub(crate) enum TurnEvent {
         text: String,
         timestamp: String,
     },
+    /// A streamed assistant segment the loop discarded via retry. Consumers
+    /// drop the pending assistant text; the retry streams anew.
+    AssistantDiscarded,
     FinalResponse {
         text: String,
     },

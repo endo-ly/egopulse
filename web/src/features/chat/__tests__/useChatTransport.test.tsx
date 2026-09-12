@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, cleanup } from "@testing-library/react";
 import { useChatTransport } from "../useChatTransport";
+import { isWaitingForAssistant } from "../chatReducer";
 import { invalidateQueries } from "../../../shared/hooks/useServerState";
 
 vi.mock("../../../shared/hooks/useServerState", async (importOriginal) => {
@@ -64,6 +65,10 @@ function setup(
   return renderHook((props) => useChatTransport(props ?? initialProps), {
     initialProps,
   });
+}
+
+function assistantMessage(id: string, text: string) {
+  return { id, role: "assistant", content: [{ type: "text", text }] };
 }
 
 describe("useChatTransport reconnect", () => {
@@ -165,6 +170,24 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(1);
   });
 
+  it("chat_transport_negotiates_protocol_version_2", async () => {
+    const { result } = setup();
+    act(() => {
+      void result.current.connect();
+    });
+    const ws = FakeWebSocket.instances[0];
+    act(() => ws.simulateOpen());
+    act(() => {
+      ws.receive({ type: "event", event: "connect.challenge" });
+    });
+
+    const connect = JSON.parse(ws.sent[0]) as {
+      params: { minProtocol: number; maxProtocol: number };
+    };
+    expect(connect.params.minProtocol).toBe(2);
+    expect(connect.params.maxProtocol).toBe(2);
+  });
+
   async function connectOpen(
     options?: Parameters<typeof setup>[0],
   ) {
@@ -182,13 +205,20 @@ describe("useChatTransport reconnect", () => {
 
   function lastSentChat(ws: FakeWebSocket): {
     id: string;
-    params: { requestId: string };
+    params: { messageId: string };
   } {
     const chatFrames = ws.sent.filter((sent) => sent.includes('"chat.send"'));
     return JSON.parse(chatFrames[chatFrames.length - 1]) as {
       id: string;
-      params: { requestId: string };
+      params: { messageId: string };
     };
+  }
+
+  function expectCanonicalId(messageId: string): void {
+    expect(messageId.startsWith("web:")).toBe(true);
+    expect(messageId.slice("web:".length)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
   }
 
   it("chat_transport_resolves_send_on_ack_and_shows_text_immediately", async () => {
@@ -200,26 +230,57 @@ describe("useChatTransport reconnect", () => {
     });
     const chatFrame = lastSentChat(ws);
     const rpcId = chatFrame.id;
-    const durableRequestId = chatFrame.params.requestId;
+    const messageId = chatFrame.params.messageId;
+    // One send is one canonical message id from the start.
+    expectCanonicalId(messageId);
     // Optimistic message is visible before the ack lands.
     expect(
-      result.current.state.messages.find((m) => m.id === `local:${durableRequestId}`),
+      result.current.state.messages.find((m) => m.id === messageId),
     ).toMatchObject({ sender_kind: "user", content: "hello" });
     const sentChat = JSON.parse(
       ws.sent.find((frame) => frame.includes('"chat.send"'))!,
-    ) as { params: { agentId: string; requestId: string } };
+    ) as { params: { agentId: string; messageId: string } };
     expect(sentChat.params.agentId).toBe("default");
-    expect(sentChat.params.requestId).toBe(durableRequestId);
+    expect(sentChat.params.messageId).toBe(messageId);
 
     let resolved: string | null = null;
     await act(async () => {
       ws.receive({ type: "res", id: rpcId, ok: true });
       resolved = await pending;
     });
-    expect(resolved).toBe(durableRequestId);
+    expect(resolved).toBe(messageId);
     expect(
-      result.current.state.messages.some((m) => m.id === `local:${durableRequestId}`),
+      result.current.state.messages.some((m) => m.id === messageId),
     ).toBe(true);
+  });
+
+  it("chat_transport_tags_ownership_and_shows_progress_on_ack", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const chatFrame = lastSentChat(ws);
+    const messageId = chatFrame.params.messageId;
+
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: chatFrame.id,
+        ok: true,
+        payload: { runId: "run-tag", sessionKey: "s1" },
+      });
+      await pending;
+    });
+
+    // The optimistic entry gains run ownership for replay cleanup, and the
+    // UI shows assistant progress without any fake message.
+    expect(
+      result.current.state.messages.find((m) => m.id === messageId),
+    ).toMatchObject({ runId: "run-tag" });
+    expect(isWaitingForAssistant(result.current.state)).toBe(true);
+    expect(result.current.state.messages).toHaveLength(1);
   });
 
   it("chat_transport_routes_events_to_the_current_session", async () => {
@@ -272,7 +333,7 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "session-b",
           seq: 1,
           state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "wrong session" }] },
+          message: assistantMessage("turn:b:assistant:1", "wrong session"),
         },
       });
       ws.receive({
@@ -283,7 +344,7 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "chat:42",
           seq: 1,
           state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "right session" }] },
+          message: assistantMessage("turn:a:assistant:1", "right session"),
         },
       });
     });
@@ -292,6 +353,129 @@ describe("useChatTransport reconnect", () => {
     expect(result.current.state.messages.some((message) => message.id === "tool:call-b")).toBe(false);
     expect(result.current.state.messages.some((message) => message.content === "wrong session")).toBe(false);
     expect(result.current.state.messages.some((message) => message.content === "right session")).toBe(true);
+  });
+
+  it("chat_transport_applies_deltas_and_done_by_stable_id", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    const messageId = lastSentChat(ws).params.messageId;
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "s1" },
+      });
+      await pending;
+    });
+
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: assistantMessage("turn:t1:assistant:1", "Hel"),
+        },
+      });
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 2,
+          state: "delta",
+          message: assistantMessage("turn:t1:assistant:1", "lo"),
+        },
+      });
+    });
+    expect(
+      result.current.state.messages.find((m) => m.id === "turn:t1:assistant:1"),
+    ).toMatchObject({ content: "Hello" });
+
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 3,
+          state: "done",
+          terminal: true,
+          message: assistantMessage("turn:t1:assistant:1", "Hello"),
+        },
+      });
+    });
+
+    // The optimistic user entry and the assistant entry share their ids
+    // with history, so the merge converges with no duplicates.
+    expect(result.current.state.messages.map((m) => m.id)).toEqual([
+      messageId,
+      "turn:t1:assistant:1",
+    ]);
+    expect(isWaitingForAssistant(result.current.state)).toBe(false);
+  });
+
+  it("chat_transport_removes_discarded_messages_by_id", async () => {
+    const { result, ws } = await connectOpen();
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    await act(async () => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "s1" },
+      });
+      await pending;
+    });
+
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: assistantMessage("turn:t1:assistant:1", "I will check"),
+        },
+      });
+    });
+    expect(
+      result.current.state.messages.some((m) => m.id === "turn:t1:assistant:1"),
+    ).toBe(true);
+
+    // The loop retried over the streamed text: it disappears, and the retry
+    // streams under a new id while progress stays visible.
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "assistant_discarded",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          messageId: "turn:t1:assistant:1",
+        },
+      });
+    });
+    expect(
+      result.current.state.messages.some((m) => m.id === "turn:t1:assistant:1"),
+    ).toBe(false);
+    expect(isWaitingForAssistant(result.current.state)).toBe(true);
   });
 
   it("chat_transport_rejects_send_and_withdraws_text_on_busy", async () => {
@@ -318,7 +502,7 @@ describe("useChatTransport reconnect", () => {
       pending = result.current.sendMessage("hello", "draft-1");
       pending.catch(() => {});
     });
-    const durableRequestId = lastSentChat(ws).params.requestId;
+    const messageId = lastSentChat(ws).params.messageId;
 
     await act(async () => {
       ws.receive({
@@ -331,7 +515,7 @@ describe("useChatTransport reconnect", () => {
     });
 
     expect(
-      result.current.state.messages.some((m) => m.id === `local:${durableRequestId}`),
+      result.current.state.messages.some((m) => m.id === messageId),
     ).toBe(false);
     // The caller surfaces the failure (composer keeps the text); the
     // transport itself stays quiet.
@@ -347,18 +531,18 @@ describe("useChatTransport reconnect", () => {
       pending.catch(() => {});
     });
     const ws = FakeWebSocket.instances[0];
-    const durableRequestId = lastSentChat(ws).params.requestId;
+    const messageId = lastSentChat(ws).params.messageId;
 
     await act(async () => {
       vi.advanceTimersByTime(15_000);
     });
     await expect(pending).rejects.toThrow("timed out");
     expect(
-      result.current.state.messages.some((m) => m.id === `local:${durableRequestId}`),
+      result.current.state.messages.some((m) => m.id === messageId),
     ).toBe(false);
   });
 
-  it("chat_transport_reuses_the_request_id_when_retrying_after_ack_timeout", async () => {
+  it("chat_transport_reuses_the_message_id_when_retrying_after_ack_timeout", async () => {
     const { result, ws } = await connectOpen();
 
     let first!: Promise<string | null>;
@@ -367,20 +551,26 @@ describe("useChatTransport reconnect", () => {
       first.catch(() => {});
     });
     const firstFrame = lastSentChat(ws);
-    const durableRequestId = firstFrame.params.requestId;
+    const messageId = firstFrame.params.messageId;
 
     await act(async () => {
       vi.advanceTimersByTime(15_000);
     });
     await expect(first).rejects.toThrow("timed out");
 
+    // The same draft retries under the same canonical id, so the server
+    // dedupes instead of duplicating — and the optimistic bubble is back
+    // under that same id.
     let retry!: Promise<string | null>;
     await act(async () => {
       retry = result.current.sendMessage("hello", "draft-1");
     });
     const retryFrame = lastSentChat(ws);
     expect(retryFrame.id).not.toBe(firstFrame.id);
-    expect(retryFrame.params.requestId).toBe(durableRequestId);
+    expect(retryFrame.params.messageId).toBe(messageId);
+    expect(
+      result.current.state.messages.filter((m) => m.id === messageId),
+    ).toHaveLength(1);
 
     let retrySettled = false;
     retry.then(() => {
@@ -403,7 +593,7 @@ describe("useChatTransport reconnect", () => {
     });
   });
 
-  it("chat_transport_uses_a_new_durable_id_after_the_draft_changes", async () => {
+  it("chat_transport_uses_a_new_id_after_the_draft_changes", async () => {
     const { result, ws } = await connectOpen();
 
     let first!: Promise<string | null>;
@@ -422,7 +612,7 @@ describe("useChatTransport reconnect", () => {
       replacement = result.current.sendMessage("hello", "draft-2");
     });
     const replacementFrame = lastSentChat(ws);
-    expect(replacementFrame.params.requestId).not.toBe(firstFrame.params.requestId);
+    expect(replacementFrame.params.messageId).not.toBe(firstFrame.params.messageId);
 
     await act(async () => {
       ws.receive({ type: "res", id: replacementFrame.id, ok: true });
@@ -430,7 +620,7 @@ describe("useChatTransport reconnect", () => {
     });
   });
 
-  it("chat_transport_reuses_the_durable_id_after_connection_loss", async () => {
+  it("chat_transport_reuses_the_message_id_after_connection_loss", async () => {
     const { result, ws } = await connectOpen();
 
     let first!: Promise<string | null>;
@@ -456,7 +646,7 @@ describe("useChatTransport reconnect", () => {
     });
     const retryFrame = lastSentChat(retrySocket);
     expect(retryFrame.id).not.toBe(firstFrame.id);
-    expect(retryFrame.params.requestId).toBe(firstFrame.params.requestId);
+    expect(retryFrame.params.messageId).toBe(firstFrame.params.messageId);
 
     await act(async () => {
       retrySocket.receive({ type: "res", id: retryFrame.id, ok: true });
@@ -501,7 +691,7 @@ describe("useChatTransport reconnect", () => {
       second = hook.result.current.sendMessage("hello", "draft-1");
     });
     const secondFrame = lastSentChat(ws);
-    expect(secondFrame.params.requestId).not.toBe(firstFrame.params.requestId);
+    expect(secondFrame.params.messageId).not.toBe(firstFrame.params.messageId);
     await act(async () => {
       ws.receive({ type: "res", id: secondFrame.id, ok: true });
       await second;
@@ -565,57 +755,7 @@ describe("useChatTransport reconnect", () => {
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
 
-  it("chat_transport_shows_thinking_draft_on_ack", async () => {
-    const { result, ws } = await connectOpen();
-
-    let pending!: Promise<string | null>;
-    await act(async () => {
-      pending = result.current.sendMessage("hello", "draft-1");
-    });
-    const rpcId = lastSentChat(ws).id;
-
-    // Act: the server accepts the run.
-    await act(async () => {
-      ws.receive({
-        type: "res",
-        id: rpcId,
-        ok: true,
-        payload: { runId: "run-a", sessionKey: "s1" },
-      });
-      await pending;
-    });
-
-    // Assert: an empty assistant draft (the typing indicator) is visible
-    // before any delta arrives.
-    expect(
-      result.current.state.messages.find((m) => m.id === "draft:run-a"),
-    ).toMatchObject({ sender_kind: "assistant", sender_id: "default", content: "" });
-
-    // The first delta fills the placeholder instead of adding a bubble.
-    act(() => {
-      ws.receive({
-        type: "event",
-        event: "chat",
-        payload: {
-          runId: "run-a",
-          sessionKey: "s1",
-          seq: 1,
-          state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
-        },
-      });
-    });
-    expect(
-      result.current.state.messages.filter((m) =>
-        m.id.startsWith("draft:run-a"),
-      ),
-    ).toHaveLength(1);
-    expect(
-      result.current.state.messages.find((m) => m.id === "draft:run-a"),
-    ).toMatchObject({ content: "Hi" });
-  });
-
-  it("chat_transport_ack_from_a_left_session_does_not_pollute_the_active_one", async () => {
+  it("chat_transport_ack_from_a_left_session_shows_no_progress", async () => {
     const onSessionResolved = vi.fn();
     const { result, ws, rerender } = await connectOpen({
       onSessionResolved,
@@ -660,7 +800,7 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "chat:42",
           seq: 1,
           state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+          message: assistantMessage("turn:a:assistant:1", "Hi"),
         },
       });
     });
@@ -674,14 +814,16 @@ describe("useChatTransport reconnect", () => {
           seq: 2,
           state: "done",
           terminal: true,
-          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+          message: assistantMessage("turn:a:assistant:1", "Hi"),
         },
       });
     });
 
-    // Assert: session s2 shows nothing from s1's send, and the canonical
-    // session of s1's run never switches the displayed session.
+    // Assert: session s2 shows nothing from s1's send — no entries, no
+    // progress — and the canonical session of s1's run never switches the
+    // displayed session.
     expect(result.current.state.messages).toHaveLength(0);
+    expect(isWaitingForAssistant(result.current.state)).toBe(false);
     expect(onSessionResolved).not.toHaveBeenCalled();
   });
 
@@ -744,7 +886,7 @@ describe("useChatTransport reconnect", () => {
           seq: 2,
           state: "done",
           terminal: true,
-          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+          message: assistantMessage("turn:a:assistant:1", "Hi"),
         },
       });
     });
@@ -769,8 +911,22 @@ describe("useChatTransport reconnect", () => {
       });
       await pending;
     });
+    // Live entries of run-a exist under their stable ids.
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "s1",
+          seq: 1,
+          state: "delta",
+          message: assistantMessage("turn:a:assistant:1", "part"),
+        },
+      });
+    });
     expect(
-      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+      result.current.state.messages.find((m) => m.id === "turn:a:assistant:1"),
     ).toBeTruthy();
 
     // The socket drops and reconnects; the run is resubscribed.
@@ -797,10 +953,10 @@ describe("useChatTransport reconnect", () => {
       });
     });
 
-    // Assert: the frozen draft is dropped and history is refetched instead
-    // of trusting a stream that starts mid-run.
+    // Assert: run-a's live entries are dropped by run ownership and history
+    // is refetched instead of trusting a stream that starts mid-run.
     expect(
-      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+      result.current.state.messages.find((m) => m.id === "turn:a:assistant:1"),
     ).toBeUndefined();
     expect(invalidateQueries).toHaveBeenCalledWith("sessions");
     expect(invalidateQueries).toHaveBeenCalledWith("history");
@@ -845,7 +1001,7 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "s1",
           seq: 1,
           state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "Hi" }] },
+          message: assistantMessage("turn:a:assistant:1", "Hi"),
         },
       });
     });
@@ -853,7 +1009,7 @@ describe("useChatTransport reconnect", () => {
     // Assert: the streamed message is attributed to the sending agent, not
     // the one selected at event time.
     expect(
-      result.current.state.messages.find((m) => m.id === "draft:run-a"),
+      result.current.state.messages.find((m) => m.id === "turn:a:assistant:1"),
     ).toMatchObject({ sender_id: "default" });
   });
 
@@ -883,7 +1039,7 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "s1",
           seq: 1,
           state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "Hello" }] },
+          message: assistantMessage("turn:a:assistant:1", "Hello"),
         },
       });
     });
@@ -911,7 +1067,8 @@ describe("useChatTransport reconnect", () => {
       lastSeq: 1,
     });
 
-    // The replayed remainder completes the transcript.
+    // The replayed remainder completes the transcript under the same id —
+    // reconnecting never renames a message.
     act(() => {
       retry.receive({
         type: "res",
@@ -927,15 +1084,12 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "s1",
           seq: 2,
           state: "done",
-          message: {
-            role: "assistant",
-            content: [{ type: "text", text: "Hello world" }],
-          },
+          message: assistantMessage("turn:a:assistant:1", "Hello world"),
         },
       });
     });
     expect(
-      result.current.state.messages.find((m) => m.id === "draft:run-a:done"),
+      result.current.state.messages.find((m) => m.id === "turn:a:assistant:1"),
     ).toMatchObject({ content: "Hello world" });
   });
 
@@ -965,7 +1119,7 @@ describe("useChatTransport reconnect", () => {
         sessionKey: "s1",
         seq: 1,
         state: "delta",
-        message: { role: "assistant", content: [{ type: "text", text }] },
+        message: assistantMessage("turn:a:assistant:1", text),
       },
     });
 
@@ -976,8 +1130,8 @@ describe("useChatTransport reconnect", () => {
     });
 
     // Assert: the duplicate is not appended twice.
-    const draft = result.current.state.messages.find((m) => m.id === "draft:run-a");
-    expect(draft?.content).toBe("Hello");
+    const entry = result.current.state.messages.find((m) => m.id === "turn:a:assistant:1");
+    expect(entry?.content).toBe("Hello");
   });
 
   it("chat_transport_forgets_run_after_run_not_found", async () => {
@@ -989,6 +1143,7 @@ describe("useChatTransport reconnect", () => {
       pending = result.current.sendMessage("hello", "draft-1");
     });
     const rpcId = lastSentChat(ws).id;
+    const messageId = lastSentChat(ws).params.messageId;
     await act(async () => {
       ws.receive({
         type: "res",
@@ -1007,7 +1162,7 @@ describe("useChatTransport reconnect", () => {
           sessionKey: "s1",
           seq: 1,
           state: "delta",
-          message: { role: "assistant", content: [{ type: "text", text: "Hel" }] },
+          message: assistantMessage("turn:a:assistant:1", "Hel"),
         },
       });
     });
@@ -1041,10 +1196,15 @@ describe("useChatTransport reconnect", () => {
     // Assert: the transport falls back to persisted history...
     expect(mockInvalidate).toHaveBeenCalledWith("history");
 
-    // ...and discards the frozen draft its events can never complete.
+    // ...and discards the frozen entries of the forgotten run by ownership —
+    // both the streamed assistant entry and the optimistic user entry.
     expect(
-      result.current.state.messages.some((m) => m.id.startsWith("draft:run-a")),
-      "a forgotten run's frozen draft must not linger",
+      result.current.state.messages.some((m) => m.runId === "run-a"),
+      "a forgotten run's entries must not linger",
+    ).toBe(false);
+    expect(
+      result.current.state.messages.some((m) => m.id === messageId),
+      "the optimistic entry was tagged, so it is dropped too",
     ).toBe(false);
 
     // ...and stops resubscribing to the forgotten run.

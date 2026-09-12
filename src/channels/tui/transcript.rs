@@ -159,6 +159,13 @@ impl Transcript {
                 }
                 self.commit(Block::User(text));
             }
+            TurnEvent::AssistantDiscarded => {
+                // The loop retried over streamed text it will never persist;
+                // drop the pending segment so the retry starts clean.
+                if let Some(active) = self.active.as_mut() {
+                    active.buffer.clear();
+                }
+            }
             TurnEvent::FinalResponse { text } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
@@ -461,6 +468,37 @@ mod tests {
         assert_eq!(
             transcript.drain_pending().last(),
             Some(&Block::Error("failed".to_string()))
+        );
+    }
+
+    #[test]
+    fn discarded_assistant_segment_clears_the_pending_buffer() {
+        // Arrange
+        let mut transcript = Transcript::new();
+        transcript.begin_turn("do the work");
+        transcript.apply_turn_event(TurnEvent::Delta {
+            text: "I will check".to_string(),
+        });
+
+        // Act: the loop retried over the streamed text, so it is dropped and
+        // the retry streams anew instead of appending to stale text.
+        transcript.apply_turn_event(TurnEvent::AssistantDiscarded);
+        transcript.apply_turn_event(TurnEvent::Delta {
+            text: "done".to_string(),
+        });
+        transcript.apply_turn_event(TurnEvent::FinalResponse {
+            text: "done".to_string(),
+        });
+
+        // Assert
+        let pending = transcript.drain_pending();
+        assert_eq!(pending.last(), Some(&Block::Assistant("done".to_string())));
+        assert!(
+            !pending.iter().any(|block| matches!(
+                block,
+                Block::Assistant(text) if text.contains("I will check")
+            )),
+            "discarded text must not survive the retry"
         );
     }
 }

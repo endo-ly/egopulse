@@ -32,16 +32,10 @@ function avatarLetter(message: ChatMessage): string {
 
 export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
   const cls = `message-row bubble-${message.sender_kind}`;
-  const isDraft =
-    message.id.startsWith("draft:") && !message.id.endsWith(":done");
   const avatarSrc =
     message.sender_kind === "assistant"
       ? agentAvatars?.[message.sender_id]
       : undefined;
-  // An accepted run shows an empty assistant draft until the first delta
-  // lands; render it as a typing indicator instead of an empty bubble.
-  const showThinking =
-    isDraft && message.sender_kind === "assistant" && message.content === "";
 
   return (
     <div className={cls}>
@@ -68,23 +62,9 @@ export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
       </div>
       <div className="message-body">
         {message.sender_kind === "assistant" ? (
-          showThinking ? (
-            <span className="thinking-dots" aria-label="assistant is responding">
-              <span />
-              <span />
-              <span />
-            </span>
-          ) : (
-            <>
-              <MarkdownRenderer content={message.content} />
-              {isDraft && <span className="streaming-cursor" />}
-            </>
-          )
+          <MarkdownRenderer content={message.content} />
         ) : (
-          <>
-            {message.content}
-            {isDraft && <span className="streaming-cursor" />}
-          </>
+          <>{message.content}</>
         )}
       </div>
     </div>

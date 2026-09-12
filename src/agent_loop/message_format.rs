@@ -181,6 +181,22 @@ pub(crate) fn is_tool_preview_message(content: &str) -> bool {
         || content.starts_with(TOOL_ERROR_PREFIX)
 }
 
+/// Returns the narration part of a persisted tool-call preview.
+///
+/// Previews are stored as `{narration} [tool_call] {names}` (or the bare
+/// `[tool_call] {names}` form when the model emitted no narration).
+/// Structured UIs render the tool calls from the `tool_calls` table, so the
+/// history projection shows only the narration — the same text the client
+/// streamed live under this message id. Content without the marker is
+/// returned unchanged.
+pub(crate) fn tool_preview_narration(content: &str) -> &str {
+    const MARKER: &str = " [tool_call] ";
+    match content.rfind(MARKER) {
+        Some(index) => content[..index].trim_end(),
+        None => content,
+    }
+}
+
 fn tool_message_prefix(message: &Message) -> &'static str {
     if is_tool_error_message(message) {
         TOOL_ERROR_PREFIX
@@ -570,5 +586,28 @@ mod tests {
         ));
         assert!(!is_tool_preview_message("regular assistant text"));
         assert!(!is_tool_preview_message(""));
+    }
+
+    #[test]
+    fn tool_preview_narration_strips_the_call_suffix() {
+        assert_eq!(
+            tool_preview_narration("ファイルを読みます [tool_call] read"),
+            "ファイルを読みます"
+        );
+        assert_eq!(
+            tool_preview_narration("checking [tool_call] read, shell"),
+            "checking"
+        );
+        // Bare previews and unrelated text pass through; bare ones are
+        // skipped by the projection before this helper runs.
+        assert_eq!(
+            tool_preview_narration("[tool_call] read"),
+            "[tool_call] read"
+        );
+        assert_eq!(
+            tool_preview_narration("regular assistant text"),
+            "regular assistant text"
+        );
+        assert_eq!(tool_preview_narration(""), "");
     }
 }

@@ -295,12 +295,14 @@ UI 側は、選択中の read-only セッションの sessionKey と一致する
 ### 8.1 メッセージライフサイクル
 
 1. ユーザーが入力・Enter 押下
-2. ユーザーメッセージを in-memory に楽観追加（`local:{durableRequestId}`）
-3. WS `chat.send` を送信し、受諾 ack（`res` ok）を待つ。WebSocketのRPC IDはattemptごとに発行し、durable request IDは同じdraftのACK不明時の明示的なretryでだけ再利用する。受諾で Composer をクリアし、拒否・タイムアウト（15秒）では文面を保持したままエラーを表示する。draftを編集した場合やsessionを切り替えた場合は新しいdurable request IDを使う
-4. WS 上でトークン刻みの delta を受信 → ドラフトメッセージへ追記
-5. WS 上で done を受信 → ドラフトを確定。楽観メッセージは履歴が追いつくまで保持
-6. セッション一覧と履歴を refetch。表示は履歴と live のマージ（`mergeChatMessages`）で、ID 一致は履歴優先、楽観分・確定済みドラフトは新規到達した履歴との内容一致で履歴優先、ストリーミング中は保持
-7. WS が意図せず切断→再接続した場合はセッション一覧と履歴を refetch して追いつく（進行中ターンの購読は復活しないため、ストリーミング途中の描画は復元されない）
+2. ユーザーメッセージをcanonical ID（`web:{uuid}`）で in-memory に楽観追加。このIDは送信・Turnの `request_key`・永続化後の `messages.id` と同一
+3. WS `chat.send`（`messageId` 必須）を送信し、受諾 ack（`res` ok）を待つ。WebSocketのRPC IDはattemptごとに発行し、canonical IDは同じdraftのACK不明時の明示的なretryでだけ再利用する。受諾で Composer をクリアし、run ownershipを楽観行へ付与してassistant進捗表示（typing indicator）を出す。進捗はrun単位で管理し、複数runの同時進行や非terminal done後の次Turn待機も正しく表示する。拒否・タイムアウト（15秒）では文面を保持したままエラーを表示する。draftを編集した場合やsessionを切り替えた場合は新しいIDを使う
+4. WS 上でトークン刻みの delta を受信 → その安定ID（`turn:{turnId}:assistant:{iteration}`）のメッセージへ追記。Tool Call の前後でIDは変わらず、Tool Cardは `callId` で別行に表示する。ナレーションなしのTool Callでは空バブルを作らずTool Cardだけ表示する
+5. WS 上で done を受信 → 同じ安定IDへ確定内容で更新（authoritative置換）。履歴とはID一致でのみ突き合わせ、内容比較はしない
+6. Tool実行中に送ったfollow-upは `user_input` の `messageId`（送信時と同一ID）でupsertする。昇格した子Turnの初期イベントも同じIDのまま
+7. セッション一覧と履歴を refetch。表示は履歴と live のマージ（`mergeChatMessages`）で、ID 一致は履歴優先、履歴にないliveのみ保持
+8. WS が意図せず切断→再接続した場合は未完了runを `run.subscribe` で再購読し、replayとliveへ追従する。`replayTruncated` の場合はそのrun由来のlive entriesをrun ownershipで破棄し、履歴から再構築する。run自体が消えていた場合（`run_not_found`）も同様に破棄して履歴へフォールバックする
+9. retryで置換されたstream済み応答は `assistant_discarded` で該当IDを削除し、retryは新しいIDでstreamする
 
 ### 8.2 エラー時
 

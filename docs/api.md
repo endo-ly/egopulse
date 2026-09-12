@@ -247,7 +247,7 @@ GET /api/history?session_key=main&limit=100
 
 これにより、`tool_calls` と発行元メッセージ間の timestamp ズレによらずツールカードは親メッセージの直後に固定される。`messages` 同士の順序は timestamp に依存するため、一括永続化パス（Pulse など）では永続化の都度新鮮な timestamp を採番し、保存順と時系列順が一致するよう保証している。いずれの履歴も LLM コンテキストには含まれない。
 
-ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言内容を残すために返却される。
+ツール呼び出しを伴うターンでは、テキストベースチャネル（TUI / Discord など）向けに `messages` テーブルへ tool プレビューが assistant メッセージとして保存される。WebUI はツール情報を `tool_calls` テーブルから構造化されたツールカードとして描画するため、`GET /api/history` では次のプレビューを除外する: ツール結果プレビュー（`[tool_result]: ...` / `[tool_error]: ...`。Markdown でリンク参照定義として解釈されて空描画され、かつ `tool_calls` テーブルと完全重複）と、発言を含まないツール呼び出しプレビュー（`[tool_call] {name}`。ツールカードと完全重複）。エージェントの発言を伴うもの（`{text} [tool_call] {name}`）は発言部分（`{text}`）のみを返却する。これはliveでstreamしたnarrationと同一内容で、同じメッセージIDでmerge収束する。previewかどうかの判定は本文の接頭辞ではなく構造で行う（bare呼び出しはそのメッセージ自身へのtool_calls紐付き、結果・エラーは `parent_message_id` の有無）。そのためmarkerで始まる通常回答が誤って隠れることはない。
 
 ---
 
@@ -259,10 +259,10 @@ GET /api/history?session_key=main&limit=100
 POST /api/send_stream
 ```
 
-- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）。未永続の新規Webセッションでは `agent_id`（作成対象agent）も必須。既存の `chat:{id}` は保存済み `chats.agent_id` を使用する
+- リクエスト: `session_key`（識別キー）と `message`（送信テキスト）と `messageId`（`web:<uuid>` 形式のcanonicalメッセージID）。未永続の新規Webセッションでは `agent_id`（作成対象agent）も必須。既存の `chat:{id}` は保存済み `chats.agent_id` を使用する
 - レスポンス: `ok: true`, `run_id`（durable Turn の UUID）, `session_key`（永続化後は `chat:{id}` に切り替わる場合あり）
 
-通常メッセージはWebSocketと同じWeb共通入力を通り、`TurnScheduler` にdurableに投入される。同一sessionはFIFOで直列化され、Tool実行中の入力は既存Turnへdurable stagingされる。`request_id` が同じで本文も同じ再送は同じ `run_id` を返し、Turnを重複生成しない。`request_id` を別本文で再利用した場合は `409 Conflict` で拒否する。完了済みTurnの再送でも、保存済みの最終応答またはエラーを同じ `run_id` のstreamへreplayする。slash commandはLLM Turnとして投入せず、対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `429` で拒否する。
+通常メッセージはWebSocketと同じWeb共通入力を通り、`TurnScheduler` にdurableに投入される。同一sessionはFIFOで直列化され、Tool実行中の入力は既存Turnへdurable stagingされる。`messageId` が同じで本文も同じ再送は同じ `run_id` を返し、Turnを重複生成しない。`messageId` を別本文で再利用した場合は `409 Conflict` で拒否する。完了済みTurnの再送でも、保存済みの最終応答またはエラーを同じ `run_id` のstreamへreplayする。slash commandはLLM Turnとして投入せず、対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `429` で拒否する。
 
 #### SSE イベント受信
 
@@ -288,18 +288,20 @@ GET /api/stream?run_id=550e8400-e29b-41d4-a716-446655440000&last_event_id=0
 | `iteration` | エージェントループのイテレーション番号 |
 | `tool_start` | ツール実行開始。ツール名と入力パラメータを含む |
 | `tool_result` | ツール実行完了。出力と成否を含む |
-| `delta` | LLM からのストリーミングテキスト差分 |
-| `done` | 最終応答。完全なアシスタントメッセージ |
+| `delta` | LLM からのストリーミングテキスト差分（安定メッセージIDつき） |
+| `user_input` | staged follow-up のcommit（canonicalメッセージIDつき） |
+| `assistant_discarded` | retryで置換されたstream済み応答の破棄（メッセージIDつき） |
+| `done` | 最終応答。完全なアシスタントメッセージ（安定メッセージIDつき） |
 | `error` | エラー発生時 |
 
 ##### イベント例
 
 ```text
 event: delta
-data: {"text": "今日の東京の天気は"}
+data: {"messageId": "turn:<turn-id>:assistant:1", "delta": "今日の東京の天気は"}
 
 event: done
-data: {"message": {"role": "assistant", "content": "今日の東京の天気は晴れです。..."}, "session_key": "chat:1"}
+data: {"response": "今日の東京の天気は晴れです。...", "messageId": "turn:<turn-id>:assistant:1"}
 ```
 
 ##### 再接続
@@ -539,7 +541,7 @@ JSON-RPC 風の双方向メッセージング。
   "type": "event",
   "event": "connect.challenge",
   "payload": {
-    "protocol": 1,
+    "protocol": 2,
     "connId": "uuid"
   }
 }
@@ -555,8 +557,8 @@ JSON-RPC 風の双方向メッセージング。
   "id": "1",
   "method": "connect",
   "params": {
-    "minProtocol": 1,
-    "maxProtocol": 1,
+    "minProtocol": 2,
+    "maxProtocol": 2,
     "auth_token": "<web_auth_token>"
   }
 }
@@ -572,11 +574,11 @@ JSON-RPC 風の双方向メッセージング。
   "id": "1",
   "ok": true,
   "payload": {
-    "protocol": 1,
+    "protocol": 2,
     "server": { "version": "0.1.0", "connId": "uuid" },
     "features": {
       "methods": ["connect", "chat.send", "run.subscribe"],
-      "events": ["connect.challenge", "chat", "tool_start", "tool_result", "user_input"]
+      "events": ["connect.challenge", "chat", "tool_start", "tool_result", "user_input", "assistant_discarded"]
     }
   }
 }
@@ -593,7 +595,7 @@ JSON-RPC 風の双方向メッセージング。
     "sessionKey": "main",
     "agentId": "default",
     "message": "こんにちは",
-    "requestId": "client-generated-uuid"
+    "messageId": "web:550e8400-e29b-41d4-a716-446655440000"
   }
 }
 ```
@@ -613,9 +615,9 @@ JSON-RPC 風の双方向メッセージング。
 }
 ```
 
-WebSocket の ordinary message は `requestId` を durable request identity としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。`req.id` はWebSocketの1回のRPC attemptとresponse照合だけに使うため、ACK不明後のretryでは新しい `req.id` と同じ `requestId` を組み合わせる。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。複数Turnのinteractionでは個別の `done` / `error` が `terminal: false` で流れ、最後のTurnだけが `terminal: true` になる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
+WebSocket の ordinary message は `messageId`（`web:<uuid>` 形式のcanonicalメッセージID）をそのまま Turn の `request_key` としてRESTと同じWeb共通入力を通り、共通 TurnScheduler へ durable に投入する。1回の送信は1つのユーザーメッセージを作る操作なので、同じメッセージのretryは同じ `messageId` を再利用し、別の送信は別の `messageId` を生成する。`req.id` はWebSocketの1回のRPC attemptとresponse照合だけに使うため、ACK不明後のretryでは新しい `req.id` と同じ `messageId` を組み合わせる。同一 `sessionKey` では FIFO で実行され、現在の Turn が Tool 実行中なら durable staging される（staged行のIDもこの `messageId` のまま）。受付 COMMIT 後、staging された follow-up は親Turnの `runId` を使った `queued` ACK を返し、Tool Result の後に `user_input` event を同じ stream へ送る。通常の scheduler queue に入った message は個別の durable Turn IDを `runId` とする `queued` ACK を持ち、前の Turn の完了後にその stream へイベントを送る。ACKと `chat` / `tool_start` / `tool_result` / `user_input` / `assistant_discarded` event には `runId` と `sessionKey` を含めるため、クライアントは同じ接続上の別sessionのイベントを混在させずに処理できる。複数Turnのinteractionでは個別の `done` / `error` が `terminal: false` で流れ、最後のTurnだけが `terminal: true` になる。別 session は独立して受け付ける。slash command は対象sessionのbusy確認から実行完了まで通常入力と直列化され、未完了Turnがある場合は `busy` となり、別sessionでは実行できる。
 
-`user_input` event の payload は `messageId`, `senderId`, `text`, `timestamp` を持つ。client は message ID で重複を除去し、Tool Result の後に user message を表示する。
+`user_input` event の payload は `messageId`（送信時からcanonicalなメッセージID。楽観表示と同一）、`senderId`, `text`, `timestamp` を持つ。client は message ID でupsertする（既存の楽観行があれば同じIDなので重複しない）。Tool Result の後に user message を表示する。昇格した子Turnの開始時に送られる初期 `user_input` も元の `messageId` のままで、IDの予測や置換は行わない。
 
 #### チャットイベント受信
 
@@ -632,6 +634,7 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
     "state": "delta",
     "terminal": false,
     "message": {
+      "id": "turn:<turn-id>:assistant:1",
       "role": "assistant",
       "content": [{"type": "text", "text": "こんにちは！"}]
     }
@@ -639,13 +642,19 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 }
 ```
 
+Message identity は end-to-end で安定している。ユーザーメッセージは送信時からcanonical ID（`chat.send` の `messageId`）を持ち、Turn の `request_key`・永続化後の `messages.id` と同一である。Assistantメッセージはモデル呼び出し前に確定する `turn:{turnId}:assistant:{iteration}` を最初のdeltaから持ち、Tool narration・Tool preview・final行のすべてが同じIDを共有する。Frontend は message ID で追加・更新・削除するだけで、runId や content から対応を推測しない。
+
 | state | 説明 |
 |-------|------|
-| `delta` | テキストの差分。`message` を含む |
-| `done` | 1 Turnの完了。`message` に応答を含む。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる |
-| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する |
+| `delta` | テキストの差分。`message`（安定IDつき）を含む。同じIDへ追記する |
+| `done` | 1 Turnの完了。`message.id` は応答がstreamした安定IDで、`message` に確定内容を含む（authoritative置換）。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。永続finalを持たない通知（重複受付など）はイベント生成側で確定した `turn:{turnId}:notice` という安定IDで届く |
+| `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。partial出力はstreamしたIDのまま残し、ID解決は行わない |
 
-`chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ durable `requestId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `requestId` を使う。本文を変更した同じ `requestId` の再利用は `409 Conflict` になる。
+クライアントは live 表示を message ID でupsertし、履歴とはID一致でのみ突き合わせる（history優先）。内容比較はしない。bareのTool preview・result summaryは履歴投影に現れず、Tool Cardは `call_id` で突き合わせる。narration付きpreviewはnarration部分のみで返却されるため、liveの表示内容と一致する。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のfinal IDを運ぶため、親TurnのIDが子Turnに再送されることはない。
+
+宣言的応答などのretryでstream済み応答を破棄する場合、サーバーは `assistant_discarded` event（`messageId`）を送る。クライアントは該当IDのメッセージを削除するだけで、retryは新しいIDでstreamする。stream後にLLM errorになったpartial出力はlive表示に残してよい。
+
+`chat.send` のACKがタイムアウトまたは接続断で不明になった場合、送信が拒否されたとは限らない。クライアントは未変更の同じdraftを明示的に再送するときだけ、同じ `messageId` と新しいWebSocket `req.id` を使ってdurable Turnのidempotencyを維持する。draftを編集した送信や別sessionの送信は新しい `messageId` を使う。本文を変更した同じ `messageId` の再利用は `409 Conflict` になる。
 
 `chat` イベントの `seq` はrun内で単調増加するRunHubのイベントIDである（転送がスキップしたイベントで歯抜けになることがある）。クライアントは受信した最大の `seq` をrunごとに記録し、再購読時の `lastSeq` として使う。
 
@@ -685,7 +694,7 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 
 - 転送されるイベントの `sessionKey` は、run作成時にサーバーがRunHubへ登録したcanonicalキー（`chat:{id}`）。通常のエージェントTurnとスラッシュコマンドのどちらのrunも同じ契約で再購読でき、クライアントが送信時に使った一時キーが転送に持ち込まれることはない
 - `replayed`: この要求でリプレイされたイベント数。同一接続ですでに転送中のrun（`chat.send` 起点）を指定した場合は二重転送を避けるため `0` になる
-- `replayTruncated`: リプレイバッファが `lastSeq` 以降の全イベントを保持できていない（512件のTTL退避で欠落がある）場合に `true`。リプレイだけでは途切れのないトランスクリプトを復元できないため、クライアントは凍結したdraftを破棄し、永続化済み履歴から再構築する（live購読は継続する）
+- `replayTruncated`: リプレイバッファが `lastSeq` 以降の全イベントを保持できていない（512件のTTL退避で欠落がある）場合に `true`。リプレイだけでは途切れのないトランスクリプトを復元できないため、クライアントはそのrun由来のlive entries（run ownershipで特定）を破棄し、永続化済み履歴から再構築する（live購読は継続する）
 - `done`: 購読時点でrunが完了済みかどうか
 - runが保持期間切れ・プロセス再起動などでRunHubから見つからない場合は `run_not_found` エラーを返す。クライアントは永続化済み履歴 (`GET /api/history`) から再構築する
 
@@ -725,8 +734,9 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 
 | イベント | 説明 |
 |---------|------|
-| `tool_start` | ツール実行開始。`callId`, `name`, `input` を含む |
+| `tool_start` | ツール実行開始。`callId`, `name`, `input` を含む。narrationはstreamした安定IDのまま残り、名前変更は行わない |
 | `tool_result` | ツール実行完了。`callId`, `name`, `isError`, `preview`, `durationMs` を含む。同じ `callId` の `tool_start` を更新する |
+| `assistant_discarded` | stream済み応答の破棄（retryによる置換）。`messageId` のメッセージを削除する |
 
 `preview` はツール出力の先頭（最大 200 文字）。完全な出力は履歴取得時に `tool_calls` テーブルから復元される。
 
@@ -764,7 +774,7 @@ WebSocket の ordinary message は `requestId` を durable request identity と�
 | `tracker_full` | 429 | origin の turn tracker が追跡上限（同時追跡可能な origin 数）に達し、新規 origin の受付を拒否した |
 | `chain_terminated` | 429 | 同一 origin の turn chain が既に終了（terminal reason 記録済み）しており、受付を拒否した |
 | `shutdown` | 429 | Runtime が shutdown 中であり、新規 Turn の受付を拒否した |
-| `request_conflict` | 409 | 同一 `request_id` / `request_key` が別本文で再利用された |
+| `request_conflict` | 409 | 同一 `messageId` / `request_key` が別本文で再利用された |
 | `internal` | 500 | 受付処理の内部エラー |
 | `internal_error` | 500 | サーバー内部エラー |
 

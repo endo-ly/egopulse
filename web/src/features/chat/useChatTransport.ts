@@ -1,13 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   initialChatState,
+  reduceAssistantDiscarded,
   reduceChatEvent,
-  reduceDiscardOptimisticUserMessage,
+  reduceDiscardUserMessage,
+  reduceDropRunMessages,
   reduceOptimisticUserMessage,
   reduceRunAccepted,
+  reduceRunMissing,
+  reduceTagMessageRun,
   reduceUserInput,
   reduceToolResult,
   reduceToolStart,
+  type AssistantDiscardedPayload,
   type ChatEventPayload,
   type ChatState,
   type ToolResultPayload,
@@ -50,16 +55,16 @@ interface ChatAckPayload {
 
 interface UncertainSend {
   draftId: string;
-  durableRequestId: string;
+  messageId: string;
   sessionKey: string;
   text: string;
 }
 
 interface PendingSend {
-  resolve: (durableRequestId: string) => void;
+  resolve: (messageId: string) => void;
   reject: (error: Error) => void;
   draftId: string;
-  durableRequestId: string;
+  messageId: string;
   // The session and agent at the time the send was issued. The user may
   // switch to another session before the ack arrives, so per-run state must
   // not depend on what the transport happens to show at that moment.
@@ -116,8 +121,8 @@ export function useChatTransport({
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
-  // RPC ids identify one WebSocket attempt. Durable request ids identify the
-  // logical send and remain stable only while its current draft is uncertain.
+  // RPC ids identify one WebSocket attempt. Canonical message ids identify
+  // the logical send and remain stable while its current draft is uncertain.
   const pendingSendsRef = useRef(new Map<string, PendingSend>());
   const uncertainSendRef = useRef<UncertainSend | null>(null);
   // Runs accepted by this transport, until they terminate. After every
@@ -150,12 +155,10 @@ export function useChatTransport({
       pendingSendsRef.current.delete(rpcId);
       clearTimeout(pending.timer);
       if (error) {
-        setState((prev) =>
-          reduceDiscardOptimisticUserMessage(prev, pending.durableRequestId),
-        );
+        setState((prev) => reduceDiscardUserMessage(prev, pending.messageId));
         pending.reject(error);
       } else {
-        pending.resolve(pending.durableRequestId);
+        pending.resolve(pending.messageId);
       }
     },
     [],
@@ -169,7 +172,7 @@ export function useChatTransport({
       if (retryable) {
         uncertainSendRef.current = {
           draftId: entry.draftId,
-          durableRequestId: entry.durableRequestId,
+          messageId: entry.messageId,
           sessionKey: entry.sessionKey,
           text: entry.text,
         };
@@ -181,7 +184,7 @@ export function useChatTransport({
       setState((prev) =>
         pending.reduce(
           (state, [_rpcId, entry]) =>
-            reduceDiscardOptimisticUserMessage(state, entry.durableRequestId),
+            reduceDiscardUserMessage(state, entry.messageId),
           prev,
         ),
       );
@@ -243,7 +246,7 @@ export function useChatTransport({
           type: "req",
           id: "connect",
           method: "connect",
-          params: { minProtocol: 1, maxProtocol: 1, authToken },
+          params: { minProtocol: 2, maxProtocol: 2, authToken },
         }));
         return;
       }
@@ -280,14 +283,7 @@ export function useChatTransport({
             // arrive, so drop the frozen live transcript and per-run seq
             // state, then reconcile from persisted history.
             runsRef.current.delete(resubscribedRunId);
-            setState((prev) => ({
-              ...prev,
-              messages: prev.messages.filter(
-                (message) =>
-                  message.id !== `draft:${resubscribedRunId}` &&
-                  !message.id.startsWith(`draft:${resubscribedRunId}:`),
-              ),
-            }));
+            setState((prev) => reduceRunMissing(prev, resubscribedRunId));
             invalidateQueries("sessions");
             invalidateQueries("history");
           } else {
@@ -297,16 +293,10 @@ export function useChatTransport({
             if (result?.replayTruncated) {
               // The replay buffer already evicted events the client applied,
               // so the resumed stream starts mid-run and would render a
-              // half transcript. Drop the drafts and rebuild from history;
+              // half transcript. Drop that run's live entries (addressed by
+              // run ownership, never by id prefix) and rebuild from history;
               // the live subscription stays attached and fills forward.
-              setState((prev) => ({
-                ...prev,
-                messages: prev.messages.filter(
-                  (message) =>
-                    message.id !== `draft:${resubscribedRunId}` &&
-                    !message.id.startsWith(`draft:${resubscribedRunId}:`),
-                ),
-              }));
+              setState((prev) => reduceDropRunMessages(prev, resubscribedRunId));
               invalidateQueries("sessions");
               invalidateQueries("history");
             }
@@ -324,16 +314,20 @@ export function useChatTransport({
               agentId: pending.agentId,
               lastSeq: 0,
             });
+            // Tag the optimistic message with its run for replay-truncated
+            // cleanup. Identity needs no tag: the message already carries
+            // its canonical id.
+            setState((prev) =>
+              reduceTagMessageRun(prev, {
+                messageId: pending.messageId,
+                runId,
+              }),
+            );
             // Show the assistant's turn has started only in the session that
             // issued the send: the user may have switched away while the ack
-            // was in flight, and that session must not inherit the draft.
+            // was in flight, and that session must not inherit the progress.
             if (sessionKeyRef.current === pending.sessionKey) {
-              setState((prev) =>
-                reduceRunAccepted(prev, {
-                  runId,
-                  agentId: pending.agentId,
-                }),
-              );
+              setState((prev) => reduceRunAccepted(prev, runId));
             }
           }
         } else if (!parsed.ok && pending) {
@@ -420,6 +414,21 @@ export function useChatTransport({
           return;
         }
         setState((prev) => reduceUserInput(prev, parsed.payload as UserInputPayload));
+        return;
+      }
+
+      if (
+        parsed.type === "event" &&
+        parsed.event === "assistant_discarded" &&
+        parsed.payload
+      ) {
+        const payload = parsed.payload as RoutedEventPayload;
+        if (!belongsToCurrentSession(payload, sessionKeyRef.current, runsRef.current)) {
+          return;
+        }
+        setState((prev) =>
+          reduceAssistantDiscarded(prev, parsed.payload as AssistantDiscardedPayload),
+        );
       }
     },
     [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend, resubscribeInFlightRuns],
@@ -533,13 +542,15 @@ export function useChatTransport({
       if (!ws || ws.readyState !== WebSocket.OPEN) return null;
 
       const uncertain = uncertainSendRef.current;
-      const durableRequestId =
+      // One send is one message: the canonical id doubles as the retry
+      // identity, so a lost ack reuses it and the server dedupes by id.
+      const messageId =
         uncertain &&
         uncertain.draftId === draftId &&
         uncertain.sessionKey === sessionKey &&
         uncertain.text === text
-          ? uncertain.durableRequestId
-          : crypto.randomUUID();
+          ? uncertain.messageId
+          : `web:${crypto.randomUUID()}`;
       uncertainSendRef.current = null;
       const rpcId = crypto.randomUUID();
       const msg = {
@@ -550,11 +561,11 @@ export function useChatTransport({
           sessionKey,
           agentId,
           message: text,
-          requestId: durableRequestId,
+          messageId,
         },
       };
       setState((prev) =>
-        reduceOptimisticUserMessage(prev, { requestId: durableRequestId, text }),
+        reduceOptimisticUserMessage(prev, { messageId, text }),
       );
       // Resolve on the server ack; reject on refusal or timeout so the
       // caller can keep the text instead of losing it.
@@ -565,12 +576,12 @@ export function useChatTransport({
           pendingSendsRef.current.delete(rpcId);
           uncertainSendRef.current = {
             draftId,
-            durableRequestId,
+            messageId,
             sessionKey,
             text,
           };
           setState((prev) =>
-            reduceDiscardOptimisticUserMessage(prev, durableRequestId),
+            reduceDiscardUserMessage(prev, messageId),
           );
           reject(new Error("send acknowledgement timed out"));
         }, SEND_ACK_TIMEOUT_MS);
@@ -578,7 +589,7 @@ export function useChatTransport({
           resolve,
           reject,
           draftId,
-          durableRequestId,
+          messageId,
           sessionKey,
           agentId,
           text,
@@ -591,12 +602,12 @@ export function useChatTransport({
           clearTimeout(timer);
           uncertainSendRef.current = {
             draftId,
-            durableRequestId,
+            messageId,
             sessionKey,
             text,
           };
           setState((prev) =>
-            reduceDiscardOptimisticUserMessage(prev, durableRequestId),
+            reduceDiscardUserMessage(prev, messageId),
           );
           reject(error instanceof Error ? error : new Error("failed to send message"));
         }

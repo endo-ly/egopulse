@@ -607,6 +607,7 @@ fn agent_status(event: &TurnEvent) -> String {
         TurnEvent::FinalResponse { .. } => "Ready".to_string(),
         TurnEvent::Error { .. } => "Turn failed".to_string(),
         TurnEvent::UserInputInjected { .. } => "Queued input".to_string(),
+        TurnEvent::AssistantDiscarded => "Retrying…".to_string(),
     }
 }
 
