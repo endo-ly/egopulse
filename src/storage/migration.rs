@@ -1614,13 +1614,6 @@ mod tests {
         ).unwrap();
     }
 
-    fn run_v5_migration(db: &super::super::Database) {
-        {
-            let conn = db.get_conn().expect("pool");
-            super::run_migrations(&conn).expect("re-run migrations");
-        }
-    }
-
     /// Creates a Database with v4 schema (old messages columns) for testing v5 migration.
     fn create_v4_db(dir: &tempfile::TempDir) -> super::super::Database {
         let db_path = dir.path().join("runtime").join("egopulse.db");
@@ -1679,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v4_to_v5_converts_bot_message() {
+    fn migration_v4_to_v5_preserves_message_identity_and_data() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = create_v4_db(&dir);
 
@@ -1688,156 +1681,77 @@ mod tests {
             seed_v4_messages(&conn);
         }
 
-        run_v5_migration(&db);
+        {
+            let conn = db.get_conn().expect("pool");
+            super::run_migrations(&conn).expect("run migrations");
+        }
 
         let conn = db.get_conn().expect("pool");
-        let (sender_id, sender_kind): (String, String) = conn
-            .query_row(
-                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+        let rows: Vec<(String, String, String, String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT id, sender_id, sender_kind, content, message_kind, recipient_agent_id
+                 FROM messages ORDER BY id",
             )
-            .expect("row");
-        assert_eq!(sender_id, "egopulse");
-        assert_eq!(sender_kind, "assistant");
-    }
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
 
-    #[test]
-    fn migration_v4_to_v5_converts_agent_message() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create_v4_db(&dir);
-
-        {
-            let conn = db.get_conn().expect("pool");
-            seed_v4_messages(&conn);
-        }
-
-        run_v5_migration(&db);
-
-        let conn = db.get_conn().expect("pool");
-        let (sender_id, sender_kind): (String, String) = conn
-            .query_row(
-                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm2'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("row");
-        assert_eq!(sender_id, "lyre");
-        assert_eq!(sender_kind, "assistant");
-    }
-
-    #[test]
-    fn migration_v4_to_v5_converts_user_message() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create_v4_db(&dir);
-
-        {
-            let conn = db.get_conn().expect("pool");
-            seed_v4_messages(&conn);
-        }
-
-        run_v5_migration(&db);
-
-        let conn = db.get_conn().expect("pool");
-        let (sender_id, sender_kind): (String, String) = conn
-            .query_row(
-                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm3'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("row");
-        assert_eq!(sender_id, "alice");
-        assert_eq!(sender_kind, "user");
-    }
-
-    #[test]
-    fn migration_v4_to_v5_converts_system_event() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create_v4_db(&dir);
-
-        {
-            let conn = db.get_conn().expect("pool");
-            seed_v4_messages(&conn);
-        }
-
-        run_v5_migration(&db);
-
-        let conn = db.get_conn().expect("pool");
-        let (sender_id, sender_kind): (String, String) = conn
-            .query_row(
-                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm4'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("row");
-        assert_eq!(sender_id, "system");
-        assert_eq!(sender_kind, "system");
-    }
-
-    #[test]
-    fn migration_v4_to_v5_preserves_recipient_agent_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create_v4_db(&dir);
-
-        {
-            let conn = db.get_conn().expect("pool");
-            seed_v4_messages(&conn);
-        }
-
-        run_v5_migration(&db);
-
-        let conn = db.get_conn().expect("pool");
-        let recipient: Option<String> = conn
-            .query_row(
-                "SELECT recipient_agent_id FROM messages WHERE id = 'm5'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("row");
-        assert_eq!(recipient.as_deref(), Some("bob"));
-    }
-
-    #[test]
-    fn migration_v4_to_v5_preserves_data_count() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create_v4_db(&dir);
-
-        {
-            let conn = db.get_conn().expect("pool");
-            seed_v4_messages(&conn);
-        }
-
-        run_v5_migration(&db);
-
-        let conn = db.get_conn().expect("pool");
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-            .expect("count");
-        assert_eq!(count, 5);
-    }
-
-    #[test]
-    fn migration_v4_to_v5_converts_agent_send_to_tool() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = create_v4_db(&dir);
-
-        {
-            let conn = db.get_conn().expect("pool");
-            seed_v4_messages(&conn);
-        }
-
-        run_v5_migration(&db);
-
-        let conn = db.get_conn().expect("pool");
-        let (sender_id, sender_kind): (String, String) = conn
-            .query_row(
-                "SELECT sender_id, sender_kind FROM messages WHERE id = 'm5'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("row");
-        assert_eq!(sender_id, "lyre");
-        assert_eq!(sender_kind, "tool");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "m1".to_string(),
+                    "egopulse".to_string(),
+                    "assistant".to_string(),
+                    "bot hello".to_string(),
+                    "message".to_string(),
+                    None,
+                ),
+                (
+                    "m2".to_string(),
+                    "lyre".to_string(),
+                    "assistant".to_string(),
+                    "agent reply".to_string(),
+                    "message".to_string(),
+                    None,
+                ),
+                (
+                    "m3".to_string(),
+                    "alice".to_string(),
+                    "user".to_string(),
+                    "user hello".to_string(),
+                    "message".to_string(),
+                    None,
+                ),
+                (
+                    "m4".to_string(),
+                    "system".to_string(),
+                    "system".to_string(),
+                    "{\"reason\":\"TurnCountExceeded\"}".to_string(),
+                    "system_event".to_string(),
+                    None,
+                ),
+                (
+                    "m5".to_string(),
+                    "lyre".to_string(),
+                    "tool".to_string(),
+                    "agent send".to_string(),
+                    "agent_send".to_string(),
+                    Some("bob".to_string()),
+                ),
+            ]
+        );
     }
 
     // --- v7: sleep_run_steps ---------------------------------------------------
@@ -2659,41 +2573,64 @@ mod tests {
     }
 
     #[test]
-    fn migration_v12_backfills_message_seq_in_timestamp_id_order() {
-        // Arrange
+    fn migration_v12_backfills_durable_state_and_preserves_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = super::super::Database::new(&db_path).expect("db");
         let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-seq", None, "private", "default")
+            .resolve_or_create_chat_id("cli", "cli:v12-state", None, "private", "default")
             .expect("chat");
+        let empty_chat = db
+            .resolve_or_create_chat_id("cli", "cli:v12-empty", None, "private", "default")
+            .expect("empty chat");
+        let llm_context = r#"[{"role":"user","content":"hi"}]"#;
+        db.save_session(chat, llm_context).expect("session");
+
         {
             let conn = db.get_conn().expect("conn");
-            // Insert out of id/timestamp order to confirm stable (timestamp, id) sorting.
+            // Insert out of id/timestamp order and include a same-timestamp pair.
+            for (id, content, sender_kind, timestamp) in [
+                ("m-b", "second", "assistant", "2024-01-01T00:00:01Z"),
+                ("m-c", "third", "assistant", "2024-01-01T00:00:00Z"),
+                ("m-a", "first", "user", "2024-01-01T00:00:00Z"),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
+                     VALUES (?1, ?2, 'a', ?3, ?4, ?5, 'message')",
+                    rusqlite::params![id, chat, content, sender_kind, timestamp],
+                )
+                .expect("insert message");
+            }
             conn.execute(
-                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                 VALUES ('m-b', ?1, 'a', 'second', 'assistant', '2024-01-01T00:00:01Z', 'message')",
+                "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+                 VALUES ('tc-done', ?1, 'm-a', 'shell', '{}', '{\"ok\":true}', '2024-01-01T00:00:00Z')",
                 rusqlite::params![chat],
             )
-            .expect("insert b");
+            .expect("insert done tool call");
             conn.execute(
-                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                 VALUES ('m-a', ?1, 'a', 'first', 'user', '2024-01-01T00:00:00Z', 'message')",
+                "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
+                 VALUES ('tc-pending', ?1, 'm-b', 'shell', '{}', NULL, '2024-01-01T00:00:01Z')",
                 rusqlite::params![chat],
             )
-            .expect("insert a");
-            conn.execute(
-                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                 VALUES ('m-c', ?1, 'a', 'third', 'assistant', '2024-01-01T00:00:02Z', 'message')",
-                rusqlite::params![chat],
-            )
-            .expect("insert c");
+            .expect("insert pending tool call");
         }
 
-        // Act
+        let before: Vec<(String, String)> = {
+            let conn = db.get_conn().expect("conn");
+            conn.prepare(
+                "SELECT id, content FROM messages WHERE chat_id = ?1 ORDER BY timestamp, id",
+            )
+            .expect("prepare")
+            .query_map(rusqlite::params![chat], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect")
+        };
+
         rollback_schema(&db, 11, "v12");
 
-        // Assert
         let conn = db.get_conn().expect("conn");
         let rows: Vec<(String, i64)> = conn
             .prepare("SELECT id, seq FROM messages WHERE chat_id = ?1 ORDER BY seq")
@@ -2708,199 +2645,62 @@ mod tests {
             rows,
             vec![
                 ("m-a".to_string(), 1),
-                ("m-b".to_string(), 2),
-                ("m-c".to_string(), 3)
+                ("m-c".to_string(), 2),
+                ("m-b".to_string(), 3),
             ],
             "seq must follow (timestamp, id) order"
         );
-    }
 
-    #[test]
-    fn migration_v12_assigns_deterministic_seq_for_same_timestamp() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-        let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-same-ts", None, "private", "default")
-            .expect("chat");
-        let timestamp = "2024-01-01T00:00:00Z";
-        {
-            let conn = db.get_conn().expect("conn");
-            for (id, content) in [("z-id", "z"), ("a-id", "a"), ("m-id", "m")] {
-                conn.execute(
-                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                     VALUES (?1, ?2, 'a', ?3, 'user', ?4, 'message')",
-                    rusqlite::params![id, chat, content, timestamp],
-                )
-                .expect("insert");
-            }
-        }
-
-        // Act
-        rollback_schema(&db, 11, "v12");
-
-        // Assert: identical timestamps resolve by id ascending.
-        let conn = db.get_conn().expect("conn");
-        let rows: Vec<(String, i64)> = conn
-            .prepare("SELECT id, seq FROM messages WHERE chat_id = ?1 ORDER BY seq")
-            .expect("prepare")
-            .query_map(rusqlite::params![chat], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect");
-        assert_eq!(
-            rows,
-            vec![
-                ("a-id".to_string(), 1),
-                ("m-id".to_string(), 2),
-                ("z-id".to_string(), 3)
-            ],
-        );
-    }
-
-    #[test]
-    fn migration_v12_backfills_chats_revision_and_next_message_seq() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-        let chat_with_msgs = db
-            .resolve_or_create_chat_id("cli", "cli:v12-chats", None, "private", "default")
-            .expect("chat");
-        let empty_chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-empty", None, "private", "default")
-            .expect("empty chat");
-        {
-            let conn = db.get_conn().expect("conn");
-            for i in 0..3 {
-                conn.execute(
-                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                     VALUES (?1, ?2, 'a', ?3, 'user', ?4, 'message')",
-                    rusqlite::params![
-                        format!("m-{i}"),
-                        chat_with_msgs,
-                        format!("c{i}"),
-                        format!("2024-01-01T00:00:0{i}Z")
-                    ],
-                )
-                .expect("insert");
-            }
-        }
-
-        // Act
-        rollback_schema(&db, 11, "v12");
-
-        // Assert
-        let conn = db.get_conn().expect("conn");
         let (revision, next_seq): (i64, i64) = conn
             .query_row(
                 "SELECT revision, next_message_seq FROM chats WHERE chat_id = ?1",
-                rusqlite::params![chat_with_msgs],
+                rusqlite::params![chat],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("row");
-        assert_eq!(revision, 3, "revision = message count");
-        assert_eq!(next_seq, 4, "next_message_seq = max seq + 1");
-
-        let (revision, next_seq): (i64, i64) = conn
+            .expect("chat state");
+        assert_eq!((revision, next_seq), (3, 4));
+        let empty_state: (i64, i64) = conn
             .query_row(
                 "SELECT revision, next_message_seq FROM chats WHERE chat_id = ?1",
                 rusqlite::params![empty_chat],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("row");
-        assert_eq!(revision, 0, "empty chat has 0 changes");
-        assert_eq!(next_seq, 1, "empty chat starts at seq 1");
-    }
+            .expect("empty chat state");
+        assert_eq!(empty_state, (0, 1));
 
-    #[test]
-    fn migration_v12_backfills_sessions_snapshot_through_seq() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-        let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-sess", None, "private", "default")
-            .expect("chat");
-        let llm_context = r#"[{"role":"user","content":"hi"}]"#;
-        db.save_session(chat, llm_context).expect("session");
-        {
-            let conn = db.get_conn().expect("conn");
-            conn.execute(
-                "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                 VALUES ('m-1', ?1, 'a', 'hi', 'user', '2024-01-01T00:00:00Z', 'message')",
-                rusqlite::params![chat],
-            )
-            .expect("insert");
-        }
-
-        // Act
-        rollback_schema(&db, 11, "v12");
-
-        // Assert
-        let conn = db.get_conn().expect("conn");
         let (snapshot_through, json): (i64, String) = conn
             .query_row(
                 "SELECT snapshot_through_seq, messages_json FROM sessions WHERE chat_id = ?1",
                 rusqlite::params![chat],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .expect("row");
-        assert_eq!(snapshot_through, 1, "snapshot covers the legacy message");
-        assert_eq!(json, llm_context, "LLM context must be preserved verbatim");
-    }
+            .expect("session state");
+        assert_eq!(snapshot_through, 3);
+        assert_eq!(json, llm_context);
 
-    #[test]
-    fn migration_v12_backfills_tool_calls_state_from_output_presence() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-        let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-tools", None, "private", "default")
-            .expect("chat");
-        {
-            let conn = db.get_conn().expect("conn");
-            conn.execute(
-                "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
-                 VALUES ('tc-done', ?1, 'm-1', 'shell', '{}', '{\"ok\":true}', '2024-01-01T00:00:00Z')",
-                rusqlite::params![chat],
-            )
-            .expect("insert done");
-            conn.execute(
-                "INSERT INTO tool_calls (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp)
-                 VALUES ('tc-pending', ?1, 'm-2', 'shell', '{}', NULL, '2024-01-01T00:00:01Z')",
-                rusqlite::params![chat],
-            )
-            .expect("insert pending");
-        }
-
-        // Act
-        rollback_schema(&db, 11, "v12");
-
-        // Assert
-        let conn = db.get_conn().expect("conn");
-        let done: String = conn
-            .query_row(
-                "SELECT state FROM tool_calls WHERE id = 'tc-done'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("row");
-        let pending: String = conn
-            .query_row(
-                "SELECT state FROM tool_calls WHERE id = 'tc-pending'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("row");
-        assert_eq!(done, "succeeded", "output present => succeeded");
+        let tool_states: Vec<(String, String)> = conn
+            .prepare("SELECT id, state FROM tool_calls ORDER BY id")
+            .expect("prepare tool state")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query tool state")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect tool state");
         assert_eq!(
-            pending, "uncertain",
-            "no output => uncertain, never auto-retried"
+            tool_states,
+            vec![
+                ("tc-done".to_string(), "succeeded".to_string()),
+                ("tc-pending".to_string(), "uncertain".to_string()),
+            ]
+        );
+
+        let after = db.get_all_messages(chat).expect("messages after");
+        assert_eq!(
+            before,
+            after
+                .iter()
+                .map(|message| (message.id.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            "message history must be unchanged by migration"
         );
     }
 
@@ -2949,58 +2749,6 @@ mod tests {
             )
             .expect("version");
         assert_eq!(version.parse::<i64>().unwrap(), super::SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn migration_v12_preserves_web_history_order_and_content() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("runtime").join("egopulse.db");
-        let db = super::super::Database::new(&db_path).expect("db");
-        let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-preserve", None, "private", "default")
-            .expect("chat");
-        {
-            let conn = db.get_conn().expect("conn");
-            for (id, content, ts) in [
-                ("m-1", "hello", "2024-01-01T00:00:00Z"),
-                ("m-2", "world", "2024-01-01T00:00:01Z"),
-            ] {
-                conn.execute(
-                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind)
-                     VALUES (?1, ?2, 'a', ?3, 'user', ?4, 'message')",
-                    rusqlite::params![id, chat, content, ts],
-                )
-                .expect("insert");
-            }
-        }
-        let before: Vec<(String, String)> = {
-            let conn = db.get_conn().expect("conn");
-            conn.prepare(
-                "SELECT id, content FROM messages WHERE chat_id = ?1 ORDER BY timestamp, id",
-            )
-            .expect("prepare")
-            .query_map(rusqlite::params![chat], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .expect("query")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("collect")
-        };
-
-        // Act
-        rollback_schema(&db, 11, "v12");
-
-        // Assert: messages table content/order unchanged (only seq added).
-        let after = db.get_all_messages(chat).expect("messages after");
-        assert_eq!(
-            before,
-            after
-                .iter()
-                .map(|m| (m.id.clone(), m.content.clone()))
-                .collect::<Vec<_>>(),
-            "web history must be unchanged by migration"
-        );
     }
 
     #[test]

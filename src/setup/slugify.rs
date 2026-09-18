@@ -43,34 +43,20 @@ mod tests {
     use super::slugify_agent_id;
 
     #[test]
-    fn slugify_lowercases_ascii_letters() {
-        assert_eq!(slugify_agent_id("Lyre"), "lyre");
-    }
+    fn slugify_covers_normalization_and_fallback_cases() {
+        let cases = [
+            ("Lyre", "lyre"),
+            ("My Agent", "my-agent"),
+            ("Vega 2", "vega-2"),
+            ("  Multi   Space  ", "multi-space"),
+            ("", "default"),
+            ("!!!", "default"),
+            ("   ", "default"),
+            ("日本語Agent", "agent"),
+        ];
 
-    #[test]
-    fn slugify_replaces_whitespace_with_hyphen() {
-        assert_eq!(slugify_agent_id("My Agent"), "my-agent");
-    }
-
-    #[test]
-    fn slugify_preserves_alphanumeric() {
-        assert_eq!(slugify_agent_id("Vega 2"), "vega-2");
-    }
-
-    #[test]
-    fn slugify_compresses_consecutive_separators_and_trims() {
-        assert_eq!(slugify_agent_id("  Multi   Space  "), "multi-space");
-    }
-
-    #[test]
-    fn slugify_falls_back_to_default_for_empty_or_symbols_only() {
-        assert_eq!(slugify_agent_id(""), "default");
-        assert_eq!(slugify_agent_id("!!!"), "default");
-        assert_eq!(slugify_agent_id("   "), "default");
-    }
-
-    #[test]
-    fn slugify_replaces_non_ascii_with_hyphen() {
-        assert_eq!(slugify_agent_id("日本語Agent"), "agent");
+        for (input, expected) in cases {
+            assert_eq!(slugify_agent_id(input), expected, "input: {input:?}");
+        }
     }
 }

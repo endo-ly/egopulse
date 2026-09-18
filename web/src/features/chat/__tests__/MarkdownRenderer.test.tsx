@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { MarkdownRenderer } from "../MarkdownRenderer";
 
 describe("MarkdownRenderer", () => {
@@ -39,5 +39,34 @@ describe("MarkdownRenderer", () => {
 
     expect(writeText).toHaveBeenCalled();
     expect(writeText.mock.calls[0][0]).toContain("hello world");
+  });
+
+  it("code_block_fold_respects_line_threshold", () => {
+    const cases = [
+      {
+        content:
+          "```\n" +
+          Array.from({ length: 25 }, (_, i) => `line ${i}`).join("\n") +
+          "\n```",
+        folds: true,
+      },
+      { content: "```\nline1\nline2\n```", folds: false },
+    ];
+
+    for (const { content, folds } of cases) {
+      const { container } = render(<MarkdownRenderer content={content} />);
+      const foldButton = container.querySelector(".code-block-fold");
+      if (folds) {
+        expect(foldButton).toBeTruthy();
+        expect(foldButton?.textContent).toContain("Show all (25 lines)");
+        fireEvent.click(foldButton!);
+        expect(container.querySelector(".code-block-fold")?.textContent).toBe(
+          "Collapse",
+        );
+      } else {
+        expect(foldButton).toBeFalsy();
+      }
+      cleanup();
+    }
   });
 });

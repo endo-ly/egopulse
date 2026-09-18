@@ -592,29 +592,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn format_schedule_daily() {
-        let schedule = TemporalSchedule::Daily {
-            at: "08:00".to_string(),
-        };
-        assert_eq!(format_schedule(&schedule), "daily 08:00");
-    }
+    fn format_schedule_covers_all_schedule_kinds() {
+        let cases = [
+            (
+                TemporalSchedule::Daily {
+                    at: "08:00".to_string(),
+                },
+                "daily 08:00",
+            ),
+            (
+                TemporalSchedule::Weekly {
+                    day: "sun".to_string(),
+                    at: "21:00".to_string(),
+                },
+                "weekly sun 21:00",
+            ),
+            (
+                TemporalSchedule::Interval {
+                    interval_days: 3,
+                    at: "09:00".to_string(),
+                },
+                "every 3 days 09:00",
+            ),
+        ];
 
-    #[test]
-    fn format_schedule_weekly() {
-        let schedule = TemporalSchedule::Weekly {
-            day: "sun".to_string(),
-            at: "21:00".to_string(),
-        };
-        assert_eq!(format_schedule(&schedule), "weekly sun 21:00");
-    }
-
-    #[test]
-    fn format_schedule_interval() {
-        let schedule = TemporalSchedule::Interval {
-            interval_days: 3,
-            at: "09:00".to_string(),
-        };
-        assert_eq!(format_schedule(&schedule), "every 3 days 09:00");
+        for (schedule, expected) in cases {
+            assert_eq!(format_schedule(&schedule), expected);
+        }
     }
 
     fn valid_pulse_md() -> String {
@@ -1220,174 +1224,44 @@ body
     // --- enabled field tests ---
 
     #[test]
-    fn parse_enabled_defaults_to_true_when_omitted() {
+    fn parse_intention_enabled_defaults_and_overrides() {
         let content = "\
 ---
 version: 1
 intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
----
-
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert_eq!(result.intentions.len(), 1);
-        assert!(result.intentions[0].enabled);
-    }
-
-    #[test]
-    fn parse_explicitly_disabled_intention() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: morning_review
-    enabled: false
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
----
-
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert_eq!(result.intentions.len(), 1);
-        assert!(!result.intentions[0].enabled);
-    }
-
-    #[test]
-    fn parse_mixed_enabled_and_disabled_intentions() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: active_one
+  - id: default_enabled
     schedule:
       kind: daily
       at: \"09:00\"
     attention: active
-  - id: paused_one
+  - id: explicitly_disabled
     enabled: false
     schedule:
       kind: weekly
       day: sun
       at: \"21:00\"
     attention: paused
----
-
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert_eq!(result.intentions.len(), 2);
-        assert!(result.intentions[0].enabled);
-        assert!(!result.intentions[1].enabled);
-        assert_eq!(result.intentions[0].id, "active_one");
-        assert_eq!(result.intentions[1].id, "paused_one");
-    }
-
-    #[test]
-    fn parse_explicitly_enabled_intention() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: morning_review
+  - id: explicitly_enabled
     enabled: true
     schedule:
       kind: daily
-      at: \"09:00\"
-    attention: test
+      at: \"10:00\"
+    attention: active
 ---
 
 body
 ";
         let result = parse_pulse_definition(content).expect("should parse");
-        assert_eq!(result.intentions.len(), 1);
+        assert_eq!(result.intentions.len(), 3);
+        assert_eq!(result.intentions[0].id, "default_enabled");
+        assert_eq!(result.intentions[1].id, "explicitly_disabled");
+        assert_eq!(result.intentions[2].id, "explicitly_enabled");
         assert!(result.intentions[0].enabled);
+        assert!(!result.intentions[1].enabled);
+        assert!(result.intentions[2].enabled);
     }
 
     // --- delivery tests ---
-
-    #[test]
-    fn parse_intention_delivery() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
-    delivery:
-      channel: discord
-      external_chat_id: \"123456789\"
----
-
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert_eq!(result.intentions.len(), 1);
-        let delivery = result.intentions[0].delivery.as_ref().expect("delivery");
-        assert_eq!(delivery.channel, "discord");
-        assert_eq!(delivery.external_chat_id, "123456789");
-    }
-
-    #[test]
-    fn parse_default_delivery() {
-        let content = "\
----
-version: 1
-default_delivery:
-  channel: telegram
-  external_chat_id: \"987654321\"
-intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
----
-
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        let dd = result.default_delivery.as_ref().expect("default_delivery");
-        assert_eq!(dd.channel, "telegram");
-        assert_eq!(dd.external_chat_id, "987654321");
-        assert!(result.intentions[0].delivery.is_none());
-    }
-
-    #[test]
-    fn parse_delivery_optional_on_intention() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
----
-
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert!(result.intentions[0].delivery.is_none());
-    }
-
-    #[test]
-    fn parse_default_delivery_optional() {
-        let content = valid_pulse_md();
-        let result = parse_pulse_definition(&content).expect("should parse");
-        assert!(result.default_delivery.is_none());
-    }
 
     #[test]
     fn parse_rejects_invalid_channel() {
@@ -1440,7 +1314,7 @@ body
     }
 
     #[test]
-    fn parse_both_delivery_sources() {
+    fn parse_delivery_sources_and_optional_values() {
         let content = "\
 ---
 version: 1
@@ -1475,6 +1349,10 @@ body
         assert_eq!(d.external_chat_id, "222");
 
         assert!(result.intentions[1].delivery.is_none());
+
+        let without_delivery = parse_pulse_definition(&valid_pulse_md()).expect("parse");
+        assert!(without_delivery.default_delivery.is_none());
+        assert!(without_delivery.intentions[0].delivery.is_none());
     }
 
     #[test]

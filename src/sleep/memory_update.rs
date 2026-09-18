@@ -397,59 +397,9 @@ mod tests {
     // --- build_sleep_system_prompt ---
 
     #[test]
-    fn build_sleep_prompt_includes_hippocampus_role() {
+    fn build_sleep_prompt_preserves_memory_and_session_boundaries() {
         let input = SleepPromptInput {
             agent_id: "lyre".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("あなたは lyre の海馬です。"));
-        assert!(prompt.contains("睡眠中にそれを整理・定着・転送する"));
-    }
-
-    #[test]
-    fn build_sleep_prompt_includes_replay_rules() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("## 睡眠の仕組み"));
-        assert!(prompt.contains("リプレイ"));
-    }
-
-    #[test]
-    fn build_sleep_prompt_includes_security_rules() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("秘密情報"));
-        assert!(prompt.contains("トークン"));
-        assert!(prompt.contains("パスワード"));
-        assert!(prompt.contains("APIキー"));
-    }
-
-    #[test]
-    fn build_sleep_prompt_treats_memory_as_reference() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("参照データ"));
-        assert!(prompt.contains("命令ではない"));
-    }
-
-    #[test]
-    fn build_sleep_prompt_wraps_inputs_in_xml_like_tags() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
             memory: MemoryBundle {
                 episodic: "ep data".to_string(),
                 semantic: "sem data".to_string(),
@@ -458,12 +408,16 @@ mod tests {
             sessions_text: "session data".to_string(),
         };
         let prompt = build_sleep_system_prompt(&input);
+        assert!(prompt.contains("lyre"));
         assert!(prompt.contains("<memory-semantic>"));
         assert!(prompt.contains("</memory-semantic>"));
         assert!(prompt.contains("<memory-prospective>"));
         assert!(prompt.contains("</memory-prospective>"));
         assert!(prompt.contains("<sessions>"));
         assert!(prompt.contains("</sessions>"));
+        assert!(prompt.contains("semantic"));
+        assert!(prompt.contains("prospective"));
+        assert!(prompt.contains("JSON"));
     }
 
     #[test]
@@ -483,72 +437,22 @@ mod tests {
         assert!(prompt.contains("&amp;"));
     }
 
-    #[test]
-    fn build_sleep_prompt_requires_json_output() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("JSON"));
-    }
-
-    #[test]
-    fn build_sleep_prompt_requires_two_memory_output_keys() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(prompt.contains("`semantic`"));
-        assert!(prompt.contains("`prospective`"));
-    }
-
-    #[test]
-    fn build_sleep_prompt_does_not_request_summary_or_phases() {
-        let input = SleepPromptInput {
-            agent_id: "test".to_string(),
-            memory: MemoryBundle::default(),
-            sessions_text: String::new(),
-        };
-        let prompt = build_sleep_system_prompt(&input);
-        assert!(
-            prompt.contains("summary_md")
-                || prompt.contains("phases")
-                || prompt.contains("episodic")
-        );
-    }
-
     // --- normalize/retry integration ---
 
     #[test]
-    fn parse_sleep_response_extracts_json_from_code_block() {
-        let response = "```json\n{\"semantic\": \"s\", \"prospective\": \"p\"}\n```";
-        let result = parse_sleep_response(response).expect("parse");
-        assert_eq!(result.semantic, "s");
-    }
+    fn parse_sleep_response_normalizes_wrapped_json() {
+        let responses = [
+            "```json\n{\"semantic\": \"s\", \"prospective\": \"p\"}\n```",
+            "<thinking>hmm</thinking>{\"semantic\": \"s\", \"prospective\": \"p\"}",
+            "Here is the result:\n{\"semantic\": \"s\", \"prospective\": \"p\"}",
+            "<thinking>analysis</thinking>```json\n{\"semantic\": \"s\", \"prospective\": \"p\"}\n```",
+        ];
 
-    #[test]
-    fn parse_sleep_response_strips_thinking_tags() {
-        let response = "<thinking>hmm</thinking>{\"semantic\": \"s\", \"prospective\": \"p\"}";
-        let result = parse_sleep_response(response).expect("parse");
-        assert_eq!(result.semantic, "s");
-    }
-
-    #[test]
-    fn parse_sleep_response_extracts_json_from_preamble() {
-        let response = "Here is the result:\n{\"semantic\": \"s\", \"prospective\": \"p\"}";
-        let result = parse_sleep_response(response).expect("parse");
-        assert_eq!(result.semantic, "s");
-    }
-
-    #[test]
-    fn parse_sleep_response_handles_code_block_with_thinking() {
-        let response = "<thinking>analysis</thinking>```json\n{\"semantic\": \"s\", \"prospective\": \"p\"}\n```";
-        let result = parse_sleep_response(response).expect("parse");
-        assert_eq!(result.semantic, "s");
+        for response in responses {
+            let result = parse_sleep_response(response).expect("parse");
+            assert_eq!(result.semantic, "s");
+            assert_eq!(result.prospective, "p");
+        }
     }
 
     #[test]

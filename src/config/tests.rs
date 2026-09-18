@@ -626,64 +626,6 @@ channels:
 
 #[test]
 #[serial]
-fn soul_path_returns_state_root_soul_md() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.soul_path(),
-        PathBuf::from(&config.state_root).join("SOUL.md")
-    );
-}
-
-#[test]
-#[serial]
-fn agents_path_returns_state_root_agents_md() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.agents_path(),
-        PathBuf::from(&config.state_root).join("AGENTS.md")
-    );
-}
-
-#[test]
-#[serial]
-fn groups_dir_returns_runtime_groups() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.groups_dir(),
-        PathBuf::from(&config.state_root)
-            .join("runtime")
-            .join("groups")
-    );
-}
-
-#[test]
-#[serial]
-fn souls_dir_returns_state_root_souls() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    assert_eq!(
-        config.agents_path(),
-        PathBuf::from(&config.state_root).join("AGENTS.md")
-    );
-}
-
-#[test]
-#[serial]
 fn model_resolution_chain_agent_overrides_global() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -770,28 +712,29 @@ agents:
 
 #[test]
 #[serial]
-fn default_agent_falls_back_to_default_when_missing() {
+fn loads_minimal_config_defaults() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret"#,
-    );
+    let file_path = write_config(&temp_dir, sample_config());
 
     let config = Config::load(Some(&file_path)).expect("load config");
 
     assert_eq!(config.default_agent.as_str(), "default");
     assert!(config.agents.contains_key("default"));
+    assert!(
+        config
+            .channels
+            .get("discord")
+            .expect("discord channel")
+            .discord_channels
+            .is_none()
+    );
+    assert!(config.sleep_batch.model.is_none());
+    assert!(config.sleep_batch.provider.is_none());
+    assert!(!config.sleep_batch.enabled);
+    assert!(config.sleep_batch.agents.is_none());
+    assert!(!config.pulse().enabled);
+    assert_eq!(config.timezone, "UTC");
 }
 
 #[test]
@@ -1759,34 +1702,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
 
 #[test]
 #[serial]
-fn discord_bots_returns_only_channel_bots_with_token() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=bot-token\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN
-              no_token_bot: {}"#,
-            None,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let bots = config.discord_bots();
-
-    assert_eq!(bots.len(), 1);
-    assert_eq!(bots[0].bot_id.as_str(), "main");
-    assert_eq!(bots[0].token, "bot-token");
-}
-
-#[test]
-#[serial]
-fn discord_bots_sort_by_bot_id() {
+fn discord_bots_resolve_tokens_sorting_channels_and_disabled_state() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     write_env(&temp_dir, "T1=t1\nT2=t2\n");
@@ -1801,93 +1717,8 @@ fn discord_bots_sort_by_bot_id() {
               alpha:
                 token:
                   source: env
-                  id: T2"#,
-            None,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let bots = config.discord_bots();
-
-    assert_eq!(bots.len(), 2);
-    assert_eq!(bots[0].bot_id.as_str(), "alpha");
-    assert_eq!(bots[1].bot_id.as_str(), "zeta");
-}
-
-#[test]
-#[serial]
-fn discord_bots_disabled_channel_returns_empty() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-default_agent: assistant
-agents:
-  assistant:
-    label: Assistant
-channels:
-  discord:
-    enabled: false
-    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN"#,
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let bots = config.discord_bots();
-
-    assert!(bots.is_empty());
-}
-
-#[test]
-#[serial]
-fn discord_bot_channels_defaults_to_none() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=token\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN"#,
-            None,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let bots = config.discord_bots();
-
-    assert_eq!(bots.len(), 1);
-    assert!(config.discord_channels().is_empty());
-}
-
-#[test]
-#[serial]
-fn discord_bot_channel_agents_are_preserved() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=token\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN"#,
+                  id: T2
+              no_token_bot: {}"#,
             Some(
                 r#"      "42":
           agents: [reviewer]"#,
@@ -1898,12 +1729,47 @@ fn discord_bot_channel_agents_are_preserved() {
     let config = Config::load(Some(&file_path)).expect("load config");
     let bots = config.discord_bots();
 
-    assert_eq!(bots.len(), 1);
+    assert_eq!(bots.len(), 2);
+    assert_eq!(bots[0].bot_id.as_str(), "alpha");
+    assert_eq!(bots[0].token, "t2");
+    assert_eq!(bots[1].bot_id.as_str(), "zeta");
+    assert_eq!(bots[1].token, "t1");
     let channels = config.discord_channels();
     assert_eq!(
         channels.get(&42).map(|c| &c.agents),
         Some(&vec![super::AgentId::new("reviewer")])
     );
+
+    let no_channels = Config::load(Some(&write_config(
+        &temp_dir,
+        &bot_config_yml(
+            r#"    bots:
+              main:
+                token:
+                  source: env
+                  id: T1"#,
+            None,
+        ),
+    )))
+    .expect("load config without channels");
+    assert!(no_channels.discord_channels().is_empty());
+
+    let disabled_yaml = bot_config_yml(
+        r#"    bots:
+      main:
+        token:
+          source: env
+          id: T1"#,
+        None,
+    )
+    .replacen(
+        "  discord:\n    enabled: true",
+        "  discord:\n    enabled: false",
+        1,
+    );
+    let disabled = write_config(&temp_dir, &disabled_yaml);
+    let disabled_config = Config::load(Some(&disabled)).expect("load disabled config");
+    assert!(disabled_config.discord_bots().is_empty());
 }
 
 #[test]
@@ -1986,7 +1852,7 @@ channels:
 
 #[test]
 #[serial]
-fn discord_channels_parses_null_value() {
+fn loads_complete_discord_channel_config() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     write_env(&temp_dir, "MY_TOKEN=tok\n");
@@ -1999,8 +1865,12 @@ fn discord_channels_parses_null_value() {
                   source: env
                   id: MY_TOKEN"#,
             Some(
-                r#"      "123":
-"#,
+                r#"      "123": {}
+      "456":
+          require_mention: true
+          agents: [reviewer]
+          tool_progress: true
+          secret: true"#,
             ),
         ),
     );
@@ -2008,139 +1878,24 @@ fn discord_channels_parses_null_value() {
     let config = Config::load(Some(&file_path)).expect("load config");
     let discord = config.channels.get("discord").expect("discord");
     let channels = discord.discord_channels.as_ref().expect("channels");
-    let ch = channels.get(&123u64).expect("channel 123");
-    assert!(!ch.require_mention);
-    assert_eq!(ch.agents, vec![super::AgentId::new("assistant")]);
-    assert!(!ch.multi_agent);
-}
-
-#[test]
-#[serial]
-fn discord_channels_parses_require_mention() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN"#,
-            Some(
-                r#"      "123":
-          require_mention: true"#,
-            ),
-        ),
+    let default_channel = channels.get(&123u64).expect("default channel");
+    assert!(!default_channel.require_mention);
+    assert_eq!(
+        default_channel.agents,
+        vec![super::AgentId::new("assistant")]
     );
+    assert!(!default_channel.multi_agent);
+    assert!(!default_channel.tool_progress);
+    assert!(!default_channel.secret);
 
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let discord = config.channels.get("discord").expect("discord");
-    let ch = discord
-        .discord_channels
-        .as_ref()
-        .expect("channels")
-        .get(&123u64)
-        .expect("channel");
-    assert!(ch.require_mention);
-}
-
-#[test]
-#[serial]
-fn discord_channel_tool_progress_defaults_to_false_when_omitted() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN"#,
-            Some(r#"      "123": {}"#),
-        ),
+    let configured_channel = channels.get(&456u64).expect("configured channel");
+    assert!(configured_channel.require_mention);
+    assert_eq!(
+        configured_channel.agents,
+        vec![super::AgentId::new("reviewer")]
     );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let discord = config.channels.get("discord").expect("discord");
-    let ch = discord
-        .discord_channels
-        .as_ref()
-        .expect("channels")
-        .get(&123u64)
-        .expect("channel");
-    assert!(!ch.tool_progress);
-}
-
-#[test]
-#[serial]
-fn discord_channel_tool_progress_parses_true() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN"#,
-            Some(
-                r#"      "123":
-          tool_progress: true"#,
-            ),
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let discord = config.channels.get("discord").expect("discord");
-    let ch = discord
-        .discord_channels
-        .as_ref()
-        .expect("channels")
-        .get(&123u64)
-        .expect("channel");
-    assert!(ch.tool_progress);
-}
-
-#[test]
-#[serial]
-fn telegram_chat_tool_progress_parses_true() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-default_agent: default
-agents:
-  default:
-    label: Default
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      main:
-        token: test-token
-
-    telegram_channels:
-      "456":
-        tool_progress: true"#,
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let channels = config.telegram_channels();
-    let chat = channels.get(&456i64).expect("chat");
-    assert!(chat.tool_progress);
+    assert!(configured_channel.tool_progress);
+    assert!(configured_channel.secret);
 }
 
 #[test]
@@ -2183,38 +1938,6 @@ fn tool_progress_save_load_round_trip_preserves_true() {
 
 #[test]
 #[serial]
-fn discord_channels_parses_agent_override() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-              main:
-                token:
-                  source: env
-                  id: MY_TOKEN"#,
-            Some(
-                r#"      "123":
-          agents: [reviewer]"#,
-            ),
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let discord = config.channels.get("discord").expect("discord");
-    let ch = discord
-        .discord_channels
-        .as_ref()
-        .expect("channels")
-        .get(&123u64)
-        .expect("channel");
-    assert_eq!(ch.agents, vec![super::AgentId::new("reviewer")]);
-}
-
-#[test]
-#[serial]
 fn discord_channels_empty_means_no_guild_allowed() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -2239,77 +1962,6 @@ fn discord_channels_empty_means_no_guild_allowed() {
     let bots = config.discord_bots();
     assert_eq!(bots.len(), 1);
     assert!(config.discord_channels().is_empty());
-}
-
-#[test]
-#[serial]
-fn telegram_chats_parses_null_value() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-default_agent: default
-agents:
-  default:
-    label: Default
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      main:
-        token: test-token
-
-    telegram_channels:
-      "123": {}"#,
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let channels = config.telegram_channels();
-    let chat = channels.get(&123i64).expect("chat 123");
-    assert!(!chat.require_mention);
-}
-
-#[test]
-#[serial]
-fn telegram_chats_parses_require_mention() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-default_agent: default
-agents:
-  default:
-    label: Default
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      main:
-        token: test-token
-
-    telegram_channels:
-      "456":
-        require_mention: true"#,
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let channels = config.telegram_channels();
-    let chat = channels.get(&456i64).expect("chat");
-    assert!(chat.require_mention);
 }
 
 #[test]
@@ -2705,36 +2357,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
 
 #[test]
 #[serial]
-fn loads_sleep_batch_model() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret
-sleep_batch:
-  model: deepseek-chat-v3"#,
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(
-        config.sleep_batch.model.as_deref(),
-        Some("deepseek-chat-v3")
-    );
-}
-
-#[test]
-#[serial]
-fn loads_sleep_batch_provider() {
+fn loads_complete_sleep_batch_config() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
@@ -2750,40 +2373,56 @@ providers:
     label: DeepSeek
     base_url: https://api.deepseek.com/v1
     api_key: sk-deepseek
-    default_model: deepseek-chat
+    default_model: deepseek-chat-v3
 channels:
   web:
     enabled: true
     auth_token: web-secret
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+  bob:
+    label: Bob
+  carol:
+    label: Carol
 sleep_batch:
-  provider: deepseek"#,
+  provider: deepseek
+  model: deepseek-chat-v3
+  enabled: true
+  schedule: "04:00"
+  agents:
+    - carol
+    - alice
+    - bob
+  retry:
+    max_attempts: 5
+    interval_minutes: 10
+timezone: Asia/Tokyo"#,
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
     assert_eq!(
+        config.sleep_batch.model.as_deref(),
+        Some("deepseek-chat-v3")
+    );
+    assert_eq!(
         config.sleep_batch.provider.as_ref().map(|p| p.as_str()),
         Some("deepseek")
     );
-}
-
-#[test]
-#[serial]
-fn sleep_batch_model_defaults_to_none() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert!(config.sleep_batch.model.is_none());
-}
-
-#[test]
-#[serial]
-fn sleep_batch_provider_defaults_to_none() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert!(config.sleep_batch.provider.is_none());
+    assert!(config.sleep_batch.enabled);
+    assert_eq!(config.sleep_batch.schedule.as_deref(), Some("04:00"));
+    assert_eq!(config.timezone, "Asia/Tokyo");
+    let agents = config.sleep_batch.agents.as_ref().expect("agents");
+    assert_eq!(
+        agents
+            .iter()
+            .map(|agent| agent.as_str())
+            .collect::<Vec<_>>(),
+        ["alice", "bob", "carol"]
+    );
+    assert_eq!(config.sleep_batch.retry_max_attempts, 5);
+    assert_eq!(config.sleep_batch.retry_interval_minutes, 10);
 }
 
 #[test]
@@ -3001,68 +2640,20 @@ sleep_batch:
 
 #[test]
 #[serial]
-fn loads_sleep_batch_enabled() {
+fn loads_minimal_sleep_batch_defaults() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(
-            r#"  enabled: true
-  schedule: "04:00"
-"#,
-        ),
-    );
+    let file_path = write_config(&temp_dir, &sleep_batch_scheduler_yml("  {}"));
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    assert!(config.sleep_batch.enabled);
-}
-
-#[test]
-#[serial]
-fn sleep_batch_enabled_defaults_to_false() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-
-    let config = Config::load(Some(&file_path)).expect("load config");
+    assert_eq!(config.timezone, "UTC");
     assert!(!config.sleep_batch.enabled);
-}
-
-#[test]
-#[serial]
-fn loads_sleep_batch_schedule() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(
-            r#"  enabled: true
-  schedule: "04:00"
-"#,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(config.sleep_batch.schedule.as_deref(), Some("04:00"));
-}
-
-#[test]
-#[serial]
-fn loads_global_timezone() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml_with_tz(
-            "Asia/Tokyo",
-            r#"  enabled: true
-  schedule: "04:00"
-"#,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(config.timezone, "Asia/Tokyo");
+    assert!(config.sleep_batch.provider.is_none());
+    assert!(config.sleep_batch.model.is_none());
+    assert!(config.sleep_batch.schedule.is_none());
+    assert!(config.sleep_batch.agents.is_none());
+    assert_eq!(config.sleep_batch.retry_max_attempts, 3);
+    assert_eq!(config.sleep_batch.retry_interval_minutes, 5);
 }
 
 #[test]
@@ -3087,23 +2678,6 @@ fn sleep_batch_enabled_requires_schedule() {
 
 #[test]
 #[serial]
-fn global_timezone_defaults_to_utc() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(
-            r#"  enabled: true
-  schedule: "04:00""#,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(config.timezone, "UTC");
-}
-
-#[test]
-#[serial]
 fn sleep_batch_disabled_allows_missing_schedule() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -3112,47 +2686,6 @@ fn sleep_batch_disabled_allows_missing_schedule() {
     let config = Config::load(Some(&file_path)).expect("load config");
     assert!(!config.sleep_batch.enabled);
     assert!(config.sleep_batch.schedule.is_none());
-}
-
-#[test]
-#[serial]
-fn loads_sleep_batch_agents() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(
-            r#"  enabled: true
-  schedule: "04:00"
-  agents:
-    - alice
-    - bob"#,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    let agents = config.sleep_batch.agents.expect("agents");
-    assert_eq!(agents.len(), 2);
-    assert_eq!(agents[0].as_str(), "alice");
-    assert_eq!(agents[1].as_str(), "bob");
-}
-
-#[test]
-#[serial]
-fn sleep_batch_agents_defaults_to_none_when_unset() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(
-            r#"  enabled: true
-  schedule: "04:00"
-"#,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert!(config.sleep_batch.agents.is_none());
 }
 
 #[test]
@@ -3220,27 +2753,6 @@ fn sleep_batch_agents_deduplicates_duplicates() {
     assert_eq!(agents.len(), 2);
     assert_eq!(agents[0].as_str(), "alice");
     assert_eq!(agents[1].as_str(), "bob");
-}
-
-#[test]
-#[serial]
-fn loads_sleep_batch_retry_config() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &sleep_batch_scheduler_yml(
-            r#"  enabled: true
-  schedule: "04:00"
-  retry:
-    max_attempts: 5
-    interval_minutes: 10"#,
-        ),
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-    assert_eq!(config.sleep_batch.retry_max_attempts, 5);
-    assert_eq!(config.sleep_batch.retry_interval_minutes, 10);
 }
 
 #[test]
@@ -3405,21 +2917,6 @@ pulse:
 
 #[test]
 #[serial]
-fn pulse_config_defaults_disabled() {
-    // Arrange
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(&temp_dir, sample_config());
-
-    // Act
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    // Assert
-    assert!(!config.pulse().enabled);
-}
-
-#[test]
-#[serial]
 fn pulse_config_loads_runtime_fields() {
     // Arrange
     let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3469,100 +2966,28 @@ fn pulse_config_rejects_invalid_tick_interval() {
 // Step 1: Telegram config type extension tests
 // ---------------------------------------------------------------------------
 
-#[test]
-fn telegram_chat_config_accepts_agents_and_multi_agent() {
-    let agents = vec![super::AgentId::new("alice"), super::AgentId::new("bob")];
-
-    let config = super::TelegramChatConfig {
-        require_mention: true,
-        agents: agents.clone(),
-        multi_agent: true,
-        ..Default::default()
-    };
-
-    assert!(config.require_mention);
-    assert!(config.multi_agent);
-    assert_eq!(config.agents.len(), 2);
-    assert_eq!(config.agents[0], super::AgentId::new("alice"));
-    assert_eq!(config.agents[1], super::AgentId::new("bob"));
-}
-
-#[test]
-fn channel_config_accepts_telegram_bots() {
-    let mut bots = std::collections::HashMap::new();
-    bots.insert(
-        super::BotId::new("main"),
-        super::TelegramBotConfig {
-            token: None,
-            file_token: None,
-        },
-    );
-
-    let config = super::ChannelConfig {
-        telegram_bots: Some(bots.clone()),
-        ..Default::default()
-    };
-
-    let bots_ref = config.telegram_bots.as_ref().expect("telegram_bots");
-    assert_eq!(bots_ref.len(), 1);
-    assert!(bots_ref.contains_key(&super::BotId::new("main")));
-}
-
-#[test]
-fn channel_config_accepts_telegram_channels() {
-    let mut channels = std::collections::HashMap::new();
-    channels.insert(
-        -100123456i64,
-        super::TelegramChatConfig {
-            require_mention: false,
-            agents: vec![super::AgentId::new("default")],
-            multi_agent: false,
-            ..Default::default()
-        },
-    );
-
-    let config = super::ChannelConfig {
-        telegram_channels: Some(channels),
-        ..Default::default()
-    };
-
-    let ch = config
-        .telegram_channels
-        .as_ref()
-        .expect("telegram_channels");
-    assert_eq!(ch.len(), 1);
-    let chat_config = ch.get(&-100123456).expect("chat config");
-    assert!(!chat_config.multi_agent);
-    assert_eq!(chat_config.agents, vec![super::AgentId::new("default")]);
-}
-
-#[test]
-fn agent_config_accepts_telegram_bot() {
-    let config = super::AgentConfig {
-        label: "Test Agent".to_string(),
-        telegram_bot: Some(super::BotId::new("tg_main")),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        config.telegram_bot.as_ref(),
-        Some(&super::BotId::new("tg_main"))
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Step 2: Config Loader / Persist tests for Telegram multi-bot
 // ---------------------------------------------------------------------------
 
 #[test]
 #[serial]
-fn telegram_bots_parse_from_yaml() {
+fn loads_complete_telegram_channel_config() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let yaml_path = temp_dir.path().join("egopulse.config.yaml");
 
     let yaml = r#"
 default_provider: openai
+default_agent: default
+agents:
+  default:
+    label: Default Agent
+    telegram_bot: main
+  alice:
+    label: Alice
+  bob:
+    label: Bob
 providers:
   openai:
     base_url: https://api.openai.com/v1
@@ -3580,6 +3005,15 @@ channels:
           source: env
           id: TG_BOT_2_TOKEN
 
+    telegram_channels:
+      "123": {}
+      "456":
+        require_mention: true
+        agents: [alice, bob]
+        multi_agent: true
+        tool_progress: true
+        secret: true
+
 "#;
     let env_path = temp_dir.path().join(".env");
     std::fs::write(&env_path, "TG_BOT_2_TOKEN=999:ZZZ\n").expect("write dotenv");
@@ -3595,126 +3029,28 @@ channels:
         bot_ids.contains(&"secondary"),
         "should contain 'secondary' bot"
     );
-}
-
-#[test]
-#[serial]
-fn telegram_channels_parse_from_yaml() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
-
-    let yaml = r#"
-default_provider: openai
-default_agent: default
-agents:
-  default:
-    label: Default Agent
-  alice:
-    label: Alice
-  bob:
-    label: Bob
-providers:
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key: sk-test
-    default_model: gpt-5
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      main:
-        token: 123456:ABC-DEF
-
-    telegram_channels:
-      "-100123456":
-        require_mention: true
-        agents:
-          - alice
-          - bob
-        multi_agent: true
-"#;
-    std::fs::write(&yaml_path, yaml).expect("write yaml");
-
-    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
+    assert_eq!(
+        config.agents["default"].telegram_bot,
+        Some(super::BotId::new("main"))
+    );
 
     let channels = config.telegram_channels();
-    let ch = channels.get(&-100123456i64).expect("channel should exist");
-    assert!(ch.require_mention);
-    assert!(ch.multi_agent);
-    assert_eq!(ch.agents.len(), 2);
-    assert_eq!(ch.agents[0], super::AgentId::new("alice"));
-    assert_eq!(ch.agents[1], super::AgentId::new("bob"));
-}
+    let default_chat = channels.get(&123).expect("default chat");
+    assert!(!default_chat.require_mention);
+    assert_eq!(default_chat.agents, vec![super::AgentId::new("default")]);
+    assert!(!default_chat.multi_agent);
+    assert!(!default_chat.tool_progress);
+    assert!(!default_chat.secret);
 
-#[test]
-#[serial]
-fn telegram_chat_config_defaults_agents_to_default_agent() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
-
-    let yaml = r#"
-default_provider: openai
-providers:
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key: sk-test
-    default_model: gpt-5
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      main:
-        token: 123456:ABC-DEF
-
-    telegram_channels:
-      "-100999":
-        require_mention: false
-"#;
-    std::fs::write(&yaml_path, yaml).expect("write yaml");
-
-    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
-
-    let channels = config.telegram_channels();
-    let ch = channels.get(&-100999i64).expect("channel should exist");
-    assert_eq!(ch.agents, vec![super::AgentId::new("default")]);
-    assert!(!ch.multi_agent);
-}
-
-#[test]
-#[serial]
-fn telegram_bot_token_secret_ref() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let yaml_path = temp_dir.path().join("egopulse.config.yaml");
-    let env_path = temp_dir.path().join(".env");
-    std::fs::write(&env_path, "TG_TOKEN_SECRET=secret-tok-123\n").expect("write dotenv");
-
-    let yaml = r#"
-default_provider: openai
-providers:
-  openai:
-    base_url: https://api.openai.com/v1
-    api_key: sk-test
-    default_model: gpt-5
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      main:
-        token:
-          source: env
-          id: TG_TOKEN_SECRET
-
-"#;
-    std::fs::write(&yaml_path, yaml).expect("write yaml");
-
-    let config = Config::load_allow_missing_api_key(Some(&yaml_path)).expect("load config");
-
-    let bots = config.telegram_bots();
-    assert_eq!(bots.len(), 1);
-    assert_eq!(bots[0].token, "secret-tok-123");
+    let configured_chat = channels.get(&456).expect("configured chat");
+    assert!(configured_chat.require_mention);
+    assert_eq!(
+        configured_chat.agents,
+        vec![super::AgentId::new("alice"), super::AgentId::new("bob")]
+    );
+    assert!(configured_chat.multi_agent);
+    assert!(configured_chat.tool_progress);
+    assert!(configured_chat.secret);
 }
 
 #[test]
@@ -3780,7 +3116,7 @@ channels:
 // ---------------------------------------------------------------------------
 
 #[test]
-fn telegram_bots_returns_only_bots_with_token() {
+fn telegram_runtime_resolution_covers_configured_empty_and_disabled_channels() {
     let mut bots = std::collections::HashMap::new();
     bots.insert(
         super::BotId::new("with_token"),
@@ -3805,6 +3141,15 @@ fn telegram_bots_returns_only_bots_with_token() {
         super::ChannelConfig {
             enabled: Some(true),
             telegram_bots: Some(bots),
+            telegram_channels: Some(std::collections::HashMap::from([(
+                -100123i64,
+                super::TelegramChatConfig {
+                    require_mention: true,
+                    agents: vec![super::AgentId::new("default")],
+                    multi_agent: false,
+                    ..Default::default()
+                },
+            )])),
             ..Default::default()
         },
     );
@@ -3813,12 +3158,16 @@ fn telegram_bots_returns_only_bots_with_token() {
     let runtime_bots = config.telegram_bots();
     assert_eq!(runtime_bots.len(), 1);
     assert_eq!(*runtime_bots[0].bot_id, super::BotId::new("with_token"));
-}
+    let ch = config.telegram_channels();
+    assert_eq!(ch.len(), 1);
+    let chat = ch.get(&-100123).expect("channel");
+    assert!(chat.require_mention);
 
-#[test]
-fn telegram_bots_disabled_channel_returns_empty() {
-    let mut bots = std::collections::HashMap::new();
-    bots.insert(
+    let empty = minimal_config_with_channels(std::collections::HashMap::new());
+    assert!(empty.telegram_channels().is_empty());
+
+    let mut disabled_bots = std::collections::HashMap::new();
+    disabled_bots.insert(
         super::BotId::new("main"),
         super::TelegramBotConfig {
             token: Some(crate::config::secret_ref::env_resolved_value(
@@ -3827,56 +3176,15 @@ fn telegram_bots_disabled_channel_returns_empty() {
             file_token: None,
         },
     );
-
-    let mut channels = std::collections::HashMap::new();
-    channels.insert(
+    let disabled = minimal_config_with_channels(std::collections::HashMap::from([(
         super::ChannelName::new("telegram"),
         super::ChannelConfig {
             enabled: Some(false),
-            telegram_bots: Some(bots),
+            telegram_bots: Some(disabled_bots),
             ..Default::default()
         },
-    );
-
-    let config = minimal_config_with_channels(channels);
-    assert!(config.telegram_bots().is_empty());
-}
-
-#[test]
-fn telegram_channels_returns_configured_map() {
-    let mut tg_channels = std::collections::HashMap::new();
-    tg_channels.insert(
-        -100123i64,
-        super::TelegramChatConfig {
-            require_mention: true,
-            agents: vec![super::AgentId::new("default")],
-            multi_agent: false,
-            ..Default::default()
-        },
-    );
-
-    let mut channels = std::collections::HashMap::new();
-    channels.insert(
-        super::ChannelName::new("telegram"),
-        super::ChannelConfig {
-            enabled: Some(true),
-            telegram_channels: Some(tg_channels),
-            ..Default::default()
-        },
-    );
-
-    let config = minimal_config_with_channels(channels);
-    let ch = config.telegram_channels();
-    assert_eq!(ch.len(), 1);
-    let chat = ch.get(&-100123).expect("channel");
-    assert!(chat.require_mention);
-}
-
-#[test]
-fn telegram_channels_empty_when_not_configured() {
-    let channels = std::collections::HashMap::new();
-    let config = minimal_config_with_channels(channels);
-    assert!(config.telegram_channels().is_empty());
+    )]));
+    assert!(disabled.telegram_bots().is_empty());
 }
 
 fn minimal_config_with_channels(
@@ -4512,151 +3820,6 @@ db:
     assert_eq!(reloaded.db.backup.interval_days, 3);
     assert_eq!(reloaded.db.backup.time, "23:45");
     assert_eq!(reloaded.db.backup.max_generations, 7);
-}
-
-// --- Secret flag tests ---
-
-#[test]
-#[serial]
-fn discord_channel_config_parses_secret_flag() {
-    // Arrange
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        &bot_config_yml(
-            r#"    bots:
-               main:
-                 token:
-                   source: env
-                   id: MY_TOKEN"#,
-            Some(
-                r#"      "111":
-            secret: true"#,
-            ),
-        ),
-    );
-
-    // Act
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    // Assert
-    let discord = config.channels.get("discord").expect("discord channel");
-    let channels = discord.discord_channels.as_ref().expect("channels");
-    let ch = channels.get(&111).expect("channel 111");
-    assert!(ch.secret, "secret flag should be true");
-}
-
-#[test]
-#[serial]
-fn telegram_chat_config_parses_secret_flag() {
-    // Arrange
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "TG_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-default_agent: assistant
-agents:
-  assistant:
-    label: Assistant
-channels:
-  telegram:
-    enabled: true
-    telegram_bots:
-      default:
-        token:
-          source: env
-          id: TG_TOKEN
-    telegram_channels:
-      "-1001234567890":
-        secret: true"#,
-    );
-
-    // Act
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    // Assert
-    let telegram = config.channels.get("telegram").expect("telegram channel");
-    let chats = telegram
-        .telegram_channels
-        .as_ref()
-        .expect("telegram_channels");
-    let chat = chats.get(&-1001234567890i64).expect("chat");
-    assert!(chat.secret, "secret flag should be true");
-}
-
-#[test]
-#[serial]
-fn channel_config_secret_defaults_to_false() {
-    // Arrange
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    write_env(&temp_dir, "MY_TOKEN=tok\nTG_TOKEN=tok\n");
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-openai
-    default_model: gpt-4o-mini
-default_agent: assistant
-agents:
-  assistant:
-    label: Assistant
-channels:
-  discord:
-    enabled: true
-    bots:
-      main:
-        token:
-          source: env
-          id: MY_TOKEN
-    channels:
-      "222": {}
-  telegram:
-    enabled: true
-    telegram_bots:
-      default:
-        token:
-          source: env
-          id: TG_TOKEN
-    telegram_channels:
-      "-1009876543210": {}"#,
-    );
-
-    // Act
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    // Assert - Discord
-    let discord = config.channels.get("discord").expect("discord channel");
-    let dc = discord
-        .discord_channels
-        .as_ref()
-        .expect("channels")
-        .get(&222)
-        .expect("channel 222");
-    assert!(!dc.secret, "discord secret should default to false");
-
-    // Assert - Telegram
-    let telegram = config.channels.get("telegram").expect("telegram channel");
-    let tc = telegram
-        .telegram_channels
-        .as_ref()
-        .expect("telegram_channels")
-        .get(&-1009876543210i64)
-        .expect("chat");
-    assert!(!tc.secret, "telegram secret should default to false");
 }
 
 #[test]

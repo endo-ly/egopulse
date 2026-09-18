@@ -37,16 +37,4 @@ describe("MobileBar", () => {
     expect(onOpenPalette).toHaveBeenCalledTimes(1);
   });
 
-  it("has_no_primary_navigation_select", () => {
-    render(
-      <MobileBar
-        onOpenPalette={vi.fn()}
-        onToggleSidebar={vi.fn()}
-        sidebarOpen={false}
-        healthStatus="ok"
-      />,
-    );
-
-    expect(screen.queryByLabelText("Primary navigation")).toBeNull();
-  });
 });

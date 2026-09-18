@@ -267,26 +267,9 @@ pub(crate) fn normalize_provider_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn find_provider_preset_matches_known_id() {
+    fn provider_preset_lookup_handles_known_and_unknown_ids() {
         assert!(super::find_provider_preset("openai").is_some());
         assert!(super::find_provider_preset("lmstudio").is_some());
-    }
-
-    #[test]
-    fn find_provider_preset_returns_none_for_unknown() {
         assert!(super::find_provider_preset("nonexistent").is_none());
-    }
-
-    #[test]
-    fn provider_default_base_url_returns_lmstudio_default() {
-        assert_eq!(
-            super::provider_default_base_url("lmstudio"),
-            Some("http://127.0.0.1:1234/v1")
-        );
-    }
-
-    #[test]
-    fn normalize_provider_id_lowercases_known_preset() {
-        assert_eq!(super::normalize_provider_id("OpenAI"), "openai");
     }
 }

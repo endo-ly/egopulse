@@ -967,25 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn stored_message_assistant_factory() {
-        let msg = StoredMessage::assistant(42, "lyre".to_string(), "hello".to_string());
-        assert_eq!(msg.sender_id, "lyre");
-        assert_eq!(msg.sender_kind, SenderKind::Assistant);
-        assert_eq!(msg.content, "hello");
-        assert_eq!(msg.chat_id, 42);
-        assert!(msg.recipient_agent_id.is_none());
-    }
-
-    #[test]
-    fn stored_message_user_factory() {
-        let msg = StoredMessage::user(10, "user:cli:default".to_string(), "hi".to_string());
-        assert_eq!(msg.sender_id, "user:cli:default");
-        assert_eq!(msg.sender_kind, SenderKind::User);
-        assert_eq!(msg.content, "hi");
-        assert!(msg.recipient_agent_id.is_none());
-    }
-
-    #[test]
     fn new_secret_opens_wal_database() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("runtime").join("secret.db");

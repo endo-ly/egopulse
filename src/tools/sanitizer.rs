@@ -478,176 +478,14 @@ mod tests {
         }
     }
 
-    /// collect_config_secrets: Provider API キーが抽出される。
+    /// collect_config_secrets: 全ての設定由来の秘密値を抽出し、空値と重複値を除外する。
     #[test]
-    fn test_collect_config_secrets_extracts_api_keys() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-        let config = Config {
-            default_provider: ProviderId::new("openai"),
-            default_model: None,
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("openai"),
-                ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(ResolvedValue::Literal("sk-test-key-123".to_string())),
-                    default_model: "gpt-4o".to_string(),
-                    models: std::collections::HashMap::from([(
-                        "gpt-4o".to_string(),
-                        crate::config::ModelConfig::default(),
-                    )]),
-                },
-            )]),
-            state_root: dir.path().to_str().expect("path").to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
-            channels: std::collections::HashMap::new(),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-            timezone: "UTC".to_string(),
-            sleep_batch: crate::config::SleepBatchConfig::default(),
-            pulse: crate::config::PulseConfig::default(),
-            db: crate::config::DatabaseConfig::default(),
-            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
-            webhooks: crate::config::WebhooksConfig::default(),
-        };
-
-        // Act
-        let secrets = collect_config_secrets(&config);
-
-        // Assert
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].0, "provider.openai.api_key");
-        assert_eq!(secrets[0].1, "sk-test-key-123");
-    }
-
-    /// collect_config_secrets: Channel の auth_token / Discord bot token が抽出される。
-    #[test]
-    fn test_collect_config_secrets_extracts_auth_tokens() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let mut bots = std::collections::HashMap::new();
-        bots.insert(
-            crate::config::BotId::new("main"),
-            crate::config::DiscordBotConfig {
-                token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
-                file_token: None,
-            },
-        );
-
-        let config = Config {
-            default_provider: ProviderId::new("local"),
-            default_model: None,
-            providers: std::collections::HashMap::new(),
-            state_root: dir.path().to_str().expect("path").to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
-            channels: std::collections::HashMap::from([(
-                ChannelName::new("discord"),
-                ChannelConfig {
-                    enabled: Some(true),
-                    auth_token: Some(ResolvedValue::Literal("auth-token-value".to_string())),
-                    file_auth_token: None,
-                    discord_bots: Some(bots),
-                    ..Default::default()
-                },
-            )]),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-            timezone: "UTC".to_string(),
-            sleep_batch: crate::config::SleepBatchConfig::default(),
-            pulse: crate::config::PulseConfig::default(),
-            db: crate::config::DatabaseConfig::default(),
-            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
-            webhooks: crate::config::WebhooksConfig::default(),
-        };
-
-        // Act
-        let secrets = collect_config_secrets(&config);
-
-        // Assert
-        let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(keys.contains(&"channel.discord.auth_token"));
-        assert!(keys.contains(&"channels.discord.bots.main.token"));
-        assert_eq!(secrets.len(), 2);
-    }
-
-    /// collect_config_secrets: channels.discord.bots.<bot_id>.token が抽出される。
-    #[test]
-    fn test_collect_config_secrets_extracts_discord_bot_tokens() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let mut bots = std::collections::HashMap::new();
-        bots.insert(
-            crate::config::BotId::new("bot123"),
-            crate::config::DiscordBotConfig {
-                token: Some(ResolvedValue::Literal("bot-token-value".to_string())),
-                file_token: None,
-            },
-        );
-
-        let config = Config {
-            default_provider: ProviderId::new("local"),
-            default_model: None,
-            providers: std::collections::HashMap::new(),
-            state_root: dir.path().to_str().expect("path").to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
-            channels: std::collections::HashMap::from([(
-                ChannelName::new("discord"),
-                ChannelConfig {
-                    enabled: Some(true),
-                    discord_bots: Some(bots),
-                    ..Default::default()
-                },
-            )]),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-            timezone: "UTC".to_string(),
-            sleep_batch: crate::config::SleepBatchConfig::default(),
-            pulse: crate::config::PulseConfig::default(),
-            db: crate::config::DatabaseConfig::default(),
-            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
-            webhooks: crate::config::WebhooksConfig::default(),
-        };
-
-        let secrets = collect_config_secrets(&config);
-
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].0, "channels.discord.bots.bot123.token");
-        assert_eq!(secrets[0].1, "bot-token-value");
-    }
-
-    /// collect_config_secrets: openai-codex プロバイダー存在時に bearer_token が抽出される。
-    #[test]
-    fn test_collect_config_secrets_extracts_codex_bearer_token() {
-        // Arrange
+    fn test_collect_config_secrets_covers_all_config_sources() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _guard = EnvVarGuard::set("HOME", dir.path())
             .also_set("OPENAI_CODEX_ACCESS_TOKEN", "")
             .also_set("CODEX_HOME", "");
         crate::llm::codex_auth::clear_auth_cache();
-
         let codex_dir = dir.path().join(".codex");
         std::fs::create_dir_all(&codex_dir).expect("create .codex dir");
         std::fs::write(
@@ -656,208 +494,68 @@ mod tests {
         )
         .expect("write auth.json");
 
-        let config = Config {
-            default_provider: ProviderId::new("openai-codex"),
-            default_model: None,
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("openai-codex"),
-                ProviderConfig {
-                    label: "Codex".to_string(),
-                    base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                    api_key: None,
-                    default_model: "codex-mini".to_string(),
-                    models: std::collections::HashMap::from([(
-                        "codex-mini".to_string(),
-                        crate::config::ModelConfig::default(),
-                    )]),
-                },
-            )]),
-            state_root: dir.path().to_str().expect("path").to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
-            channels: std::collections::HashMap::new(),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-            timezone: "UTC".to_string(),
-            sleep_batch: crate::config::SleepBatchConfig::default(),
-            pulse: crate::config::PulseConfig::default(),
-            db: crate::config::DatabaseConfig::default(),
-            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
-            webhooks: crate::config::WebhooksConfig::default(),
-        };
-
-        // Act
-        let secrets = collect_config_secrets(&config);
-
-        // Assert
-        let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(
-            keys.contains(&"codex.bearer_token"),
-            "expected codex.bearer_token in {keys:?}"
-        );
-        let bearer = secrets
-            .iter()
-            .find(|(k, _)| k == "codex.bearer_token")
-            .expect("bearer_token entry");
-        assert_eq!(bearer.1, "test-codex-bearer-abc123");
-    }
-
-    /// collect_config_secrets: openai-codex なしの場合は codex 系エントリが含まれない。
-    #[test]
-    fn test_collect_config_secrets_no_codex_without_provider() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let config = Config {
-            default_provider: ProviderId::new("openai"),
-            default_model: None,
-            providers: std::collections::HashMap::from([(
-                ProviderId::new("openai"),
-                ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(ResolvedValue::Literal("sk-test".to_string())),
-                    default_model: "gpt-4o".to_string(),
-                    models: std::collections::HashMap::from([(
-                        "gpt-4o".to_string(),
-                        crate::config::ModelConfig::default(),
-                    )]),
-                },
-            )]),
-            state_root: dir.path().to_str().expect("path").to_string(),
-            log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
-            max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
-            channels: std::collections::HashMap::new(),
-            default_agent: crate::config::AgentId::new("default"),
-            agents: std::collections::HashMap::new(),
-            timezone: "UTC".to_string(),
-            sleep_batch: crate::config::SleepBatchConfig::default(),
-            pulse: crate::config::PulseConfig::default(),
-            db: crate::config::DatabaseConfig::default(),
-            web_fetch: crate::config::web_fetch::WebFetchConfig::default(),
-            webhooks: crate::config::WebhooksConfig::default(),
-        };
-
-        // Act
-        let secrets = collect_config_secrets(&config);
-
-        // Assert
-        let keys: Vec<&str> = secrets.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(
-            !keys.iter().any(|k| k.starts_with("codex.")),
-            "codex entries should not exist: {keys:?}"
-        );
-    }
-
-    /// collect_config_secrets: channels.telegram.telegram_bots.<bot_id>.token が抽出される。
-    #[test]
-    fn test_collect_config_secrets_extracts_telegram_bot_tokens() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let mut bots = std::collections::HashMap::new();
-        bots.insert(
-            crate::config::BotId::new("main"),
-            crate::config::TelegramBotConfig {
-                token: Some(ResolvedValue::Literal("tg-bot-token-value".to_string())),
-                file_token: None,
-            },
-        );
-
         let mut config = base_config(dir.path().to_str().expect("path"));
-        config.channels.insert(
-            ChannelName::new("telegram"),
-            ChannelConfig {
-                telegram_bots: Some(bots),
-                ..Default::default()
+        config.providers.insert(
+            ProviderId::new("openai"),
+            ProviderConfig {
+                label: "OpenAI".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: Some(ResolvedValue::Literal("openai-api-key".to_string())),
+                default_model: "gpt-4o".to_string(),
+                models: std::collections::HashMap::new(),
             },
         );
-
-        let secrets = collect_config_secrets(&config);
-
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].0, "channels.telegram.telegram_bots.main.token");
-        assert_eq!(secrets[0].1, "tg-bot-token-value");
-    }
-
-    /// collect_config_secrets: webhooks.receivers.<receiver_id>.token が抽出される。
-    #[test]
-    fn test_collect_config_secrets_extracts_webhook_receiver_tokens() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let mut config = base_config(dir.path().to_str().expect("path"));
-        config.webhooks.receivers.insert(
-            crate::config::WebhookReceiverId::new("egograph"),
-            crate::config::WebhookReceiverConfig {
-                token: Some(ResolvedValue::Literal("wh-receiver-token".to_string())),
-                file_token: None,
-                target: crate::config::WebhookTargetConfig {
-                    channel: ChannelName::new("web"),
-                    thread: "main".to_string(),
-                    agent: None,
-                },
+        config.providers.insert(
+            ProviderId::new("openai-codex"),
+            ProviderConfig {
+                label: "Codex".to_string(),
+                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                api_key: None,
+                default_model: "codex-mini".to_string(),
+                models: std::collections::HashMap::new(),
             },
         );
-
-        let secrets = collect_config_secrets(&config);
-
-        assert_eq!(secrets.len(), 1);
-        assert_eq!(secrets[0].0, "webhooks.receivers.egograph.token");
-        assert_eq!(secrets[0].1, "wh-receiver-token");
-    }
-
-    /// collect_config_secrets: 空値は除外し、同じ値は 1 件に deduplicate される。
-    #[test]
-    fn test_collect_config_secrets_skips_empty_and_deduplicates_by_value() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let _home = EnvVarGuard::set("HOME", dir.path());
-
-        let mut discord_bots = std::collections::HashMap::new();
-        discord_bots.insert(
-            crate::config::BotId::new("a"),
-            crate::config::DiscordBotConfig {
-                token: Some(ResolvedValue::Literal("dup-tok".to_string())),
-                file_token: None,
-            },
-        );
-        let mut telegram_bots = std::collections::HashMap::new();
-        telegram_bots.insert(
-            crate::config::BotId::new("b"),
-            crate::config::TelegramBotConfig {
-                token: Some(ResolvedValue::Literal("dup-tok".to_string())),
-                file_token: None,
-            },
-        );
-
-        let mut config = base_config(dir.path().to_str().expect("path"));
-        // Empty API key must be skipped.
         config.providers.insert(
             ProviderId::new("empty"),
             ProviderConfig {
                 label: "Empty".to_string(),
                 base_url: "https://example.com".to_string(),
                 api_key: Some(ResolvedValue::Literal(String::new())),
-                default_model: "m".to_string(),
+                default_model: "model".to_string(),
                 models: std::collections::HashMap::new(),
+            },
+        );
+
+        let mut discord_bots = std::collections::HashMap::new();
+        discord_bots.insert(
+            crate::config::BotId::new("alias"),
+            crate::config::DiscordBotConfig {
+                token: Some(ResolvedValue::Literal("discord-bot-token".to_string())),
+                file_token: None,
+            },
+        );
+        discord_bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::DiscordBotConfig {
+                token: Some(ResolvedValue::Literal("discord-bot-token".to_string())),
+                file_token: None,
             },
         );
         config.channels.insert(
             ChannelName::new("discord"),
             ChannelConfig {
+                auth_token: Some(ResolvedValue::Literal("channel-auth".to_string())),
                 discord_bots: Some(discord_bots),
                 ..Default::default()
+            },
+        );
+
+        let mut telegram_bots = std::collections::HashMap::new();
+        telegram_bots.insert(
+            crate::config::BotId::new("main"),
+            crate::config::TelegramBotConfig {
+                token: Some(ResolvedValue::Literal("telegram-bot-token".to_string())),
+                file_token: None,
             },
         );
         config.channels.insert(
@@ -868,9 +566,9 @@ mod tests {
             },
         );
         config.webhooks.receivers.insert(
-            crate::config::WebhookReceiverId::new("r"),
+            crate::config::WebhookReceiverId::new("egograph"),
             crate::config::WebhookReceiverConfig {
-                token: Some(ResolvedValue::Literal("unique-wh".to_string())),
+                token: Some(ResolvedValue::Literal("webhook-token".to_string())),
                 file_token: None,
                 target: crate::config::WebhookTargetConfig {
                     channel: ChannelName::new("web"),
@@ -881,23 +579,45 @@ mod tests {
         );
 
         let secrets = collect_config_secrets(&config);
-
-        // "dup-tok" appears once (deduplicated), "unique-wh" once, empty excluded.
-        assert_eq!(secrets.len(), 2, "secrets = {secrets:?}");
-        assert!(
-            secrets.iter().all(|(_, v)| !v.is_empty()),
-            "empty values must be skipped: {secrets:?}"
-        );
-        let dup_count = secrets.iter().filter(|(_, v)| v == "dup-tok").count();
         assert_eq!(
-            dup_count, 1,
-            "duplicate value must be deduplicated: {secrets:?}"
+            secrets,
+            vec![
+                (
+                    "channel.discord.auth_token".to_string(),
+                    "channel-auth".to_string(),
+                ),
+                (
+                    "channels.discord.bots.alias.token".to_string(),
+                    "discord-bot-token".to_string(),
+                ),
+                (
+                    "channels.telegram.telegram_bots.main.token".to_string(),
+                    "telegram-bot-token".to_string(),
+                ),
+                (
+                    "codex.bearer_token".to_string(),
+                    "test-codex-bearer-abc123".to_string(),
+                ),
+                (
+                    "provider.openai.api_key".to_string(),
+                    "openai-api-key".to_string(),
+                ),
+                (
+                    "webhooks.receivers.egograph.token".to_string(),
+                    "webhook-token".to_string(),
+                ),
+            ]
         );
-        // Sorted by key; the discord bot key sorts before the webhook receiver key.
-        assert_eq!(secrets[0].0, "channels.discord.bots.a.token");
-        assert_eq!(secrets[0].1, "dup-tok");
-        assert_eq!(secrets[1].0, "webhooks.receivers.r.token");
-        assert_eq!(secrets[1].1, "unique-wh");
+
+        let mut without_codex = config.clone();
+        without_codex
+            .providers
+            .remove(&ProviderId::new("openai-codex"));
+        assert!(
+            collect_config_secrets(&without_codex)
+                .iter()
+                .all(|(key, _)| !key.starts_with("codex."))
+        );
     }
 
     /// collect_config_secrets + sanitize: 複数種の秘密値が string / JSON details / LLM content の全経路でマスクされる。

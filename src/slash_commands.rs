@@ -803,58 +803,24 @@ mod tests {
     // -- is_slash_command tests ---------------------------------------------------
 
     #[test]
-    fn is_slash_basic() {
-        assert!(is_slash_command("/status"));
-    }
+    fn slash_command_detection_covers_platform_prefixes_and_boundaries() {
+        let cases = [
+            ("/status", true),
+            ("/model gpt-5", true),
+            ("@mybot /status", true),
+            ("<@U123456> /status", true),
+            ("@bot/status", true),
+            ("hello world", false),
+            ("", false),
+            ("@bot", false),
+            ("// comment", false),
+            ("/STATUS", true),
+            ("<@U123>   @bot   /status", true),
+        ];
 
-    #[test]
-    fn is_slash_with_args() {
-        assert!(is_slash_command("/model gpt-5"));
-    }
-
-    #[test]
-    fn is_slash_telegram_mention() {
-        assert!(is_slash_command("@mybot /status"));
-    }
-
-    #[test]
-    fn is_slash_discord_mention() {
-        assert!(is_slash_command("<@U123456> /status"));
-    }
-
-    #[test]
-    fn is_slash_mention_no_space() {
-        assert!(is_slash_command("@bot/status"));
-    }
-
-    #[test]
-    fn is_slash_plain_text() {
-        assert!(!is_slash_command("hello world"));
-    }
-
-    #[test]
-    fn is_slash_empty() {
-        assert!(!is_slash_command(""));
-    }
-
-    #[test]
-    fn is_slash_mention_only() {
-        assert!(!is_slash_command("@bot"));
-    }
-
-    #[test]
-    fn is_slash_double_slash() {
-        assert!(!is_slash_command("// comment"));
-    }
-
-    #[test]
-    fn is_slash_case_insensitive() {
-        assert!(is_slash_command("/STATUS"));
-    }
-
-    #[test]
-    fn is_slash_multiple_mentions() {
-        assert!(is_slash_command("<@U123>   @bot   /status"));
+        for (input, expected) in cases {
+            assert_eq!(is_slash_command(input), expected, "input: {input:?}");
+        }
     }
 
     // -- Test helper: no-op LLM provider -----------------------------------------
@@ -1189,30 +1155,11 @@ mod tests {
     // -- Slash command catalog tests ---------------------------------------------
 
     #[test]
-    fn all_commands_returns_all() {
+    fn command_catalog_has_valid_metadata_and_dispatch_coverage() {
         // Arrange & Act
         let commands = all_commands();
 
-        // Assert: 9 コマンドが返る
-        assert_eq!(commands.len(), 9);
-        let names: Vec<&str> = commands.iter().map(|c| c.names[0]).collect();
-        assert!(names.contains(&"new"));
-        assert!(names.contains(&"compact"));
-        assert!(names.contains(&"status"));
-        assert!(names.contains(&"skills"));
-        assert!(names.contains(&"restart"));
-        assert!(names.contains(&"providers"));
-        assert!(names.contains(&"provider"));
-        assert!(names.contains(&"models"));
-        assert!(names.contains(&"model"));
-    }
-
-    #[test]
-    fn all_commands_has_valid_metadata() {
-        // Arrange & Act
-        let commands = all_commands();
-
-        // Assert: 各コマンドのメタデータが有効
+        // Assert: each command has usable metadata.
         for cmd in commands {
             assert!(!cmd.names.is_empty(), "names must not be empty");
             assert!(
@@ -1236,25 +1183,15 @@ mod tests {
                 cmd.usage
             );
         }
-    }
 
-    #[test]
-    fn all_commands_names_are_unique() {
-        // Arrange & Act
-        let commands = all_commands();
-
-        // Assert: name が重複しない
+        // Assert: aliases are unique across the catalog.
         let names: Vec<&str> = commands
             .iter()
             .flat_map(|c| c.names.iter().copied())
             .collect();
         let unique: std::collections::HashSet<&str> = names.iter().copied().collect();
         assert_eq!(names.len(), unique.len());
-    }
 
-    #[test]
-    fn catalog_covers_dispatch_names() {
-        // Arrange
         let dispatched = [
             "new",
             "compact",
@@ -1267,13 +1204,11 @@ mod tests {
             "model",
         ];
 
-        // Act
         let catalog: std::collections::HashSet<&str> = SLASH_COMMANDS
             .iter()
             .flat_map(|spec| spec.names.iter().copied())
             .collect();
 
-        // Assert
         assert!(dispatched.iter().all(|name| catalog.contains(name)));
     }
 

@@ -353,54 +353,50 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn format_synthetic_content_daily() {
-        let intention = TemporalIntention {
-            id: "morning_review".to_string(),
-            enabled: true,
-            schedule: crate::pulse::definition::TemporalSchedule::Daily {
-                at: "08:00".to_string(),
-            },
-            attention: "Check today's schedule.\n".to_string(),
-            delivery: None,
-        };
-        let content = format_synthetic_content(&intention);
-        assert_eq!(
-            content,
-            "[Pulse: morning_review]\nSchedule: daily 08:00\nAttention:\nCheck today's schedule."
-        );
-    }
+    fn format_synthetic_content_covers_schedule_and_attention_cases() {
+        let cases = [
+            (
+                TemporalIntention {
+                    id: "morning_review".to_string(),
+                    enabled: true,
+                    schedule: crate::pulse::definition::TemporalSchedule::Daily {
+                        at: "08:00".to_string(),
+                    },
+                    attention: "Check today's schedule.\n".to_string(),
+                    delivery: None,
+                },
+                "[Pulse: morning_review]\nSchedule: daily 08:00\nAttention:\nCheck today's schedule.",
+            ),
+            (
+                TemporalIntention {
+                    id: "weekly_reflection".to_string(),
+                    enabled: true,
+                    schedule: crate::pulse::definition::TemporalSchedule::Weekly {
+                        day: "sun".to_string(),
+                        at: "21:00".to_string(),
+                    },
+                    attention: "Reflect on the week.".to_string(),
+                    delivery: None,
+                },
+                "[Pulse: weekly_reflection]\nSchedule: weekly sun 21:00\nAttention:\nReflect on the week.",
+            ),
+            (
+                TemporalIntention {
+                    id: "test".to_string(),
+                    enabled: true,
+                    schedule: crate::pulse::definition::TemporalSchedule::Daily {
+                        at: "09:00".to_string(),
+                    },
+                    attention: "  hello world  \n\n".to_string(),
+                    delivery: None,
+                },
+                "[Pulse: test]\nSchedule: daily 09:00\nAttention:\nhello world",
+            ),
+        ];
 
-    #[test]
-    fn format_synthetic_content_weekly() {
-        let intention = TemporalIntention {
-            id: "weekly_reflection".to_string(),
-            enabled: true,
-            schedule: crate::pulse::definition::TemporalSchedule::Weekly {
-                day: "sun".to_string(),
-                at: "21:00".to_string(),
-            },
-            attention: "Reflect on the week.".to_string(),
-            delivery: None,
-        };
-        let content = format_synthetic_content(&intention);
-        assert!(content.starts_with("[Pulse: weekly_reflection]"));
-        assert!(content.contains("Schedule: weekly sun 21:00"));
-        assert!(content.contains("Attention:\nReflect on the week."));
-    }
-
-    #[test]
-    fn format_synthetic_content_trims_attention_whitespace() {
-        let intention = TemporalIntention {
-            id: "test".to_string(),
-            enabled: true,
-            schedule: crate::pulse::definition::TemporalSchedule::Daily {
-                at: "09:00".to_string(),
-            },
-            attention: "  hello world  \n\n".to_string(),
-            delivery: None,
-        };
-        let content = format_synthetic_content(&intention);
-        assert!(content.contains("Attention:\nhello world"));
+        for (intention, expected) in cases {
+            assert_eq!(format_synthetic_content(&intention), expected);
+        }
     }
 
     /// A no-op channel adapter for testing that records nothing but succeeds.

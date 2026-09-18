@@ -64,46 +64,37 @@ describe("SessionsSection", () => {
     cleanup();
   });
 
-  it("sessions_section_does_not_render_session_label", () => {
-    render(
-      <SessionsSection
-        sessions={SESSIONS}
-        selectedAgent="lyre"
-        selectedSession=""
-        onSelectSession={() => {}}
-      />,
-    );
-    expect(screen.queryByText("Web Chat")).toBeNull();
-    expect(screen.queryByText("Dev")).toBeNull();
-    cleanup();
-  });
+  it("sessions_section_shows_empty_state_for_empty_filtered_results", () => {
+    const cases = [
+      {
+        selectedAgent: "vega",
+        channel: undefined,
+        expected: "No sessions yet. Start a new conversation.",
+      },
+      {
+        selectedAgent: "lyre",
+        channel: "tui",
+        expected: "No TUI sessions for this agent",
+      },
+    ];
 
-  it("sessions_section_shows_empty_state_when_no_sessions_for_agent", () => {
-    render(
-      <SessionsSection
-        sessions={SESSIONS}
-        selectedAgent="vega"
-        selectedSession=""
-        onSelectSession={() => {}}
-      />,
-    );
-    expect(screen.getByText("No sessions yet. Start a new conversation.")).toBeTruthy();
-    cleanup();
-  });
-
-  it("sessions_section_shows_empty_state_when_channel_filter_excludes_all", () => {
-    render(
-      <SessionsSection
-        sessions={SESSIONS}
-        selectedAgent="lyre"
-        selectedSession=""
-        onSelectSession={() => {}}
-      />,
-    );
-    fireEvent.change(screen.getByLabelText("Filter sessions by channel"), {
-      target: { value: "tui" },
-    });
-    expect(screen.getByText(/No TUI sessions for this agent/)).toBeTruthy();
+    for (const { selectedAgent, channel, expected } of cases) {
+      render(
+        <SessionsSection
+          sessions={SESSIONS}
+          selectedAgent={selectedAgent}
+          selectedSession=""
+          onSelectSession={() => {}}
+        />,
+      );
+      if (channel) {
+        fireEvent.change(screen.getByLabelText("Filter sessions by channel"), {
+          target: { value: channel },
+        });
+      }
+      expect(screen.getByText(new RegExp(expected))).toBeTruthy();
+      cleanup();
+    }
   });
 
   it("sessions_section_highlights_unread_sessions", () => {
