@@ -234,39 +234,16 @@ mod tests {
     }
 
     #[test]
-    fn classify_output_pulse_ok_is_silent() {
-        // Arrange
-        let input = "PULSE_OK";
+    fn classify_output_covers_silent_and_notify_results() {
+        let cases = [
+            ("PULSE_OK", PulseOutputKind::Silent),
+            ("  pulse_ok  ", PulseOutputKind::Silent),
+            ("You have 3 unread messages.", PulseOutputKind::Notify),
+        ];
 
-        // Act
-        let kind = classify_output(input);
-
-        // Assert
-        assert_eq!(kind, PulseOutputKind::Silent);
-    }
-
-    #[test]
-    fn classify_output_pulse_ok_case_insensitive_and_whitespace_trimmed() {
-        // Arrange
-        let input = "  pulse_ok  ";
-
-        // Act
-        let kind = classify_output(input);
-
-        // Assert
-        assert_eq!(kind, PulseOutputKind::Silent);
-    }
-
-    #[test]
-    fn classify_output_non_pulse_ok_is_notify() {
-        // Arrange
-        let input = "You have 3 unread messages.";
-
-        // Act
-        let kind = classify_output(input);
-
-        // Assert
-        assert_eq!(kind, PulseOutputKind::Notify);
+        for (input, expected) in cases {
+            assert_eq!(classify_output(input), expected, "input: {input:?}");
+        }
     }
 
     #[test]

@@ -351,20 +351,17 @@ mod tests {
     use super::{format_api_key_for_review, parse_confirm_answer};
 
     #[test]
-    fn format_api_key_for_review_masks_long_values() {
-        let result = format_api_key_for_review("sk-abcdef123456");
-        assert_eq!(result, "sk-...3456");
-    }
+    fn format_api_key_for_review_covers_masking_cases() {
+        let cases = [
+            ("sk-abcdef123456", "sk-...3456"),
+            ("", "(empty)"),
+            ("abc", "********"),
+            ("sk-1234", "********"),
+        ];
 
-    #[test]
-    fn format_api_key_for_review_shows_empty_for_blank() {
-        assert_eq!(format_api_key_for_review(""), "(empty)");
-    }
-
-    #[test]
-    fn format_api_key_for_review_fully_masks_short_values() {
-        assert_eq!(format_api_key_for_review("abc"), "********");
-        assert_eq!(format_api_key_for_review("sk-1234"), "********");
+        for (input, expected) in cases {
+            assert_eq!(format_api_key_for_review(input), expected);
+        }
     }
 
     #[test]

@@ -209,119 +209,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allows_normal_commands() {
-        assert!(check_command("echo hello").is_ok());
-        assert!(check_command("ls -la").is_ok());
-        assert!(check_command("cat file.txt | grep pattern").is_ok());
-        assert!(check_command("cargo build --release").is_ok());
+    fn command_guard_preserves_allowed_and_blocked_security_cases() {
+        let blocked_commands = [
+            "env",
+            "env | grep API",
+            "env | sort",
+            "echo hello; env",
+            "echo hello && env",
+            "echo hello || env",
+            "echo ok\nenv",
+            "printenv",
+            "printenv API_KEY",
+            "cat file | printenv",
+            "cat /proc/self/environ",
+            "cat /proc/1/environ",
+            "strings /proc/self/environ | grep KEY",
+            "cat /proc/self/mem",
+            "cat /proc/self/maps",
+            "cat /proc/self/fd/3",
+            "cat /proc/self/cmdline",
+            "cat /proc/42/mem",
+            "cat /proc/123/maps",
+            "set",
+            "set  ",
+            "echo hi; set",
+            "echo ok\nset",
+            "bash -c 'env'",
+            "bash -c '/usr/bin/env | sort'",
+            "eval \"printenv\"",
+            "env | grep -E '(MODEL|MODEL_NAME|LLM|OPENAI|API)' | sort",
+        ];
+        for command in blocked_commands {
+            assert!(check_command(command).is_err(), "should block: {command}");
+        }
+
+        let allowed_commands = [
+            "echo hello",
+            "ls -la",
+            "cat file.txt | grep pattern",
+            "cargo build --release",
+            "set -e",
+            "set -o pipefail",
+            "set -euxo pipefail",
+            "set +x",
+            "echo 'environment'",
+            "echo \"the env variable\"",
+            "bash -c 'echo event'",
+            "bash -c 'echo printenvy'",
+            "echo $HOME",
+            "echo $OPENAI_API_KEY",
+            "printf '%s' \"$API_KEY\"",
+        ];
+        for command in allowed_commands {
+            assert!(check_command(command).is_ok(), "should allow: {command}");
+        }
     }
 
     #[test]
-    fn blocks_env_command() {
-        assert!(check_command("env").is_err());
-        assert!(check_command("env | grep API").is_err());
-        assert!(check_command("env | sort").is_err());
-        assert!(check_command("echo hello; env").is_err());
-        assert!(check_command("echo hello && env").is_err());
-        assert!(check_command("echo hello || env").is_err());
-        assert!(check_command("echo ok\nenv").is_err());
-    }
-
-    #[test]
-    fn blocks_printenv() {
-        assert!(check_command("printenv").is_err());
-        assert!(check_command("printenv API_KEY").is_err());
-        assert!(check_command("cat file | printenv").is_err());
-    }
-
-    #[test]
-    fn blocks_proc_self_environ() {
-        assert!(check_command("cat /proc/self/environ").is_err());
-        assert!(check_command("cat /proc/1/environ").is_err());
-        assert!(check_command("strings /proc/self/environ | grep KEY").is_err());
-    }
-
-    #[test]
-    fn blocks_proc_self_mem() {
-        assert!(check_command("cat /proc/self/mem").is_err());
-        assert!(check_command("cat /proc/self/maps").is_err());
-        assert!(check_command("cat /proc/self/fd/3").is_err());
-        assert!(check_command("cat /proc/self/cmdline").is_err());
-    }
-
-    #[test]
-    fn blocks_proc_pid_access() {
-        assert!(check_command("cat /proc/42/mem").is_err());
-        assert!(check_command("cat /proc/123/maps").is_err());
-    }
-
-    #[test]
-    fn blocks_bare_set() {
-        assert!(check_command("set").is_err());
-        assert!(check_command("set  ").is_err());
-        assert!(check_command("echo hi; set").is_err());
-    }
-
-    #[test]
-    fn allows_set_with_options() {
-        assert!(check_command("set -e").is_ok());
-        assert!(check_command("set -o pipefail").is_ok());
-        assert!(check_command("set -euxo pipefail").is_ok());
-        assert!(check_command("set +x").is_ok());
-    }
-
-    #[test]
-    fn allows_env_in_quotes() {
-        assert!(check_command("echo 'environment'").is_ok());
-        assert!(check_command("echo \"the env variable\"").is_ok());
-    }
-
-    #[test]
-    fn blocks_bare_set_after_newline() {
-        assert!(check_command("echo ok\nset").is_err());
-    }
-
-    #[test]
-    fn allows_shell_exec_words_containing_env() {
-        assert!(check_command("bash -c 'echo event'").is_ok());
-        assert!(check_command("bash -c 'echo printenvy'").is_ok());
-    }
-
-    #[test]
-    fn blocks_shell_exec_env_tokens_with_boundaries() {
-        assert!(check_command("bash -c 'env'").is_err());
-        assert!(check_command("bash -c '/usr/bin/env | sort'").is_err());
-        assert!(check_command("eval \"printenv\"").is_err());
-    }
-
-    #[test]
-    fn allows_echo_specific_var() {
-        assert!(check_command("echo $HOME").is_ok());
-        assert!(check_command("echo $OPENAI_API_KEY").is_ok());
-        assert!(check_command("printf '%s' \"$API_KEY\"").is_ok());
-    }
-
-    #[test]
-    fn tokenize_splits_pipes() {
-        let tokens = tokenize("echo hello | grep world");
-        assert_eq!(tokens, vec!["echo", "hello", "grep", "world"]);
-    }
-
-    #[test]
-    fn tokenize_splits_semicolons() {
-        let tokens = tokenize("echo a ; echo b ; echo c");
-        assert_eq!(tokens, vec!["echo", "a", "echo", "b", "echo", "c"]);
-    }
-
-    #[test]
-    fn tokenize_splits_logical_operators() {
-        let tokens = tokenize("echo a && echo b || echo c");
-        assert_eq!(tokens, vec!["echo", "a", "echo", "b", "echo", "c"]);
-    }
-
-    #[test]
-    fn blocks_original_attack_commands() {
-        assert!(check_command("env | grep -E '(MODEL|MODEL_NAME|LLM|OPENAI|API)' | sort").is_err());
-        assert!(check_command("cat /proc/self/environ").is_err());
+    fn tokenizer_splits_shell_operators() {
+        let cases = [
+            (
+                "echo hello | grep world",
+                vec!["echo", "hello", "grep", "world"],
+            ),
+            (
+                "echo a ; echo b ; echo c",
+                vec!["echo", "a", "echo", "b", "echo", "c"],
+            ),
+            (
+                "echo a && echo b || echo c",
+                vec!["echo", "a", "echo", "b", "echo", "c"],
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(tokenize(input), expected);
+        }
     }
 }

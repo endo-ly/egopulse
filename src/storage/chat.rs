@@ -2126,107 +2126,66 @@ mod tests {
     }
 
     #[test]
-    fn store_system_event_sender_is_system() {
+    fn stores_sender_kinds_round_trip_in_one_database() {
         let (db, _dir) = test_db();
 
-        let chat_id = db.resolve_channel_log_chat_id(302).expect("create");
-        db.store_system_event(chat_id, &crate::runtime::turn::StopReason::LlmFailure)
-            .expect("store");
-
-        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs[0].sender_id, "system");
-        assert_eq!(msgs[0].sender_kind, SenderKind::System);
-    }
-
-    #[test]
-    fn store_message_with_sender_kind() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:sender-kind", None, "cli", "default")
-            .expect("create chat");
-        let message = StoredMessage {
-            id: "msg-assitant".to_string(),
-            chat_id,
-            sender_id: "lyre".to_string(),
-            content: "assitant says hi".to_string(),
-            sender_kind: SenderKind::Assistant,
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            message_kind: MessageKind::Message,
-            recipient_agent_id: None,
-            seq: None,
-            turn_id: None,
-            parent_message_id: None,
-        };
-
-        db.store_message_with_session(&message, r#"[]"#, None)
-            .expect("store");
-
-        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].sender_id, "lyre");
-        assert_eq!(msgs[0].sender_kind, SenderKind::Assistant);
-    }
-
-    #[test]
-    fn store_message_user_kind() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
+        let user_chat = db
             .resolve_or_create_chat_id("cli", "cli:user-kind", None, "cli", "default")
-            .expect("create chat");
-        let message =
-            StoredMessage::user(chat_id, "user:discord:123".to_string(), "hello".to_string());
+            .expect("create user chat");
+        let user = StoredMessage::user(
+            user_chat,
+            "user:discord:123".to_string(),
+            "hello".to_string(),
+        );
+        db.store_message_with_session(&user, r#"[]"#, None)
+            .expect("store user");
 
-        db.store_message_with_session(&message, r#"[]"#, None)
-            .expect("store");
+        let system_chat = db
+            .resolve_or_create_chat_id("cli", "cli:system-kind", None, "cli", "default")
+            .expect("create system chat");
+        let system = StoredMessage::system(system_chat, "boot complete".to_string());
+        db.store_message_with_session(&system, r#"[]"#, None)
+            .expect("store system");
 
-        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].sender_kind, SenderKind::User);
-        assert_eq!(msgs[0].sender_id, "user:discord:123");
-    }
-
-    #[test]
-    fn store_message_system_kind() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:sys-kind", None, "cli", "default")
-            .expect("create chat");
-        let message = StoredMessage::system(chat_id, "boot complete".to_string());
-
-        db.store_message_with_session(&message, r#"[]"#, None)
-            .expect("store");
-
-        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].sender_kind, SenderKind::System);
-        assert_eq!(msgs[0].sender_id, "system");
-    }
-
-    #[test]
-    fn store_message_tool_kind() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db
+        let tool_chat = db
             .resolve_or_create_chat_id("cli", "cli:tool-kind", None, "cli", "default")
-            .expect("create chat");
-        let message = StoredMessage::tool(
-            chat_id,
+            .expect("create tool chat");
+        let tool = StoredMessage::tool(
+            tool_chat,
             "tool:web_fetch".to_string(),
             "lyre".to_string(),
             "fetched https://example.com".to_string(),
         );
+        db.store_message_with_session(&tool, r#"[]"#, None)
+            .expect("store tool");
 
-        db.store_message_with_session(&message, r#"[]"#, None)
-            .expect("store");
+        let assistant_chat = db
+            .resolve_channel_log_chat_id(700)
+            .expect("create assistant chat");
+        db.store_channel_log_bot_response(assistant_chat, "lyre", "Hello from agent")
+            .expect("store assistant");
 
-        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].sender_kind, SenderKind::Tool);
-        assert_eq!(msgs[0].sender_id, "tool:web_fetch");
-        assert_eq!(msgs[0].recipient_agent_id.as_deref(), Some("lyre"));
+        let user = &db.get_recent_messages(user_chat, 10).expect("read user")[0];
+        assert_eq!(user.sender_id, "user:discord:123");
+        assert_eq!(user.sender_kind, SenderKind::User);
+
+        let system = &db
+            .get_recent_messages(system_chat, 10)
+            .expect("read system")[0];
+        assert_eq!(system.sender_id, "system");
+        assert_eq!(system.sender_kind, SenderKind::System);
+
+        let tool = &db.get_recent_messages(tool_chat, 10).expect("read tool")[0];
+        assert_eq!(tool.sender_id, "tool:web_fetch");
+        assert_eq!(tool.sender_kind, SenderKind::Tool);
+        assert_eq!(tool.recipient_agent_id.as_deref(), Some("lyre"));
+
+        let assistant = &db
+            .get_recent_messages(assistant_chat, 10)
+            .expect("read assistant")[0];
+        assert_eq!(assistant.sender_id, "lyre");
+        assert_eq!(assistant.sender_kind, SenderKind::Assistant);
+        assert_eq!(assistant.content, "Hello from agent");
     }
 
     #[test]
@@ -2280,20 +2239,6 @@ mod tests {
         assert_eq!(msgs[0].sender_id, "system");
         assert_eq!(msgs[0].sender_kind, SenderKind::System);
         assert_eq!(msgs[0].message_kind, MessageKind::SystemEvent);
-    }
-
-    #[test]
-    fn store_agent_response_sets_assistant_kind() {
-        let (db, _dir) = test_db();
-
-        let chat_id = db.resolve_channel_log_chat_id(700).expect("create");
-        db.store_channel_log_bot_response(chat_id, "lyre", "Hello from agent")
-            .expect("store");
-
-        let msgs = db.get_recent_messages(chat_id, 10).expect("messages");
-        assert_eq!(msgs[0].sender_id, "lyre");
-        assert_eq!(msgs[0].sender_kind, SenderKind::Assistant);
-        assert_eq!(msgs[0].content, "Hello from agent");
     }
 
     #[test]

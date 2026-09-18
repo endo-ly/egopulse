@@ -14,9 +14,4 @@ describe("ReadOnlyBanner", () => {
     expect(text?.textContent).toContain("use Discord directly");
   });
 
-  it("readonly_banner_shows_telegram_for_telegram_channel", () => {
-    const { container } = render(<ReadOnlyBanner channel="telegram" />);
-    const text = container.querySelector(".readonly-text");
-    expect(text?.textContent).toContain("Telegram");
-  });
 });

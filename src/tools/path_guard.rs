@@ -436,106 +436,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blocks_ssh_directory() {
-        assert!(is_blocked(Path::new("/home/user/.ssh/id_rsa")));
-        assert!(is_blocked(Path::new("/home/user/.ssh/config")));
+    fn blocked_path_matrix_covers_sensitive_locations_and_traversal() {
+        let blocked = [
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.ssh/config",
+            "/home/user/.aws/credentials",
+            "/home/user/.gnupg/private-keys-v1.d",
+            "/home/user/.kube/config",
+            "/home/user/.config/gcloud/credentials.db",
+            "/project/.env",
+            "/project/.env.local",
+            "/project/.env.production",
+            "/project/.env.development",
+            "/project/.env.test",
+            "/project/.env.staging",
+            "/project/.envrc",
+            "/project/credentials.json",
+            "/project/token.json",
+            "/project/secrets.yaml",
+            "/project/secrets.json",
+            "/home/user/.codex/auth.json",
+            "/root/.codex/auth.json",
+            "/project/auth.json",
+            "/home/user/id_rsa",
+            "/home/user/id_ed25519",
+            "/proc/self/environ",
+            "/proc/self/mem",
+            "/proc/self/maps",
+            "/proc/self/cmdline",
+            "/proc/self/fd/3",
+            "/proc/1/environ",
+            "/proc/123/mem",
+            "/tmp/../etc/shadow",
+            "/home/user/project/../../.ssh/id_rsa",
+        ];
+
+        for path in blocked {
+            assert!(is_blocked(Path::new(path)), "should block: {path}");
+        }
     }
 
     #[test]
-    fn blocks_aws_directory() {
-        assert!(is_blocked(Path::new("/home/user/.aws/credentials")));
-    }
+    fn allowed_path_matrix_avoids_proc_and_file_false_positives() {
+        let allowed = [
+            "/proc/cpuinfo",
+            "/proc/meminfo",
+            "/proc/",
+            "/home/user/project/main.rs",
+            "/tmp/test.txt",
+            "src/config.rs",
+        ];
 
-    #[test]
-    fn blocks_gnupg_directory() {
-        assert!(is_blocked(Path::new("/home/user/.gnupg/private-keys-v1.d")));
-    }
-
-    #[test]
-    fn blocks_kube_directory() {
-        assert!(is_blocked(Path::new("/home/user/.kube/config")));
-    }
-
-    #[test]
-    fn blocks_gcloud_config() {
-        assert!(is_blocked(Path::new(
-            "/home/user/.config/gcloud/credentials.db"
-        )));
-    }
-
-    #[test]
-    fn blocks_env_files() {
-        assert!(is_blocked(Path::new("/project/.env")));
-        assert!(is_blocked(Path::new("/project/.env.local")));
-        assert!(is_blocked(Path::new("/project/.env.production")));
-        assert!(is_blocked(Path::new("/project/.env.development")));
-        assert!(is_blocked(Path::new("/project/.env.test")));
-        assert!(is_blocked(Path::new("/project/.env.staging")));
-        assert!(is_blocked(Path::new("/project/.envrc")));
-    }
-
-    #[test]
-    fn blocks_credential_files() {
-        assert!(is_blocked(Path::new("/project/credentials.json")));
-        assert!(is_blocked(Path::new("/project/token.json")));
-        assert!(is_blocked(Path::new("/project/secrets.yaml")));
-        assert!(is_blocked(Path::new("/project/secrets.json")));
-    }
-
-    /// auth.json は任意のパスでブロックされる（OAuth トークンを含むため）。
-    #[test]
-    fn blocks_auth_json() {
-        assert!(is_blocked(Path::new("/home/user/.codex/auth.json")));
-        assert!(is_blocked(Path::new("/root/.codex/auth.json")));
-        assert!(is_blocked(Path::new("/project/auth.json")));
-    }
-
-    #[test]
-    fn blocks_ssh_keys() {
-        assert!(is_blocked(Path::new("/home/user/id_rsa")));
-        assert!(is_blocked(Path::new("/home/user/id_ed25519")));
-    }
-
-    #[test]
-    fn blocks_proc_self_environ() {
-        assert!(is_blocked(Path::new("/proc/self/environ")));
-    }
-
-    #[test]
-    fn blocks_proc_self_mem() {
-        assert!(is_blocked(Path::new("/proc/self/mem")));
-        assert!(is_blocked(Path::new("/proc/self/maps")));
-        assert!(is_blocked(Path::new("/proc/self/cmdline")));
-        assert!(is_blocked(Path::new("/proc/self/fd/3")));
-    }
-
-    #[test]
-    fn blocks_proc_pid_paths() {
-        assert!(is_blocked(Path::new("/proc/1/environ")));
-        assert!(is_blocked(Path::new("/proc/123/mem")));
-    }
-
-    #[test]
-    fn allows_proc_non_numeric() {
-        // /proc/cpuinfo 等の数値以外はプロセス情報ではないため許可
-        assert!(!is_blocked(Path::new("/proc/cpuinfo")));
-        assert!(!is_blocked(Path::new("/proc/meminfo")));
-        assert!(!is_blocked(Path::new("/proc/")));
-    }
-
-    #[test]
-    fn allows_normal_files() {
-        assert!(!is_blocked(Path::new("/home/user/project/main.rs")));
-        assert!(!is_blocked(Path::new("/tmp/test.txt")));
-        assert!(!is_blocked(Path::new("src/config.rs")));
-    }
-
-    #[test]
-    fn blocks_traversal_via_parent_dir() {
-        assert!(is_blocked(Path::new("/tmp/../etc/shadow")));
-        assert!(is_blocked(Path::new(
-            "/home/user/project/../../.ssh/id_rsa"
-        )));
+        for path in allowed {
+            assert!(!is_blocked(Path::new(path)), "should allow: {path}");
+        }
     }
 
     #[test]
@@ -560,51 +514,38 @@ mod tests {
     }
 
     #[test]
-    fn check_command_paths_blocks_directory_references() {
-        assert!(check_command_paths("find ~/.ssh -type f -exec cat {} +").is_err());
-        assert!(check_command_paths("tar czf - /home/user/.aws").is_err());
+    fn command_path_guard_preserves_blocked_and_allowed_boundaries() {
+        let cases = [
+            ("find ~/.ssh -type f -exec cat {} +", false),
+            ("tar czf - /home/user/.aws", false),
+            ("tar czf - ~/.config/gcloud", false),
+            ("cat /home/user/.config/gcloud/credentials.db", false),
+            ("cat .env.test", false),
+            ("cat ./config/.env.staging", false),
+            ("cat .envrc", false),
+            ("cat /etc//shadow", false),
+            ("cat /proc//self/environ", false),
+            ("cat /proc/", true),
+            ("cat /etc/shadow.bak", true),
+            ("echo credentials-json", true),
+        ];
+
+        for (command, allowed) in cases {
+            assert_eq!(
+                check_command_paths(command).is_ok(),
+                allowed,
+                "command: {command}"
+            );
+        }
     }
 
     #[test]
-    fn check_command_paths_blocks_subpath_references() {
-        assert!(check_command_paths("tar czf - ~/.config/gcloud").is_err());
-        assert!(check_command_paths("cat /home/user/.config/gcloud/credentials.db").is_err());
-    }
-
-    #[test]
-    fn check_command_paths_blocks_env_family_variants() {
-        assert!(check_command_paths("cat .env.test").is_err());
-        assert!(check_command_paths("cat ./config/.env.staging").is_err());
-        assert!(check_command_paths("cat .envrc").is_err());
-    }
-
-    #[test]
-    fn check_command_paths_normalizes_redundant_separators() {
-        assert!(check_command_paths("cat /etc//shadow").is_err());
-        assert!(check_command_paths("cat /proc//self/environ").is_err());
-        assert!(check_command_paths("cat /proc/").is_ok());
-    }
-
-    #[test]
-    fn check_command_paths_avoids_suffix_false_positive() {
-        assert!(check_command_paths("cat /etc/shadow.bak").is_ok());
-    }
-
-    #[test]
-    fn check_command_paths_avoids_word_false_positive() {
-        assert!(check_command_paths("echo credentials-json").is_ok());
-    }
-
-    #[test]
-    fn ripgrep_exclude_globs_include_sensitive_targets() {
+    fn search_exclude_patterns_include_sensitive_targets() {
         let globs = blocked_ripgrep_exclude_globs();
         assert!(globs.iter().any(|g| g == "!**/.ssh/**"));
         assert!(globs.iter().any(|g| g == "!**/.env*"));
         assert!(globs.iter().any(|g| g == "!**/.config/gcloud/**"));
-    }
 
-    #[test]
-    fn fd_exclude_patterns_include_sensitive_targets() {
         let patterns = blocked_fd_exclude_patterns();
         assert!(patterns.iter().any(|p| p == ".ssh"));
         assert!(patterns.iter().any(|p| p == "**/.env*"));

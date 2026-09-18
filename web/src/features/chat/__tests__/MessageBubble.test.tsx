@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { render } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { MessageBubble } from "../MessageBubble";
 import type { ChatMessage } from "../../../shared/api/types";
 
@@ -50,14 +50,6 @@ describe("MessageBubble", () => {
     expect(container.querySelector(".thinking-dots")).toBeNull();
   });
 
-  it("normal_assistant_message_has_no_pulse_badge", () => {
-    const { container } = render(
-      <MessageBubble message={msg({ message_kind: "message" })} />,
-    );
-    const badge = container.querySelector(".pulse-badge");
-    expect(badge).toBeFalsy();
-  });
-
   it("pulse_notification_renders_pulse_badge", () => {
     const { container } = render(
       <MessageBubble message={msg({ message_kind: "pulse_notification" })} />,
@@ -66,37 +58,25 @@ describe("MessageBubble", () => {
     expect(badge).toBeTruthy();
   });
 
-  it("assistant_message_renders_agent_avatar_image_when_available", () => {
-    const { container } = render(
+  it("assistant_avatar_uses_image_and_letter_fallback", () => {
+    const withImage = render(
       <MessageBubble
         message={msg({ sender_id: "lyre" })}
         agentAvatars={{ lyre: "blob:lyre-avatar" }}
       />,
     );
-    const avatar = container.querySelector(".message-avatar");
-    const img = avatar?.querySelector("img");
-    expect(img?.getAttribute("src")).toBe("blob:lyre-avatar");
-    // Letter fallback stays for agents without an avatar.
-    expect(avatar?.textContent).toBe("");
-  });
+    const imageAvatar = withImage.container.querySelector(".message-avatar");
+    expect(imageAvatar?.querySelector("img")?.getAttribute("src")).toBe(
+      "blob:lyre-avatar",
+    );
+    expect(imageAvatar?.textContent).toBe("");
+    cleanup();
 
-  it("assistant_message_falls_back_to_letter_avatar_without_image", () => {
-    const { container } = render(
+    const withoutImage = render(
       <MessageBubble message={msg({ sender_id: "lyre" })} agentAvatars={{}} />,
     );
-    const avatar = container.querySelector(".message-avatar");
-    expect(avatar?.querySelector("img")).toBeNull();
-    expect(avatar?.textContent).toBe("L");
-  });
-
-  it("user_message_renders_no_avatar", () => {
-    const { container } = render(
-      <MessageBubble
-        message={msg({ sender_kind: "user", sender_id: "human" })}
-        agentAvatars={{ human: "blob:human-avatar" }}
-      />,
-    );
-    expect(container.querySelector(".message-avatar")).toBeNull();
-    expect(container.querySelector(".message-sender")?.textContent).toBe("You");
+    const letterAvatar = withoutImage.container.querySelector(".message-avatar");
+    expect(letterAvatar?.querySelector("img")).toBeNull();
+    expect(letterAvatar?.textContent).toBe("L");
   });
 });

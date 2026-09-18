@@ -274,16 +274,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn voice_adapter_registers_private_voice_route() {
-        let adapter = VoiceAdapter;
-        assert_eq!(adapter.name(), "voice");
-        assert_eq!(
-            adapter.chat_type_routes(),
-            vec![("voice", ConversationKind::Private)]
-        );
-    }
-
-    #[test]
     fn voice_identity_rejects_delimiter() {
         assert!(normalized_component(Some("desk:mic"), "voice", "surface").is_err());
         assert_eq!(

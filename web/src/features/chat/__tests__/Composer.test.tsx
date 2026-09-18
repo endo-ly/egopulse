@@ -107,6 +107,31 @@ describe("Composer", () => {
     expect(onSubmit).not.toHaveBeenCalled();
   });
 
+  it("composer_draft_persists_and_restores_from_localstorage", () => {
+    localStorage.clear();
+
+    const { container, unmount } = render(
+      <Composer onSubmit={vi.fn()} storageKey="main" />,
+    );
+    const textarea = container.querySelector(
+      ".composer-textarea",
+    ) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: "draft text" } });
+    unmount();
+
+    expect(localStorage.getItem("egopulse.draft.main")).toBe("draft text");
+
+    const restored = render(
+      <Composer onSubmit={vi.fn()} storageKey="main" />,
+    );
+    expect(
+      (restored.container.querySelector(".composer-textarea") as HTMLTextAreaElement)
+        .value,
+    ).toBe("draft text");
+    restored.unmount();
+    localStorage.clear();
+  });
+
   it("composer_slash_shows_suggest", () => {
     const onSubmit = vi.fn();
     const { container } = render(<Composer onSubmit={onSubmit} />);

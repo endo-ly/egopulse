@@ -144,7 +144,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_default_values() {
+    fn config_loads_complete_and_minimal_values() {
         let cfg = WebFetchConfig::default();
 
         assert_eq!(cfg.allowed_schemes, vec!["https"]);
@@ -157,10 +157,7 @@ mod tests {
         assert!(cfg.content_validation.enabled);
         assert!(!cfg.content_validation.strict_mode);
         assert_eq!(cfg.content_validation.max_scan_bytes, 64 * 1024);
-    }
 
-    #[test]
-    fn config_deserialize_full_yaml() {
         let yaml = r#"
 allowed_schemes:
   - https
@@ -190,10 +187,7 @@ content_validation:
         assert!(!cfg.content_validation.enabled);
         assert!(cfg.content_validation.strict_mode);
         assert_eq!(cfg.content_validation.max_scan_bytes, 100_000);
-    }
 
-    #[test]
-    fn config_deserialize_missing_optional() {
         let yaml = "";
         let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
 
@@ -205,99 +199,156 @@ content_validation:
     }
 
     #[test]
-    fn config_normalize_empty_schemes() {
-        let yaml = r#"
-allowed_schemes: []
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        assert!(cfg.allowed_schemes.is_empty());
+    fn config_normalize_preserves_security_limits_and_defaults() {
+        struct Expected {
+            allowed_schemes: &'static [&'static str],
+            denylist: &'static [&'static str],
+            allowlist: &'static [&'static str],
+            max_fetch_bytes: usize,
+            max_output_bytes: usize,
+            timeout_secs: u64,
+            max_scan_bytes: usize,
+        }
 
-        let normalized = cfg.normalize();
-
-        assert_eq!(normalized.allowed_schemes, vec!["https"]);
-    }
-
-    #[test]
-    fn config_normalize_hosts() {
-        let yaml = r#"
+        let cases = [
+            (
+                r#"allowed_schemes: []"#,
+                Expected {
+                    allowed_schemes: &["https"],
+                    denylist: &[],
+                    allowlist: &[],
+                    max_fetch_bytes: 512 * 1024,
+                    max_output_bytes: 64 * 1024,
+                    timeout_secs: 15,
+                    max_scan_bytes: 64 * 1024,
+                },
+            ),
+            (
+                r#"
 denylist:
   - "  EVIL.COM.  "
   - "*.WildCARD.Net."
   - "  "
 allowlist:
   - " SAFE.org "
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        let normalized = cfg.normalize();
-
-        assert_eq!(normalized.denylist, vec!["evil.com", "*.wildcard.net"]);
-        assert_eq!(normalized.allowlist, vec!["safe.org"]);
-    }
-
-    #[test]
-    fn config_normalize_zero_max_fetch_bytes() {
-        let yaml = r#"
+"#,
+                Expected {
+                    allowed_schemes: &["https"],
+                    denylist: &["evil.com", "*.wildcard.net"],
+                    allowlist: &["safe.org"],
+                    max_fetch_bytes: 512 * 1024,
+                    max_output_bytes: 64 * 1024,
+                    timeout_secs: 15,
+                    max_scan_bytes: 64 * 1024,
+                },
+            ),
+            (
+                r#"
 max_fetch_bytes: 0
 max_output_bytes: 0
 timeout_secs: 0
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        assert_eq!(cfg.max_fetch_bytes, 0);
-        assert_eq!(cfg.max_output_bytes, 0);
-        assert_eq!(cfg.timeout_secs, 0);
-
-        let normalized = cfg.normalize();
-
-        assert_eq!(normalized.max_fetch_bytes, 512 * 1024);
-        assert_eq!(normalized.max_output_bytes, 64 * 1024);
-        assert_eq!(normalized.timeout_secs, 15);
-    }
-
-    #[test]
-    fn config_normalize_preserves_nonzero_values() {
-        let yaml = r#"
+"#,
+                Expected {
+                    allowed_schemes: &["https"],
+                    denylist: &[],
+                    allowlist: &[],
+                    max_fetch_bytes: 512 * 1024,
+                    max_output_bytes: 64 * 1024,
+                    timeout_secs: 15,
+                    max_scan_bytes: 64 * 1024,
+                },
+            ),
+            (
+                r#"
 max_fetch_bytes: 100000
 max_output_bytes: 50000
 timeout_secs: 30
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        let normalized = cfg.normalize();
-
-        assert_eq!(normalized.max_fetch_bytes, 100_000);
-        assert_eq!(normalized.max_output_bytes, 50_000);
-        assert_eq!(normalized.timeout_secs, 30);
-    }
-
-    #[test]
-    fn config_normalize_raises_max_scan_bytes_to_max_output_bytes() {
-        let yaml = r#"
+"#,
+                Expected {
+                    allowed_schemes: &["https"],
+                    denylist: &[],
+                    allowlist: &[],
+                    max_fetch_bytes: 100_000,
+                    max_output_bytes: 50_000,
+                    timeout_secs: 30,
+                    max_scan_bytes: 64 * 1024,
+                },
+            ),
+            (
+                r#"
 max_output_bytes: 200000
 content_validation:
   max_scan_bytes: 10000
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        assert_eq!(cfg.max_output_bytes, 200_000);
-        assert_eq!(cfg.content_validation.max_scan_bytes, 10_000);
-
-        let normalized = cfg.normalize();
-
-        assert_eq!(normalized.max_output_bytes, 200_000);
-        assert_eq!(
-            normalized.content_validation.max_scan_bytes, 200_000,
-            "max_scan_bytes must be raised to max_output_bytes"
-        );
-    }
-
-    #[test]
-    fn config_normalize_preserves_max_scan_bytes_when_already_sufficient() {
-        let yaml = r#"
+"#,
+                Expected {
+                    allowed_schemes: &["https"],
+                    denylist: &[],
+                    allowlist: &[],
+                    max_fetch_bytes: 512 * 1024,
+                    max_output_bytes: 200_000,
+                    timeout_secs: 15,
+                    max_scan_bytes: 200_000,
+                },
+            ),
+            (
+                r#"
 max_output_bytes: 50000
 content_validation:
   max_scan_bytes: 100000
-"#;
-        let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
-        let normalized = cfg.normalize();
+"#,
+                Expected {
+                    allowed_schemes: &["https"],
+                    denylist: &[],
+                    allowlist: &[],
+                    max_fetch_bytes: 512 * 1024,
+                    max_output_bytes: 50_000,
+                    timeout_secs: 15,
+                    max_scan_bytes: 100_000,
+                },
+            ),
+        ];
 
-        assert_eq!(normalized.content_validation.max_scan_bytes, 100_000);
+        for (yaml, expected) in cases {
+            let cfg: WebFetchConfig = yaml_serde::from_str(yaml).expect("deserialize");
+            let normalized = cfg.normalize();
+            let strings = |values: &[&str]| {
+                values
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect::<Vec<_>>()
+            };
+
+            assert_eq!(
+                normalized.allowed_schemes,
+                strings(expected.allowed_schemes),
+                "yaml: {yaml}"
+            );
+            assert_eq!(
+                normalized.denylist,
+                strings(expected.denylist),
+                "yaml: {yaml}"
+            );
+            assert_eq!(
+                normalized.allowlist,
+                strings(expected.allowlist),
+                "yaml: {yaml}"
+            );
+            assert_eq!(
+                normalized.max_fetch_bytes, expected.max_fetch_bytes,
+                "yaml: {yaml}"
+            );
+            assert_eq!(
+                normalized.max_output_bytes, expected.max_output_bytes,
+                "yaml: {yaml}"
+            );
+            assert_eq!(
+                normalized.timeout_secs, expected.timeout_secs,
+                "yaml: {yaml}"
+            );
+            assert_eq!(
+                normalized.content_validation.max_scan_bytes, expected.max_scan_bytes,
+                "yaml: {yaml}"
+            );
+        }
     }
 }

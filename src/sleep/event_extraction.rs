@@ -395,14 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn build_extract_system_prompt_includes_sessions() {
+    fn extract_prompt_contains_input_and_event_contract() {
         let prompt = build_extract_system_prompt("test-agent", "session data here");
         assert!(prompt.contains("session data here"));
-    }
-
-    #[test]
-    fn build_extract_system_prompt_includes_kinds() {
-        let prompt = build_extract_system_prompt("test-agent", "");
         assert!(
             prompt.contains("decision") || prompt.contains("insight") || prompt.contains("anomaly")
         );
@@ -411,114 +406,14 @@ mod tests {
     // --- messages_to_extract_text ---
 
     #[test]
-    fn messages_to_extract_text_formats_user_message() {
-        let messages = vec![StoredMessage {
-            id: "m1".to_string(),
-            chat_id: 1,
-            sender_id: "alice".to_string(),
-            content: "hello world".to_string(),
-            sender_kind: SenderKind::User,
-            timestamp: "2025-01-01T00:00:00Z".to_string(),
-            message_kind: crate::storage::MessageKind::Message,
-            recipient_agent_id: None,
-            seq: None,
-            turn_id: None,
-            parent_message_id: None,
-        }];
-        let text = messages_to_extract_text(&messages);
-        assert!(text.contains("2025-01-01T00:00:00Z [user]: hello world"));
-    }
-
-    #[test]
-    fn messages_to_extract_text_formats_assistant_message() {
-        let messages = vec![StoredMessage {
-            id: "m2".to_string(),
-            chat_id: 1,
-            sender_id: "lyre".to_string(),
-            content: "hi there".to_string(),
-            sender_kind: SenderKind::Assistant,
-            timestamp: "2025-01-01T00:00:01Z".to_string(),
-            message_kind: crate::storage::MessageKind::Message,
-            recipient_agent_id: None,
-            seq: None,
-            turn_id: None,
-            parent_message_id: None,
-        }];
-        let text = messages_to_extract_text(&messages);
-        assert!(text.contains("[assistant]: hi there"));
-    }
-
-    #[test]
-    fn messages_to_extract_text_truncates_long_tool_content() {
+    fn messages_to_extract_text_formats_and_sanitizes_a_conversation_fixture() {
         let long_content = "A".repeat(300);
-        let messages = vec![StoredMessage {
-            id: "m3".to_string(),
-            chat_id: 1,
-            sender_id: "tool-1".to_string(),
-            content: long_content.clone(),
-            sender_kind: SenderKind::Tool,
-            timestamp: "2025-01-01T00:00:02Z".to_string(),
-            message_kind: crate::storage::MessageKind::Message,
-            recipient_agent_id: Some("lyre".to_string()),
-            seq: None,
-            turn_id: None,
-            parent_message_id: None,
-        }];
-        let text = messages_to_extract_text(&messages);
-        assert!(text.contains("[tool]:"));
-        assert!(text.contains("..."));
-        assert!(text.contains(&"A".repeat(50)));
-    }
-
-    #[test]
-    fn messages_to_extract_text_keeps_short_tool_content() {
-        let messages = vec![StoredMessage {
-            id: "m4".to_string(),
-            chat_id: 1,
-            sender_id: "tool-1".to_string(),
-            content: "short".to_string(),
-            sender_kind: SenderKind::Tool,
-            timestamp: "2025-01-01T00:00:03Z".to_string(),
-            message_kind: crate::storage::MessageKind::Message,
-            recipient_agent_id: Some("lyre".to_string()),
-            seq: None,
-            turn_id: None,
-            parent_message_id: None,
-        }];
-        let text = messages_to_extract_text(&messages);
-        assert!(text.contains("[tool]: short"));
-        assert!(!text.contains("..."));
-    }
-
-    #[test]
-    fn messages_to_extract_text_strips_thinking_tags() {
-        let messages = vec![StoredMessage {
-            id: "m5".to_string(),
-            chat_id: 1,
-            sender_id: "lyre".to_string(),
-            content: "<thinking>internal</thinking>visible".to_string(),
-            sender_kind: SenderKind::Assistant,
-            timestamp: "2025-01-01T00:00:04Z".to_string(),
-            message_kind: crate::storage::MessageKind::Message,
-            recipient_agent_id: None,
-            seq: None,
-            turn_id: None,
-            parent_message_id: None,
-        }];
-        let text = messages_to_extract_text(&messages);
-        assert!(text.contains("visible"));
-        assert!(!text.contains("thinking"));
-        assert!(!text.contains("internal"));
-    }
-
-    #[test]
-    fn messages_to_extract_text_joins_multiple_messages() {
         let messages = vec![
             StoredMessage {
-                id: "a".to_string(),
+                id: "m1".to_string(),
                 chat_id: 1,
-                sender_id: "u".to_string(),
-                content: "first".to_string(),
+                sender_id: "alice".to_string(),
+                content: "hello world".to_string(),
                 sender_kind: SenderKind::User,
                 timestamp: "2025-01-01T00:00:00Z".to_string(),
                 message_kind: crate::storage::MessageKind::Message,
@@ -528,10 +423,10 @@ mod tests {
                 parent_message_id: None,
             },
             StoredMessage {
-                id: "b".to_string(),
+                id: "m2".to_string(),
                 chat_id: 1,
-                sender_id: "a".to_string(),
-                content: "second".to_string(),
+                sender_id: "lyre".to_string(),
+                content: "<thinking>internal</thinking>visible".to_string(),
                 sender_kind: SenderKind::Assistant,
                 timestamp: "2025-01-01T00:00:01Z".to_string(),
                 message_kind: crate::storage::MessageKind::Message,
@@ -540,12 +435,45 @@ mod tests {
                 turn_id: None,
                 parent_message_id: None,
             },
+            StoredMessage {
+                id: "m3".to_string(),
+                chat_id: 1,
+                sender_id: "tool-1".to_string(),
+                content: long_content,
+                sender_kind: SenderKind::Tool,
+                timestamp: "2025-01-01T00:00:02Z".to_string(),
+                message_kind: crate::storage::MessageKind::Message,
+                recipient_agent_id: Some("lyre".to_string()),
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
+            },
+            StoredMessage {
+                id: "m4".to_string(),
+                chat_id: 1,
+                sender_id: "tool-1".to_string(),
+                content: "short".to_string(),
+                sender_kind: SenderKind::Tool,
+                timestamp: "2025-01-01T00:00:03Z".to_string(),
+                message_kind: crate::storage::MessageKind::Message,
+                recipient_agent_id: Some("lyre".to_string()),
+                seq: None,
+                turn_id: None,
+                parent_message_id: None,
+            },
         ];
         let text = messages_to_extract_text(&messages);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("[user]: first"));
-        assert!(lines[1].contains("[assistant]: second"));
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].contains("2025-01-01T00:00:00Z [user]: hello world"));
+        assert!(lines[1].contains("[assistant]: visible"));
+        assert!(!lines[1].contains("thinking"));
+        assert!(!lines[1].contains("internal"));
+        assert!(lines[2].contains("[tool]:"));
+        assert!(lines[2].contains("..."));
+        assert!(lines[2].contains(&"A".repeat(50)));
+        assert!(lines[3].contains("[tool]: short"));
+        assert!(!lines[3].contains("..."));
     }
 
     // --- build_extract_chunks ---

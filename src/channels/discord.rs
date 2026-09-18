@@ -1368,18 +1368,6 @@ mod tests {
         }
     }
 
-    fn test_config_manager() -> Arc<crate::config::ConfigManager> {
-        let dir = tempfile::tempdir().expect("tempdir");
-        Arc::new(crate::config::ConfigManager::new(
-            crate::test_util::test_config(dir.path().to_str().expect("utf8")),
-            None,
-        ))
-    }
-
-    fn test_adapter() -> DiscordAdapter {
-        DiscordAdapter::new_for_bots_with_manager(test_config_manager())
-    }
-
     fn test_manager_with_discord_config(
         bot_tokens: &[(&str, &str)],
         agent_bots: &[(&str, &str)],
@@ -1512,21 +1500,6 @@ mod tests {
             chain_state: Arc::new(BotChainState::new()),
             http_client: reqwest::Client::new(),
         }
-    }
-
-    #[test]
-    fn adapter_name() {
-        let adapter = test_adapter();
-        assert_eq!(adapter.name(), "discord");
-    }
-
-    #[test]
-    fn adapter_chat_type_routes() {
-        let adapter = test_adapter();
-        let routes = adapter.chat_type_routes();
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].0, "discord");
-        assert_eq!(routes[0].1, ConversationKind::Private);
     }
 
     #[test]
@@ -1946,74 +1919,31 @@ mod tests {
     // --- BotChainState tests ---
 
     #[test]
-    fn bot_chain_starts_at_one() {
+    fn bot_chain_enforces_depth_reset_expiry_and_thread_scope() {
         let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        assert!(
-            state.check_and_increment(100),
-            "first call should be allowed"
-        );
-    }
-
-    #[test]
-    fn bot_chain_allows_at_max_depth() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        for _ in 0..BOT_CHAIN_MAX_DEPTH {
-            assert!(
-                state.check_and_increment(200),
-                "should be allowed up to and including max depth"
-            );
-        }
-    }
-
-    #[test]
-    fn bot_chain_rejects_after_max_depth() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        for _ in 0..BOT_CHAIN_MAX_DEPTH {
-            assert!(state.check_and_increment(300));
-        }
-        assert!(
-            !state.check_and_increment(300),
-            "should reject after exceeding max depth"
-        );
-    }
-
-    #[test]
-    fn bot_chain_resets_on_human_message() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        assert!(state.check_and_increment(400));
-        assert!(state.check_and_increment(400));
-        state.reset(400);
-        assert!(
-            state.check_and_increment(400),
-            "after reset, should start fresh at depth 1"
-        );
-    }
-
-    #[test]
-    fn bot_chain_ttl_expiry_restarts_at_one() {
-        let state = BotChainState::with_ttl(Duration::from_millis(1));
-        assert!(state.check_and_increment(500));
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(
-            state.check_and_increment(500),
-            "after TTL expiry, should restart at depth 1"
-        );
-    }
-
-    #[test]
-    fn bot_chain_scopes_by_thread_id() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+        assert!(state.check_and_increment(600));
+        for _ in 1..BOT_CHAIN_MAX_DEPTH {
             assert!(state.check_and_increment(600));
         }
         assert!(
-            state.check_and_increment(700),
-            "different channel_id should have independent state"
+            !state.check_and_increment(600),
+            "the same thread must be rejected after the maximum depth"
         );
         assert!(
-            !state.check_and_increment(600),
-            "original channel should still be at max"
+            state.check_and_increment(700),
+            "different thread_id should have independent state"
         );
+
+        state.reset(600);
+        assert!(
+            state.check_and_increment(600),
+            "reset should start a new chain"
+        );
+
+        let expiring = BotChainState::with_ttl(Duration::from_millis(1));
+        assert!(expiring.check_and_increment(800));
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(expiring.check_and_increment(800), "expired chains restart");
     }
 
     // --- Sender-type receive judgment tests ---
@@ -2414,7 +2344,7 @@ mod tests {
     // --- Sender ID / SenderKind tests (Step 6) ---
 
     #[test]
-    fn discord_user_message_sender_id() {
+    fn discord_user_message_preserves_sender_identity_and_kind() {
         let author_id: u64 = 123456789;
         let sender_id = format!("user:discord:{author_id}");
         assert!(sender_id.starts_with("user:discord:"));

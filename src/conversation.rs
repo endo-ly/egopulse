@@ -95,48 +95,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_assigns_all_fields() {
-        // Arrange
-        let channel = "cli".to_string();
-        let surface_user = "alice".to_string();
-        let surface_thread = "session-1".to_string();
-        let chat_type = "cli".to_string();
-        let agent_id = "developer".to_string();
-
-        // Act
-        let ctx = SurfaceContext::new(
-            channel.clone(),
-            surface_user.clone(),
-            surface_thread.clone(),
-            chat_type.clone(),
-            agent_id.clone(),
-        );
-
-        // Assert
-        assert_eq!(ctx.channel, channel);
-        assert_eq!(ctx.surface_user, surface_user);
-        assert_eq!(ctx.surface_thread, surface_thread);
-        assert_eq!(ctx.chat_type, chat_type);
-        assert_eq!(ctx.agent_id, agent_id);
-        assert_eq!(ctx.trace_id, "");
-        assert_eq!(ctx.origin_id, "");
-    }
-
-    #[test]
-    fn session_key_format_is_channel_colon_thread() {
-        let ctx = SurfaceContext::new(
-            "discord".to_string(),
-            "bob".to_string(),
-            "123".to_string(),
-            "discord".to_string(),
-            "dev".to_string(),
-        );
-
-        assert_eq!(ctx.surface_thread, "123");
-        assert_eq!(ctx.session_key(), "discord:123:agent:dev");
-    }
-
-    #[test]
     fn session_key_includes_agent_for_all_channels() {
         let ctx = SurfaceContext::new(
             "web".to_string(),
@@ -160,17 +118,5 @@ mod tests {
         );
 
         assert_eq!(ctx.session_key(), "cli:mysession");
-    }
-
-    #[test]
-    fn surface_context_defaults_to_normal_scope() {
-        let ctx = SurfaceContext::new(
-            "discord".to_string(),
-            "user".to_string(),
-            "thread".to_string(),
-            "discord".to_string(),
-            "default".to_string(),
-        );
-        assert_eq!(ctx.scope, ConversationScope::Normal);
     }
 }

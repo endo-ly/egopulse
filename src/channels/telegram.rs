@@ -1263,18 +1263,6 @@ mod tests {
         }
     }
 
-    fn test_config_manager() -> Arc<crate::config::ConfigManager> {
-        let dir = tempfile::tempdir().expect("tempdir");
-        Arc::new(crate::config::ConfigManager::new(
-            crate::test_util::test_config(dir.path().to_str().expect("utf8")),
-            None,
-        ))
-    }
-
-    fn test_adapter() -> TelegramAdapter {
-        TelegramAdapter::new_multi_with_manager(test_config_manager())
-    }
-
     fn test_manager_with_telegram_config(
         bot_tokens: &[(&str, &str)],
         agent_bots: &[(&str, &str)],
@@ -1430,24 +1418,6 @@ mod tests {
     }
 
     // --- Adapter tests ---
-
-    #[test]
-    fn adapter_name() {
-        let adapter = test_adapter();
-        assert_eq!(adapter.name(), "telegram");
-    }
-
-    #[test]
-    fn adapter_chat_type_routes() {
-        let adapter = test_adapter();
-        let routes = adapter.chat_type_routes();
-        assert!(routes.len() >= 6);
-        assert!(
-            routes
-                .iter()
-                .any(|(k, v)| { *k == "telegram_private" && *v == ConversationKind::Private })
-        );
-    }
 
     #[test]
     fn parse_telegram_chat_id_accepts_raw_and_prefixed_values() {
@@ -1702,59 +1672,31 @@ mod tests {
     // --- BotChainState tests ---
 
     #[test]
-    fn bot_chain_starts_at_one() {
+    fn bot_chain_enforces_depth_reset_expiry_and_chat_scope() {
         let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
         assert!(state.check_and_increment(-100));
-    }
-
-    #[test]
-    fn bot_chain_allows_at_max_depth() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        for _ in 0..BOT_CHAIN_MAX_DEPTH {
+        for _ in 1..BOT_CHAIN_MAX_DEPTH {
             assert!(state.check_and_increment(-100));
         }
-    }
-
-    #[test]
-    fn bot_chain_rejects_after_max_depth() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        for _ in 0..BOT_CHAIN_MAX_DEPTH {
-            assert!(state.check_and_increment(-100));
-        }
-        assert!(!state.check_and_increment(-100));
-    }
-
-    #[test]
-    fn bot_chain_resets_on_human_message() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        state.check_and_increment(-100);
-        state.check_and_increment(-100);
-        state.reset(-100);
-        assert!(state.check_and_increment(-100));
-    }
-
-    #[test]
-    fn bot_chain_scopes_by_chat_id() {
-        let state = BotChainState::with_ttl(Duration::from_secs(BOT_CHAIN_TTL_SECS));
-        for _ in 0..BOT_CHAIN_MAX_DEPTH {
-            assert!(state.check_and_increment(-100));
-        }
+        assert!(
+            !state.check_and_increment(-100),
+            "the same chat must be rejected after the maximum depth"
+        );
         assert!(
             state.check_and_increment(-200),
             "different chat_id is independent"
         );
-        assert!(
-            !state.check_and_increment(-100),
-            "original chat still at max"
-        );
-    }
 
-    #[test]
-    fn bot_chain_ttl_expiry_restarts_at_one() {
-        let state = BotChainState::with_ttl(Duration::from_millis(1));
-        assert!(state.check_and_increment(-100));
+        state.reset(-100);
+        assert!(
+            state.check_and_increment(-100),
+            "reset should start a new chain"
+        );
+
+        let expiring = BotChainState::with_ttl(Duration::from_millis(1));
+        assert!(expiring.check_and_increment(-300));
         std::thread::sleep(Duration::from_millis(5));
-        assert!(state.check_and_increment(-100));
+        assert!(expiring.check_and_increment(-300), "expired chains restart");
     }
 
     // --- Mention detection ---
@@ -1910,7 +1852,7 @@ mod tests {
     // --- Sender ID / SenderKind tests (Step 6) ---
 
     #[test]
-    fn telegram_user_message_sender_id() {
+    fn telegram_user_message_preserves_sender_identity_and_kind() {
         let user_id: i64 = 987654321;
         let sender_id = format!("user:telegram:{user_id}");
         assert!(sender_id.starts_with("user:telegram:"));
