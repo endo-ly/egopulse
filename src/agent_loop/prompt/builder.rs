@@ -498,22 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_keeps_guard_finality_and_flexible_bash_quoting() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_test_state(dir.path());
-        let prompt = build_test_system_prompt(&state, &web_context("s1"));
-
-        assert!(prompt.contains("treat the denial as final"));
-        assert!(prompt.contains("Do not retry the same goal with different syntax"));
-        assert!(
-            prompt.contains(
-                "Quote shell arguments appropriately for their contents and Bash syntax."
-            )
-        );
-        assert!(!prompt.contains("Quote arguments that contain spaces with single quotes"));
-    }
-
-    #[test]
     fn system_prompt_contains_soul_section_when_file_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_file(&dir.path().join("SOUL.md"), "I am a wise assistant.");

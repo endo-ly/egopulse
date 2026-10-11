@@ -99,6 +99,7 @@ read-only ツール（`is_read_only: true`）は副作用がなく crash 後の�
 - 行は `succeeded` / `failed` の終端状態で直接書き込まれ、`pending` / `running` を経由しない。crash recovery の `running` スキャンに影響しない
 - `idempotency_class = read_only`。sanitize 済みの `tool_input` / `tool_output` と `error_kind` を非 read-only 行と同じ形式で保持する
 - 重複する `(turn_id, id)` は、`input_hash` / `tool_name` / `idempotency_class = read_only` の一致を確認してから既存行を維持する。不一致は conflict とし、並列ブロック全体を rollback する
+- Tool の実行前に JSON 解析で拒否された要求は、LLM へ `invalid_input` を返すが台帳へ記録しない。non-read-only Tool と同じ扱いとする。実際に実行された Tool の成功・失敗結果は記録する
 
 #### ガード拒否後の停止
 
@@ -380,7 +381,7 @@ required_env: API_KEY
 
 | 特性 | 内容 |
 |---|---|
-| スコープ | 実行ごと。bash サブプロセス起動時に解決し、終了後に破棄。値はセッション・グローバル状態に一切保存しない |
+| スコープ | Bash 実行前に毎回最新の値を解決し、Turn 内の `ToolExecutionContext.skill_env` に保持する。次の Bash 実行で再解決し、Turn 終了時に破棄する。値は DB・グローバル状態に保存しない |
 | 注入先 | `bash` ツールのサブプロセスのみ（`grep` / `find` / `ls` / MCP には注入しない） |
 | Allowlist | インストール済み全 skill の `required_env` の和集合のみ。dotenv 全体は注入しない |
 | 秘密値の取り扱い | 解決済みの値は LLM 出力・ログ・ツール結果に一切含まれない。注入された値と redaction 対象は完全に一致する |

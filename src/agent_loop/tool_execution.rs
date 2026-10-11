@@ -29,7 +29,6 @@ pub(crate) const GUARD_DENIAL_LIMIT: usize = 3;
 #[derive(Default)]
 pub(crate) struct GuardDenialTracker {
     count: std::sync::atomic::AtomicUsize,
-    limit_reached: std::sync::atomic::AtomicBool,
 }
 
 impl GuardDenialTracker {
@@ -40,17 +39,12 @@ impl GuardDenialTracker {
     /// Records one denial. Returns `true` only on the call that reaches the limit.
     pub(crate) fn record(&self) -> bool {
         let previous = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if previous + 1 == GUARD_DENIAL_LIMIT {
-            self.limit_reached
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            return true;
-        }
-        false
+        previous == GUARD_DENIAL_LIMIT - 1
     }
 
     /// Whether the denial limit has been reached.
     pub(crate) fn limit_reached(&self) -> bool {
-        self.limit_reached.load(std::sync::atomic::Ordering::SeqCst)
+        self.count.load(std::sync::atomic::Ordering::SeqCst) >= GUARD_DENIAL_LIMIT
     }
 }
 
@@ -108,7 +102,7 @@ impl<'a> ToolExecutor<'a> {
         }
     }
 
-    /// Tracks security-guard denials for the run and stops `bash` at the limit.
+    /// Tracks security-guard denials and stops all Tool execution at the limit.
     pub(crate) fn with_guard_denial_tracker(mut self, tracker: Arc<GuardDenialTracker>) -> Self {
         self.guard_tracker = Some(tracker);
         self
@@ -146,7 +140,7 @@ impl<'a> ToolExecutor<'a> {
                     .map(|tool_call| {
                         // The whole parallel block is already in flight. A
                         // denial inside it does not cancel sibling reads.
-                        self.execute_single_tool(assistant_message_id, tool_call, true, true)
+                        self.execute_single_tool(assistant_message_id, tool_call, true)
                     })
                     .collect::<Vec<_>>();
                 let block_results = join_all(block_futures).await;
@@ -165,7 +159,6 @@ impl<'a> ToolExecutor<'a> {
                         assistant_message_id,
                         tool_calls[cursor].clone(),
                         read_only_flags[cursor],
-                        false,
                     )
                     .await?,
                 );
@@ -189,17 +182,12 @@ impl<'a> ToolExecutor<'a> {
         assistant_message_id: &str,
         tool_call: ToolCall,
         is_read_only: bool,
-        allow_after_guard_limit: bool,
     ) -> Result<ExecutedToolCall, EgoPulseError> {
         if let Some(on_start) = &self.hooks.on_start {
             on_start(&tool_call);
         }
 
         let tool_start = std::time::Instant::now();
-
-        if !allow_after_guard_limit && self.is_run_blocked() {
-            return Ok(self.build_guard_limit_rejection(tool_call, tool_start));
-        }
 
         let (result, payload, executed) = match tool_call.invalid_arguments.as_deref() {
             // The provider sent arguments that are not valid JSON. Report it to
@@ -241,27 +229,7 @@ impl<'a> ToolExecutor<'a> {
             );
         }
 
-        let message = Message {
-            role: "tool".to_string(),
-            content: tool_message_content(&payload, &result),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_call.id.clone()),
-        };
-
-        let outcome = ExecutedToolCall {
-            tool_call,
-            result,
-            payload,
-            message,
-            duration_ms,
-        };
-
-        if let Some(on_result) = &self.hooks.on_result {
-            on_result(&outcome);
-        }
-
-        Ok(outcome)
+        Ok(self.finish_tool_call(tool_call, result, payload, duration_ms))
     }
 
     /// Whether all further Tool execution must be refused for this run.
@@ -275,14 +243,6 @@ impl<'a> ToolExecutor<'a> {
         if let Some(on_start) = &self.hooks.on_start {
             on_start(&tool_call);
         }
-        self.build_guard_limit_rejection(tool_call, std::time::Instant::now())
-    }
-
-    fn build_guard_limit_rejection(
-        &self,
-        tool_call: ToolCall,
-        started_at: std::time::Instant,
-    ) -> ExecutedToolCall {
         let result = ToolResult::error_with_kind(
             crate::tools::ToolErrorKind::GuardDenied,
             format!(
@@ -290,6 +250,16 @@ impl<'a> ToolExecutor<'a> {
             ),
         );
         let payload = format_tool_result(&tool_call, &result);
+        self.finish_tool_call(tool_call, result, payload, 0)
+    }
+
+    fn finish_tool_call(
+        &self,
+        tool_call: ToolCall,
+        result: ToolResult,
+        payload: String,
+        duration_ms: u128,
+    ) -> ExecutedToolCall {
         let message = Message {
             role: "tool".to_string(),
             content: tool_message_content(&payload, &result),
@@ -302,7 +272,7 @@ impl<'a> ToolExecutor<'a> {
             result,
             payload,
             message,
-            duration_ms: started_at.elapsed().as_millis(),
+            duration_ms,
         };
         if let Some(on_result) = &self.hooks.on_result {
             on_result(&outcome);
@@ -313,10 +283,9 @@ impl<'a> ToolExecutor<'a> {
     /// Appends a finished read-only parallel block to the execution ledger.
     ///
     /// Read-only Tools skip claim-before-execute to keep parallel execution
-    /// free of SQLite write contention, so the finished block is recorded in
-    /// one transaction afterwards. This keeps `tool_calls` a complete record
-    /// of every Tool call while preserving the ledger's recovery semantics
-    /// (read-only rows are never `running`).
+    /// free of SQLite write contention, so completed calls are recorded in one
+    /// transaction afterwards. Invalid JSON requests never reach a Tool and
+    /// are omitted from the ledger.
     async fn record_read_only_block(
         &self,
         assistant_message_id: &str,
@@ -328,6 +297,7 @@ impl<'a> ToolExecutor<'a> {
         let chat_id = self.context.chat_id;
         let records = outcomes
             .iter()
+            .filter(|outcome| outcome.tool_call.invalid_arguments.is_none())
             .map(|outcome| {
                 let canonical =
                     canonical_tool_input(&outcome.tool_call.name, &outcome.tool_call.arguments);
@@ -353,7 +323,10 @@ impl<'a> ToolExecutor<'a> {
                     error_message: is_error.then(|| outcome.result.content.clone()),
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        if records.is_empty() {
+            return Ok(());
+        }
         Ok(
             call_blocking(self.runtime.db_for(self.context.scope), move |db| {
                 db.record_read_only_tool_outcomes(records)
@@ -389,11 +362,21 @@ impl<'a> ToolExecutor<'a> {
                 // (e.g. `agent_send`) can build per-call idempotency keys.
                 let mut exec_context = self.context.clone();
                 exec_context.tool_call_id = tool_call.id.clone();
-                let result = self
-                    .runtime
-                    .tools
-                    .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
-                    .await;
+                let result = if is_read_only {
+                    self.runtime
+                        .tools
+                        .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
+                        .await
+                } else {
+                    self.runtime
+                        .tools
+                        .execute_prepared(
+                            &tool_call.name,
+                            tool_call.arguments.clone(),
+                            &exec_context,
+                        )
+                        .await
+                };
                 let payload = format_tool_result(tool_call, &result);
                 if !is_read_only {
                     self.record_tool_outcome(tool_call, &result, &payload)
@@ -427,6 +410,8 @@ impl<'a> ToolExecutor<'a> {
         assistant_message_id: &str,
         tool_call: &ToolCall,
     ) -> Result<ClaimOutcome, EgoPulseError> {
+        // Resolve Bash secrets before persistence so the claimed input and the
+        // later child process use the same execution values.
         self.runtime
             .tools
             .prepare_execution_context(&tool_call.name, self.context);
@@ -550,24 +535,6 @@ mod tests {
     }
 
     #[test]
-    fn guard_denial_tracker_flags_limit_once_at_crossing() {
-        // Arrange
-        let tracker = GuardDenialTracker::new();
-
-        // Act & Assert: below the limit nothing is flagged
-        assert!(!tracker.limit_reached());
-        assert!(!tracker.record());
-        assert!(!tracker.record());
-        assert!(!tracker.limit_reached());
-
-        // Act & Assert: the call that reaches the limit flags it exactly once
-        assert!(tracker.record());
-        assert!(tracker.limit_reached());
-        assert!(!tracker.record());
-        assert!(tracker.limit_reached());
-    }
-
-    #[test]
     fn build_tool_result_phase_preserves_order_and_previews_results() {
         // Arrange
         let first = ExecutedToolCall {
@@ -658,14 +625,24 @@ mod integration_tests {
 
         async fn execute(
             &self,
-            _input: serde_json::Value,
+            input: serde_json::Value,
             _context: &ToolExecutionContext,
         ) -> ToolResult {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
             self.barrier.wait().await;
             self.active.fetch_sub(1, Ordering::SeqCst);
-            ToolResult::success("concurrent result".to_string())
+            match input["outcome"].as_str().expect("outcome") {
+                "not_found" => ToolResult::error_with_kind(
+                    crate::tools::ToolErrorKind::NotFound,
+                    "requested test resource was not found".to_string(),
+                ),
+                "guard_denied" => ToolResult::error_with_kind(
+                    crate::tools::ToolErrorKind::GuardDenied,
+                    "blocked by the test security guard".to_string(),
+                ),
+                outcome => ToolResult::success(outcome.to_string()),
+            }
         }
 
         fn is_read_only(&self) -> bool {
@@ -754,15 +731,15 @@ mod integration_tests {
                     reasoning_content: None,
                     tool_calls: vec![
                         ToolCall {
-                            id: "call-1".to_string(),
+                            id: "call-success".to_string(),
                             name: "concurrent_read".to_string(),
-                            arguments: serde_json::json!({}),
+                            arguments: serde_json::json!({"outcome": "first result"}),
                             invalid_arguments: None,
                         },
                         ToolCall {
-                            id: "call-2".to_string(),
+                            id: "call-failure".to_string(),
                             name: "concurrent_read".to_string(),
-                            arguments: serde_json::json!({}),
+                            arguments: serde_json::json!({"outcome": "not_found"}),
                             invalid_arguments: None,
                         },
                     ],
@@ -823,32 +800,76 @@ mod integration_tests {
         .await
         .expect("tool calls");
         assert_eq!(tool_calls.len(), 2);
+        let success = tool_calls
+            .iter()
+            .find(|call| call.id == "call-success")
+            .expect("successful read ledger row");
+        assert_eq!(success.state, crate::storage::ToolState::Succeeded);
+        assert_eq!(success.error_kind, None);
         assert!(
-            tool_calls
-                .iter()
-                .all(|call| call.state == crate::storage::ToolState::Succeeded)
+            success
+                .tool_output
+                .as_deref()
+                .unwrap()
+                .contains("first result")
         );
-        assert!(
-            tool_calls.iter().all(|call| call.tool_output.is_some()),
-            "read-only rows store the sanitized payload like non-read-only rows"
+        let failure = tool_calls
+            .iter()
+            .find(|call| call.id == "call-failure")
+            .expect("failed read ledger row");
+        assert_eq!(failure.state, crate::storage::ToolState::Failed);
+        assert_eq!(failure.error_kind.as_deref(), Some("not_found"));
+        assert!(failure.tool_output.is_none());
+        assert_eq!(
+            failure.error_message.as_deref(),
+            Some("requested test resource was not found")
         );
     }
 
     #[tokio::test]
     #[serial]
-    async fn invalid_read_only_arguments_are_reported_and_ledgered_as_invalid_input() {
+    async fn invalid_json_requests_are_reported_without_ledgering_and_turn_continues() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(workspace.join("valid.txt"), "read succeeded").expect("input file");
         let provider = RecordingProvider::new(
             vec![
                 Ok(MessagesResponse {
                     content: String::new(),
                     reasoning_content: None,
-                    tool_calls: vec![ToolCall::from_raw_arguments(
-                        "call-broken".to_string(),
-                        "read".to_string(),
-                        r#"{"path": "x.txt""#,
-                    )],
+                    tool_calls: vec![
+                        ToolCall::from_raw_arguments(
+                            "invalid-read".to_string(),
+                            "read".to_string(),
+                            r#"{"path": "valid.txt""#,
+                        ),
+                        ToolCall::from_raw_arguments(
+                            "invalid-bash".to_string(),
+                            "bash".to_string(),
+                            r#"{"command": "printf ran > invalid-bash-ran""#,
+                        ),
+                    ],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "valid-read".to_string(),
+                            name: "read".to_string(),
+                            arguments: serde_json::json!({"path": "valid.txt"}),
+                            invalid_arguments: None,
+                        },
+                        ToolCall {
+                            id: "valid-bash".to_string(),
+                            name: "bash".to_string(),
+                            arguments: serde_json::json!({"command": "printf bash-ran"}),
+                            invalid_arguments: None,
+                        },
+                    ],
                     usage: None,
                 }),
                 Ok(MessagesResponse {
@@ -858,7 +879,7 @@ mod integration_tests {
                     usage: None,
                 }),
             ],
-            vec![0, 0],
+            vec![0, 0, 0],
         );
         let observer = provider.clone();
         let state = build_state_with_provider(
@@ -870,22 +891,36 @@ mod integration_tests {
         let reply = process_turn(
             &state.turn_dependencies(),
             &cli_context("invalid-tool-arguments"),
-            "read a file",
+            "read a file and run a command",
         )
         .await
         .expect("turn should continue after invalid tool arguments");
 
-        // Assert
+        // Assert: both malformed calls return input errors linked to their call IDs,
+        // then valid requests execute and complete the same Turn.
         assert_eq!(reply, "recovered");
         let seen_messages = observer.seen_messages();
-        assert_eq!(seen_messages.len(), 2);
-        let tool_result = seen_messages[1].last().expect("tool result message");
-        assert_eq!(tool_result.role, "tool");
-        let tool_result_text = crate::agent_loop::message_format::message_to_text(tool_result);
-        assert!(
-            tool_result_text.contains("not valid JSON"),
-            "{tool_result_text}"
-        );
+        assert_eq!(seen_messages.len(), 3);
+        for call_id in ["invalid-read", "invalid-bash"] {
+            let tool_result = seen_messages[1]
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+                .expect("invalid request result");
+            let text = crate::agent_loop::message_format::message_to_text(tool_result);
+            assert!(text.contains("not valid JSON"), "{text}");
+        }
+        for (call_id, expected_result) in
+            [("valid-read", "read succeeded"), ("valid-bash", "bash-ran")]
+        {
+            let tool_result = seen_messages[2]
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(call_id))
+                .expect("executed request result");
+            let text = crate::agent_loop::message_format::message_to_text(tool_result);
+            assert!(text.contains(expected_result), "{text}");
+        }
+        assert!(!workspace.join("invalid-bash-ran").exists());
+
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
@@ -902,74 +937,17 @@ mod integration_tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1, "read-only invalid input is ledgered");
-        assert_eq!(tool_calls[0].state, crate::storage::ToolState::Failed);
-        assert_eq!(tool_calls[0].error_kind.as_deref(), Some("invalid_input"));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn failed_read_only_tool_is_ledgered_with_its_error_kind() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: "Looking.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-read-missing".to_string(),
-                        name: "read".to_string(),
-                        arguments: serde_json::json!({"path": "missing.txt"}),
-                        invalid_arguments: None,
-                    }],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "reported".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
+        assert_eq!(tool_calls.len(), 2);
+        assert!(
+            tool_calls
+                .iter()
+                .all(|call| { call.id == "valid-read" || call.id == "valid-bash" })
         );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
+        assert!(
+            tool_calls
+                .iter()
+                .all(|call| { call.state == crate::storage::ToolState::Succeeded })
         );
-
-        // Act
-        let reply = process_turn(
-            &state.turn_dependencies(),
-            &cli_context("read-only-failure"),
-            "read the file",
-        )
-        .await
-        .expect("turn continues after read-only failure");
-
-        // Assert
-        assert_eq!(reply, "reported");
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:read-only-failure:agent:default",
-                Some("read-only-failure"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].state, crate::storage::ToolState::Failed);
-        assert_eq!(tool_calls[0].error_kind.as_deref(), Some("not_found"));
-        assert!(tool_calls[0].tool_output.is_none());
     }
 
     #[tokio::test]
@@ -1105,6 +1083,14 @@ mod integration_tests {
                 "{}",
                 call.tool_input
             );
+            if let Some(output) = &call.tool_output {
+                assert!(!output.contains(secret), "{output}");
+                assert!(!output.contains(skill_secret), "{output}");
+            }
+            assert!(
+                call.tool_output.is_some(),
+                "successfully executed tools should persist their result"
+            );
             let persisted_input: serde_json::Value =
                 serde_json::from_str(&call.tool_input).expect("persisted JSON");
             if call.tool_name == "bash" {
@@ -1144,98 +1130,27 @@ mod integration_tests {
 
     #[tokio::test]
     #[serial]
-    async fn guard_denied_bash_call_is_ledgered_with_guard_kind() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: String::new(),
-                    reasoning_content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "call-guard".to_string(),
-                        name: "bash".to_string(),
-                        arguments: serde_json::json!({"command": "cat .env"}),
-                        invalid_arguments: None,
-                    }],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "reported".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-            ],
-            vec![0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-
-        // Act
-        let reply = process_turn(
-            &state.turn_dependencies(),
-            &cli_context("guard-kind"),
-            "read the env file",
-        )
-        .await
-        .expect("turn continues after guard denial");
-
-        // Assert
-        assert_eq!(reply, "reported");
-        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:guard-kind:agent:default",
-                Some("guard-kind"),
-                "cli",
-                "default",
-            )
-        })
-        .await
-        .expect("chat id");
-        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
-            db.get_tool_calls_for_chat(chat_id)
-        })
-        .await
-        .expect("tool calls");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].error_kind.as_deref(), Some("guard_denied"));
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn guard_denial_limit_blocks_side_effect_tools_and_injects_wrap_guard() {
-        // Arrange: three denied bash calls cross the limit; a side-effecting
-        // non-bash Tool is refused and the next model request exposes no tools.
+        // Arrange: three concurrent read denials cross the limit; a later
+        // side-effecting Tool is refused and the next request exposes no tools.
         let dir = tempfile::tempdir().expect("tempdir");
         let write_calls = Arc::new(AtomicUsize::new(0));
-        let denied_call = || ToolCall {
-            id: format!("call-{}", uuid::Uuid::new_v4()),
-            name: "bash".to_string(),
-            arguments: serde_json::json!({"command": "cat .env"}),
-            invalid_arguments: None,
-        };
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let denial_barrier = Arc::new(Barrier::new(3));
         let provider = RecordingProvider::new(
             vec![
                 Ok(MessagesResponse {
-                    content: "Trying.".to_string(),
+                    content: "Trying three reads concurrently.".to_string(),
                     reasoning_content: None,
-                    tool_calls: vec![denied_call()],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "Retrying.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![denied_call()],
-                    usage: None,
-                }),
-                Ok(MessagesResponse {
-                    content: "Again.".to_string(),
-                    reasoning_content: None,
-                    tool_calls: vec![denied_call()],
+                    tool_calls: (1..=3)
+                        .map(|number| ToolCall {
+                            id: format!("parallel-denial-{number}"),
+                            name: "concurrent_read".to_string(),
+                            arguments: serde_json::json!({"outcome": "guard_denied"}),
+                            invalid_arguments: None,
+                        })
+                        .collect(),
                     usage: None,
                 }),
                 Ok(MessagesResponse {
@@ -1256,49 +1171,58 @@ mod integration_tests {
                     usage: None,
                 }),
             ],
-            vec![0, 0, 0, 0, 0],
+            vec![0, 0, 0],
         );
         let observer = provider.clone();
         let mut state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider),
         );
-        Arc::get_mut(&mut state.tools)
-            .expect("tool registry is uniquely owned")
-            .register_tool(Box::new(SideEffectProbeTool {
-                calls: Arc::clone(&write_calls),
-            }));
+        let tools = Arc::get_mut(&mut state.tools).expect("tool registry is uniquely owned");
+        tools.register_tool(Box::new(ConcurrentReadTool {
+            barrier: denial_barrier,
+            active,
+            max_active: Arc::clone(&max_active),
+        }));
+        tools.register_tool(Box::new(SideEffectProbeTool {
+            calls: Arc::clone(&write_calls),
+        }));
 
         // Act
-        let reply = process_turn(
-            &state.turn_dependencies(),
-            &cli_context("guard-limit"),
-            "read the env file",
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            process_turn(
+                &state.turn_dependencies(),
+                &cli_context("guard-limit"),
+                "read three files",
+            ),
         )
         .await
+        .expect("all reads in the block must run concurrently")
         .expect("turn wraps up after the denial limit");
 
-        // Assert: the wrap-up guard rode along with the fourth request.
+        // Assert: the wrap-up guard followed the concurrent denial block.
         assert_eq!(reply, "wrapped up");
         let seen_messages = observer.seen_messages();
-        assert_eq!(seen_messages.len(), 5);
-        let fourth_request = seen_messages[3]
+        assert_eq!(seen_messages.len(), 3);
+        let second_request = seen_messages[1]
             .iter()
             .map(crate::agent_loop::message_format::message_to_text)
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            fourth_request.contains("security-guard denial limit has been reached"),
-            "wrap guard must be injected: {fourth_request}"
+            second_request.contains("security-guard denial limit has been reached"),
+            "wrap guard must be injected: {second_request}"
         );
         assert!(
-            observer.seen_tools()[3].as_ref().is_some_and(Vec::is_empty),
+            observer.seen_tools()[1].as_ref().is_some_and(Vec::is_empty),
             "subsequent model requests must not expose Tool definitions"
         );
+        assert_eq!(max_active.load(Ordering::SeqCst), 3);
 
-        // Assert: the blocked bash never executed; its tool result reports the
-        // stop condition instead of command output.
-        let blocked_result = seen_messages[4]
+        // Assert: the blocked side-effecting Tool receives a linked result but
+        // never runs.
+        let blocked_result = seen_messages[2]
             .iter()
             .find(|message| message.tool_call_id.as_deref() == Some("call-blocked"))
             .expect("blocked call must receive a tool result");
@@ -1309,7 +1233,7 @@ mod integration_tests {
         );
         assert_eq!(write_calls.load(Ordering::SeqCst), 0);
 
-        // Assert: only the three executed denials are ledgered.
+        // Assert: all three simultaneous denials are ledgered exactly once.
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
             db.resolve_or_create_chat_id(
                 "cli",
@@ -1331,6 +1255,11 @@ mod integration_tests {
             tool_calls
                 .iter()
                 .all(|call| call.error_kind.as_deref() == Some("guard_denied"))
+        );
+        assert!(
+            tool_calls
+                .iter()
+                .all(|call| call.tool_name == "concurrent_read")
         );
     }
 

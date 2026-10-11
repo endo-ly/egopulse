@@ -299,7 +299,7 @@ LLM ツール/ファンクション呼び出しの実行記録。
 
 `turn_id + tool_call_id` で Tool Call を一意にし、成功結果を再利用する。NULL の `turn_id`（legacy 行）は index 対象外。
 
-read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に `succeeded` / `failed` の終端状態で直接 INSERT される。replay 時に `(turn_id, id)` の行がすでにある場合は `input_hash` / `tool_name` / `idempotency_class` の一致を検証し、一致すれば既存行を維持、不一致なら conflict としてブロック全体を rollback する。すべての行で `tool_input` はサニタイズ済み JSON、`input_hash` は元の入力から計算される。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
+read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に実行結果を `succeeded` / `failed` の終端状態で直接 INSERT する。JSON 解析で実行前に拒否された要求は read-only / non-read-only とも記録しない。replay 時に `(turn_id, id)` の行がすでにある場合は `input_hash` / `tool_name` / `idempotency_class` の一致を検証し、一致すれば既存行を維持、不一致なら conflict としてブロック全体を rollback する。保存する `tool_input` はサニタイズ済み JSON、`input_hash` は元の入力から計算される。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
 
 **操作**:
 - `store_tool_call(tool_call)` — INSERT

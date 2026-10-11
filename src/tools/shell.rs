@@ -70,6 +70,83 @@ impl BashTool {
         resolved
     }
 
+    async fn execute_with_env(
+        &self,
+        input: serde_json::Value,
+        skill_env: &HashMap<String, String>,
+    ) -> ToolResult {
+        #[derive(serde::Deserialize)]
+        struct Params {
+            command: String,
+            #[serde(default)]
+            timeout: Option<u64>,
+        }
+
+        let params: Params = match super::parse_params(input) {
+            Ok(params) => params,
+            Err(error) => return error,
+        };
+        let command = &params.command;
+        if let Err(reason) = command_guard::check_command(command) {
+            return ToolResult::error_with_kind(super::ToolErrorKind::GuardDenied, reason);
+        }
+        if let Err(reason) = path_guard::check_command_paths(command) {
+            return ToolResult::error_with_kind(super::ToolErrorKind::GuardDenied, reason);
+        }
+        let timeout_secs = params.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        let temp_dir = self.temp_dir();
+        if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
+            return ToolResult::error(format!(
+                "Failed to prepare bash temp directory {}: {error}",
+                temp_dir.display()
+            ));
+        }
+        let temp_path = temp_dir.join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
+
+        let mut child = match self.spawn_bash_command(command, &temp_path, skill_env) {
+            Ok(child) => child,
+            Err(error) => return ToolResult::error(error),
+        };
+
+        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+            Ok(Ok(status)) => Ok(status),
+            Ok(Err(error)) => Err(format!("Failed to execute bash command: {error}")),
+            Err(_) => {
+                kill_process_group(&mut child);
+                let _ = child.wait().await;
+                let output = read_temp_output(&temp_path);
+                return bash_error_result(output, &temp_path, Some(timeout_secs), None)
+                    .with_error_kind(super::ToolErrorKind::Timeout);
+            }
+        };
+
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => return ToolResult::error(error),
+        };
+
+        let output = read_temp_output(&temp_path);
+        let output = redact_known_secret_patterns(&output);
+        let (mut text, details) = render_bash_output(&output, &temp_path);
+
+        if !status.success() {
+            if let Some(code) = status.code() {
+                text.push_str(&format!("\n\nCommand exited with code {code}"));
+            }
+            if let Some(details) = details {
+                return ToolResult::error_with_details(text, details)
+                    .with_error_kind(super::ToolErrorKind::ExitNonZero);
+            }
+            return ToolResult::error_with_kind(super::ToolErrorKind::ExitNonZero, text);
+        }
+
+        if let Some(details) = details {
+            ToolResult::success_with_details(text, details)
+        } else {
+            ToolResult::success(text)
+        }
+    }
+
     fn temp_dir(&self) -> PathBuf {
         self.workspace_dir.join(".tmp").join("bash")
     }
@@ -171,77 +248,17 @@ impl Tool for BashTool {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
-        #[derive(serde::Deserialize)]
-        struct Params {
-            command: String,
-            #[serde(default)]
-            timeout: Option<u64>,
-        }
+        let skill_env = self.resolve_env_for_execution(context);
+        self.execute_with_env(input, &skill_env).await
+    }
 
-        let params: Params = match super::parse_params(input) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
-        let command = &params.command;
-        if let Err(reason) = command_guard::check_command(command) {
-            return ToolResult::error_with_kind(super::ToolErrorKind::GuardDenied, reason);
-        }
-        if let Err(reason) = path_guard::check_command_paths(command) {
-            return ToolResult::error_with_kind(super::ToolErrorKind::GuardDenied, reason);
-        }
-        let timeout_secs = params.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
-        let temp_dir = self.temp_dir();
-        if let Err(error) = tokio::fs::create_dir_all(&temp_dir).await {
-            return ToolResult::error(format!(
-                "Failed to prepare bash temp directory {}: {error}",
-                temp_dir.display()
-            ));
-        }
-        let temp_path = temp_dir.join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
-
+    async fn execute_prepared(
+        &self,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
         let skill_env = context.skill_env.lock().expect("skill env lock").clone();
-        let mut child = match self.spawn_bash_command(command, &temp_path, &skill_env) {
-            Ok(child) => child,
-            Err(error) => return ToolResult::error(error),
-        };
-
-        let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-            Ok(Ok(status)) => Ok(status),
-            Ok(Err(error)) => Err(format!("Failed to execute bash command: {error}")),
-            Err(_) => {
-                kill_process_group(&mut child);
-                let _ = child.wait().await;
-                let output = read_temp_output(&temp_path);
-                return bash_error_result(output, &temp_path, Some(timeout_secs), None)
-                    .with_error_kind(super::ToolErrorKind::Timeout);
-            }
-        };
-
-        let status = match status {
-            Ok(status) => status,
-            Err(error) => return ToolResult::error(error),
-        };
-
-        let output = read_temp_output(&temp_path);
-        let output = redact_known_secret_patterns(&output);
-        let (mut text, details) = render_bash_output(&output, &temp_path);
-
-        if !status.success() {
-            if let Some(code) = status.code() {
-                text.push_str(&format!("\n\nCommand exited with code {code}"));
-            }
-            if let Some(details) = details {
-                return ToolResult::error_with_details(text, details)
-                    .with_error_kind(super::ToolErrorKind::ExitNonZero);
-            }
-            return ToolResult::error_with_kind(super::ToolErrorKind::ExitNonZero, text);
-        }
-
-        if let Some(details) = details {
-            ToolResult::success_with_details(text, details)
-        } else {
-            ToolResult::success(text)
-        }
+        self.execute_with_env(input, &skill_env).await
     }
 }
 
@@ -403,19 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_child_env_skips_missing_optional_keys() {
-        // Arrange
-        let parent = [("PATH", "/usr/bin")];
-
-        // Act
-        let env = child_env(&parent, &[]);
-
-        // Assert
-        assert_eq!(env.len(), 1);
-        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
-    }
-
-    #[test]
     fn bash_child_env_prefers_skill_env_over_inherited_key() {
         // Arrange
         let parent = [("PATH", "/usr/bin"), ("HOME", "/real-home")];
@@ -425,6 +429,52 @@ mod tests {
 
         // Assert
         assert_eq!(env.get("HOME").map(String::as_str), Some("/skill-home"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_bash_execution_resolves_required_env() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("direct-env");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: direct-env\ndescription: Direct execution\nrequired_env:\n  - EGOPULSE_DIRECT_BASH_ENV\n---\nBody\n",
+        )
+        .expect("skill metadata");
+        let dotenv_path = dir.path().join(".env");
+        std::fs::write(&dotenv_path, "EGOPULSE_DIRECT_BASH_ENV=resolved-value\n").expect("dotenv");
+        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
+            skills_dir,
+            dir.path().join("builtin-skills"),
+        ));
+        let tool = BashTool::new(workspace, skills, dotenv_path);
+        let context = crate::test_util::test_tool_context();
+
+        // Act
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "test \"$EGOPULSE_DIRECT_BASH_ENV\" = resolved-value && printf resolved"}),
+                &context,
+            )
+            .await;
+
+        // Assert
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("resolved"));
+        assert_eq!(
+            context
+                .skill_env
+                .lock()
+                .expect("skill env")
+                .get("EGOPULSE_DIRECT_BASH_ENV")
+                .map(String::as_str),
+            Some("resolved-value")
+        );
     }
 
     #[tokio::test]

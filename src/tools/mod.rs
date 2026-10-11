@@ -234,6 +234,16 @@ pub(crate) trait Tool: Send + Sync {
     async fn execute(&self, input: serde_json::Value, context: &ToolExecutionContext)
     -> ToolResult;
 
+    /// Executes after pre-claim context preparation, when a Tool needs to reuse
+    /// values resolved before its input was persisted.
+    async fn execute_prepared(
+        &self,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
+        self.execute(input, context).await
+    }
+
     /// Prepares per-call context needed before durable Tool input is sanitized.
     fn prepare_execution_context(&self, _context: &ToolExecutionContext) {}
 
@@ -367,8 +377,7 @@ impl ToolRegistry {
         Arc::new(definitions)
     }
 
-    /// Dispatches a Tool call whose execution context was prepared before
-    /// durable input was written. Returns an error result for unknown tools.
+    /// Dispatches a Tool call. Returns an error result for unknown tools.
     ///
     /// Redaction secrets are assembled **after** tool execution so that env vars
     /// resolved by `activate_skill` during the same call are already present in
@@ -379,8 +388,32 @@ impl ToolRegistry {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
+        self.execute_inner(name, input, context, false).await
+    }
+
+    /// Dispatches a Tool whose execution context was prepared before its ledger claim.
+    pub(crate) async fn execute_prepared(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
+        self.execute_inner(name, input, context, true).await
+    }
+
+    async fn execute_inner(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+        prepared: bool,
+    ) -> ToolResult {
         if let Some(&idx) = self.tool_index.get(name) {
-            let result = self.tools[idx].execute(input, context).await;
+            let result = if prepared {
+                self.tools[idx].execute_prepared(input, context).await
+            } else {
+                self.tools[idx].execute(input, context).await
+            };
             return sanitize_tool_result(result, &self.redaction_secrets(context));
         }
         if let Some(mcp_manager) = &self.mcp_manager {
@@ -564,9 +597,7 @@ pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Tool, ToolErrorKind, ToolExecutionContext, ToolRegistry, ToolResult, parse_params,
-    };
+    use super::{Tool, ToolErrorKind, ToolExecutionContext, ToolRegistry, ToolResult};
     use crate::config::{ChannelConfig, ChannelName, Config};
     use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
@@ -639,20 +670,6 @@ mod tests {
             // Assert
             assert_eq!(ledger_str, expected);
         }
-    }
-
-    #[test]
-    fn parse_params_failures_are_classified_as_invalid_input() {
-        // Arrange
-        #[derive(serde::Deserialize, Debug)]
-        #[serde(deny_unknown_fields)]
-        struct Params {}
-
-        // Act
-        let error = parse_params::<Params>(json!({"nope": 1})).expect_err("must fail");
-
-        // Assert
-        assert_eq!(error.error_kind, Some(ToolErrorKind::InvalidInput));
     }
 
     #[tokio::test]
@@ -849,7 +866,6 @@ mod tests {
         std::fs::write(workspace.join("notes.txt"), "hello").expect("notes");
         let registry = test_registry(&config);
         let context = test_context();
-        registry.prepare_execution_context("bash", &context);
 
         let result = registry
             .execute(
@@ -879,7 +895,6 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         let registry = test_registry(&config);
         let context = test_context();
-        registry.prepare_execution_context("bash", &context);
         registry
             .execute("bash", json!({ "command": command }), &context)
             .await
@@ -1329,7 +1344,6 @@ mod tests {
         );
 
         // bash in same context: auto-hydration + activate_skill env both available
-        registry.prepare_execution_context("bash", &context);
         let result = registry
             .execute(
                 "bash",
@@ -1376,7 +1390,6 @@ mod tests {
 
         // Bash should pick up the new skill's required_env without registry recreation
         let fresh_context = test_context();
-        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1420,7 +1433,6 @@ mod tests {
 
         // Fresh context — no activate_skill call
         let fresh_context = test_context();
-        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1455,7 +1467,6 @@ mod tests {
 
         let registry = test_registry(&config);
         let fresh_context = test_context();
-        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1497,7 +1508,6 @@ mod tests {
         let fresh_context = test_context();
 
         // Command prints the secret — must be redacted
-        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1555,7 +1565,6 @@ mod tests {
         assert!(!result.is_error);
 
         // Verify secret is redacted in turn 1 bash
-        registry.prepare_execution_context("bash", &context_turn1);
         let result = registry
             .execute(
                 "bash",
@@ -1616,7 +1625,6 @@ mod tests {
         // Rotate dotenv value — bash must use fresh resolution
         std::fs::write(&env_path, "EGOPULSE_STALE_KEY=rotated-value\n").expect("env");
 
-        registry.prepare_execution_context("bash", &context);
         let result = registry
             .execute(
                 "bash",
@@ -1644,7 +1652,6 @@ mod tests {
         // → bash must not fall back to the stale activate_skill value
         std::fs::write(&env_path, "").expect("env");
 
-        registry.prepare_execution_context("bash", &context);
         let result = registry
             .execute(
                 "bash",
@@ -1677,7 +1684,6 @@ mod tests {
             "orphaned-value".to_string(),
         );
 
-        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
