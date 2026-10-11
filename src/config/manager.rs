@@ -752,6 +752,9 @@ mod tests {
     fn reload_from_file_swaps_only_after_valid_external_edit() {
         let (_dir, manager, path) = file_manager();
         let before = manager.current_blocking();
+        // Reload resolves LOG_LEVEL from the environment before the file, while
+        // the initial state comes from memory; pin it so reload sees no change.
+        let _log_level = crate::test_env::EnvVarGuard::set("LOG_LEVEL", &before.config.log_level);
         let mut candidate = before.config.clone();
         candidate.timezone = "Asia/Tokyo".to_string();
         crate::config::persist::save_config_with_secrets(&candidate, &path).expect("edit config");

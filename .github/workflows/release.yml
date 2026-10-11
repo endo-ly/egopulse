@@ -160,7 +160,7 @@ jobs:
           path: web/dist
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup show active-toolchain
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2

@@ -4,6 +4,7 @@
 //! `VACUUM INTO`, generation-based pruning, and the next-run schedule
 //! calculator used by the periodic backup scheduler.
 
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, NaiveTime, Utc};
@@ -110,8 +111,7 @@ pub(crate) fn run_backup_with_integrity_checker(
 
     {
         let conn = db.get_conn()?;
-        let escaped = dest_path.to_string_lossy().replace('\'', "''");
-        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+        vacuum_into(&conn, &dest_path)?;
     }
 
     finalize_backup(dest_dir, dest_path, max_generations, prefix, checker)
@@ -140,8 +140,7 @@ pub(crate) fn run_startup_backup(
 
     {
         let conn = Connection::open(db_path)?;
-        let escaped = dest_path.to_string_lossy().replace('\'', "''");
-        conn.execute_batch(&format!("VACUUM INTO '{escaped}'"))?;
+        vacuum_into(&conn, &dest_path)?;
     }
 
     finalize_backup(
@@ -151,6 +150,27 @@ pub(crate) fn run_startup_backup(
         prefix,
         run_pragma_integrity_check,
     )
+}
+
+/// Writes a `VACUUM INTO` snapshot of `conn` to `dest_path`.
+///
+/// The destination is pre-created empty with mode `0600` before SQLite writes
+/// it, so a backup is never readable by other users, not even briefly. SQLite
+/// accepts an existing empty file as the `VACUUM INTO` target. On failure the
+/// partial file is removed.
+fn vacuum_into(conn: &Connection, dest_path: &Path) -> Result<(), StorageError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(dest_path)?;
+
+    let escaped = dest_path.to_string_lossy().replace('\'', "''");
+    if let Err(error) = conn.execute_batch(&format!("VACUUM INTO '{escaped}'")) {
+        let _ = std::fs::remove_file(dest_path);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn finalize_backup(
@@ -401,6 +421,26 @@ mod tests {
         );
         assert!(outcome.path.exists(), "backup file should exist");
         assert!(outcome.integrity_ok);
+    }
+
+    #[test]
+    fn run_backup_creates_file_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Arrange
+        let (db, _src_dir) = test_db();
+        let dest = tempfile::tempdir().expect("dest");
+        let now: DateTime<Utc> = "2026-06-20T03:00:00Z".parse().unwrap();
+
+        // Act
+        let outcome = run_backup(&db, dest.path(), "UTC", now, 1, "egopulse").expect("backup");
+
+        // Assert
+        let mode = std::fs::metadata(&outcome.path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "backup must be owner-only");
     }
 
     #[test]
@@ -729,6 +769,30 @@ mod tests {
         // Assert
         let expected = backup_dir.path().join("egopulse-20260620-030000.db");
         assert!(expected.exists(), "startup backup file should exist");
+    }
+
+    #[test]
+    fn run_startup_backup_creates_file_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Arrange
+        let src = tempfile::tempdir().expect("src");
+        let db_path = src.path().join("runtime").join("egopulse.db");
+        {
+            let _db = Database::new(&db_path).expect("seed db");
+        }
+        let backup_dir = tempfile::tempdir().expect("backup");
+        let settings = backup_settings(backup_dir.path().to_path_buf());
+
+        // Act
+        let outcome = run_startup_backup(&db_path, &settings, "egopulse").expect("backup");
+
+        // Assert
+        let mode = std::fs::metadata(&outcome.path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "startup backup must be owner-only");
     }
 
     #[test]

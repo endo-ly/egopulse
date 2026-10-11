@@ -65,6 +65,7 @@ pub(crate) struct RecordingProvider {
     seen_messages: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
     seen_systems: Arc<std::sync::Mutex<Vec<String>>>,
     delays_ms: Arc<std::sync::Mutex<Vec<u64>>>,
+    streaming_delta: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -129,7 +130,9 @@ impl LlmProvider for RecordingProvider {
         tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
-        let _ = on_delta;
+        if let Some(delta) = &self.streaming_delta {
+            on_delta(delta.clone());
+        }
         self.send_message(system, messages, tools).await
     }
 
@@ -157,7 +160,13 @@ impl RecordingProvider {
             seen_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
             seen_systems: Arc::new(std::sync::Mutex::new(Vec::new())),
             delays_ms: Arc::new(std::sync::Mutex::new(delays_ms)),
+            streaming_delta: None,
         }
+    }
+
+    pub(crate) fn with_streaming_delta(mut self, delta: &str) -> Self {
+        self.streaming_delta = Some(delta.to_string());
+        self
     }
 
     pub(crate) fn seen_messages(&self) -> Vec<Vec<Message>> {

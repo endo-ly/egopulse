@@ -1046,11 +1046,13 @@ mod tests {
                         id: "call_a".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({}),
+                        invalid_arguments: None,
                     },
                     ToolCall {
                         id: "call_b".to_string(),
                         name: "grep".to_string(),
                         arguments: serde_json::json!({}),
+                        invalid_arguments: None,
                     },
                 ],
                 tool_call_id: None,
@@ -1083,6 +1085,7 @@ mod tests {
                 id: id.to_string(),
                 name: "read".to_string(),
                 arguments: serde_json::json!({}),
+                invalid_arguments: None,
             }],
             tool_call_id: None,
         }

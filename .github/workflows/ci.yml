@@ -20,9 +20,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+        run: rustup show active-toolchain
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -31,7 +29,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Run cargo check
-        run: cargo check
+        run: cargo check --all-targets --all-features
 
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -39,7 +37,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y fd-find ripgrep
+          sudo apt-get install -y fd-find ripgrep python3
           sudo ln -sf $(which fdfind) /usr/local/bin/fd
 
       - name: Run tests

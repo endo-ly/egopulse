@@ -137,47 +137,18 @@ impl<'a> ToolExecutor<'a> {
 
         let tool_start = std::time::Instant::now();
 
-        // Claim the ledger slot before executing so a Tool call is never run
-        // before its durable row exists. Read-only Tools skip the ledger because
-        // they have no side effects and may be safely retried after a crash;
-        // this avoids SQLite write contention during parallel execution.
-        let claim = if is_read_only {
-            ClaimOutcome::Acquired
-        } else {
-            self.claim_tool_slot(assistant_message_id, &tool_call)
-                .await?
-        };
-
-        let (result, payload, executed) = match claim {
-            ClaimOutcome::Acquired => {
-                // Bind this execution's Tool Call ID into the context so tools
-                // (e.g. `agent_send`) can build per-call idempotency keys.
-                let mut exec_context = self.context.clone();
-                exec_context.tool_call_id = tool_call.id.clone();
-                let result = self
-                    .runtime
-                    .tools
-                    .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
-                    .await;
-                let payload = format_tool_result(&tool_call, &result);
-                if !is_read_only {
-                    self.record_tool_outcome(&tool_call, &result, &payload)
-                        .await?;
-                }
-                (result, payload, true)
-            }
-            ClaimOutcome::Reused { tool_output } => {
-                // A prior execution already succeeded; return the stored output
-                // without re-running the Tool.
-                let result = ToolResult::success(tool_output.clone());
-                (result, tool_output, false)
-            }
-            ClaimOutcome::Blocked { state: tool_state } => {
-                // The ledger forbids execution (failed / uncertain / in flight).
+        let (result, payload, executed) = match tool_call.invalid_arguments.as_deref() {
+            // The provider sent arguments that are not valid JSON. Report it to
+            // the model so it can resend the call instead of failing the Turn.
+            Some(parse_error) => {
                 let result =
-                    ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
+                    ToolResult::error(invalid_arguments_message(&tool_call.name, parse_error));
                 let payload = format_tool_result(&tool_call, &result);
                 (result, payload, false)
+            }
+            None => {
+                self.run_claimed_tool(assistant_message_id, &tool_call, is_read_only)
+                    .await?
             }
         };
 
@@ -211,6 +182,61 @@ impl<'a> ToolExecutor<'a> {
         }
 
         Ok(outcome)
+    }
+
+    /// Claims the ledger slot (for side-effecting Tools) and executes the call.
+    ///
+    /// Returns the result, the payload sent to the model, and whether the Tool
+    /// actually ran.
+    async fn run_claimed_tool(
+        &self,
+        assistant_message_id: &str,
+        tool_call: &ToolCall,
+        is_read_only: bool,
+    ) -> Result<(ToolResult, String, bool), EgoPulseError> {
+        // Claim the ledger slot before executing so a Tool call is never run
+        // before its durable row exists. Read-only Tools skip the ledger because
+        // they have no side effects and may be safely retried after a crash;
+        // this avoids SQLite write contention during parallel execution.
+        let claim = if is_read_only {
+            ClaimOutcome::Acquired
+        } else {
+            self.claim_tool_slot(assistant_message_id, tool_call)
+                .await?
+        };
+
+        Ok(match claim {
+            ClaimOutcome::Acquired => {
+                // Bind this execution's Tool Call ID into the context so tools
+                // (e.g. `agent_send`) can build per-call idempotency keys.
+                let mut exec_context = self.context.clone();
+                exec_context.tool_call_id = tool_call.id.clone();
+                let result = self
+                    .runtime
+                    .tools
+                    .execute(&tool_call.name, tool_call.arguments.clone(), &exec_context)
+                    .await;
+                let payload = format_tool_result(tool_call, &result);
+                if !is_read_only {
+                    self.record_tool_outcome(tool_call, &result, &payload)
+                        .await?;
+                }
+                (result, payload, true)
+            }
+            ClaimOutcome::Reused { tool_output } => {
+                // A prior execution already succeeded; return the stored output
+                // without re-running the Tool.
+                let result = ToolResult::success(tool_output.clone());
+                (result, tool_output, false)
+            }
+            ClaimOutcome::Blocked { state: tool_state } => {
+                // The ledger forbids execution (failed / uncertain / in flight).
+                let result =
+                    ToolResult::error(format!("tool call blocked: ledger state={tool_state}"));
+                let payload = format_tool_result(tool_call, &result);
+                (result, payload, false)
+            }
+        })
     }
 
     /// Claims a Tool execution slot in the `tool_calls` ledger.
@@ -290,6 +316,14 @@ impl<'a> ToolExecutor<'a> {
     }
 }
 
+fn invalid_arguments_message(tool_name: &str, parse_error: &str) -> String {
+    format!(
+        "Tool call was not executed: the arguments for '{tool_name}' are not valid JSON \
+         ({parse_error}). Resend the call with complete, valid JSON arguments. For large \
+         file content, use `write` or split the change into smaller `edit` calls."
+    )
+}
+
 pub(crate) fn build_tool_result_phase(outcomes: Vec<ExecutedToolCall>) -> ToolResultPhase {
     let tool_messages = outcomes
         .into_iter()
@@ -321,6 +355,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            invalid_arguments: None,
         }
     }
 
@@ -451,11 +486,13 @@ mod integration_tests {
                             id: "call-1".to_string(),
                             name: "concurrent_read".to_string(),
                             arguments: serde_json::json!({}),
+                            invalid_arguments: None,
                         },
                         ToolCall {
                             id: "call-2".to_string(),
                             name: "concurrent_read".to_string(),
                             arguments: serde_json::json!({}),
+                            invalid_arguments: None,
                         },
                     ],
                     usage: None,
@@ -519,6 +556,77 @@ mod integration_tests {
 
     #[tokio::test]
     #[serial]
+    async fn invalid_tool_arguments_are_reported_to_model_without_execution() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall::from_raw_arguments(
+                        "call-broken".to_string(),
+                        "bash".to_string(),
+                        r#"{"command": "echo should-not-run""#,
+                    )],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        // Act
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("invalid-tool-arguments"),
+            "run a command",
+        )
+        .await
+        .expect("turn should continue after invalid tool arguments");
+
+        // Assert
+        assert_eq!(reply, "recovered");
+        let seen_messages = observer.seen_messages();
+        assert_eq!(seen_messages.len(), 2);
+        let tool_result = seen_messages[1].last().expect("tool result message");
+        assert_eq!(tool_result.role, "tool");
+        let tool_result_text = crate::agent_loop::message_format::message_to_text(tool_result);
+        assert!(
+            tool_result_text.contains("not valid JSON"),
+            "{tool_result_text}"
+        );
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:invalid-tool-arguments:agent:default",
+                Some("invalid-tool-arguments"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert!(tool_calls.is_empty(), "invalid call must not be executed");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn secret_turn_writes_tool_ledger_to_secret_db_only() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -531,6 +639,7 @@ mod integration_tests {
                         id: "call-secret".to_string(),
                         name: "bash".to_string(),
                         arguments: serde_json::json!({"command": "echo secret-side-effect"}),
+                        invalid_arguments: None,
                     }],
                     usage: None,
                 }),
@@ -598,6 +707,7 @@ mod integration_tests {
                             id: "call-b1".to_string(),
                             name: "bash".to_string(),
                             arguments: serde_json::json!({"command": "echo step1"}),
+                            invalid_arguments: None,
                         },
                         ToolCall {
                             id: "call-w1".to_string(),
@@ -606,6 +716,7 @@ mod integration_tests {
                                 "path": file_a.clone(),
                                 "content": "hello"
                             }),
+                            invalid_arguments: None,
                         },
                     ],
                     usage: None,
@@ -682,16 +793,19 @@ mod integration_tests {
                             id: "call-r1".to_string(),
                             name: "read".to_string(),
                             arguments: serde_json::json!({"path": file_a.clone()}),
+                            invalid_arguments: None,
                         },
                         ToolCall {
                             id: "call-b1".to_string(),
                             name: "bash".to_string(),
                             arguments: serde_json::json!({"command": "echo step2"}),
+                            invalid_arguments: None,
                         },
                         ToolCall {
                             id: "call-r2".to_string(),
                             name: "read".to_string(),
                             arguments: serde_json::json!({"path": file_b.clone()}),
+                            invalid_arguments: None,
                         },
                     ],
                     usage: None,

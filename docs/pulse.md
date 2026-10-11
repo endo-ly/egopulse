@@ -405,6 +405,7 @@ resolve_home_surface(agent_id, delivery):
 
 - 明示指定時の DB ルックアップは `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
 - 送信可能 channel は Discord / Telegram のみ。Web / CLI は対象外
+- Activation の `SurfaceContext` / Tool 実行コンテキストは、Home Surface の `external_chat_id`（session key 形式）から生の `surface_thread` を復元して構築する。これにより Activation 中の `agent_send` は宛先エージェントの通常 session key（`{channel}:{surface_thread}:agent:{to}`）を解決する
 - Home Surface が解決できない場合は、その run を `skipped` として記録する（LLM は呼ばない）
 
 ### 7.3 注意点
@@ -503,7 +504,13 @@ Capsule (user message) には prospective memory を含めない。
 - 通常セッションと system prompt が完全一致 → prompt cache が最大効率で hit する
 - agent の人格・記憶・スキルが Pulse でも一貫して利用可能
 
+各 LLM 呼び出しは、通常 Turn と同じリトライ判定（`ModelRunner` の共通リトライループ）で一過性エラー（送信失敗・429・5xx）を最大 3 回まで試行する。Pulse は全エージェントを逐次スキャンするため、待機時間（サーバーの `Retry-After` を含む）が 60 秒を超えるリトライは行わず、その Activation を即座に `failed` とする。これによりプロバイダのクォータ枯渇時に後続の Pulse が止まらない。
+
+Pulse の生成途中の delta は破棄し、外部公開済み出力として扱わない。途中でストリームが中断しても同じ LLM 呼び出しを再試行でき、最終応答が空の場合も共通の runtime guard による回復を行う。通常 Turn は delta を外部公開した時点で再試行を抑止する。いずれも実行済み Tool や Activation 全体を再実行しない。
+
 ### 8.3 Tools
+
+Home Surface が Multi-Agent Room の場合、共有 Channel Log を解決または作成し、その ID を Tool 実行と `agent_send` の宛先 Turn へ引き継ぐ。`agent_send` の公開メッセージは共有 Log、宛先の直接入力と内部イベントは宛先 Agent Session に保存する。Single-Agent Channel では共有 Log を作成せず、Home の Agent Session を保存先とする。
 
 Pulse Activation は通常 turn と同じく built-in tools + MCP tools を使用可能。tool loop を最大 50 イテレーション回し、48回目に終了警告を付け、49〜50回目は最終回答を優先する指示を追加する。activation 全体は 30 分のタイムアウトで保護され、タイムアウト・パニック時は run を `failed` として記録する。
 
@@ -675,7 +682,7 @@ src/
 | timezone helper | now / local date / due 判定補助 |
 | active_turn defer | agent active 中は defer |
 | shutdown 連動 | runtime 停止時に scheduler も止まる |
-| retry utility | Turn と Pulse の tool phase で共通利用 |
+| retry utility | Turn と Pulse の LLM 呼び出しで共通のリトライループを利用（Pulse は待機時間に上限あり） |
 
 ### 11.3 分けるもの
 

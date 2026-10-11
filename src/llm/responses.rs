@@ -12,7 +12,7 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
         .unwrap_or_default()
         .into_iter()
         .map(parse_tool_call)
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
     let content = extract_text(
         choice
             .message
@@ -88,13 +88,8 @@ pub(crate) fn parse_responses_response(
                 name,
                 arguments,
             } => {
-                let arguments = parse_tool_arguments(&arguments, &name)?;
                 let call_id = call_id.or(id).unwrap_or_default();
-                tool_calls.push(ToolCall {
-                    id: call_id,
-                    name,
-                    arguments,
-                });
+                tool_calls.push(ToolCall::from_raw_arguments(call_id, name, &arguments));
             }
             ResponsesOutputItem::Ignored | ResponsesOutputItem::Message { .. } => {}
         }
@@ -163,14 +158,8 @@ impl ResponsesApiResponse {
     }
 }
 
-pub(crate) fn parse_tool_call(raw: OaiToolCall) -> Result<ToolCall, LlmError> {
-    let arguments = parse_tool_arguments(&raw.function.arguments, &raw.function.name)?;
-
-    Ok(ToolCall {
-        id: raw.id,
-        name: raw.function.name,
-        arguments,
-    })
+pub(crate) fn parse_tool_call(raw: OaiToolCall) -> ToolCall {
+    ToolCall::from_raw_arguments(raw.id, raw.function.name, &raw.function.arguments)
 }
 
 fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
@@ -179,19 +168,6 @@ fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
         ResponsesOutputPart::Refusal { refusal } => Some(refusal),
         ResponsesOutputPart::Ignored => None,
     }
-}
-
-pub(super) fn parse_tool_arguments(
-    arguments: &str,
-    name: &str,
-) -> Result<serde_json::Value, LlmError> {
-    if arguments.trim().is_empty() {
-        return Ok(serde_json::json!({}));
-    }
-
-    serde_json::from_str::<serde_json::Value>(arguments).map_err(|error| {
-        LlmError::InvalidResponse(format!("invalid tool arguments for '{}': {error}", name))
-    })
 }
 
 fn parse_rescued_tool_arguments(input_json: &str) -> Option<serde_json::Value> {
@@ -211,6 +187,7 @@ fn rescue_raw_tool_calls(content: &str) -> Option<(Vec<ToolCall>, String)> {
                 id: raw.id,
                 name: raw.name,
                 arguments: parse_rescued_tool_arguments(&raw.input_json)?,
+                invalid_arguments: None,
             })
         })
         .collect::<Option<Vec<_>>>()?;

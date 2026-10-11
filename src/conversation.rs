@@ -88,6 +88,31 @@ impl SurfaceContext {
         }
         format!("{}:{}", self.channel, self.surface_thread)
     }
+
+    /// Recovers the raw `surface_thread` from a stored session key.
+    ///
+    /// This is the inverse of [`Self::session_key`]: it strips the
+    /// `{channel}:` prefix and the `:agent:{agent_id}` suffix so that a context
+    /// rebuilt from a persisted `external_chat_id` maps back to the same
+    /// session instead of nesting the key. Keys without the prefix or suffix
+    /// are returned with only the parts that are present removed.
+    pub(crate) fn surface_thread_from_session_key(
+        channel: &str,
+        session_key: &str,
+        agent_id: &str,
+    ) -> String {
+        let thread = session_key
+            .strip_prefix(channel)
+            .and_then(|rest| rest.strip_prefix(':'))
+            .unwrap_or(session_key);
+        if agent_id.is_empty() {
+            return thread.to_string();
+        }
+        thread
+            .strip_suffix(&format!(":agent:{agent_id}"))
+            .unwrap_or(thread)
+            .to_string()
+    }
 }
 
 #[cfg(test)]
@@ -118,5 +143,49 @@ mod tests {
         );
 
         assert_eq!(ctx.session_key(), "cli:mysession");
+    }
+
+    #[test]
+    fn surface_thread_from_session_key_round_trips_agent_scoped_keys() {
+        // Arrange
+        let original = SurfaceContext::new(
+            "discord".to_string(),
+            "user".to_string(),
+            "999".to_string(),
+            "discord".to_string(),
+            "vega".to_string(),
+        );
+        let stored_key = original.session_key();
+
+        // Act
+        let thread =
+            SurfaceContext::surface_thread_from_session_key("discord", &stored_key, "vega");
+
+        // Assert
+        assert_eq!(thread, "999");
+    }
+
+    #[test]
+    fn surface_thread_from_session_key_keeps_keys_without_prefix_or_suffix() {
+        // Arrange
+        let legacy_key = "1489661143982149763";
+
+        // Act
+        let thread = SurfaceContext::surface_thread_from_session_key("discord", legacy_key, "lyre");
+
+        // Assert
+        assert_eq!(thread, legacy_key);
+    }
+
+    #[test]
+    fn surface_thread_from_session_key_handles_keys_without_agent() {
+        // Arrange
+        let stored_key = "cli:mysession";
+
+        // Act
+        let thread = SurfaceContext::surface_thread_from_session_key("cli", stored_key, "");
+
+        // Assert
+        assert_eq!(thread, "mysession");
     }
 }

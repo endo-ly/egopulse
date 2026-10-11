@@ -646,6 +646,7 @@ mod tests {
                 id: "call-read".to_string(),
                 name: "read".to_string(),
                 arguments: serde_json::json!({"path": "notes.md"}),
+                invalid_arguments: None,
             }],
             tool_call_id: None,
         };

@@ -1119,6 +1119,8 @@ pub(crate) async fn start_telegram_bot_for_bot(
     bot_id: &crate::config::BotId,
     chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The bot stops when the runtime supervisor cancels its shutdown token.
+    let shutdown = state.supervisor.shutdown_token();
     let bot = Bot::new(token);
 
     bot.delete_webhook().await.inspect_err(|e| {
@@ -1176,10 +1178,7 @@ pub(crate) async fn start_telegram_bot_for_bot(
         .build();
     let shutdown_token = dispatcher.shutdown_token();
     let shutdown_task = tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Telegram bot failed to listen for Ctrl-C: {e}");
-            return;
-        }
+        shutdown.cancelled().await;
         if let Ok(wait_for_shutdown) = shutdown_token.shutdown() {
             wait_for_shutdown.await;
         }

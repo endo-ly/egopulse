@@ -830,8 +830,56 @@ async fn spawn_runtime_services(state: &Arc<AppState>) {
 }
 
 async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
+    supervise_runtime_until(state, os_shutdown_signal()).await
+}
+
+/// Waits for SIGINT (Ctrl-C) or, on Unix, SIGTERM (sent by `systemctl stop`).
+async fn os_shutdown_signal() {
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate => {},
+    }
+}
+
+/// Stops the supervisor, then closes MCP servers.
+///
+/// MCP servers are closed after in-flight turns have drained because those
+/// turns may still call MCP tools.
+async fn shutdown_runtime(state: &AppState) {
+    state.supervisor.shutdown().await;
+    if let Some(mcp_manager) = &state.mcp_manager {
+        mcp_manager.write().await.shutdown().await;
+    }
+}
+
+/// Runs the supervision loop until `shutdown_signal` resolves or a critical
+/// task exits.
+///
+/// A shutdown signal is the only graceful stop trigger: channels do not listen
+/// for OS signals themselves and stop through the supervisor's cancellation
+/// token, so their exit during shutdown is never mistaken for a failure.
+async fn supervise_runtime_until(
+    state: &AppState,
+    shutdown_signal: impl std::future::Future<Output = ()>,
+) -> Result<(), EgoPulseError> {
     state.supervisor.start_accepting();
-    info!("Runtime active; waiting for Ctrl-C or channel failure");
+    info!("Runtime active; waiting for a shutdown signal or channel failure");
+    tokio::pin!(shutdown_signal);
 
     loop {
         if let Some(outcome) = state.supervisor.poll_long_lived() {
@@ -842,7 +890,7 @@ async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
                 result = ?outcome.result(),
                 "critical task exited; initiating shutdown"
             );
-            state.supervisor.shutdown().await;
+            shutdown_runtime(state).await;
             return Err(EgoPulseError::Channel(ChannelError::SendFailed(format!(
                 "critical task '{}' exited unexpectedly",
                 outcome.name()
@@ -850,8 +898,9 @@ async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
         }
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                state.supervisor.shutdown().await;
+            _ = &mut shutdown_signal => {
+                info!("shutdown signal received");
+                shutdown_runtime(state).await;
                 return Ok(());
             },
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -926,6 +975,176 @@ mod tests {
         let b = tempfile::TempDir::new().unwrap();
         let _g1 = InstanceGuard::acquire(a.path()).unwrap();
         let _g2 = InstanceGuard::acquire(b.path()).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn sigterm_drains_runtime_and_closes_mcp_process_groups() {
+        const CHILD_ROOT: &str = "EGOPULSE_SIGTERM_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            // Child process: run the real signal handler and shutdown path.
+            let root = std::path::PathBuf::from(root);
+            let mut state = crate::test_util::build_state_with_config(
+                test_config_for_runtime(root.to_str().unwrap().to_string()),
+                None,
+                None,
+                None,
+                None,
+            );
+            state.mcp_manager = Some(Arc::new(tokio::sync::RwLock::new(
+                crate::tools::mcp::McpManager::new(&root).await.unwrap(),
+            )));
+            assert_eq!(
+                state
+                    .mcp_manager
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .await
+                    .status_snapshot()
+                    .connected
+                    .len(),
+                2
+            );
+            let token = state.supervisor.shutdown_token();
+            let turn_supervisor = Arc::clone(&state.supervisor);
+            let drain_root = root.clone();
+            state.supervisor.spawn_long_lived(
+                TaskSpec::new(
+                    supervisor::TaskKind::Channel,
+                    "test-channel",
+                    Criticality::Critical,
+                ),
+                async move {
+                    token.cancelled().await;
+                    Ok(())
+                },
+            );
+            state.supervisor.spawn_turn(async move {
+                while !turn_supervisor.is_shutting_down() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::fs::write(drain_root.join("turn.drained"), "drained").unwrap();
+            });
+            // Signal registration happens when supervise_runtime is first polled.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::fs::write(root.join("runtime.ready"), "ready").unwrap();
+            });
+            supervise_runtime(&state)
+                .await
+                .expect("SIGTERM is graceful shutdown");
+            assert!(
+                state
+                    .runtime_status
+                    .snapshot()
+                    .critical_task_failure
+                    .is_none()
+            );
+            return;
+        }
+
+        // Arrange: isolated runtime subprocess with a graceful server and an
+        // orphan server whose launcher exits first.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_server.py");
+        let mut servers = serde_json::Map::new();
+        for mode in ["early", "graceful"] {
+            servers.insert(
+                mode.to_string(),
+                serde_json::json!({
+                    "transport":"stdio", "command":"python3", "args":[fixture, dir.path(), mode]
+                }),
+            );
+        }
+        std::fs::write(
+            dir.path().join("mcp.json"),
+            serde_json::to_vec(&serde_json::json!({"mcpServers":servers})).unwrap(),
+        )
+        .unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for mode in ["early", "graceful"] {
+                    if let Ok(text) =
+                        std::fs::read_to_string(self.0.join(format!("{mode}.launcher")))
+                    {
+                        if let Ok(pid) = text.trim().parse::<i32>() {
+                            // SAFETY: only dedicated test server groups are targeted.
+                            unsafe {
+                                libc::kill(-pid, libc::SIGKILL);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _cleanup = Cleanup(dir.path().to_path_buf());
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "runtime::tests::sigterm_drains_runtime_and_closes_mcp_process_groups",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, dir.path())
+            .env("HOME", dir.path())
+            .kill_on_drop(true);
+        let mut child = child.spawn().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !dir.path().join("runtime.ready").exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "runtime exited before becoming ready"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("runtime must become ready");
+        let pids = ["early", "graceful"].map(|mode| {
+            std::fs::read_to_string(dir.path().join(format!("{mode}.pid")))
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+        });
+
+        // Act: SIGTERM must resolve the real supervisor loop, not kill the runtime.
+        // SAFETY: child.id is the PID of the test runtime subprocess.
+        assert_eq!(
+            unsafe { libc::kill(child.id().unwrap() as i32, libc::SIGTERM) },
+            0
+        );
+        let status = tokio::time::timeout(Duration::from_secs(6), child.wait())
+            .await
+            .expect("runtime shutdown must finish")
+            .unwrap();
+
+        // Assert: clean process exit, drain-before-MCP-close, and no living server.
+        assert!(status.success(), "{status}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("graceful.closed")).unwrap(),
+            "drained"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let any_alive = pids.iter().any(|pid| {
+                    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .ok()
+                        .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.starts_with('Z')))
+                        .is_some_and(|zombie| !zombie)
+                });
+                if !any_alive {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("MCP descendants must not outlive runtime");
     }
 
     #[test]

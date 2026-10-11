@@ -64,6 +64,8 @@ egopulse --version
 
 Rust toolchain が必要。未導入の場合は [rustup](https://rustup.rs/) でインストールする。
 
+ソースビルド・開発・CI・Release は `rust-toolchain.toml` の Rust 1.95.0 を使用する。rustup はリポジトリ内で指定バージョンを選択し、必要なコンポーネントをインストールする。ツールチェーンの更新は Clippy・テストを含む品質チェックと合わせて行う。
+
 > **Rust toolchain / Rustup とは？**
 > - **Rust toolchain**: Rust コンパイラ(`rustc`)、ビルドツール(`cargo`)、標準ライブラリなどの一式
 > - **Rustup**: toolchain のインストール・バージョン管理を行う公式ツール

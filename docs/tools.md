@@ -30,6 +30,7 @@
 - path 解決は workspace 配下に制限される
 - tool 実行結果は turn loop で `{"tool":"...","status":"success|error","result":"...","details":{...}}` の JSON に包まれて LLM に返る
 - `details` は tool によって `truncation`、`diff`、`firstChangedLine`、`fullOutputPath` などを含む
+- LLM が有効な JSON でない引数を返した tool call は実行せず、Tool 実行台帳にも記録しない。Turn / Pulse は失敗させず、パースエラーを含む `status: error` の tool result をモデルへ返して再送を促す。会話履歴にはその tool call の引数を `{}` として保存する
 - マルチモーダル画像対応: `read` tool で画像ファイルを検出した場合、base64 data URL として LLM に直接渡す。マルチモーダルメッセージが含まれる場合は OpenAI Responses API (`/responses`) に自動ルーティングされる（Chat Completions API はマルチモーダル tool result に非対応のため）。セッション永続化時は画像を SHA256 ハッシュで内容重複排除し、参照形式 (`input_image_ref`) で保存する
 
 ## 2. Tool Registry
@@ -203,8 +204,8 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `command: string` 必須
   - `timeout: integer` 任意。秒
 - 挙動:
-  - workspace を cwd にして `bash -lc` で実行する
-  - stdout / stderr は 1 つのログに結合する
+  - workspace を cwd にして、コマンド文字列を加工せず `bash -lc` に渡して実行する。末尾の heredoc デリミタやコメントもそのまま解釈される
+  - stdout / stderr はプロセス起動時に同一の一時ファイルへ割り当て、1 つのログに結合する。bash 自身の構文エラーもこのログに含まれる
   - 出力は末尾側を最大 `2000` 行または `100KB` に tail truncation する
   - truncation が発生した場合は full output を temp file に保存する
   - 最後の 1 行だけで byte limit を超える場合は、その行の末尾だけを返す special case がある

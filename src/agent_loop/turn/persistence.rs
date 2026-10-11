@@ -411,6 +411,7 @@ mod tests {
                         id: "call-turnid".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: None,
                 }),

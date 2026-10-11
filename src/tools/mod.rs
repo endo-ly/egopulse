@@ -745,6 +745,69 @@ mod tests {
         );
     }
 
+    async fn run_bash_in_temp_workspace(command: &str) -> ToolResult {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let workspace = config.workspace_dir().expect("workspace_dir");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let registry = test_registry(&config);
+        registry
+            .execute("bash", json!({ "command": command }), &test_context())
+            .await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_runs_command_ending_with_heredoc_delimiter() {
+        // Arrange
+        let command = "cat <<'EOF'\nfrom-heredoc\nEOF";
+
+        // Act
+        let result = run_bash_in_temp_workspace(command).await;
+
+        // Assert
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "from-heredoc\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_runs_command_ending_with_comment() {
+        // Arrange
+        let command = "echo commented # trailing note";
+
+        // Act
+        let result = run_bash_in_temp_workspace(command).await;
+
+        // Assert
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.content, "commented\n");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_reports_shell_syntax_errors() {
+        // Arrange
+        let command = "echo 'unclosed";
+
+        // Act
+        let result = run_bash_in_temp_workspace(command).await;
+
+        // Assert
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("unexpected EOF"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("Command exited with code 2"),
+            "{}",
+            result.content
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn activate_skill_loads_skill_instructions() {

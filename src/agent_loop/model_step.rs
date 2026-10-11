@@ -32,6 +32,13 @@ pub(crate) struct AssistantToolPhase {
 
 pub(crate) fn ignore_delta(_: String) {}
 
+/// Whether the caller exposes streaming deltas outside the model request.
+#[derive(Clone, Copy)]
+enum DeltaPublication {
+    Published,
+    Discarded,
+}
+
 pub(crate) enum ModelStep {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
@@ -65,20 +72,6 @@ impl<'a> ModelRunner<'a> {
     /// Creates a model runner from the dependencies shared by one turn.
     pub(crate) fn new(request: ModelStepRequest<'a>) -> Self {
         Self { request }
-    }
-
-    /// Executes one model step, including the shared empty-response recovery.
-    pub(crate) async fn run(
-        &self,
-        empty_retry_attempted: &mut bool,
-        output_published: Option<&AtomicBool>,
-    ) -> Result<ModelStep, ModelStepError> {
-        send_model_step_with_empty_retry(
-            self.request.clone(),
-            empty_retry_attempted,
-            output_published,
-        )
-        .await
     }
 
     /// Executes one durable model iteration with bounded transport retries.
@@ -116,6 +109,47 @@ impl<'a> ModelRunner<'a> {
             });
         }
 
+        let db = self.request.state.db_for(self.request.scope);
+        self.retry_transient_failures(DeltaPublication::Published, None, || {
+            let db = Arc::clone(&db);
+            let turn_id = turn_id.to_string();
+            async move {
+                let _ =
+                    call_blocking(db, move |db| db.increment_turn_model_attempt(&turn_id)).await;
+            }
+        })
+        .await
+    }
+
+    /// Executes one model step with bounded transport retries for callers that
+    /// have no durable Turn, such as Pulse activations.
+    /// Streaming deltas are discarded, so receiving one does not constitute
+    /// published output and cannot prevent transport or empty-response recovery.
+    ///
+    /// A retry whose backoff (including a server `Retry-After`) would exceed
+    /// `max_backoff` is not attempted; the error is returned immediately so a
+    /// long provider quota wait cannot stall the caller.
+    pub(crate) async fn run_with_transient_retry(
+        &self,
+        max_backoff: Duration,
+    ) -> Result<ModelStep, ModelRequestError> {
+        self.retry_transient_failures(DeltaPublication::Discarded, Some(max_backoff), || async {})
+            .await
+    }
+
+    /// Shared retry loop: retries retryable LLM errors up to [`MAX_LLM_RETRIES`]
+    /// attempts unless output was already published. `before_retry` runs before
+    /// each backoff so callers can record the attempt.
+    async fn retry_transient_failures<F, Fut>(
+        &self,
+        delta_publication: DeltaPublication,
+        max_backoff: Option<Duration>,
+        mut before_retry: F,
+    ) -> Result<ModelStep, ModelRequestError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let output_published = Arc::new(AtomicBool::new(false));
         let mut empty_reply_retry_attempted = false;
         let mut retry_messages = Arc::clone(&self.request.messages);
@@ -123,8 +157,10 @@ impl<'a> ModelRunner<'a> {
             let published_flag = Arc::clone(&output_published);
             let caller_on_delta = self.request.on_delta;
             let on_delta = move |text: String| {
-                published_flag.store(true, Ordering::SeqCst);
-                caller_on_delta(text);
+                if matches!(delta_publication, DeltaPublication::Published) {
+                    published_flag.store(true, Ordering::SeqCst);
+                    caller_on_delta(text);
+                }
             };
             let response = self
                 .run_once(
@@ -142,14 +178,11 @@ impl<'a> ModelRunner<'a> {
                     let published = output_published.load(Ordering::SeqCst);
                     let retryable =
                         matches!(&error, EgoPulseError::Llm(error) if error.is_retryable());
-                    if retryable && !published && attempt < MAX_LLM_RETRIES {
-                        let turn_id_for_attempt = turn_id.to_string();
-                        let _ = call_blocking(
-                            self.request.state.db_for(self.request.scope),
-                            move |db| db.increment_turn_model_attempt(&turn_id_for_attempt),
-                        )
-                        .await;
-                        let backoff = llm_retry_backoff(attempt, &error);
+                    let backoff = llm_retry_backoff(attempt, &error);
+                    let within_backoff_limit = max_backoff.is_none_or(|limit| backoff <= limit);
+                    if retryable && !published && within_backoff_limit && attempt < MAX_LLM_RETRIES
+                    {
+                        before_retry().await;
                         warn!(
                             attempt,
                             max = MAX_LLM_RETRIES,
@@ -215,11 +248,6 @@ impl ModelStepError {
             error,
             retry_messages,
         }
-    }
-
-    /// Returns the underlying error when the caller has no retry policy.
-    pub(crate) fn into_error(self) -> EgoPulseError {
-        self.error
     }
 
     /// Returns the underlying error and the exact messages for the next retry.
@@ -528,6 +556,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            invalid_arguments: None,
         }
     }
 
@@ -624,6 +653,63 @@ mod tests {
         // Assert
         assert_eq!(long_delay, Duration::from_secs(3_600));
         assert_eq!(preserved, Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn transient_model_retry_stops_at_shared_attempt_limit() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            (0..MAX_LLM_RETRIES)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body_preview: "provider error".to_string(),
+                        retry_after_secs: Some(0),
+                    })
+                })
+                .collect(),
+            vec![0; MAX_LLM_RETRIES],
+        )
+        .with_streaming_delta("unpublished partial output");
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("transient-retry-limit");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(ModelStepRequest {
+            state: &dependencies,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+
+        // Act
+        let result = runner
+            .run_with_transient_retry(Duration::from_secs(60))
+            .await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
     }
 
     #[tokio::test]
@@ -880,7 +966,7 @@ mod tests {
         .await;
         let error = match result {
             Ok(_) => panic!("non-empty invalid response should remain an error"),
-            Err(error) => error.into_error(),
+            Err(error) => error.into_parts().0,
         };
 
         // Assert
@@ -1039,6 +1125,7 @@ mod tests {
                         id: "call-iter-1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 15,
@@ -1332,6 +1419,7 @@ mod tests {
                         id: "call-tc-1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: None,
                 }),

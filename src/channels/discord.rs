@@ -1231,6 +1231,8 @@ pub(crate) async fn start_discord_bot_for_bot(
     bot_id: &crate::config::BotId,
     chain_state: Arc<BotChainState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The bot stops when the runtime supervisor cancels its shutdown token.
+    let shutdown = state.supervisor.shutdown_token();
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT;
@@ -1272,10 +1274,7 @@ pub(crate) async fn start_discord_bot_for_bot(
 
     let shard_manager = client.shard_manager.clone();
     let shutdown_task = tokio::spawn(async move {
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            error!("Discord bot failed to listen for Ctrl-C: {e}");
-            return;
-        }
+        shutdown.cancelled().await;
         shard_manager.shutdown_all().await;
     });
 

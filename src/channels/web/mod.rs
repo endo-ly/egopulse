@@ -422,26 +422,7 @@ pub(crate) async fn run_server(
     };
     let app = build_router(web_state);
 
-    let shutdown_signal = async move {
-        let ctrl_c = tokio::signal::ctrl_c();
-
-        #[cfg(unix)]
-        let terminate = async {
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to install signal handler")
-                .recv()
-                .await;
-        };
-
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => {},
-            _ = terminate => {},
-            _ = shutdown.cancelled() => {},
-        }
-    };
+    let shutdown_signal = async move { shutdown.cancelled().await };
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal)

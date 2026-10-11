@@ -18,6 +18,12 @@ use crate::storage::PulseOutputKind;
 use crate::tools::ToolExecutionContext;
 use tracing::warn;
 
+/// Longest backoff a Pulse activation waits before retrying an LLM call.
+///
+/// Pulse scans agents sequentially, so a provider quota wait (a long
+/// `Retry-After`) fails the activation instead of stalling every later Pulse.
+const PULSE_MAX_LLM_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// RAII guard that decrements the active turn counter on drop.
 struct PulseTurnGuard<'a> {
     tracker: &'a crate::runtime::ActiveTurnTracker,
@@ -51,6 +57,25 @@ pub(crate) struct ToolPhase {
     pub tool_result_preview: String,
 }
 
+/// Builds the surface context for a Pulse activation on the agent's home surface.
+///
+/// The home surface stores the full session key as `external_chat_id`, so the
+/// raw thread is recovered from it; otherwise tools that derive session keys
+/// from the context (e.g. `agent_send`) would nest the key.
+fn pulse_surface_context(home_surface: &HomeSurface, agent_id: &str) -> SurfaceContext {
+    SurfaceContext::new(
+        home_surface.channel.clone(),
+        agent_id.to_string(),
+        SurfaceContext::surface_thread_from_session_key(
+            &home_surface.channel,
+            &home_surface.external_chat_id,
+            agent_id,
+        ),
+        home_surface.chat_type.clone(),
+        agent_id.to_string(),
+    )
+}
+
 /// Execute a Pulse Activation.
 ///
 /// This runs the Pulse Capsule through the LLM with tool support.
@@ -74,13 +99,47 @@ pub(crate) async fn run_activation_with_snapshot(
         agent_id: agent_id.to_string(),
     };
 
-    let context = SurfaceContext::new(
-        home_surface.channel.clone(),
-        agent_id.to_string(),
-        home_surface.external_chat_id.clone(),
-        home_surface.chat_type.clone(),
-        agent_id.to_string(),
-    );
+    let mut context = pulse_surface_context(home_surface, agent_id);
+    let channel_log_key = match context.channel.as_str() {
+        "discord" => context
+            .surface_thread
+            .parse::<u64>()
+            .ok()
+            .filter(|id| {
+                config_snapshot
+                    .config
+                    .discord_channels()
+                    .get(id)
+                    .is_some_and(|channel| channel.multi_agent)
+            })
+            .map(crate::runtime::ChannelLogKey::Discord),
+        "telegram" => context
+            .surface_thread
+            .parse::<i64>()
+            .ok()
+            .filter(|id| {
+                config_snapshot
+                    .config
+                    .telegram_channels()
+                    .get(id)
+                    .is_some_and(|channel| channel.multi_agent)
+            })
+            .map(crate::runtime::ChannelLogKey::Telegram),
+        _ => None,
+    };
+    if let Some(key) = channel_log_key {
+        context.channel_log_chat_id = Some(
+            crate::storage::call_blocking(state.db_for(context.scope), move |db| match key {
+                crate::runtime::ChannelLogKey::Discord(channel_id) => {
+                    db.resolve_channel_log_chat_id(channel_id)
+                }
+                crate::runtime::ChannelLogKey::Telegram(chat_id) => {
+                    db.resolve_telegram_channel_log_chat_id(chat_id)
+                }
+            })
+            .await?,
+        );
+    }
 
     let turn_dependencies = state.turn_dependencies();
     let channel_llm = turn_dependencies
@@ -98,10 +157,10 @@ pub(crate) async fn run_activation_with_snapshot(
     let tool_context = ToolExecutionContext {
         chat_id,
         channel: home_surface.channel.clone(),
-        surface_thread: home_surface.external_chat_id.clone(),
+        surface_thread: context.surface_thread.clone(),
         chat_type: home_surface.chat_type.clone(),
         agent_id: agent_id.to_string(),
-        channel_log_chat_id: None,
+        channel_log_chat_id: context.channel_log_chat_id,
         chain_depth: 0,
         origin_id: String::new(),
         turn_id: uuid::Uuid::new_v4().to_string(),
@@ -121,7 +180,6 @@ pub(crate) async fn run_activation_with_snapshot(
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        let mut empty_reply_retry_attempted = false;
         let request_messages = messages_for_iteration(&messages, iteration);
         let model_runner = ModelRunner::new(ModelStepRequest {
             state: &turn_dependencies,
@@ -140,9 +198,9 @@ pub(crate) async fn run_activation_with_snapshot(
             on_delta: &ignore_delta,
         });
         let phase_response = model_runner
-            .run(&mut empty_reply_retry_attempted, None)
+            .run_with_transient_retry(PULSE_MAX_LLM_RETRY_BACKOFF)
             .await
-            .map_err(|error| error.into_error())?;
+            .map_err(|error| error.into_parts().0)?;
 
         let assistant_phase = match phase_response {
             ModelStep::Final(response) => {
@@ -231,6 +289,24 @@ mod tests {
             external_chat_id: "123".to_string(),
             chat_type: "dm".to_string(),
         }
+    }
+
+    #[test]
+    fn pulse_surface_context_maps_back_to_home_session_key() {
+        // Arrange
+        let home_surface = HomeSurface {
+            chat_id: 25,
+            channel: "discord".to_string(),
+            external_chat_id: "discord:999:agent:vega".to_string(),
+            chat_type: "discord".to_string(),
+        };
+
+        // Act
+        let context = pulse_surface_context(&home_surface, "vega");
+
+        // Assert
+        assert_eq!(context.surface_thread, "999");
+        assert_eq!(context.session_key(), home_surface.external_chat_id);
     }
 
     #[test]
@@ -349,6 +425,7 @@ mod tests {
                     id: format!("pulse-ls-{iteration}"),
                     name: "ls".to_string(),
                     arguments: serde_json::json!({}),
+                    invalid_arguments: None,
                 }],
                 usage: None,
             }));
@@ -564,6 +641,320 @@ mod tests {
         assert_eq!(retry_message.role, "user");
         assert!(
             crate::agent_loop::message_format::message_to_text(retry_message)
+                .contains("no user-visible text")
+        );
+    }
+
+    fn pulse_ok_response() -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        Ok(crate::llm::MessagesResponse {
+            content: "PULSE_OK".to_string(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            usage: None,
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_agent_send_uses_shared_log_and_target_session() {
+        use crate::config::{
+            AgentConfig, AgentId, ChannelConfig, ChannelName, DiscordChannelConfig,
+        };
+        use crate::runtime::turn::{ResponseDelivery, ScheduleResult, ScheduledTurn};
+
+        for (multi_agent, existing_log) in [(true, true), (true, false), (false, false)] {
+            // Arrange: a real tool, durable intake and DB, with the recipient
+            // queued until the activation has completed its model loop.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut config = crate::test_util::test_config(dir.path().to_str().unwrap());
+            config
+                .agents
+                .insert(AgentId::new("vega"), AgentConfig::default());
+            config.channels.insert(
+                ChannelName::new("discord"),
+                ChannelConfig {
+                    enabled: Some(true),
+                    discord_channels: Some(std::collections::HashMap::from([(
+                        123,
+                        DiscordChannelConfig {
+                            multi_agent,
+                            agents: vec![AgentId::new("default"), AgentId::new("vega")],
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            );
+            let mut send_response = pulse_ok_response().unwrap();
+            send_response.tool_calls.push(crate::llm::ToolCall {
+                id: "pulse-send".to_string(),
+                name: "agent_send".to_string(),
+                arguments: serde_json::json!({"to":"vega", "message":"pulse delivery"}),
+                invalid_arguments: None,
+            });
+            let provider = crate::agent_loop::test_support::RecordingProvider::new(
+                vec![Ok(send_response), pulse_ok_response(), pulse_ok_response()],
+                vec![0; 3],
+            );
+            let mut state = crate::test_util::build_state_with_config(
+                config,
+                Some(Arc::new(provider)),
+                None,
+                None,
+                None,
+            );
+            let intake = Arc::new(crate::runtime::TurnIntake::new());
+            let tool = crate::tools::AgentSendTool::new_with_manager(
+                Arc::clone(&state.db),
+                None,
+                Arc::clone(&state.channels),
+                Arc::clone(&intake),
+                Arc::clone(&state.config_manager),
+            );
+            Arc::get_mut(&mut state.tools)
+                .unwrap()
+                .register_tool(Box::new(tool));
+            let state = Arc::new(state);
+            intake.bind(&state);
+            state.supervisor.start_accepting();
+            let sender_id = state
+                .db
+                .resolve_or_create_chat_id(
+                    "discord",
+                    "discord:123:agent:default",
+                    None,
+                    "discord",
+                    "default",
+                )
+                .unwrap();
+            let preexisting_log_id =
+                existing_log.then(|| state.db.resolve_channel_log_chat_id(123).unwrap());
+            let surface = crate::pulse::capsule::resolve_home_surface(
+                &state.db,
+                "default",
+                &["discord"],
+                Some(&crate::pulse::definition::DeliverySpec {
+                    channel: "discord".to_string(),
+                    external_chat_id: "123".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(surface.chat_id, sender_id);
+            let target_context = SurfaceContext::new(
+                "discord".to_string(),
+                "scheduler".to_string(),
+                "123".to_string(),
+                "discord".to_string(),
+                "vega".to_string(),
+            );
+            assert!(matches!(
+                state.turn_scheduler.submit(ScheduledTurn {
+                    turn_id: "blocker".to_string(),
+                    origin_id: "blocker".to_string(),
+                    context: target_context,
+                    input: "blocker".to_string(),
+                    config_snapshot: Some(state.config_manager.current_blocking()),
+                    received_at: None,
+                    response_delivery: ResponseDelivery::Channel,
+                }),
+                ScheduleResult::Started(_)
+            ));
+            let capsule = build_capsule(
+                "default",
+                &test_intention(),
+                "",
+                &[],
+                &surface,
+                "2026-05-10T09:00:00+09:00",
+            );
+
+            // Act
+            run_activation_with_snapshot(
+                &state,
+                "default",
+                &capsule,
+                &surface,
+                state.config_manager.current_blocking(),
+            )
+            .await
+            .unwrap();
+            let target = state
+                .turn_scheduler
+                .on_turn_completed("discord:123:agent:vega")
+                .expect("queued recipient turn");
+            let shared_log = state
+                .db
+                .get_chat_by_channel_external_and_agent("discord", "discord:123:multi-room-log", "")
+                .unwrap();
+            assert_eq!(shared_log.is_some(), multi_agent);
+            let expected_log = shared_log.as_ref().map(|chat| chat.chat_id);
+            if let Some(preexisting_log_id) = preexisting_log_id {
+                assert_eq!(expected_log, Some(preexisting_log_id));
+            }
+
+            assert_eq!(target.context.channel_log_chat_id, expected_log);
+            assert_eq!(target.context.session_key(), "discord:123:agent:vega");
+            let (stored_chat, count): (i64, i64) = state
+                .db
+                .get_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT chat_id, COUNT(*) FROM messages WHERE message_kind = 'agent_send'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(stored_chat, expected_log.unwrap_or(sender_id));
+            crate::runtime::execute_scheduled_turn(&state, target).await;
+            let target_chat = state
+                .db
+                .get_chat_by_channel_external_and_agent("discord", "discord:123:agent:vega", "vega")
+                .unwrap()
+                .unwrap();
+            assert!(
+                state
+                    .db
+                    .load_session_snapshot(target_chat.chat_id, 30)
+                    .unwrap()
+                    .messages_json
+                    .is_some()
+            );
+            let chat_count: i64 = state
+                .db
+                .get_conn()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM chats", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                chat_count,
+                2 + i64::from(multi_agent),
+                "only the sender, recipient, and configured shared log exist"
+            );
+            state.supervisor.shutdown().await;
+        }
+    }
+
+    fn api_error(status: u16, retry_after_secs: Option<u64>) -> crate::error::LlmError {
+        crate::error::LlmError::ApiError {
+            status: reqwest::StatusCode::from_u16(status).expect("status"),
+            body_preview: "provider error".to_string(),
+            retry_after_secs,
+        }
+    }
+
+    async fn activate_with_responses(
+        state_root: &str,
+        responses: Vec<Result<crate::llm::MessagesResponse, crate::error::LlmError>>,
+    ) -> (
+        Result<ActivationResult, EgoPulseError>,
+        crate::agent_loop::test_support::RecordingProvider,
+    ) {
+        let delays = vec![0; responses.len()];
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(responses, delays)
+            .with_streaming_delta("partial, unpublished text");
+        let observer = provider.clone();
+        let state = crate::test_util::build_state_with_config(
+            crate::test_util::test_config(state_root),
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        let surface = HomeSurface {
+            chat_id: 1,
+            channel: "cli".to_string(),
+            external_chat_id: "test-pulse-retry".to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await;
+        (result, observer)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_retries_transient_llm_error() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = vec![Err(api_error(503, None)), pulse_ok_response()];
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        let result = result.expect("activation should recover from a transient error");
+        assert_eq!(result.output_kind, PulseOutputKind::Silent);
+        assert_eq!(observer.seen_messages().len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_fails_fast_when_retry_after_exceeds_backoff_limit() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = vec![Err(api_error(429, Some(3_600))), pulse_ok_response()];
+
+        // Act
+        let (result, observer) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses),
+        )
+        .await
+        .expect("long Retry-After must fail without waiting");
+
+        // Assert
+        assert!(result.is_err(), "quota wait must not be retried");
+        assert_eq!(observer.seen_messages().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_recovers_empty_response_after_delta_and_guard_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut empty = pulse_ok_response().unwrap();
+        empty.content = "<thinking>hidden</thinking>".to_string();
+        let responses = vec![Ok(empty), Err(api_error(503, Some(0))), pulse_ok_response()];
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        assert_eq!(
+            result.expect("empty response should recover").output_kind,
+            PulseOutputKind::Silent
+        );
+        let requests = observer.seen_messages();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1], requests[2],
+            "transport retry must preserve the guarded request"
+        );
+        assert!(
+            requests[1]
+                .last()
+                .unwrap()
+                .content
+                .as_text_lossy()
                 .contains("no user-visible text")
         );
     }
