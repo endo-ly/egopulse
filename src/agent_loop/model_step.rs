@@ -657,6 +657,63 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn transient_model_retry_stops_at_shared_attempt_limit() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            (0..MAX_LLM_RETRIES)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                        body_preview: "provider error".to_string(),
+                        retry_after_secs: Some(0),
+                    })
+                })
+                .collect(),
+            vec![0; MAX_LLM_RETRIES],
+        )
+        .with_streaming_delta("unpublished partial output");
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("transient-retry-limit");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(ModelStepRequest {
+            state: &dependencies,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+
+        // Act
+        let result = runner
+            .run_with_transient_retry(Duration::from_secs(60))
+            .await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn process_turn_logs_llm_usage_on_agent_loop() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");

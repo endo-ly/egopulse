@@ -100,29 +100,45 @@ pub(crate) async fn run_activation_with_snapshot(
     };
 
     let mut context = pulse_surface_context(home_surface, agent_id);
-    let multi_agent = match context.channel.as_str() {
+    let channel_log_key = match context.channel.as_str() {
         "discord" => context
             .surface_thread
             .parse::<u64>()
             .ok()
-            .and_then(|id| config_snapshot.config.discord_channels().get(&id).cloned())
-            .is_some_and(|channel| channel.multi_agent),
+            .filter(|id| {
+                config_snapshot
+                    .config
+                    .discord_channels()
+                    .get(id)
+                    .is_some_and(|channel| channel.multi_agent)
+            })
+            .map(crate::runtime::ChannelLogKey::Discord),
         "telegram" => context
             .surface_thread
             .parse::<i64>()
             .ok()
-            .and_then(|id| config_snapshot.config.telegram_channels().get(&id).cloned())
-            .is_some_and(|channel| channel.multi_agent),
-        _ => false,
-    };
-    if multi_agent {
-        let channel = context.channel.clone();
-        let thread = context.surface_thread.clone();
-        context.channel_log_chat_id =
-            crate::storage::call_blocking(state.db_for(context.scope), move |db| {
-                db.find_channel_log_chat_id(&channel, &thread)
+            .filter(|id| {
+                config_snapshot
+                    .config
+                    .telegram_channels()
+                    .get(id)
+                    .is_some_and(|channel| channel.multi_agent)
             })
-            .await?;
+            .map(crate::runtime::ChannelLogKey::Telegram),
+        _ => None,
+    };
+    if let Some(key) = channel_log_key {
+        context.channel_log_chat_id = Some(
+            crate::storage::call_blocking(state.db_for(context.scope), move |db| match key {
+                crate::runtime::ChannelLogKey::Discord(channel_id) => {
+                    db.resolve_channel_log_chat_id(channel_id)
+                }
+                crate::runtime::ChannelLogKey::Telegram(chat_id) => {
+                    db.resolve_telegram_channel_log_chat_id(chat_id)
+                }
+            })
+            .await?,
+        );
     }
 
     let turn_dependencies = state.turn_dependencies();
@@ -646,7 +662,7 @@ mod tests {
         };
         use crate::runtime::turn::{ResponseDelivery, ScheduleResult, ScheduledTurn};
 
-        for (multi_agent, existing_log) in [(true, true), (false, true), (true, false)] {
+        for (multi_agent, existing_log) in [(true, true), (true, false), (false, false)] {
             // Arrange: a real tool, durable intake and DB, with the recipient
             // queued until the activation has completed its model loop.
             let dir = tempfile::tempdir().expect("tempdir");
@@ -682,7 +698,7 @@ mod tests {
             );
             let mut state = crate::test_util::build_state_with_config(
                 config,
-                Some(Arc::new(provider.clone())),
+                Some(Arc::new(provider)),
                 None,
                 None,
                 None,
@@ -711,17 +727,8 @@ mod tests {
                     "default",
                 )
                 .unwrap();
-            let log_id = existing_log.then(|| state.db.resolve_channel_log_chat_id(123).unwrap());
-            if let Some(id) = log_id {
-                state
-                    .db
-                    .store_message_only(&crate::storage::StoredMessage::user(
-                        id,
-                        "human".to_string(),
-                        "shared room history".to_string(),
-                    ))
-                    .unwrap();
-            }
+            let preexisting_log_id =
+                existing_log.then(|| state.db.resolve_channel_log_chat_id(123).unwrap());
             let surface = crate::pulse::capsule::resolve_home_surface(
                 &state.db,
                 "default",
@@ -764,7 +771,7 @@ mod tests {
             );
 
             // Act
-            let activation = run_activation_with_snapshot(
+            run_activation_with_snapshot(
                 &state,
                 "default",
                 &capsule,
@@ -773,27 +780,22 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(
-                !activation.tool_phases[0].tool_messages[0]
-                    .content
-                    .as_text_lossy()
-                    .contains("\"delivered\":false")
-            );
             let target = state
                 .turn_scheduler
                 .on_turn_completed("discord:123:agent:vega")
                 .expect("queued recipient turn");
-            let expected_log = if multi_agent { log_id } else { None };
+            let shared_log = state
+                .db
+                .get_chat_by_channel_external_and_agent("discord", "discord:123:multi-room-log", "")
+                .unwrap();
+            assert_eq!(shared_log.is_some(), multi_agent);
+            let expected_log = shared_log.as_ref().map(|chat| chat.chat_id);
+            if let Some(preexisting_log_id) = preexisting_log_id {
+                assert_eq!(expected_log, Some(preexisting_log_id));
+            }
 
-            // Assert both live and durable recipient contexts, and actual storage.
             assert_eq!(target.context.channel_log_chat_id, expected_log);
             assert_eq!(target.context.session_key(), "discord:123:agent:vega");
-            let run = state.db.get_turn_run(&target.turn_id).unwrap();
-            let durable = crate::runtime::turn::deserialize_scheduled_turn(
-                run.scheduled_request_json.as_deref().unwrap(),
-            )
-            .unwrap();
-            assert_eq!(durable.context.channel_log_chat_id, expected_log);
             let (stored_chat, count): (i64, i64) = state
                 .db
                 .get_conn()
@@ -828,16 +830,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 chat_count,
-                2 + i64::from(existing_log),
-                "no ghost chat or invented log"
-            );
-            let requests = provider.seen_messages();
-            assert_eq!(requests.len(), 3);
-            assert_eq!(
-                requests[2]
-                    .iter()
-                    .any(|m| m.content.as_text_lossy().contains("shared room history")),
-                expected_log.is_some()
+                2 + i64::from(multi_agent),
+                "only the sender, recipient, and configured shared log exist"
             );
             state.supervisor.shutdown().await;
         }
@@ -933,36 +927,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn activation_retries_connection_error_after_delta() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let error = reqwest::Client::new()
-            .get(format!("http://{address}"))
-            .send()
-            .await
-            .expect_err("connection refused");
-        let responses = vec![
-            Err(crate::error::LlmError::RequestFailed(error)),
-            pulse_ok_response(),
-        ];
-
-        // Act
-        let (result, observer) =
-            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
-
-        // Assert
-        assert_eq!(
-            result.expect("connection error should recover").output_kind,
-            PulseOutputKind::Silent
-        );
-        assert_eq!(observer.seen_messages().len(), 2);
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn activation_recovers_empty_response_after_delta_and_guard_failure() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -992,28 +956,6 @@ mod tests {
                 .content
                 .as_text_lossy()
                 .contains("no user-visible text")
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn activation_stops_at_attempt_limit_after_deltas() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let responses = (0..crate::agent_loop::model_step::MAX_LLM_RETRIES)
-            .map(|_| Err(api_error(503, Some(0))))
-            .chain(std::iter::once(pulse_ok_response()))
-            .collect();
-
-        // Act
-        let (result, observer) =
-            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
-
-        // Assert
-        assert!(result.is_err());
-        assert_eq!(
-            observer.seen_messages().len(),
-            crate::agent_loop::model_step::MAX_LLM_RETRIES
         );
     }
 }

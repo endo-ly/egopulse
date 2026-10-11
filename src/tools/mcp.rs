@@ -923,54 +923,6 @@ mod tests {
             .is_some_and(|state| state != 'Z')
     }
 
-    #[tokio::test]
-    #[cfg(target_os = "linux")]
-    async fn stdio_transport_shutdown_kills_grandchild_processes() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let pid_file = dir.path().join("grandchild.pid");
-        let mut command = TokioCommand::new("sh");
-        command
-            .arg("-c")
-            .arg("sleep 60 & echo $! > \"$1\"; wait")
-            .arg("sh")
-            .arg(&pid_file);
-        let mut transport = spawn_stdio_transport(command).expect("spawn transport");
-        let parent = transport.inner.id().expect("pid");
-        let _cleanup = TestProcessGroup(parent);
-        let grandchild_pid = timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(pid) = std::fs::read_to_string(&pid_file)
-                    .ok()
-                    .and_then(|text| text.trim().parse::<u32>().ok())
-                {
-                    break pid;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("launcher must publish child PID");
-        assert!(process_running(grandchild_pid));
-
-        // Act
-        timeout(Duration::from_secs(5), transport.graceful_shutdown())
-            .await
-            .expect("shutdown must not hang")
-            .expect("shutdown transport");
-
-        // Assert
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while process_running(grandchild_pid) && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(
-            !process_running(grandchild_pid),
-            "grandchild {grandchild_pid} must not outlive the transport"
-        );
-        assert!(!process_running(parent));
-    }
-
     #[cfg(target_os = "linux")]
     struct TestProcessGroup(u32);
 

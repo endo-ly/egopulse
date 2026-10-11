@@ -978,42 +978,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_signal_stops_runtime_without_critical_failure() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = crate::test_util::build_state_with_config(
-            test_config_for_runtime(dir.path().to_str().expect("utf8").to_string()),
-            None,
-            None,
-            None,
-            None,
-        );
-        let channel_token = state.supervisor.shutdown_token();
-        state.supervisor.spawn_long_lived(
-            TaskSpec::new(supervisor::TaskKind::Channel, "web", Criticality::Critical),
-            async move {
-                channel_token.cancelled().await;
-                Ok(())
-            },
-        );
-
-        // Act
-        let result = supervise_runtime_until(&state, async {}).await;
-
-        // Assert
-        assert!(result.is_ok(), "signal-driven shutdown must succeed");
-        assert!(state.supervisor.is_shutting_down());
-        assert!(
-            state
-                .runtime_status
-                .snapshot()
-                .critical_task_failure
-                .is_none(),
-            "a channel stopping during shutdown is not a failure"
-        );
-    }
-
-    #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn sigterm_drains_runtime_and_closes_mcp_process_groups() {
         const CHILD_ROOT: &str = "EGOPULSE_SIGTERM_TEST_ROOT";

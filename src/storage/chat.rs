@@ -1016,19 +1016,6 @@ impl Database {
         self.resolve_or_create_chat_id("telegram", &external_id, None, "channel_log", "")
     }
 
-    /// Looks up an existing shared log without creating a chat or session.
-    pub(crate) fn find_channel_log_chat_id(
-        &self,
-        channel: &str,
-        surface_thread: &str,
-    ) -> Result<Option<i64>, StorageError> {
-        let external_id = channel_log_external_id(channel, surface_thread);
-        Ok(self
-            .get_chat_by_channel_external_and_agent(channel, &external_id, "")?
-            .filter(|chat| chat.chat_type == "channel_log")
-            .map(|chat| chat.chat_id))
-    }
-
     /// Returns recent public Channel Log events projected for one target agent.
     ///
     /// Events already delivered to the target are omitted because the target
