@@ -630,7 +630,8 @@ mod tests {
         crate::agent_loop::test_support::RecordingProvider,
     ) {
         let delays = vec![0; responses.len()];
-        let provider = crate::agent_loop::test_support::RecordingProvider::new(responses, delays);
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(responses, delays)
+            .with_streaming_delta("partial, unpublished text");
         let observer = provider.clone();
         let state = crate::test_util::build_state_with_config(
             crate::test_util::test_config(state_root),
@@ -689,11 +690,101 @@ mod tests {
         let responses = vec![Err(api_error(429, Some(3_600))), pulse_ok_response()];
 
         // Act
-        let (result, observer) =
-            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+        let (result, observer) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses),
+        )
+        .await
+        .expect("long Retry-After must fail without waiting");
 
         // Assert
         assert!(result.is_err(), "quota wait must not be retried");
         assert_eq!(observer.seen_messages().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_retries_connection_error_after_delta() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .expect_err("connection refused");
+        let responses = vec![
+            Err(crate::error::LlmError::RequestFailed(error)),
+            pulse_ok_response(),
+        ];
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        assert_eq!(
+            result.expect("connection error should recover").output_kind,
+            PulseOutputKind::Silent
+        );
+        assert_eq!(observer.seen_messages().len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_recovers_empty_response_after_delta_and_guard_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut empty = pulse_ok_response().unwrap();
+        empty.content = "<thinking>hidden</thinking>".to_string();
+        let responses = vec![Ok(empty), Err(api_error(503, Some(0))), pulse_ok_response()];
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        assert_eq!(
+            result.expect("empty response should recover").output_kind,
+            PulseOutputKind::Silent
+        );
+        let requests = observer.seen_messages();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[1], requests[2],
+            "transport retry must preserve the guarded request"
+        );
+        assert!(
+            requests[1]
+                .last()
+                .unwrap()
+                .content
+                .as_text_lossy()
+                .contains("no user-visible text")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_stops_at_attempt_limit_after_deltas() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = (0..crate::agent_loop::model_step::MAX_LLM_RETRIES)
+            .map(|_| Err(api_error(503, Some(0))))
+            .chain(std::iter::once(pulse_ok_response()))
+            .collect();
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(
+            observer.seen_messages().len(),
+            crate::agent_loop::model_step::MAX_LLM_RETRIES
+        );
     }
 }

@@ -32,6 +32,13 @@ pub(crate) struct AssistantToolPhase {
 
 pub(crate) fn ignore_delta(_: String) {}
 
+/// Whether the caller exposes streaming deltas outside the model request.
+#[derive(Clone, Copy)]
+enum DeltaPublication {
+    Published,
+    Discarded,
+}
+
 pub(crate) enum ModelStep {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
@@ -103,7 +110,7 @@ impl<'a> ModelRunner<'a> {
         }
 
         let db = self.request.state.db_for(self.request.scope);
-        self.retry_transient_failures(None, || {
+        self.retry_transient_failures(DeltaPublication::Published, None, || {
             let db = Arc::clone(&db);
             let turn_id = turn_id.to_string();
             async move {
@@ -116,6 +123,8 @@ impl<'a> ModelRunner<'a> {
 
     /// Executes one model step with bounded transport retries for callers that
     /// have no durable Turn, such as Pulse activations.
+    /// Streaming deltas are discarded, so receiving one does not constitute
+    /// published output and cannot prevent transport or empty-response recovery.
     ///
     /// A retry whose backoff (including a server `Retry-After`) would exceed
     /// `max_backoff` is not attempted; the error is returned immediately so a
@@ -124,7 +133,7 @@ impl<'a> ModelRunner<'a> {
         &self,
         max_backoff: Duration,
     ) -> Result<ModelStep, ModelRequestError> {
-        self.retry_transient_failures(Some(max_backoff), || async {})
+        self.retry_transient_failures(DeltaPublication::Discarded, Some(max_backoff), || async {})
             .await
     }
 
@@ -133,6 +142,7 @@ impl<'a> ModelRunner<'a> {
     /// each backoff so callers can record the attempt.
     async fn retry_transient_failures<F, Fut>(
         &self,
+        delta_publication: DeltaPublication,
         max_backoff: Option<Duration>,
         mut before_retry: F,
     ) -> Result<ModelStep, ModelRequestError>
@@ -147,8 +157,10 @@ impl<'a> ModelRunner<'a> {
             let published_flag = Arc::clone(&output_published);
             let caller_on_delta = self.request.on_delta;
             let on_delta = move |text: String| {
-                published_flag.store(true, Ordering::SeqCst);
-                caller_on_delta(text);
+                if matches!(delta_publication, DeltaPublication::Published) {
+                    published_flag.store(true, Ordering::SeqCst);
+                    caller_on_delta(text);
+                }
             };
             let response = self
                 .run_once(
