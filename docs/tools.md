@@ -92,6 +92,14 @@ MCP の詳細は以下を参照。
 2. **実行**: claim 成功後にのみ Tool を実行する。実行前に台帳行を作ることを保証する。
 3. **結果保存**: 成功時は `succeeded` + sanitized `tool_output` + `finished_at` を同一 transaction で保存する。失敗時は `failed` + `error_kind` + sanitized `error_message` を保存する。
 
+#### read-only ツールの記録方針
+
+read-only ツール（`is_read_only: true`）は副作用がなく crash 後の再実行が安全なため、claim-before-execute をスキップし、並列実行の書き込み競合を避ける。代わりに、並列ブロックの実行完了後にブロック全体を 1 transaction で台帳へ記録する。
+
+- 行は `succeeded` / `failed` の終端状態で直接書き込まれ、`pending` / `running` を経由しない。crash recovery の `running` スキャンに影響しない
+- `idempotency_class = read_only`。sanitize 済みの `tool_input` / `tool_output` と `error_kind` を非 read-only 行と同じ形式で保持する
+- `INSERT OR IGNORE` により `(turn_id, id)` の一意性で crash replay 時の重複記録を防ぐ
+
 #### error_kind 分類
 
 `ToolResult` が持つ失敗分類が `error_kind` に記録される。分類されないエラーは `tool_error` となる。

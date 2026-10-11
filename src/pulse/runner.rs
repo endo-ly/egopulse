@@ -581,8 +581,19 @@ mod tests {
             None,
             None,
         );
+        let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:late-pulse:agent:default",
+                Some("late-pulse"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
         let surface = HomeSurface {
-            chat_id: 1,
+            chat_id,
             channel: "cli".to_string(),
             external_chat_id: "late-pulse".to_string(),
             chat_type: "cli".to_string(),

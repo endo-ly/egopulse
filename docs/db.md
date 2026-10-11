@@ -299,6 +299,8 @@ LLM ツール/ファンクション呼び出しの実行記録。
 
 `turn_id + tool_call_id` で Tool Call を一意にし、成功結果を再利用する。NULL の `turn_id`（legacy 行）は index 対象外。
 
+read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に `succeeded` / `failed` の終端状態で直接 INSERT される（`INSERT OR IGNORE` により replay 冪等）。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
+
 **操作**:
 - `store_tool_call(tool_call)` — INSERT
 - `update_tool_call_output(id, output)` — 出力の事後更新

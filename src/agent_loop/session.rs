@@ -119,9 +119,10 @@ fn stored_history_to_messages(
                         }
                     }
 
-                    // Tool summaries for read-only tools do not have a ledger
-                    // row. Keep an unstructured summary rather than dropping
-                    // the result when structured reconstruction is unavailable.
+                    // Ledger rows may be missing for some restored calls (e.g.
+                    // synthetic calls without a stored row). Keep an
+                    // unstructured summary rather than dropping the result
+                    // when structured reconstruction is unavailable.
                     history.push(Message::text("tool", stored.content));
                     continue;
                 }

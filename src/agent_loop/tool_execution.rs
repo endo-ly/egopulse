@@ -10,7 +10,9 @@ use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, ToolCall};
 use crate::storage::call_blocking;
-use crate::storage::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
+use crate::storage::{
+    ClaimOutcome, ClaimParams, ReadOnlyToolOutcome, canonical_tool_input, input_hash,
+};
 use crate::tools::{ToolExecutionContext, ToolResult};
 use futures_util::future::join_all;
 
@@ -142,9 +144,15 @@ impl<'a> ToolExecutor<'a> {
                     })
                     .collect::<Vec<_>>();
                 let block_results = join_all(block_futures).await;
+                let block_len = block_results.len();
                 for result in block_results {
                     outcomes.push(result?);
                 }
+                self.record_read_only_block(
+                    assistant_message_id,
+                    &outcomes[outcomes.len() - block_len..],
+                )
+                .await?;
             } else {
                 outcomes.push(
                     self.execute_single_tool(
@@ -277,6 +285,54 @@ impl<'a> ToolExecutor<'a> {
                 .guard_tracker
                 .as_ref()
                 .is_some_and(|tracker| tracker.limit_reached())
+    }
+
+    /// Appends a finished read-only parallel block to the execution ledger.
+    ///
+    /// Read-only Tools skip claim-before-execute to keep parallel execution
+    /// free of SQLite write contention, so the finished block is recorded in
+    /// one transaction afterwards. This keeps `tool_calls` a complete record
+    /// of every Tool call while preserving the ledger's recovery semantics
+    /// (read-only rows are never `running`).
+    async fn record_read_only_block(
+        &self,
+        assistant_message_id: &str,
+        outcomes: &[ExecutedToolCall],
+    ) -> Result<(), EgoPulseError> {
+        if outcomes.is_empty() {
+            return Ok(());
+        }
+        let chat_id = self.context.chat_id;
+        let records = outcomes
+            .iter()
+            .map(|outcome| {
+                let canonical =
+                    canonical_tool_input(&outcome.tool_call.name, &outcome.tool_call.arguments);
+                let is_error = outcome.result.is_error;
+                ReadOnlyToolOutcome {
+                    turn_id: self.context.turn_id.clone(),
+                    chat_id,
+                    message_id: assistant_message_id.to_string(),
+                    tool_call_id: outcome.tool_call.id.clone(),
+                    tool_name: outcome.tool_call.name.clone(),
+                    tool_input: outcome.tool_call.arguments.to_string(),
+                    input_hash: input_hash(&canonical),
+                    tool_output: (!is_error).then(|| outcome.payload.clone()),
+                    succeeded: !is_error,
+                    error_kind: outcome
+                        .result
+                        .error_kind
+                        .map(|kind| kind.as_ledger_str().to_string()),
+                    error_message: is_error.then(|| outcome.result.content.clone()),
+                }
+            })
+            .collect();
+        Ok(
+            call_blocking(self.runtime.db_for(self.context.scope), move |db| {
+                db.record_read_only_tool_outcomes(records)
+            })
+            .await?,
+        )
     }
 
     /// Claims the ledger slot (for side-effecting Tools) and executes the call.
@@ -669,7 +725,16 @@ mod integration_tests {
         })
         .await
         .expect("tool calls");
-        assert_eq!(tool_calls.len(), 0, "read-only tools skip the ledger");
+        assert_eq!(tool_calls.len(), 2);
+        assert!(
+            tool_calls
+                .iter()
+                .all(|call| call.state == crate::storage::ToolState::Succeeded)
+        );
+        assert!(
+            tool_calls.iter().all(|call| call.tool_output.is_some()),
+            "read-only rows store the sanitized payload like non-read-only rows"
+        );
     }
 
     #[tokio::test]
@@ -741,6 +806,71 @@ mod integration_tests {
         .await
         .expect("tool calls");
         assert!(tool_calls.is_empty(), "invalid call must not be executed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn failed_read_only_tool_is_ledgered_with_its_error_kind() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Looking.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-read-missing".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "missing.txt"}),
+                        invalid_arguments: None,
+                    }],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "reported".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        // Act
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("read-only-failure"),
+            "read the file",
+        )
+        .await
+        .expect("turn continues after read-only failure");
+
+        // Assert
+        assert_eq!(reply, "reported");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:read-only-failure:agent:default",
+                Some("read-only-failure"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].state, crate::storage::ToolState::Failed);
+        assert_eq!(tool_calls[0].error_kind.as_deref(), Some("not_found"));
+        assert!(tool_calls[0].tool_output.is_none());
     }
 
     #[tokio::test]

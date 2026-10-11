@@ -79,6 +79,25 @@ pub(crate) struct ClaimParams<'a> {
     pub idempotency_key: Option<&'a str>,
 }
 
+/// One completed read-only Tool execution to append to the ledger.
+#[derive(Clone)]
+pub(crate) struct ReadOnlyToolOutcome {
+    pub turn_id: String,
+    pub chat_id: i64,
+    pub message_id: String,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// Original JSON arguments, preserved verbatim like non-read-only rows.
+    pub tool_input: String,
+    pub input_hash: String,
+    /// Sanitized result payload; `None` when the call failed.
+    pub tool_output: Option<String>,
+    pub succeeded: bool,
+    /// Ledger failure kind (`ToolErrorKind::as_ledger_str`).
+    pub error_kind: Option<String>,
+    pub error_message: Option<String>,
+}
+
 /// Outcome of [`Database::claim_tool_execution`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClaimOutcome {
@@ -221,6 +240,74 @@ impl Database {
              WHERE turn_id = ?1 AND id = ?2",
             params![turn_id, tool_call_id, error_kind, error_message, &now],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Appends completed read-only Tool executions to the ledger in one transaction.
+    ///
+    /// Read-only Tools skip claim-before-execute (no side effects, safe to
+    /// retry, avoids SQLite write contention during parallel execution), so
+    /// the caller records the finished parallel block here instead. Rows
+    /// are written directly in a terminal state (`succeeded` / `failed`)
+    /// with `idempotency_class = read_only`; they never pass through
+    /// `pending` / `running`, which keeps crash-recovery state scans
+    /// unaffected. `INSERT OR IGNORE` makes turn replays idempotent via
+    /// the `(turn_id, id)` uniqueness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query failures.
+    pub(crate) fn record_read_only_tool_outcomes(
+        &self,
+        outcomes: Vec<ReadOnlyToolOutcome>,
+    ) -> Result<(), StorageError> {
+        if outcomes.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for outcome in &outcomes {
+            let (state, tool_output, error_kind, error_message) = if outcome.succeeded {
+                ("succeeded", outcome.tool_output.clone(), None, None)
+            } else {
+                (
+                    "failed",
+                    None,
+                    Some(
+                        outcome
+                            .error_kind
+                            .clone()
+                            .unwrap_or_else(|| "tool_error".to_string()),
+                    ),
+                    outcome.error_message.clone(),
+                )
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO tool_calls
+                     (id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp,
+                      turn_id, state, input_hash, idempotency_class, started_at, finished_at,
+                      error_kind, error_message)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'read_only', ?7, ?11,
+                         ?12, ?13)",
+                params![
+                    &outcome.tool_call_id,
+                    outcome.chat_id,
+                    &outcome.message_id,
+                    &outcome.tool_name,
+                    &outcome.tool_input,
+                    tool_output,
+                    &now,
+                    &outcome.turn_id,
+                    state,
+                    &outcome.input_hash,
+                    &now,
+                    error_kind,
+                    error_message,
+                ],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -710,6 +797,72 @@ mod tests {
             }
         );
         assert_eq!(row_state(&db, "turn-1", "call-1"), ToolState::Succeeded);
+    }
+
+    #[test]
+    fn record_read_only_outcomes_is_idempotent_on_replay() {
+        // Arrange
+        let (db, _dir) = ledger_test_db();
+        let outcomes = vec![
+            ReadOnlyToolOutcome {
+                turn_id: "turn-1".to_string(),
+                chat_id: 1,
+                message_id: "m-1".to_string(),
+                tool_call_id: "call-read-1".to_string(),
+                tool_name: "read".to_string(),
+                tool_input: r#"{"path":"notes.txt"}"#.to_string(),
+                input_hash: "hash-read-1".to_string(),
+                tool_output: Some("file-content".to_string()),
+                succeeded: true,
+                error_kind: None,
+                error_message: None,
+            },
+            ReadOnlyToolOutcome {
+                turn_id: "turn-1".to_string(),
+                chat_id: 1,
+                message_id: "m-1".to_string(),
+                tool_call_id: "call-grep-1".to_string(),
+                tool_name: "grep".to_string(),
+                tool_input: r#"{"pattern":"x"}"#.to_string(),
+                input_hash: "hash-grep-1".to_string(),
+                tool_output: None,
+                succeeded: false,
+                error_kind: Some("not_found".to_string()),
+                error_message: Some("File not found: x".to_string()),
+            },
+        ];
+
+        // Act: record twice, as a crash-replayed turn would.
+        db.record_read_only_tool_outcomes(outcomes.clone())
+            .expect("record");
+        db.record_read_only_tool_outcomes(outcomes)
+            .expect("re-record");
+
+        // Assert: the replay did not duplicate rows.
+        let calls = db.get_tool_calls_for_chat(1).expect("calls");
+        assert_eq!(calls.len(), 2);
+        let read_call = calls
+            .iter()
+            .find(|call| call.tool_name == "read")
+            .expect("read row");
+        assert_eq!(read_call.state, ToolState::Succeeded);
+        assert_eq!(read_call.tool_output.as_deref(), Some("file-content"));
+        let grep_call = calls
+            .iter()
+            .find(|call| call.tool_name == "grep")
+            .expect("grep row");
+        assert_eq!(grep_call.state, ToolState::Failed);
+        assert_eq!(grep_call.error_kind.as_deref(), Some("not_found"));
+        let class: String = db
+            .get_conn()
+            .expect("conn")
+            .query_row(
+                "SELECT idempotency_class FROM tool_calls WHERE turn_id = 'turn-1' AND id = 'call-read-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("class");
+        assert_eq!(class, "read_only");
     }
 
     #[test]

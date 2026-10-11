@@ -90,7 +90,9 @@ mod tool;
 mod turn;
 
 pub(crate) use backup::BackupSettings;
-pub(crate) use tool::{ClaimOutcome, ClaimParams, canonical_tool_input, input_hash};
+pub(crate) use tool::{
+    ClaimOutcome, ClaimParams, ReadOnlyToolOutcome, canonical_tool_input, input_hash,
+};
 pub(crate) use turn::RecoveredOrigin;
 pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun};
 
