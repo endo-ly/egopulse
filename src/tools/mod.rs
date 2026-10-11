@@ -46,6 +46,13 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
+/// ガード遮断メッセージに付ける方針の明示。
+///
+/// 遮断は最終判断であることを伝え、別構文・スクリプト等での回避を試みず
+/// ユーザーに確認させるための文言。Core Instructions の Security rules と対になる。
+pub(crate) const GUARD_POLICY_NOTE: &str =
+    " This is a policy decision; do not work around it. Ask the user if access is required.";
+
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone)]
 pub(crate) struct ToolExecutionContext {

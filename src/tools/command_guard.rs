@@ -25,10 +25,10 @@ fn check_blocked_patterns(command: &str) -> Result<(), String> {
             .next()
             .is_some_and(|s| s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty());
         if is_self || is_pid {
-            return Err(
-                "Access denied: command references /proc/*/..., which exposes process internals."
-                    .to_string(),
-            );
+            return Err(format!(
+                "Access denied: command references /proc/*/..., which exposes process internals.{}",
+                super::GUARD_POLICY_NOTE
+            ));
         }
         start = abs_offset + 1;
         if start >= command.len() {
@@ -57,8 +57,8 @@ fn check_blocked_commands(command: &str) -> Result<(), String> {
         for blocked in BLOCKED_COMMANDS {
             if first_word == *blocked {
                 return Err(format!(
-                    "Access denied: '{blocked}' is blocked to prevent environment variable leakage. \
-                     Use 'echo $VAR_NAME' to read a specific variable."
+                    "Access denied: '{blocked}' is blocked to prevent environment variable leakage.{}",
+                    super::GUARD_POLICY_NOTE
                 ));
             }
         }
@@ -66,7 +66,8 @@ fn check_blocked_commands(command: &str) -> Result<(), String> {
             for blocked in BLOCKED_COMMANDS {
                 if contains_blocked_command_token(trimmed, blocked) {
                     return Err(format!(
-                        "Access denied: '{blocked}' detected in shell execution context."
+                        "Access denied: '{blocked}' detected in shell execution context.{}",
+                        super::GUARD_POLICY_NOTE
                     ));
                 }
             }
@@ -100,11 +101,11 @@ fn check_set_without_options(command: &str) -> Result<(), String> {
             .get(1)
             .is_some_and(|w| w.starts_with('-') || w.starts_with('+'));
         if !next_is_option {
-            return Err(
+            return Err(format!(
                 "Access denied: bare 'set' is blocked to prevent shell variable leakage. \
-                 Use 'set -e', 'set -o pipefail', etc. for option configuration."
-                    .to_string(),
-            );
+                 Use 'set -e', 'set -o pipefail', etc. for option configuration.{}",
+                super::GUARD_POLICY_NOTE
+            ));
         }
     }
     Ok(())
@@ -263,6 +264,25 @@ mod tests {
         for command in allowed_commands {
             assert!(check_command(command).is_ok(), "should allow: {command}");
         }
+    }
+
+    #[test]
+    fn env_denial_message_states_policy_without_suggesting_workaround() {
+        // Arrange
+        let command = "env";
+
+        // Act
+        let error = check_command(command).expect_err("env must be blocked");
+
+        // Assert
+        assert!(
+            error.contains("do not work around it"),
+            "message must state the policy: {error}"
+        );
+        assert!(
+            !error.contains("echo $VAR"),
+            "message must not suggest reading values: {error}"
+        );
     }
 
     #[test]
