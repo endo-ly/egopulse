@@ -936,6 +936,9 @@ mod integration_tests {
         );
         crate::config::persist::save_config_with_secrets(&config, &config_path)
             .expect("save initial config");
+        // Reload resolves LOG_LEVEL from the environment before the file, while
+        // the initial state comes from `config`; pin it so reload sees no change.
+        let _log_level = crate::test_env::EnvVarGuard::set("LOG_LEVEL", &config.log_level);
 
         let provider = crate::agent_loop::test_support::RecordingProvider::new(
             vec![Ok(crate::llm::MessagesResponse {
