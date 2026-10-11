@@ -17,7 +17,8 @@ use super::text::{
     truncate_head,
 };
 use super::{
-    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext, ToolResult, schema_object,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolErrorKind, ToolExecutionContext, ToolResult,
+    schema_object,
 };
 
 // ---------------------------------------------------------------------------
@@ -118,16 +119,19 @@ impl Tool for ReadTool {
         let path = &params.path;
         let resolved = match resolve_workspace_path(&self.workspace_dir, path) {
             Ok(path) => path,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, error),
         };
         if let Err(reason) = path_guard::check_path(path) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, reason);
         }
 
         let bytes = match tokio::fs::read(&resolved).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ToolResult::error(format!("File not found: {path}"));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::NotFound,
+                    format!("File not found: {path}"),
+                );
             }
             Err(error) => return ToolResult::error(format!("Failed to read file: {error}")),
         };
@@ -154,10 +158,13 @@ impl Tool for ReadTool {
             .unwrap_or(0);
         if start_line >= all_lines.len() && !all_lines.is_empty() {
             let requested = params.offset.unwrap_or(1);
-            return ToolResult::error(format!(
-                "Offset {requested} is beyond end of file ({} lines total)",
-                all_lines.len()
-            ));
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                format!(
+                    "Offset {requested} is beyond end of file ({} lines total)",
+                    all_lines.len()
+                ),
+            );
         }
 
         let user_limit = params.limit.map(|value| value as usize);
@@ -228,10 +235,10 @@ impl Tool for WriteTool {
         let content = &params.content;
         let resolved = match resolve_workspace_path(&self.workspace_dir, path) {
             Ok(path) => path,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, error),
         };
         if let Err(reason) = path_guard::check_path(path) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, reason);
         }
         if let Some(parent) = resolved.parent()
             && let Err(error) = tokio::fs::create_dir_all(parent).await
@@ -306,24 +313,30 @@ impl Tool for EditTool {
         _context: &ToolExecutionContext,
     ) -> ToolResult {
         let Some(path) = input.get("path").and_then(|value| value.as_str()) else {
-            return ToolResult::error("Missing required parameter: path".to_string());
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                "Missing required parameter: path".to_string(),
+            );
         };
         let edits = match parse_edits(&input) {
             Ok(edits) => edits,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::InvalidInput, error),
         };
         let resolved = match resolve_workspace_path(&self.workspace_dir, path) {
             Ok(path) => path,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, error),
         };
         if let Err(reason) = path_guard::check_path(path) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, reason);
         }
 
         let raw_content = match tokio::fs::read_to_string(&resolved).await {
             Ok(content) => content,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ToolResult::error(format!("File not found: {path}"));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::NotFound,
+                    format!("File not found: {path}"),
+                );
             }
             Err(error) => return ToolResult::error(format!("Failed to read file: {error}")),
         };
@@ -333,7 +346,7 @@ impl Tool for EditTool {
         let normalized_original = normalize_newlines(content_without_bom);
         let applied = match apply_edits_to_normalized_content(&normalized_original, &edits, path) {
             Ok(applied) => applied,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::InvalidInput, error),
         };
 
         let final_content = format!(
@@ -381,11 +394,14 @@ pub(crate) fn parse_edits(input: &serde_json::Value) -> Result<Vec<EditSpec>, St
 fn image_read_result(bytes: &[u8], mime_type: &str) -> ToolResult {
     const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024;
     if bytes.len() > MAX_IMAGE_SIZE {
-        return ToolResult::error(format!(
-            "Image file too large ({}). Maximum size is {}.",
-            format_size(bytes.len()),
-            format_size(MAX_IMAGE_SIZE)
-        ));
+        return ToolResult::error_with_kind(
+            ToolErrorKind::InvalidInput,
+            format!(
+                "Image file too large ({}). Maximum size is {}.",
+                format_size(bytes.len()),
+                format_size(MAX_IMAGE_SIZE)
+            ),
+        );
     }
 
     let preview = format!("Read image file [{mime_type}]");

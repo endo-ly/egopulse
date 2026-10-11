@@ -92,6 +92,20 @@ MCP の詳細は以下を参照。
 2. **実行**: claim 成功後にのみ Tool を実行する。実行前に台帳行を作ることを保証する。
 3. **結果保存**: 成功時は `succeeded` + sanitized `tool_output` + `finished_at` を同一 transaction で保存する。失敗時は `failed` + `error_kind` + sanitized `error_message` を保存する。
 
+#### error_kind 分類
+
+`ToolResult` が持つ失敗分類が `error_kind` に記録される。分類されないエラーは `tool_error` となる。
+
+| error_kind | 判定元 |
+|---|---|
+| `guard_denied` | `command_guard` / `path_guard` / workspace 外アクセス / web_fetch の SSRF・コンテンツ検閲 |
+| `invalid_input` | 必須パラメータ欠落・スキーマ不一致 |
+| `timeout` | bash / web_fetch / grep のタイムアウト |
+| `exit_nonzero` | bash・ripgrep・fd の非 0 終了 |
+| `not_found` | ファイル / パス / スキル / エージェント / ツール不在 |
+| `upstream` | HTTP エラー・MCP transport エラー・チャネル API エラー |
+| `tool_error` | 上記に分類されないその他の失敗 |
+
 #### idempotency 分類
 
 Tool 定義に次のいずれかを明示する。未指定は `non_idempotent`。分類は claim 時に台帳へ記録され、同一 `(turn_id, tool_call_id)` で分類を変更する claim を拒否する。

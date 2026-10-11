@@ -113,6 +113,40 @@ pub(crate) struct ToolResult {
     pub is_error: bool,
     pub details: Option<serde_json::Value>,
     pub llm_content: crate::llm::MessageContent,
+    /// Failure classification recorded in the `tool_calls.error_kind` ledger
+    /// column. `None` falls back to the generic `tool_error` kind.
+    pub error_kind: Option<ToolErrorKind>,
+}
+
+/// Classification of tool failures, persisted as `tool_calls.error_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolErrorKind {
+    /// Denied by the command / path guards or by a workspace boundary.
+    GuardDenied,
+    /// Missing required parameters or schema mismatches.
+    InvalidInput,
+    /// bash / web_fetch / grep timeouts.
+    Timeout,
+    /// bash exited with a non-zero status.
+    ExitNonZero,
+    /// Missing file, path, skill, or agent.
+    NotFound,
+    /// HTTP errors, MCP transport errors, and channel API errors.
+    Upstream,
+}
+
+impl ToolErrorKind {
+    /// Ledger identifier stored in `tool_calls.error_kind`.
+    pub(crate) fn as_ledger_str(self) -> &'static str {
+        match self {
+            Self::GuardDenied => "guard_denied",
+            Self::InvalidInput => "invalid_input",
+            Self::Timeout => "timeout",
+            Self::ExitNonZero => "exit_nonzero",
+            Self::NotFound => "not_found",
+            Self::Upstream => "upstream",
+        }
+    }
 }
 
 impl ToolResult {
@@ -123,6 +157,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: None,
+            error_kind: None,
         }
     }
 
@@ -133,6 +168,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: Some(details),
+            error_kind: None,
         }
     }
 
@@ -146,6 +182,7 @@ impl ToolResult {
             is_error: false,
             details: None,
             llm_content,
+            error_kind: None,
         }
     }
 
@@ -156,7 +193,25 @@ impl ToolResult {
             content,
             is_error: true,
             details: None,
+            error_kind: None,
         }
+    }
+
+    /// Create an error result classified with a failure kind for the ledger.
+    pub(crate) fn error_with_kind(kind: ToolErrorKind, content: String) -> Self {
+        Self {
+            llm_content: crate::llm::MessageContent::text(content.clone()),
+            content,
+            is_error: true,
+            details: None,
+            error_kind: Some(kind),
+        }
+    }
+
+    /// Attach a failure kind to this result for the execution ledger.
+    pub(crate) fn with_error_kind(mut self, kind: ToolErrorKind) -> Self {
+        self.error_kind = Some(kind);
+        self
     }
 
     /// Create an error result with structured details.
@@ -166,6 +221,7 @@ impl ToolResult {
             content,
             is_error: true,
             details: Some(details),
+            error_kind: None,
         }
     }
 }
@@ -333,7 +389,10 @@ impl ToolRegistry {
                     return sanitize_tool_result(
                         match result {
                             Ok(output) => ToolResult::success(output),
-                            Err(error) => ToolResult::error(error.to_string()),
+                            Err(error) => ToolResult::error_with_kind(
+                                ToolErrorKind::Upstream,
+                                error.to_string(),
+                            ),
                         },
                         &self.redaction_secrets(context),
                     );
@@ -341,7 +400,7 @@ impl ToolRegistry {
             }
         }
         sanitize_tool_result(
-            ToolResult::error(format!("Unknown tool: {name}")),
+            ToolResult::error_with_kind(ToolErrorKind::NotFound, format!("Unknown tool: {name}")),
             &self.redaction_secrets(context),
         )
     }
@@ -448,7 +507,8 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
 pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(
     input: serde_json::Value,
 ) -> Result<T, ToolResult> {
-    serde_json::from_value(input).map_err(|e| ToolResult::error(e.to_string()))
+    serde_json::from_value(input)
+        .map_err(|e| ToolResult::error_with_kind(ToolErrorKind::InvalidInput, e.to_string()))
 }
 
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
@@ -484,7 +544,9 @@ pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tool, ToolExecutionContext, ToolRegistry, ToolResult};
+    use super::{
+        Tool, ToolErrorKind, ToolExecutionContext, ToolRegistry, ToolResult, parse_params,
+    };
     use crate::config::{ChannelConfig, ChannelName, Config};
     use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
@@ -536,6 +598,42 @@ mod tests {
             config,
             Arc::new(SkillManager::from_dirs(skills_dir.clone(), skills_dir)),
         )
+    }
+
+    #[test]
+    fn tool_error_kinds_map_to_ledger_identifiers() {
+        // Arrange
+        let cases = [
+            (ToolErrorKind::GuardDenied, "guard_denied"),
+            (ToolErrorKind::InvalidInput, "invalid_input"),
+            (ToolErrorKind::Timeout, "timeout"),
+            (ToolErrorKind::ExitNonZero, "exit_nonzero"),
+            (ToolErrorKind::NotFound, "not_found"),
+            (ToolErrorKind::Upstream, "upstream"),
+        ];
+
+        for (kind, expected) in cases {
+            // Act
+            let ledger_str = kind.as_ledger_str();
+
+            // Assert
+            assert_eq!(ledger_str, expected);
+        }
+    }
+
+    #[test]
+    fn parse_params_failures_are_classified_as_invalid_input() {
+        // Arrange
+        #[derive(serde::Deserialize, Debug)]
+        struct Params {
+            command: String,
+        }
+
+        // Act
+        let error = parse_params::<Params>(json!({"nope": 1})).expect_err("must fail");
+
+        // Assert
+        assert_eq!(error.error_kind, Some(ToolErrorKind::InvalidInput));
     }
 
     #[tokio::test]

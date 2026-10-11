@@ -291,7 +291,7 @@ LLM ツール/ファンクション呼び出しの実行記録。
 | idempotency_key | TEXT | nullable | idempotent Tool の重複排除 key |
 | started_at | TEXT | nullable | 実行開始時刻 |
 | finished_at | TEXT | nullable | 完了時刻 |
-| error_kind | TEXT | nullable | 失敗分類 |
+| error_kind | TEXT | nullable | 失敗分類（`tool_error` / `guard_denied` / `invalid_input` / `timeout` / `exit_nonzero` / `not_found` / `upstream`） |
 | error_message | TEXT | nullable | sanitized error 概要 |
 
 **制約**:

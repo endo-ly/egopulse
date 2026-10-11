@@ -174,10 +174,10 @@ impl Tool for BashTool {
         };
         let command = &params.command;
         if let Err(reason) = command_guard::check_command(command) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(super::ToolErrorKind::GuardDenied, reason);
         }
         if let Err(reason) = path_guard::check_command_paths(command) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(super::ToolErrorKind::GuardDenied, reason);
         }
         let timeout_secs = params.timeout.unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
         let temp_dir = self.temp_dir();
@@ -202,7 +202,8 @@ impl Tool for BashTool {
                 kill_process_group(&mut child);
                 let _ = child.wait().await;
                 let output = read_temp_output(&temp_path);
-                return bash_error_result(output, &temp_path, Some(timeout_secs), None);
+                return bash_error_result(output, &temp_path, Some(timeout_secs), None)
+                    .with_error_kind(super::ToolErrorKind::Timeout);
             }
         };
 
@@ -220,9 +221,10 @@ impl Tool for BashTool {
                 text.push_str(&format!("\n\nCommand exited with code {code}"));
             }
             if let Some(details) = details {
-                return ToolResult::error_with_details(text, details);
+                return ToolResult::error_with_details(text, details)
+                    .with_error_kind(super::ToolErrorKind::ExitNonZero);
             }
-            return ToolResult::error(text);
+            return ToolResult::error_with_kind(super::ToolErrorKind::ExitNonZero, text);
         }
 
         if let Some(details) = details {

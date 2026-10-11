@@ -10,7 +10,8 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::tools::{
-    Tool, ToolDefinition, ToolExecutionContext, ToolResult, parse_params, schema_object,
+    Tool, ToolDefinition, ToolErrorKind, ToolExecutionContext, ToolResult, parse_params,
+    schema_object,
 };
 
 const UNTRUSTED_CONTENT_WARNING: &str =
@@ -99,7 +100,10 @@ impl Tool for WebFetchTool {
 
         let url_str = params.url.trim();
         if url_str.is_empty() {
-            return ToolResult::error("url must not be empty".to_string());
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                "url must not be empty".to_string(),
+            );
         }
 
         let config = &self.config.web_fetch;
@@ -107,14 +111,16 @@ impl Tool for WebFetchTool {
         // 2. URL validation (scheme + host + denylist + allowlist + IP literal)
         let mut current_url = match url_validation::validate_url(url_str, config) {
             Ok(u) => u,
-            Err(e) => return ToolResult::error(e.to_string()),
+            Err(e) => {
+                return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, e.to_string());
+            }
         };
 
         // 3. DNS resolution + SSRF check on initial URL
         if !config.allow_private_ips {
             if let Some(host) = current_url.host_str() {
                 if let Err(e) = url_validation::resolve_dns_and_validate(host, config).await {
-                    return ToolResult::error(e.to_string());
+                    return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, e.to_string());
                 }
             }
         }
@@ -135,9 +141,15 @@ impl Tool for WebFetchTool {
                 Ok(r) => r,
                 Err(e) => {
                     if e.is_timeout() {
-                        return ToolResult::error(format!("request timed out after {timeout}s"));
+                        return ToolResult::error_with_kind(
+                            ToolErrorKind::Timeout,
+                            format!("request timed out after {timeout}s"),
+                        );
                     }
-                    return ToolResult::error(format!("request failed: {e}"));
+                    return ToolResult::error_with_kind(
+                        ToolErrorKind::Upstream,
+                        format!("request failed: {e}"),
+                    );
                 }
             };
 
@@ -145,27 +157,41 @@ impl Tool for WebFetchTool {
             if status.is_redirection() {
                 redirect_count += 1;
                 if url_validation::is_redirect_limit_exceeded(redirect_count) {
-                    return ToolResult::error("too many redirects".to_string());
+                    return ToolResult::error_with_kind(
+                        ToolErrorKind::Upstream,
+                        "too many redirects".to_string(),
+                    );
                 }
 
                 let location = match resp.headers().get("location").and_then(|v| v.to_str().ok()) {
                     Some(loc) => loc.to_string(),
                     None => {
-                        return ToolResult::error("redirect without Location header".to_string());
+                        return ToolResult::error_with_kind(
+                            ToolErrorKind::Upstream,
+                            "redirect without Location header".to_string(),
+                        );
                     }
                 };
 
                 let new_url =
                     match url_validation::validate_redirect(&current_url, &location, config) {
                         Ok(u) => u,
-                        Err(e) => return ToolResult::error(e.to_string()),
+                        Err(e) => {
+                            return ToolResult::error_with_kind(
+                                ToolErrorKind::GuardDenied,
+                                e.to_string(),
+                            );
+                        }
                     };
 
                 if !config.allow_private_ips {
                     if let Some(host) = new_url.host_str() {
                         if let Err(e) = url_validation::resolve_dns_and_validate(host, config).await
                         {
-                            return ToolResult::error(e.to_string());
+                            return ToolResult::error_with_kind(
+                                ToolErrorKind::GuardDenied,
+                                e.to_string(),
+                            );
                         }
                     }
                 }
@@ -175,7 +201,10 @@ impl Tool for WebFetchTool {
             }
 
             if !status.is_success() {
-                return ToolResult::error(format!("HTTP {}", status.as_u16()));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("HTTP {}", status.as_u16()),
+                );
             }
 
             break resp;
@@ -203,7 +232,12 @@ impl Tool for WebFetchTool {
 
         while let Some(chunk) = match response.chunk().await {
             Ok(c) => c,
-            Err(e) => return ToolResult::error(format!("failed to read response: {e}")),
+            Err(e) => {
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("failed to read response: {e}"),
+                );
+            }
         } {
             if body_buf.len() + chunk.len() > max_fetch_bytes {
                 let remaining = max_fetch_bytes - body_buf.len();
@@ -224,7 +258,10 @@ impl Tool for WebFetchTool {
         let body_text = match std::str::from_utf8(&body_buf) {
             Ok(s) => s.to_string(),
             Err(_) => {
-                return ToolResult::error("response body is not valid UTF-8".to_string());
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    "response body is not valid UTF-8".to_string(),
+                );
             }
         };
 
@@ -251,12 +288,16 @@ impl Tool for WebFetchTool {
         {
             Ok(Ok(result)) => result,
             Ok(Err(join_err)) => {
-                return ToolResult::error(format!("html processing failed: {join_err}"));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("html processing failed: {join_err}"),
+                );
             }
             Err(_) => {
-                return ToolResult::error(format!(
-                    "html processing timed out after {HTML_PROCESSING_TIMEOUT_SECS}s"
-                ));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Timeout,
+                    format!("html processing timed out after {HTML_PROCESSING_TIMEOUT_SECS}s"),
+                );
             }
         };
 
@@ -272,7 +313,10 @@ impl Tool for WebFetchTool {
         if let Err(e) =
             content_validation::validate_content(&output_text, &config.content_validation)
         {
-            return ToolResult::error(format!("content blocked: {e}"));
+            return ToolResult::error_with_kind(
+                ToolErrorKind::GuardDenied,
+                format!("content blocked: {e}"),
+            );
         }
 
         // 10. Warnings

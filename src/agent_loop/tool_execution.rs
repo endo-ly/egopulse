@@ -298,9 +298,14 @@ impl<'a> ToolExecutor<'a> {
         let tool_call_id = tool_call.id.clone();
         if result.is_error {
             let error_message = result.content.clone();
+            let error_kind = result
+                .error_kind
+                .map(|kind| kind.as_ledger_str())
+                .unwrap_or("tool_error")
+                .to_string();
             Ok(
                 call_blocking(self.runtime.db_for(self.context.scope), move |db| {
-                    db.record_tool_failure(&turn_id, &tool_call_id, "tool_error", &error_message)
+                    db.record_tool_failure(&turn_id, &tool_call_id, &error_kind, &error_message)
                 })
                 .await?,
             )
@@ -623,6 +628,69 @@ mod integration_tests {
         .await
         .expect("tool calls");
         assert!(tool_calls.is_empty(), "invalid call must not be executed");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guard_denied_bash_call_is_ledgered_with_guard_kind() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-guard".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({"command": "cat .env"}),
+                        invalid_arguments: None,
+                    }],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "reported".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        // Act
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("guard-kind"),
+            "read the env file",
+        )
+        .await
+        .expect("turn continues after guard denial");
+
+        // Assert
+        assert_eq!(reply, "reported");
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:guard-kind:agent:default",
+                Some("guard-kind"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].error_kind.as_deref(), Some("guard_denied"));
     }
 
     #[tokio::test]

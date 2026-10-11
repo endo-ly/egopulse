@@ -17,7 +17,8 @@ use super::path_guard;
 use super::text::{format_size, truncate_head};
 use super::{
     DEFAULT_FIND_LIMIT, DEFAULT_GREP_LIMIT, DEFAULT_GREP_TIMEOUT_SECS, DEFAULT_LS_LIMIT,
-    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Tool, ToolExecutionContext, ToolResult, schema_object,
+    DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, Tool, ToolErrorKind, ToolExecutionContext, ToolResult,
+    schema_object,
 };
 
 /// 相対パスを working_dir 基準に解決し、絶対パスはそのまま通す。
@@ -179,15 +180,15 @@ impl Tool for GrepTool {
         let pattern = &params.pattern;
         let literal = params.literal.unwrap_or(false);
         if let Err(error) = validate_grep_pattern(pattern, literal) {
-            return ToolResult::error(error);
+            return ToolResult::error_with_kind(ToolErrorKind::InvalidInput, error);
         }
         let requested_path = params.path.as_deref().unwrap_or(".");
         let resolved = match resolve_workspace_path(&self.workspace_dir, requested_path) {
             Ok(path) => path,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, error),
         };
         if let Err(reason) = check_resolved_path(&resolved) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, reason);
         }
 
         let limit = params
@@ -232,11 +233,17 @@ impl Tool for GrepTool {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ToolResult::error(
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
                     "ripgrep (rg) is not available and could not be downloaded".to_string(),
                 );
             }
-            Err(error) => return ToolResult::error(format!("Failed to run ripgrep: {error}")),
+            Err(error) => {
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("Failed to run ripgrep: {error}"),
+                );
+            }
         };
 
         let mut stdout_pipe = child.stdout.take();
@@ -291,11 +298,14 @@ impl Tool for GrepTool {
                     return ToolResult::success("No matches found".to_string());
                 }
                 if !status.success() && status.code() != Some(1) {
-                    return ToolResult::error(if stderr.is_empty() {
-                        format!("ripgrep exited with code {}", status.code().unwrap_or(-1))
-                    } else {
-                        stderr
-                    });
+                    return ToolResult::error_with_kind(
+                        ToolErrorKind::ExitNonZero,
+                        if stderr.is_empty() {
+                            format!("ripgrep exited with code {}", status.code().unwrap_or(-1))
+                        } else {
+                            stderr
+                        },
+                    );
                 }
 
                 let mut lines_truncated = false;
@@ -345,15 +355,21 @@ impl Tool for GrepTool {
             Ok(Err(error)) => {
                 let _ = stdout_fut.await;
                 let _ = stderr_fut.await;
-                ToolResult::error(format!("Failed to run ripgrep: {error}"))
+                ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("Failed to run ripgrep: {error}"),
+                )
             }
             Err(_) => {
                 kill_on_timeout(&mut child).await;
                 let _ = stdout_fut.await;
                 let _ = stderr_fut.await;
-                ToolResult::error(format!(
-                    "Grep timed out after {DEFAULT_GREP_TIMEOUT_SECS}s. Try a simpler pattern or narrow the search path."
-                ))
+                ToolResult::error_with_kind(
+                    ToolErrorKind::Timeout,
+                    format!(
+                        "Grep timed out after {DEFAULT_GREP_TIMEOUT_SECS}s. Try a simpler pattern or narrow the search path."
+                    ),
+                )
             }
         }
     }
@@ -425,10 +441,10 @@ impl Tool for FindTool {
         let requested_path = params.path.as_deref().unwrap_or(".");
         let resolved = match resolve_workspace_path(&self.workspace_dir, requested_path) {
             Ok(path) => path,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, error),
         };
         if let Err(reason) = check_resolved_path(&resolved) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, reason);
         }
 
         let limit = params
@@ -475,21 +491,30 @@ impl Tool for FindTool {
         let output = match command.output().await {
             Ok(output) => output,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ToolResult::error(
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
                     "fd is not available and could not be downloaded".to_string(),
                 );
             }
-            Err(error) => return ToolResult::error(format!("Failed to run fd: {error}")),
+            Err(error) => {
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("Failed to run fd: {error}"),
+                );
+            }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).replace("\r\n", "\n");
         if !output.status.success() && stdout.trim().is_empty() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return ToolResult::error(if stderr.is_empty() {
-                format!("fd exited with code {}", output.status.code().unwrap_or(-1))
-            } else {
-                stderr
-            });
+            return ToolResult::error_with_kind(
+                ToolErrorKind::ExitNonZero,
+                if stderr.is_empty() {
+                    format!("fd exited with code {}", output.status.code().unwrap_or(-1))
+                } else {
+                    stderr
+                },
+            );
         }
 
         let mut results = stdout
@@ -645,16 +670,22 @@ impl Tool for LsTool {
         let requested_path = params.path.as_deref().unwrap_or(".");
         let resolved = match resolve_workspace_path(&self.workspace_dir, requested_path) {
             Ok(path) => path,
-            Err(error) => return ToolResult::error(error),
+            Err(error) => return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, error),
         };
         if let Err(reason) = check_resolved_path(&resolved) {
-            return ToolResult::error(reason);
+            return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, reason);
         }
         if !resolved.exists() {
-            return ToolResult::error(format!("Path not found: {}", resolved.display()));
+            return ToolResult::error_with_kind(
+                ToolErrorKind::NotFound,
+                format!("Path not found: {}", resolved.display()),
+            );
         }
         if !resolved.is_dir() {
-            return ToolResult::error(format!("Not a directory: {}", resolved.display()));
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                format!("Not a directory: {}", resolved.display()),
+            );
         }
         let limit = params
             .limit
