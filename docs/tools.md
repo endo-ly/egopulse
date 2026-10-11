@@ -205,6 +205,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `timeout: integer` 任意。秒
 - 挙動:
   - workspace を cwd にして、コマンド文字列を加工せず `bash -lc` に渡して実行する。末尾の heredoc デリミタやコメントもそのまま解釈される
+  - 親プロセスの環境変数は引き継がず、`PATH` / `HOME` / `LANG` / `TERM` と skill の `required_env` の解決値のみを渡す。skill の値は同名の継承キーより優先される
   - stdout / stderr はプロセス起動時に同一の一時ファイルへ割り当て、1 つのログに結合する。bash 自身の構文エラーもこのログに含まれる
   - 出力は末尾側を最大 `2000` 行または `100KB` に tail truncation する
   - truncation が発生した場合は full output を temp file に保存する

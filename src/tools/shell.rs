@@ -101,13 +101,33 @@ impl BashTool {
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(stderr))
             .process_group(0)
-            .kill_on_drop(true);
-        if !skill_env.is_empty() {
-            cmd.envs(skill_env);
-        }
+            .kill_on_drop(true)
+            .env_clear()
+            .envs(bash_child_env(std::env::vars(), skill_env));
         cmd.spawn()
             .map_err(|error| format!("Failed to execute bash command: {error}"))
     }
+}
+
+/// bash 子プロセスへ引き継ぐ親プロセスの環境変数。それ以外は渡さない。
+const BASH_INHERITED_ENV_KEYS: &[&str] = &["PATH", "HOME", "LANG", "TERM"];
+
+/// bash 子プロセスに渡す環境変数を構築する。
+///
+/// 親プロセスの環境変数をすべて継承すると `SSH_AUTH_SOCK` 等の認証手段が
+/// LLM 生成コマンドに漏れるため、最小限の鍵だけを明示的に渡し、
+/// skill が宣言した `required_env` を上書きとして加える。
+fn bash_child_env(
+    parent_vars: impl Iterator<Item = (String, String)>,
+    skill_env: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut env: HashMap<String, String> = parent_vars
+        .filter(|(key, _)| BASH_INHERITED_ENV_KEYS.contains(&key.as_str()))
+        .collect();
+    for (key, value) in skill_env {
+        env.insert(key.clone(), value.clone());
+    }
+    env
 }
 
 #[async_trait]
@@ -309,4 +329,74 @@ fn append_truncation_summary(
         format_size(DEFAULT_MAX_BYTES),
         temp_path.to_string_lossy()
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child_env(parent: &[(&str, &str)], skill_env: &[(&str, &str)]) -> HashMap<String, String> {
+        let parent_vars = parent
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()));
+        let skill: HashMap<String, String> = skill_env
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        bash_child_env(parent_vars, &skill)
+    }
+
+    #[test]
+    fn bash_child_env_passes_only_minimal_keys_and_skill_env() {
+        // Arrange
+        let parent = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/agent"),
+            ("LANG", "C.UTF-8"),
+            ("TERM", "xterm-256color"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/bus"),
+            ("EGOPULSE_S2_CANARY", "leak-me"),
+        ];
+
+        // Act
+        let env = child_env(&parent, &[("SKILL_TOKEN", "skill-value")]);
+
+        // Assert
+        for key in ["PATH", "HOME", "LANG", "TERM", "SKILL_TOKEN"] {
+            assert!(env.contains_key(key), "should keep {key}");
+        }
+        for key in [
+            "SSH_AUTH_SOCK",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "EGOPULSE_S2_CANARY",
+        ] {
+            assert!(!env.contains_key(key), "should drop {key}");
+        }
+    }
+
+    #[test]
+    fn bash_child_env_skips_missing_optional_keys() {
+        // Arrange
+        let parent = [("PATH", "/usr/bin")];
+
+        // Act
+        let env = child_env(&parent, &[]);
+
+        // Assert
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
+    }
+
+    #[test]
+    fn bash_child_env_prefers_skill_env_over_inherited_key() {
+        // Arrange
+        let parent = [("PATH", "/usr/bin"), ("HOME", "/real-home")];
+
+        // Act
+        let env = child_env(&parent, &[("HOME", "/skill-home")]);
+
+        // Assert
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/skill-home"));
+    }
 }
