@@ -64,6 +64,7 @@ pub(crate) struct RecordingProvider {
         Arc<std::sync::Mutex<Vec<Result<crate::llm::MessagesResponse, crate::error::LlmError>>>>,
     seen_messages: Arc<std::sync::Mutex<Vec<Vec<Message>>>>,
     seen_systems: Arc<std::sync::Mutex<Vec<String>>>,
+    seen_tools: Arc<std::sync::Mutex<Vec<Option<Vec<crate::llm::ToolDefinition>>>>>,
     delays_ms: Arc<std::sync::Mutex<Vec<u64>>>,
     streaming_delta: Option<String>,
 }
@@ -106,12 +107,16 @@ impl LlmProvider for RecordingProvider {
         &self,
         system: &str,
         messages: Arc<Vec<Message>>,
-        _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
     ) -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
         self.seen_systems
             .lock()
             .expect("systems")
             .push(system.to_string());
+        self.seen_tools
+            .lock()
+            .expect("tools")
+            .push(tools.as_deref().cloned());
         self.seen_messages
             .lock()
             .expect("messages")
@@ -159,6 +164,7 @@ impl RecordingProvider {
             responses: Arc::new(std::sync::Mutex::new(responses)),
             seen_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
             seen_systems: Arc::new(std::sync::Mutex::new(Vec::new())),
+            seen_tools: Arc::new(std::sync::Mutex::new(Vec::new())),
             delays_ms: Arc::new(std::sync::Mutex::new(delays_ms)),
             streaming_delta: None,
         }
@@ -175,6 +181,10 @@ impl RecordingProvider {
 
     pub(crate) fn seen_systems(&self) -> Vec<String> {
         self.seen_systems.lock().expect("systems").clone()
+    }
+
+    pub(crate) fn seen_tools(&self) -> Vec<Option<Vec<crate::llm::ToolDefinition>>> {
+        self.seen_tools.lock().expect("tools").clone()
     }
 }
 

@@ -17,7 +17,7 @@ use crate::storage::{Database, call_blocking};
 
 use super::path_guard;
 use super::search::resolve_workspace_path;
-use super::{Tool, ToolExecutionContext, ToolResult, schema_object};
+use super::{Tool, ToolErrorKind, ToolExecutionContext, ToolResult, schema_object};
 
 async fn prepare_attachment(
     workspace_dir: &Path,
@@ -158,7 +158,8 @@ impl Tool for SendAttachmentTool {
         let path_str = match params.attachment_path.filter(|s| !s.trim().is_empty()) {
             Some(path) => path,
             None => {
-                return ToolResult::error(
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::InvalidInput,
                     "Missing required parameter: attachment_path".to_string(),
                 );
             }
@@ -173,18 +174,26 @@ impl Tool for SendAttachmentTool {
         {
             Ok(Some(info)) => info,
             Ok(None) => {
-                return ToolResult::error(format!("no chat found for chat_id {chat_id}"));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::NotFound,
+                    format!("no chat found for chat_id {chat_id}"),
+                );
             }
-            Err(e) => return ToolResult::error(format!("failed to resolve chat info: {e}")),
+            Err(e) => {
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("failed to resolve chat info: {e}"),
+                );
+            }
         };
 
         let adapter = match self.channels.get(&chat_info.channel) {
             Some(a) => a,
             None => {
-                return ToolResult::error(format!(
-                    "no adapter for channel '{}'",
-                    chat_info.channel
-                ));
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::Upstream,
+                    format!("no adapter for channel '{}'", chat_info.channel),
+                );
             }
         };
 
@@ -198,7 +207,10 @@ impl Tool for SendAttachmentTool {
             .await
         {
             Ok(()) => ToolResult::success("Attachment sent successfully".to_string()),
-            Err(e) => ToolResult::error(format!("Failed to send attachment: {e}")),
+            Err(e) => ToolResult::error_with_kind(
+                ToolErrorKind::Upstream,
+                format!("Failed to send attachment: {e}"),
+            ),
         }
     }
 }

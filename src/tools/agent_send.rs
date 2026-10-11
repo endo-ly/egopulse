@@ -19,7 +19,7 @@ use crate::runtime::turn::{StopReason, evaluate_stop_conditions};
 use crate::storage::{MessageKind, StoredMessage, call_blocking};
 use crate::tools::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object};
 
-use super::sanitize_tool_result;
+use super::{ToolErrorKind, sanitize_tool_result};
 
 const AGENT_SEND_SYSTEM_INSTRUCTION: &str = "\
 [System: This message was delivered from another agent via agent_send. \
@@ -144,7 +144,10 @@ impl Tool for AgentSendTool {
 
         let target_id = params.to.trim().to_string();
         if target_id.is_empty() {
-            return ToolResult::error("parameter 'to' must not be empty".to_string());
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                "parameter 'to' must not be empty".to_string(),
+            );
         }
 
         let config_snapshot = context
@@ -155,12 +158,18 @@ impl Tool for AgentSendTool {
 
         // Validate: agent must exist in config.agents
         if !agents.contains_key(&AgentId::new(&target_id)) {
-            return ToolResult::error(format!("agent '{target_id}' not found"));
+            return ToolResult::error_with_kind(
+                ToolErrorKind::NotFound,
+                format!("agent '{target_id}' not found"),
+            );
         }
 
         // Validate: self-send is prohibited
         if target_id == context.agent_id {
-            return ToolResult::error("cannot send a message to yourself".to_string());
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                "cannot send a message to yourself".to_string(),
+            );
         }
 
         // Preflight: reject if target turn would exceed stop conditions.

@@ -121,7 +121,7 @@ impl Tool for ActivateSkillTool {
                     ))
                 }
             }
-            Err(error) => ToolResult::error(error),
+            Err(error) => ToolResult::error_with_kind(super::ToolErrorKind::NotFound, error),
         }
     }
 }

@@ -4,6 +4,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use super::GUARD_POLICY_NOTE;
+
 const BLOCKED_DIRS: &[&str] = &[".ssh", ".aws", ".gnupg", ".kube"];
 
 const BLOCKED_SUBPATHS: &[&[&str]] = &[&[".config", "gcloud"]];
@@ -99,7 +101,7 @@ pub(crate) fn check_path(path: &str) -> Result<(), String> {
     validate_symlink_safety(candidate)?;
     if is_blocked(candidate) {
         return Err(format!(
-            "Access denied: '{path}' is a sensitive path and cannot be accessed."
+            "Access denied: '{path}' is a sensitive path and cannot be accessed.{GUARD_POLICY_NOTE}"
         ));
     }
     Ok(())
@@ -112,7 +114,7 @@ pub(crate) fn check_command_paths(command: &str) -> Result<(), String> {
     for blocked in BLOCKED_ABSOLUTE {
         if contains_path_reference(&normalized_command, blocked) {
             return Err(format!(
-                "Access denied: command references blocked path '{blocked}'."
+                "Access denied: command references blocked path '{blocked}'.{GUARD_POLICY_NOTE}"
             ));
         }
     }
@@ -132,7 +134,7 @@ fn check_blocked_files_in_command(command: &str) -> Result<(), String> {
             if is_blocked_filename(component) {
                 return Err(format!(
                     "Access denied: command references blocked file '{component}'. \
-                     Sensitive files cannot be accessed through shell commands."
+                     Sensitive files cannot be accessed through shell commands.{GUARD_POLICY_NOTE}"
                 ));
             }
         }
@@ -144,7 +146,7 @@ fn check_blocked_dirs_in_command(lower: &str) -> Result<(), String> {
     for blocked in BLOCKED_DIRS {
         if contains_path_component(lower, blocked) {
             return Err(format!(
-                "Access denied: command references blocked directory '{blocked}'."
+                "Access denied: command references blocked directory '{blocked}'.{GUARD_POLICY_NOTE}"
             ));
         }
     }
@@ -156,7 +158,7 @@ fn check_blocked_subpaths_in_command(lower: &str) -> Result<(), String> {
         let subpath = blocked.join("/");
         if contains_path_reference(lower, &subpath) {
             return Err(format!(
-                "Access denied: command references blocked path segment '{subpath}'."
+                "Access denied: command references blocked path segment '{subpath}'.{GUARD_POLICY_NOTE}"
             ));
         }
     }
@@ -247,10 +249,9 @@ fn check_proc_access(lower: &str) -> Result<(), String> {
         let segment = after.split('/').next().unwrap_or("");
         if segment == "self" || (!segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
         {
-            return Err(
-                "Access denied: command references /proc/*/..., which exposes process internals."
-                    .to_string(),
-            );
+            return Err(format!(
+                "Access denied: command references /proc/*/..., which exposes process internals.{GUARD_POLICY_NOTE}"
+            ));
         }
         start = abs + 1;
         if start >= lower.len() {
@@ -537,6 +538,18 @@ mod tests {
                 "command: {command}"
             );
         }
+    }
+
+    #[test]
+    fn command_path_guard_checks_escaped_quotes_and_command_substitutions() {
+        // The escaped quote keeps the argument quoted, so `#` is data and the
+        // command substitution still executes.
+        let command = r#"printf '%s\n' "safe\" # $(cat ~/.ssh/id_rsa)" ; echo done"#;
+
+        assert!(
+            check_command_paths(command).is_err(),
+            "the command substitution still references a blocked path"
+        );
     }
 
     #[test]

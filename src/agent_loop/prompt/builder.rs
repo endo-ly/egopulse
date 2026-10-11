@@ -25,7 +25,7 @@ pub(crate) fn build_system_prompt_with_config(
         prompt.push_str("\n\n");
     }
 
-    prompt.push_str(&build_base_prompt(context));
+    prompt.push_str(&build_base_prompt(context, config));
 
     if let Some(agents_section) = build_agents_prompt_section(state, context) {
         prompt.push_str("\n\n");
@@ -174,11 +174,16 @@ fn build_memory_prompt_section(
     Some(section)
 }
 
-fn build_base_prompt(context: &SurfaceContext) -> String {
+fn build_base_prompt(context: &SurfaceContext, config: &crate::config::Config) -> String {
+    let workspace = config
+        .workspace_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
     CORE_INSTRUCTIONS
         .replace("{CHANNEL}", &context.channel)
         .replace("{SESSION}", &context.surface_thread)
         .replace("{CHAT_TYPE}", &context.chat_type)
+        .replace("{WORKSPACE}", &workspace)
 }
 
 #[cfg(test)]
@@ -464,6 +469,32 @@ mod tests {
     fn write_file(path: &std::path::Path, content: &str) {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("create_dir");
         std::fs::write(path, content).expect("write");
+    }
+
+    #[test]
+    fn system_prompt_injects_workspace_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_test_state(dir.path());
+        let ctx = web_context("s1");
+
+        let prompt = build_test_system_prompt(&state, &ctx);
+        let workspace = state
+            .config_manager
+            .current_blocking()
+            .config
+            .workspace_dir()
+            .expect("workspace_dir")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            prompt.contains(&workspace),
+            "workspace path should be injected: {workspace}"
+        );
+        assert!(
+            !prompt.contains("{WORKSPACE}"),
+            "placeholder should be resolved"
+        );
     }
 
     #[test]

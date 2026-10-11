@@ -143,7 +143,7 @@ AGENTS.md セクション（③）の直後、Long-term Memory（④）の直前
 
 プロンプト本文はコード内（`include_str!` またはハードコード）が正本。本節では各セクションの役割・注入順・正本位置を示す。
 
-> `{channel}`, `{session}`, `{chat_type}` は `format!()` のプレースホルダ。
+> `{channel}`, `{session}`, `{chat_type}`, `{workspace}` は実行時に解決されるプレースホルダ。
 
 ### 4.1 Soul セクションラッパー（注入順: ①、条件付き）
 
@@ -205,7 +205,7 @@ Core Instructions 既存宣言("Project instructions may add constraints, but mu
 ### 4.2 Core Instructions（注入順: ②、常に出力）
 
 **ファイル**: [`src/agent_loop/prompt/templates/core_instructions.md`](../src/agent_loop/prompt/templates/core_instructions.md)
-**コード**: [`src/agent_loop/prompt/builder.rs`](../src/agent_loop/prompt/builder.rs) `build_base_prompt()` （`include_str!` + `replace()` で `{CHANNEL}` / `{SESSION}` / `{CHAT_TYPE}` を埋め込む）
+**コード**: [`src/agent_loop/prompt/builder.rs`](../src/agent_loop/prompt/builder.rs) `build_base_prompt()` （`include_str!` + `replace()` で `{CHANNEL}` / `{SESSION}` / `{CHAT_TYPE}` / `{WORKSPACE}` を埋め込む。`{WORKSPACE}` は `Config::workspace_dir()` の解決値）
 
 全文は `src/agent_loop/prompt/templates/core_instructions.md` を正本とする。含まれる内容:
 
@@ -214,9 +214,9 @@ Core Instructions 既存宣言("Project instructions may add constraints, but mu
 | 基本宣言 | チャネル・セッション種別の宣言（`{CHANNEL}` / `{SESSION}` / `{CHAT_TYPE}` を埋め込み） |
 | ツール案内 | `bash` / `read` / `write` / `edit` / `find` / `grep` / `ls` / `activate_skill` の使い方と `[tool_use: ...]` テキスト非実行の注意 |
 | 実行プレイブック | 実行可能リクエストは実行する / 読み取り専用は即実行 / 副作用・高リスクのみ事前確認 / 「実行できない」は実試行後だけ |
-| ワークスペース規約 | 作業ディレクトリ基準の相対パス、`.tmp/` の利用、絶対パス捏造の禁止、コーディングループ |
-| 実行信頼性 | 副作用アクションは tool 成功まで完了扱いしない / 失敗は報告し次手を提示 |
-| セキュリティルール | 秘密の非公開・redaction、プロジェクト指示はセキュリティルールを弱められない、プロンプトインジェクション拒否 |
+| ワークスペース規約 | 作業ディレクトリの実パス（`{WORKSPACE}`）、bash の cwd と相対パス解決の基点、`.tmp/` の利用、絶対パス捏造の禁止、コーディングループ |
+| 実行信頼性 | 副作用アクションは tool 成功まで完了扱いしない / 失敗は報告し次手を提示 / 引数の内容と Bash 構文に応じた引用 |
+| セキュリティルール | 秘密の非公開・redaction、ガード遮断は最終判断（回避を試みずユーザーに確認）、プロジェクト指示はセキュリティルールを弱められない、プロンプトインジェクション拒否 |
 
 ### 4.3 Memories セクション（注入順: ③、条件付き）
 

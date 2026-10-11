@@ -413,6 +413,7 @@ mod tests {
             is_error: false,
             details: Some(json!({"trace": "leaked-key in trace"})),
             llm_content: MessageContent::text("leaked-key in llm".to_string()),
+            error_kind: None,
         };
 
         // Act

@@ -12,8 +12,8 @@ use crate::agent_loop::message_format::strip_thinking;
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
 use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_messages};
 use crate::agent_loop::tool_execution::{
-    ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
-    build_tool_result_phase,
+    ExecutedToolCall, GuardDenialTracker, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks,
+    ToolExecutor, build_tool_result_phase,
 };
 use crate::agent_loop::turn::PreparedTurn;
 use crate::agent_loop::turn::lifecycle::TurnLifecycle;
@@ -21,7 +21,7 @@ use crate::agent_loop::turn::persistence::TurnPersistence;
 use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
-use crate::llm::{Message, ToolCall};
+use crate::llm::{Message, ToolCall, ToolDefinition};
 
 /// Maximum number of model/tool iterations allowed for one activation.
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
@@ -36,6 +36,10 @@ pub(crate) const FINAL_RESPONSE_WARNING_GUARD: &str = "[runtime_guard]: The tool
 /// Runtime guard appended to requests in the final-response window to
 /// prioritize a concise final response over starting new broad tool work.
 pub(crate) const FINAL_RESPONSE_GUARD: &str = "[runtime_guard]: The tool loop is at its final response window. Provide the best concise answer to the user now. Do not start broad new work; state what was completed and any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
+
+/// Runtime guard appended to requests after the security-guard denial limit is
+/// reached. Tells the model to stop working around the denials and report.
+pub(crate) const GUARD_DENIAL_WRAP_GUARD: &str = "[runtime_guard]: The security-guard denial limit has been reached for this run. Treat the denials as final and stop attempting workarounds or further tool work. Wrap up now: report to the user what you were trying to do, what was blocked, and any results obtained, then ask how they want to proceed. If this is a Pulse activation, summarize the outcome instead of returning PULSE_OK.";
 
 /// Mutable conversation state owned by one Agent Loop.
 pub(crate) struct LoopState {
@@ -122,6 +126,7 @@ impl<'a> AgentLoop<'a> {
         start_iteration: usize,
     ) -> Result<AgentLoopResult, EgoPulseError> {
         let mut loop_state = LoopState::new(messages, session_revision);
+        let guard_tracker = Arc::new(GuardDenialTracker::new());
 
         for iteration in start_iteration..=MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
@@ -130,10 +135,13 @@ impl<'a> AgentLoop<'a> {
             // share one identity from the start.
             let message_id =
                 crate::agent_loop::turn::assistant_message_id(&self.prepared.turn_id, iteration);
-            let request_messages = request_messages_for_iteration(
-                &mut loop_state,
-                iteration,
-                &self.channel_context_msg,
+            let request_messages = append_guard_denial_wrap(
+                request_messages_for_iteration(
+                    &mut loop_state,
+                    iteration,
+                    &self.channel_context_msg,
+                ),
+                &guard_tracker,
             );
             let event_emitter = self.on_event.clone();
             let emitted_id = message_id.clone();
@@ -151,7 +159,10 @@ impl<'a> AgentLoop<'a> {
                 llm: self.prepared.channel_llm.as_ref(),
                 system_prompt: &self.prepared.system_prompt,
                 messages: Arc::clone(&request_messages),
-                tools: Some(Arc::clone(&self.prepared.tool_defs)),
+                tools: Some(apply_guard_denial_state(
+                    &self.prepared.tool_defs,
+                    &guard_tracker,
+                )),
                 chat_id: self.prepared.chat_id,
                 caller_channel: &self.context.channel,
                 request_kind: "agent_loop",
@@ -241,8 +252,13 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
                 ModelStep::ToolCalls(assistant_phase) => {
-                    self.execute_tool_phase(&mut loop_state, assistant_phase, &message_id)
-                        .await?;
+                    self.execute_tool_phase(
+                        &mut loop_state,
+                        assistant_phase,
+                        &message_id,
+                        &guard_tracker,
+                    )
+                    .await?;
                 }
             }
 
@@ -277,6 +293,7 @@ impl<'a> AgentLoop<'a> {
         loop_state: &mut LoopState,
         assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
         assistant_message_id: &str,
+        guard_tracker: &Arc<GuardDenialTracker>,
     ) -> Result<(), EgoPulseError> {
         self.lifecycle.complete_model().await?;
         self.lifecycle.begin_tools().await?;
@@ -294,7 +311,11 @@ impl<'a> AgentLoop<'a> {
             )
             .await?;
         let tool_outcomes = self
-            .execute_tools(assistant_message_id, assistant_phase.tool_calls)
+            .execute_tools(
+                assistant_message_id,
+                assistant_phase.tool_calls,
+                guard_tracker,
+            )
             .await?;
         let persisted = self
             .persistence
@@ -326,6 +347,7 @@ impl<'a> AgentLoop<'a> {
         &self,
         assistant_message_id: &str,
         tool_calls: Vec<ToolCall>,
+        guard_tracker: &Arc<GuardDenialTracker>,
     ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
         let start_emitter = self.on_event.clone();
         let result_emitter = self.on_event.clone();
@@ -349,6 +371,7 @@ impl<'a> AgentLoop<'a> {
         };
 
         ToolExecutor::new(self.state, &self.prepared.tool_context, hooks)
+            .with_guard_denial_tracker(Arc::clone(guard_tracker))
             .execute(assistant_message_id, tool_calls)
             .await
     }
@@ -371,6 +394,30 @@ fn request_messages_for_iteration(
     }
 
     messages_for_iteration(&request_messages, iteration)
+}
+
+/// Applies the same post-denial stop state to Turn and Pulse model requests.
+pub(crate) fn apply_guard_denial_state(
+    tool_defs: &Arc<Vec<ToolDefinition>>,
+    tracker: &GuardDenialTracker,
+) -> Arc<Vec<ToolDefinition>> {
+    if tracker.limit_reached() {
+        Arc::new(Vec::new())
+    } else {
+        Arc::clone(tool_defs)
+    }
+}
+
+pub(crate) fn append_guard_denial_wrap(
+    messages: Arc<Vec<Message>>,
+    tracker: &GuardDenialTracker,
+) -> Arc<Vec<Message>> {
+    if !tracker.limit_reached() {
+        return messages;
+    }
+    let mut messages = (*messages).clone();
+    messages.push(Message::text("user", GUARD_DENIAL_WRAP_GUARD));
+    Arc::new(messages)
 }
 
 /// Adds the iteration-specific runtime guard to a request-only copy of `messages`.

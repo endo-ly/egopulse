@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::loop_runner::{MAX_TOOL_ITERATIONS, messages_for_iteration};
+use crate::agent_loop::loop_runner::{
+    MAX_TOOL_ITERATIONS, append_guard_denial_wrap, apply_guard_denial_state, messages_for_iteration,
+};
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest, ignore_delta};
 use crate::agent_loop::tool_execution::{
-    ToolExecutionHooks, ToolExecutor, build_tool_result_phase,
+    GuardDenialTracker, ToolExecutionHooks, ToolExecutor, build_tool_result_phase,
 };
 use crate::conversation::ConversationScope;
 use crate::conversation::SurfaceContext;
@@ -23,6 +25,7 @@ use tracing::warn;
 /// Pulse scans agents sequentially, so a provider quota wait (a long
 /// `Retry-After`) fails the activation instead of stalling every later Pulse.
 const PULSE_MAX_LLM_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+const GUARD_DENIAL_FALLBACK_NOTICE: &str = "Pulse stopped after repeated security-guard denials. No further tools were run; review the blocked action and decide how to proceed.";
 
 /// RAII guard that decrements the active turn counter on drop.
 struct PulseTurnGuard<'a> {
@@ -178,15 +181,17 @@ pub(crate) async fn run_activation_with_snapshot(
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
+    let guard_tracker = Arc::new(GuardDenialTracker::new());
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        let request_messages = messages_for_iteration(&messages, iteration);
+        let request_messages =
+            append_guard_denial_wrap(messages_for_iteration(&messages, iteration), &guard_tracker);
         let model_runner = ModelRunner::new(ModelStepRequest {
             state: &turn_dependencies,
             llm: channel_llm.as_ref(),
             system_prompt: &system_prompt,
             messages: Arc::clone(&request_messages),
-            tools: Some(Arc::clone(&tool_defs)),
+            tools: Some(apply_guard_denial_state(&tool_defs, &guard_tracker)),
             chat_id,
             caller_channel: &context.channel,
             request_kind: "pulse",
@@ -197,29 +202,35 @@ pub(crate) async fn run_activation_with_snapshot(
             scope: ConversationScope::Normal,
             on_delta: &ignore_delta,
         });
-        let phase_response = model_runner
+        let phase_response = match model_runner
             .run_with_transient_retry(PULSE_MAX_LLM_RETRY_BACKOFF)
             .await
-            .map_err(|error| error.into_parts().0)?;
+        {
+            Ok(response) => response,
+            Err(error) if guard_tracker.limit_reached() => {
+                let (error, _) = error.into_parts();
+                warn!(error = %error, "pulse could not generate a report after guard denial limit");
+                return Ok(guard_denial_fallback(tool_phases));
+            }
+            Err(error) => return Err(error.into_parts().0),
+        };
 
         let assistant_phase = match phase_response {
             ModelStep::Final(response) => {
                 let output_text = response.content.trim().to_string();
-                let output_kind = classify_output(&output_text);
-                return Ok(ActivationResult {
+                return Ok(activation_result(
                     output_text,
-                    output_kind,
                     tool_phases,
-                });
+                    guard_tracker.limit_reached(),
+                ));
             }
             ModelStep::MalformedToolCalls(response) => {
                 let output_text = response.content.trim().to_string();
-                let output_kind = classify_output(&output_text);
-                return Ok(ActivationResult {
+                return Ok(activation_result(
                     output_text,
-                    output_kind,
                     tool_phases,
-                });
+                    guard_tracker.limit_reached(),
+                ));
             }
             ModelStep::ToolCalls(assistant_phase) => assistant_phase,
         };
@@ -230,6 +241,7 @@ pub(crate) async fn run_activation_with_snapshot(
             &tool_context,
             ToolExecutionHooks::none(),
         )
+        .with_guard_denial_tracker(Arc::clone(&guard_tracker))
         .execute(&assistant_message_id, assistant_phase.tool_calls.clone())
         .await?;
         let tool_result_phase = build_tool_result_phase(tool_outcomes);
@@ -239,6 +251,7 @@ pub(crate) async fn run_activation_with_snapshot(
             messages_mut.push(assistant_phase.assistant_message.clone());
             messages_mut.extend(tool_result_phase.tool_messages.clone());
         }
+
         tool_phases.push(ToolPhase {
             assistant_message_id,
             assistant_message: assistant_phase.assistant_message,
@@ -248,9 +261,36 @@ pub(crate) async fn run_activation_with_snapshot(
         });
     }
 
+    if guard_tracker.limit_reached() {
+        return Ok(guard_denial_fallback(tool_phases));
+    }
+
     Err(EgoPulseError::Internal(format!(
         "pulse tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
     )))
+}
+
+fn activation_result(
+    output_text: String,
+    tool_phases: Vec<ToolPhase>,
+    guard_limit_reached: bool,
+) -> ActivationResult {
+    if guard_limit_reached && classify_output(&output_text) == PulseOutputKind::Silent {
+        return guard_denial_fallback(tool_phases);
+    }
+    ActivationResult {
+        output_kind: classify_output(&output_text),
+        output_text,
+        tool_phases,
+    }
+}
+
+fn guard_denial_fallback(tool_phases: Vec<ToolPhase>) -> ActivationResult {
+    ActivationResult {
+        output_text: GUARD_DENIAL_FALLBACK_NOTICE.to_string(),
+        output_kind: PulseOutputKind::Notify,
+        tool_phases,
+    }
 }
 
 fn classify_output(text: &str) -> PulseOutputKind {
@@ -265,10 +305,41 @@ fn classify_output(text: &str) -> PulseOutputKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::ToolDefinition;
     use crate::pulse::capsule::HomeSurface;
     use crate::pulse::capsule::build_capsule;
     use crate::pulse::definition::{TemporalIntention, TemporalSchedule};
+    use crate::tools::{Tool, ToolExecutionContext, ToolResult};
     use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SideEffectProbeTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SideEffectProbeTool {
+        fn name(&self) -> &str {
+            "write_probe"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name().to_string(),
+                description: "Test-only side-effecting Tool".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _context: &ToolExecutionContext,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ToolResult::success("write completed".to_string())
+        }
+    }
 
     fn test_intention() -> TemporalIntention {
         TemporalIntention {
@@ -409,6 +480,141 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn guard_denial_limit_blocks_side_effect_tools_and_notifies_on_report_failure() {
+        // Arrange: three denied bash calls cross the limit; a subsequent
+        // side-effecting Tool request is blocked and a failed report becomes
+        // a fixed Notify result.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let denied_call = |id: &str| crate::llm::ToolCall {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": "cat .env"}),
+            invalid_arguments: None,
+        };
+        let tool_response = |id: &str, content: &str| {
+            Ok(crate::llm::MessagesResponse {
+                content: content.to_string(),
+                reasoning_content: None,
+                tool_calls: vec![denied_call(id)],
+                usage: None,
+            })
+        };
+        let responses = vec![
+            tool_response("pulse-guard-1", "Trying."),
+            tool_response("pulse-guard-2", "Retrying."),
+            tool_response("pulse-guard-3", "Again."),
+            Ok(crate::llm::MessagesResponse {
+                content: "Once more.".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "pulse-guard-blocked".to_string(),
+                    name: "write_probe".to_string(),
+                    arguments: serde_json::json!({}),
+                    invalid_arguments: None,
+                }],
+                usage: None,
+            }),
+            Err(crate::error::LlmError::RequestConstructionFailed(
+                "report generation failed".to_string(),
+            )),
+        ];
+        let provider =
+            crate::agent_loop::test_support::RecordingProvider::new(responses, vec![0; 5]);
+        let observer = provider.clone();
+        let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        let mut state = crate::test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        Arc::get_mut(&mut state.tools)
+            .expect("tool registry is uniquely owned")
+            .register_tool(Box::new(SideEffectProbeTool {
+                calls: Arc::clone(&write_calls),
+            }));
+        let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:guard-pulse:agent:default",
+                Some("guard-pulse"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let surface = HomeSurface {
+            chat_id,
+            channel: "cli".to_string(),
+            external_chat_id: "guard-pulse".to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+
+        // Act
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await
+        .expect("pulse wraps up after the denial limit");
+
+        // Assert: the wrap-up guard rode along with the fourth request and the
+        // failed LLM report is converted to a visible fixed notification.
+        assert_eq!(result.output_text, GUARD_DENIAL_FALLBACK_NOTICE);
+        assert_eq!(result.output_kind, PulseOutputKind::Notify);
+        let seen_messages = observer.seen_messages();
+        assert_eq!(seen_messages.len(), 5);
+        assert!(
+            observer.seen_tools()[3].as_ref().is_some_and(Vec::is_empty),
+            "subsequent model requests must not expose Tool definitions"
+        );
+        let fourth_request = seen_messages[3].last().expect("wrap guard message");
+        assert!(
+            fourth_request
+                .content
+                .as_text_lossy()
+                .contains(crate::agent_loop::loop_runner::GUARD_DENIAL_WRAP_GUARD)
+        );
+
+        // Assert: the blocked side-effecting Tool did not run and its tool
+        // result reports the stop condition.
+        let blocked_result = seen_messages[4]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("pulse-guard-blocked"))
+            .expect("blocked call must receive a tool result");
+        assert!(
+            blocked_result
+                .content
+                .as_text_lossy()
+                .contains("All Tool execution is stopped for this run")
+        );
+        assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pulse_guard_limit_never_silently_accepts_pulse_ok() {
+        let result = activation_result("PULSE_OK".to_string(), Vec::new(), true);
+
+        assert_eq!(result.output_kind, PulseOutputKind::Notify);
+        assert_eq!(result.output_text, GUARD_DENIAL_FALLBACK_NOTICE);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn late_tool_loop_requests_final_response_at_hard_cap() {
         // Arrange: keep the activation in the Tool phase until the shared
         // warning boundary, then return a response after the shared guards.
@@ -449,8 +655,19 @@ mod tests {
             None,
             None,
         );
+        let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:late-pulse:agent:default",
+                Some("late-pulse"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
         let surface = HomeSurface {
-            chat_id: 1,
+            chat_id,
             channel: "cli".to_string(),
             external_chat_id: "late-pulse".to_string(),
             chat_type: "cli".to_string(),

@@ -46,6 +46,13 @@ const GREP_MAX_LINE_LENGTH: usize = 500;
 const DEFAULT_BASH_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_GREP_TIMEOUT_SECS: u64 = 30;
 
+/// ガード遮断メッセージに付ける方針の明示。
+///
+/// 遮断は最終判断であることを伝え、別構文・スクリプト等での回避を試みず
+/// ユーザーに確認させるための文言。Core Instructions の Security rules と対になる。
+pub(crate) const GUARD_POLICY_NOTE: &str =
+    " This is a policy decision; do not work around it. Ask the user if access is required.";
+
 /// Contextual metadata passed to every tool execution (chat identity, channel, thread).
 #[derive(Debug, Clone)]
 pub(crate) struct ToolExecutionContext {
@@ -106,6 +113,40 @@ pub(crate) struct ToolResult {
     pub is_error: bool,
     pub details: Option<serde_json::Value>,
     pub llm_content: crate::llm::MessageContent,
+    /// Failure classification recorded in the `tool_calls.error_kind` ledger
+    /// column. `None` falls back to the generic `tool_error` kind.
+    pub error_kind: Option<ToolErrorKind>,
+}
+
+/// Classification of tool failures, persisted as `tool_calls.error_kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolErrorKind {
+    /// Denied by the command / path guards or by a workspace boundary.
+    GuardDenied,
+    /// Missing required parameters or schema mismatches.
+    InvalidInput,
+    /// bash / web_fetch / grep timeouts.
+    Timeout,
+    /// bash exited with a non-zero status.
+    ExitNonZero,
+    /// Missing file, path, skill, or agent.
+    NotFound,
+    /// HTTP errors, MCP transport errors, and channel API errors.
+    Upstream,
+}
+
+impl ToolErrorKind {
+    /// Ledger identifier stored in `tool_calls.error_kind`.
+    pub(crate) fn as_ledger_str(self) -> &'static str {
+        match self {
+            Self::GuardDenied => "guard_denied",
+            Self::InvalidInput => "invalid_input",
+            Self::Timeout => "timeout",
+            Self::ExitNonZero => "exit_nonzero",
+            Self::NotFound => "not_found",
+            Self::Upstream => "upstream",
+        }
+    }
 }
 
 impl ToolResult {
@@ -116,6 +157,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: None,
+            error_kind: None,
         }
     }
 
@@ -126,6 +168,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: Some(details),
+            error_kind: None,
         }
     }
 
@@ -139,6 +182,7 @@ impl ToolResult {
             is_error: false,
             details: None,
             llm_content,
+            error_kind: None,
         }
     }
 
@@ -149,7 +193,25 @@ impl ToolResult {
             content,
             is_error: true,
             details: None,
+            error_kind: None,
         }
+    }
+
+    /// Create an error result classified with a failure kind for the ledger.
+    pub(crate) fn error_with_kind(kind: ToolErrorKind, content: String) -> Self {
+        Self {
+            llm_content: crate::llm::MessageContent::text(content.clone()),
+            content,
+            is_error: true,
+            details: None,
+            error_kind: Some(kind),
+        }
+    }
+
+    /// Attach a failure kind to this result for the execution ledger.
+    pub(crate) fn with_error_kind(mut self, kind: ToolErrorKind) -> Self {
+        self.error_kind = Some(kind);
+        self
     }
 
     /// Create an error result with structured details.
@@ -159,6 +221,7 @@ impl ToolResult {
             content,
             is_error: true,
             details: Some(details),
+            error_kind: None,
         }
     }
 }
@@ -170,6 +233,19 @@ pub(crate) trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     async fn execute(&self, input: serde_json::Value, context: &ToolExecutionContext)
     -> ToolResult;
+
+    /// Executes after pre-claim context preparation, when a Tool needs to reuse
+    /// values resolved before its input was persisted.
+    async fn execute_prepared(
+        &self,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
+        self.execute(input, context).await
+    }
+
+    /// Prepares per-call context needed before durable Tool input is sanitized.
+    fn prepare_execution_context(&self, _context: &ToolExecutionContext) {}
 
     /// Whether this tool only reads data without side effects.
     ///
@@ -301,7 +377,7 @@ impl ToolRegistry {
         Arc::new(definitions)
     }
 
-    /// Find and execute a tool by name. Returns an error result for unknown tools.
+    /// Dispatches a Tool call. Returns an error result for unknown tools.
     ///
     /// Redaction secrets are assembled **after** tool execution so that env vars
     /// resolved by `activate_skill` during the same call are already present in
@@ -312,8 +388,32 @@ impl ToolRegistry {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
+        self.execute_inner(name, input, context, false).await
+    }
+
+    /// Dispatches a Tool whose execution context was prepared before its ledger claim.
+    pub(crate) async fn execute_prepared(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> ToolResult {
+        self.execute_inner(name, input, context, true).await
+    }
+
+    async fn execute_inner(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        context: &ToolExecutionContext,
+        prepared: bool,
+    ) -> ToolResult {
         if let Some(&idx) = self.tool_index.get(name) {
-            let result = self.tools[idx].execute(input, context).await;
+            let result = if prepared {
+                self.tools[idx].execute_prepared(input, context).await
+            } else {
+                self.tools[idx].execute(input, context).await
+            };
             return sanitize_tool_result(result, &self.redaction_secrets(context));
         }
         if let Some(mcp_manager) = &self.mcp_manager {
@@ -326,7 +426,10 @@ impl ToolRegistry {
                     return sanitize_tool_result(
                         match result {
                             Ok(output) => ToolResult::success(output),
-                            Err(error) => ToolResult::error(error.to_string()),
+                            Err(error) => ToolResult::error_with_kind(
+                                ToolErrorKind::Upstream,
+                                error.to_string(),
+                            ),
                         },
                         &self.redaction_secrets(context),
                     );
@@ -334,7 +437,7 @@ impl ToolRegistry {
             }
         }
         sanitize_tool_result(
-            ToolResult::error(format!("Unknown tool: {name}")),
+            ToolResult::error_with_kind(ToolErrorKind::NotFound, format!("Unknown tool: {name}")),
             &self.redaction_secrets(context),
         )
     }
@@ -362,6 +465,22 @@ impl ToolRegistry {
             append_unique_secrets(&mut secrets, vec![(format!("skill_env.{k}"), v.clone())]);
         }
         secrets
+    }
+
+    /// Sanitizes string values in Tool arguments before they are persisted.
+    pub(crate) fn sanitize_tool_input(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> serde_json::Value {
+        sanitize_json_value(input.clone(), &self.redaction_secrets(context))
+    }
+
+    /// Prepares per-tool context required for input redaction and execution.
+    pub(crate) fn prepare_execution_context(&self, name: &str, context: &ToolExecutionContext) {
+        if let Some(&idx) = self.tool_index.get(name) {
+            self.tools[idx].prepare_execution_context(context);
+        }
     }
 
     pub(crate) async fn is_read_only(&self, name: &str) -> bool {
@@ -441,7 +560,8 @@ fn truncation_json(truncation: &TruncationResult) -> serde_json::Value {
 pub(crate) fn parse_params<T: serde::de::DeserializeOwned>(
     input: serde_json::Value,
 ) -> Result<T, ToolResult> {
-    serde_json::from_value(input).map_err(|e| ToolResult::error(e.to_string()))
+    serde_json::from_value(input)
+        .map_err(|e| ToolResult::error_with_kind(ToolErrorKind::InvalidInput, e.to_string()))
 }
 
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
@@ -477,7 +597,7 @@ pub(crate) fn kill_process_group(child: &mut tokio::process::Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Tool, ToolExecutionContext, ToolRegistry, ToolResult};
+    use super::{Tool, ToolErrorKind, ToolExecutionContext, ToolRegistry, ToolResult};
     use crate::config::{ChannelConfig, ChannelName, Config};
     use crate::llm::{MessageContent, MessageContentPart, ToolDefinition};
     use crate::skills::SkillManager;
@@ -529,6 +649,27 @@ mod tests {
             config,
             Arc::new(SkillManager::from_dirs(skills_dir.clone(), skills_dir)),
         )
+    }
+
+    #[test]
+    fn tool_error_kinds_map_to_ledger_identifiers() {
+        // Arrange
+        let cases = [
+            (ToolErrorKind::GuardDenied, "guard_denied"),
+            (ToolErrorKind::InvalidInput, "invalid_input"),
+            (ToolErrorKind::Timeout, "timeout"),
+            (ToolErrorKind::ExitNonZero, "exit_nonzero"),
+            (ToolErrorKind::NotFound, "not_found"),
+            (ToolErrorKind::Upstream, "upstream"),
+        ];
+
+        for (kind, expected) in cases {
+            // Act
+            let ledger_str = kind.as_ledger_str();
+
+            // Assert
+            assert_eq!(ledger_str, expected);
+        }
     }
 
     #[tokio::test]
@@ -724,12 +865,13 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("notes.txt"), "hello").expect("notes");
         let registry = test_registry(&config);
+        let context = test_context();
 
         let result = registry
             .execute(
                 "bash",
                 json!({"command": "printf 'ok\\n'; cat notes.txt"}),
-                &test_context(),
+                &context,
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
@@ -752,8 +894,9 @@ mod tests {
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let registry = test_registry(&config);
+        let context = test_context();
         registry
-            .execute("bash", json!({ "command": command }), &test_context())
+            .execute("bash", json!({ "command": command }), &context)
             .await
     }
 
