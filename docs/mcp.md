@@ -117,7 +117,7 @@ subprocess を起動して MCP server に接続。`cwd` は workspace root に�
 
 subprocess は専用の process group のリーダーとして起動する。`npx` / `uv run` などのランチャーが実際の server を孫プロセスとして起動する場合も、終了時は process group ごと停止する。
 
-Runtime の停止時は、実行中 Turn の drain 後に全 server を close する。stdio server は stdin を閉じて最大 3 秒待ち、終了しなければ process group ごと kill する。
+Runtime の停止時は、実行中 Turn の drain 後に全 server を並行して close する。stdio server は stdin を閉じて最大 3 秒待ち、終了しなければ process group ごと kill する。
 
 ### `streamable_http`
 

@@ -270,7 +270,7 @@ impl McpManager {
         })
     }
 
-    /// Closes every connected server.
+    /// Closes every connected server concurrently.
     ///
     /// Stdio servers get their stdin closed, a short grace period to exit, and
     /// are then killed together with their process group. Tool lookups return
@@ -278,11 +278,12 @@ impl McpManager {
     /// drained its turns.
     pub(crate) async fn shutdown(&mut self) {
         self.tool_name_index.clear();
-        for server in self.servers.drain(..) {
+        let closes = self.servers.drain(..).map(|server| async move {
             if let Err(error) = server.client.cancel().await {
                 warn!(server = %server.name, %error, "failed to close MCP server");
             }
-        }
+        });
+        futures_util::future::join_all(closes).await;
     }
 
     pub(crate) fn has_failed_servers(&self) -> bool {
