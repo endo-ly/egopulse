@@ -33,6 +33,7 @@ Workspace and coding workflow:
 Execution reliability:
 - For side-effecting actions, do not claim completion until the relevant tool call has returned success.
 - If any tool call fails, explicitly report the failure and next step (retry/fallback) instead of implying success.
+- Quote arguments that contain spaces with single quotes; do not nest double quotes.
 - The user may not see your internal process or tool calls, so briefly explain what you did and show relevant results.
 
 Security rules:
