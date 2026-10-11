@@ -99,7 +99,31 @@ pub(crate) async fn run_activation_with_snapshot(
         agent_id: agent_id.to_string(),
     };
 
-    let context = pulse_surface_context(home_surface, agent_id);
+    let mut context = pulse_surface_context(home_surface, agent_id);
+    let multi_agent = match context.channel.as_str() {
+        "discord" => context
+            .surface_thread
+            .parse::<u64>()
+            .ok()
+            .and_then(|id| config_snapshot.config.discord_channels().get(&id).cloned())
+            .is_some_and(|channel| channel.multi_agent),
+        "telegram" => context
+            .surface_thread
+            .parse::<i64>()
+            .ok()
+            .and_then(|id| config_snapshot.config.telegram_channels().get(&id).cloned())
+            .is_some_and(|channel| channel.multi_agent),
+        _ => false,
+    };
+    if multi_agent {
+        let channel = context.channel.clone();
+        let thread = context.surface_thread.clone();
+        context.channel_log_chat_id =
+            crate::storage::call_blocking(state.db_for(context.scope), move |db| {
+                db.find_channel_log_chat_id(&channel, &thread)
+            })
+            .await?;
+    }
 
     let turn_dependencies = state.turn_dependencies();
     let channel_llm = turn_dependencies
@@ -120,7 +144,7 @@ pub(crate) async fn run_activation_with_snapshot(
         surface_thread: context.surface_thread.clone(),
         chat_type: home_surface.chat_type.clone(),
         agent_id: agent_id.to_string(),
-        channel_log_chat_id: None,
+        channel_log_chat_id: context.channel_log_chat_id,
         chain_depth: 0,
         origin_id: String::new(),
         turn_id: uuid::Uuid::new_v4().to_string(),
@@ -612,6 +636,211 @@ mod tests {
             tool_calls: vec![],
             usage: None,
         })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_agent_send_uses_shared_log_and_target_session() {
+        use crate::config::{
+            AgentConfig, AgentId, ChannelConfig, ChannelName, DiscordChannelConfig,
+        };
+        use crate::runtime::turn::{ResponseDelivery, ScheduleResult, ScheduledTurn};
+
+        for (multi_agent, existing_log) in [(true, true), (false, true), (true, false)] {
+            // Arrange: a real tool, durable intake and DB, with the recipient
+            // queued until the activation has completed its model loop.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut config = crate::test_util::test_config(dir.path().to_str().unwrap());
+            config
+                .agents
+                .insert(AgentId::new("vega"), AgentConfig::default());
+            config.channels.insert(
+                ChannelName::new("discord"),
+                ChannelConfig {
+                    enabled: Some(true),
+                    discord_channels: Some(std::collections::HashMap::from([(
+                        123,
+                        DiscordChannelConfig {
+                            multi_agent,
+                            agents: vec![AgentId::new("default"), AgentId::new("vega")],
+                            ..Default::default()
+                        },
+                    )])),
+                    ..Default::default()
+                },
+            );
+            let mut send_response = pulse_ok_response().unwrap();
+            send_response.tool_calls.push(crate::llm::ToolCall {
+                id: "pulse-send".to_string(),
+                name: "agent_send".to_string(),
+                arguments: serde_json::json!({"to":"vega", "message":"pulse delivery"}),
+                invalid_arguments: None,
+            });
+            let provider = crate::agent_loop::test_support::RecordingProvider::new(
+                vec![Ok(send_response), pulse_ok_response(), pulse_ok_response()],
+                vec![0; 3],
+            );
+            let mut state = crate::test_util::build_state_with_config(
+                config,
+                Some(Arc::new(provider.clone())),
+                None,
+                None,
+                None,
+            );
+            let intake = Arc::new(crate::runtime::TurnIntake::new());
+            let tool = crate::tools::AgentSendTool::new_with_manager(
+                Arc::clone(&state.db),
+                None,
+                Arc::clone(&state.channels),
+                Arc::clone(&intake),
+                Arc::clone(&state.config_manager),
+            );
+            Arc::get_mut(&mut state.tools)
+                .unwrap()
+                .register_tool(Box::new(tool));
+            let state = Arc::new(state);
+            intake.bind(&state);
+            state.supervisor.start_accepting();
+            let sender_id = state
+                .db
+                .resolve_or_create_chat_id(
+                    "discord",
+                    "discord:123:agent:default",
+                    None,
+                    "discord",
+                    "default",
+                )
+                .unwrap();
+            let log_id = existing_log.then(|| state.db.resolve_channel_log_chat_id(123).unwrap());
+            if let Some(id) = log_id {
+                state
+                    .db
+                    .store_message_only(&crate::storage::StoredMessage::user(
+                        id,
+                        "human".to_string(),
+                        "shared room history".to_string(),
+                    ))
+                    .unwrap();
+            }
+            let surface = crate::pulse::capsule::resolve_home_surface(
+                &state.db,
+                "default",
+                &["discord"],
+                Some(&crate::pulse::definition::DeliverySpec {
+                    channel: "discord".to_string(),
+                    external_chat_id: "123".to_string(),
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(surface.chat_id, sender_id);
+            let target_context = SurfaceContext::new(
+                "discord".to_string(),
+                "scheduler".to_string(),
+                "123".to_string(),
+                "discord".to_string(),
+                "vega".to_string(),
+            );
+            assert!(matches!(
+                state.turn_scheduler.submit(ScheduledTurn {
+                    turn_id: "blocker".to_string(),
+                    origin_id: "blocker".to_string(),
+                    context: target_context,
+                    input: "blocker".to_string(),
+                    config_snapshot: Some(state.config_manager.current_blocking()),
+                    received_at: None,
+                    response_delivery: ResponseDelivery::Channel,
+                }),
+                ScheduleResult::Started(_)
+            ));
+            let capsule = build_capsule(
+                "default",
+                &test_intention(),
+                "",
+                &[],
+                &surface,
+                "2026-05-10T09:00:00+09:00",
+            );
+
+            // Act
+            let activation = run_activation_with_snapshot(
+                &state,
+                "default",
+                &capsule,
+                &surface,
+                state.config_manager.current_blocking(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !activation.tool_phases[0].tool_messages[0]
+                    .content
+                    .as_text_lossy()
+                    .contains("\"delivered\":false")
+            );
+            let target = state
+                .turn_scheduler
+                .on_turn_completed("discord:123:agent:vega")
+                .expect("queued recipient turn");
+            let expected_log = if multi_agent { log_id } else { None };
+
+            // Assert both live and durable recipient contexts, and actual storage.
+            assert_eq!(target.context.channel_log_chat_id, expected_log);
+            assert_eq!(target.context.session_key(), "discord:123:agent:vega");
+            let run = state.db.get_turn_run(&target.turn_id).unwrap();
+            let durable = crate::runtime::turn::deserialize_scheduled_turn(
+                run.scheduled_request_json.as_deref().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(durable.context.channel_log_chat_id, expected_log);
+            let (stored_chat, count): (i64, i64) = state
+                .db
+                .get_conn()
+                .unwrap()
+                .query_row(
+                    "SELECT chat_id, COUNT(*) FROM messages WHERE message_kind = 'agent_send'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert_eq!(stored_chat, expected_log.unwrap_or(sender_id));
+            crate::runtime::execute_scheduled_turn(&state, target).await;
+            let target_chat = state
+                .db
+                .get_chat_by_channel_external_and_agent("discord", "discord:123:agent:vega", "vega")
+                .unwrap()
+                .unwrap();
+            assert!(
+                state
+                    .db
+                    .load_session_snapshot(target_chat.chat_id, 30)
+                    .unwrap()
+                    .messages_json
+                    .is_some()
+            );
+            let chat_count: i64 = state
+                .db
+                .get_conn()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM chats", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                chat_count,
+                2 + i64::from(existing_log),
+                "no ghost chat or invented log"
+            );
+            let requests = provider.seen_messages();
+            assert_eq!(requests.len(), 3);
+            assert_eq!(
+                requests[2]
+                    .iter()
+                    .any(|m| m.content.as_text_lossy().contains("shared room history")),
+                expected_log.is_some()
+            );
+            state.supervisor.shutdown().await;
+        }
     }
 
     fn api_error(status: u16, retry_after_secs: Option<u64>) -> crate::error::LlmError {

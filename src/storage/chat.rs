@@ -990,6 +990,10 @@ impl Database {
 // Channel Log (multi-agent room shared log)
 // ---------------------------------------------------------------------------
 
+fn channel_log_external_id(channel: &str, surface_thread: &str) -> String {
+    format!("{channel}:{surface_thread}:multi-room-log")
+}
+
 impl Database {
     /// Resolves or creates the Channel Log chat for a Discord multi-agent room.
     ///
@@ -998,7 +1002,7 @@ impl Database {
     /// `chat_type = "channel_log"`, `agent_id = ""`.
     /// It has **no session row** — only messages.
     pub(crate) fn resolve_channel_log_chat_id(&self, channel_id: u64) -> Result<i64, StorageError> {
-        let external_id = format!("discord:{channel_id}:multi-room-log");
+        let external_id = channel_log_external_id("discord", &channel_id.to_string());
         self.resolve_or_create_chat_id("discord", &external_id, None, "channel_log", "")
     }
 
@@ -1008,8 +1012,21 @@ impl Database {
         &self,
         chat_id: i64,
     ) -> Result<i64, StorageError> {
-        let external_id = format!("telegram:{chat_id}:multi-room-log");
+        let external_id = channel_log_external_id("telegram", &chat_id.to_string());
         self.resolve_or_create_chat_id("telegram", &external_id, None, "channel_log", "")
+    }
+
+    /// Looks up an existing shared log without creating a chat or session.
+    pub(crate) fn find_channel_log_chat_id(
+        &self,
+        channel: &str,
+        surface_thread: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        let external_id = channel_log_external_id(channel, surface_thread);
+        Ok(self
+            .get_chat_by_channel_external_and_agent(channel, &external_id, "")?
+            .filter(|chat| chat.chat_type == "channel_log")
+            .map(|chat| chat.chat_id))
     }
 
     /// Returns recent public Channel Log events projected for one target agent.

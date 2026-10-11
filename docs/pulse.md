@@ -510,6 +510,8 @@ Pulse の生成途中の delta は破棄し、外部公開済み出力として�
 
 ### 8.3 Tools
 
+Home Surface が Multi-Agent Room の場合、既存の共有 Channel Log を参照し、その ID を Tool 実行と `agent_send` の宛先 Turn へ引き継ぐ。`agent_send` の公開メッセージは共有 Log、宛先の直接入力と内部イベントは宛先 Agent Session に保存する。Single-Agent Channel や共有 Log が存在しない Surface では Home の Agent Session を保存先とし、補完用の Log を作成しない。
+
 Pulse Activation は通常 turn と同じく built-in tools + MCP tools を使用可能。tool loop を最大 50 イテレーション回し、48回目に終了警告を付け、49〜50回目は最終回答を優先する指示を追加する。activation 全体は 30 分のタイムアウトで保護され、タイムアウト・パニック時は run を `failed` として記録する。
 
 activation 中も `active_turn` を保持するため、その間の通常 turn / 他 Pulse は defer される。
