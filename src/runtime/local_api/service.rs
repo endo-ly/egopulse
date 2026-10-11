@@ -1237,6 +1237,7 @@ mod tests {
                     id: "call-1".to_string(),
                     name: "shell".to_string(),
                     arguments: serde_json::json!({"command": "pwd"}),
+                    invalid_arguments: None,
                 }],
                 tool_call_id: None,
             },

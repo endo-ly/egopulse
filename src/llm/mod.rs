@@ -32,6 +32,37 @@ pub(crate) struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: serde_json::Value,
+    /// Parse error when the provider sent arguments that are not valid JSON.
+    ///
+    /// `arguments` is `{}` in that case. The call is reported back to the
+    /// model as a tool error instead of being executed, and this marker is not
+    /// persisted.
+    #[serde(skip)]
+    pub invalid_arguments: Option<String>,
+}
+
+impl ToolCall {
+    /// Builds a tool call from the provider's raw JSON argument string.
+    ///
+    /// Empty arguments mean `{}`. Arguments that are not valid JSON do not fail
+    /// the whole response; the call keeps `{}` and records the parse error in
+    /// [`Self::invalid_arguments`].
+    pub(crate) fn from_raw_arguments(id: String, name: String, raw_arguments: &str) -> Self {
+        let (arguments, invalid_arguments) = if raw_arguments.trim().is_empty() {
+            (serde_json::json!({}), None)
+        } else {
+            match serde_json::from_str::<serde_json::Value>(raw_arguments) {
+                Ok(arguments) => (arguments, None),
+                Err(error) => (serde_json::json!({}), Some(error.to_string())),
+            }
+        };
+        Self {
+            id,
+            name,
+            arguments,
+            invalid_arguments,
+        }
+    }
 }
 
 /// Tool definition passed to the LLM for function calling.
@@ -195,6 +226,57 @@ mod tests {
 
     fn message(content: &str) -> Arc<Vec<Message>> {
         Arc::new(vec![Message::text("user", content)])
+    }
+
+    #[test]
+    fn tool_call_from_raw_arguments_parses_valid_json() {
+        // Arrange
+        let raw = r#"{"path": "README.md"}"#;
+
+        // Act
+        let call = ToolCall::from_raw_arguments("call_1".to_string(), "read".to_string(), raw);
+
+        // Assert
+        assert_eq!(call.arguments, serde_json::json!({"path": "README.md"}));
+        assert_eq!(call.invalid_arguments, None);
+    }
+
+    #[test]
+    fn tool_call_from_raw_arguments_treats_empty_as_empty_object() {
+        // Arrange
+        let raw = "  ";
+
+        // Act
+        let call = ToolCall::from_raw_arguments("call_1".to_string(), "ls".to_string(), raw);
+
+        // Assert
+        assert_eq!(call.arguments, serde_json::json!({}));
+        assert_eq!(call.invalid_arguments, None);
+    }
+
+    #[test]
+    fn tool_call_from_raw_arguments_records_parse_error_without_failing() {
+        // Arrange
+        let raw = r#"{"path": "README.md""#;
+
+        // Act
+        let call = ToolCall::from_raw_arguments("call_1".to_string(), "read".to_string(), raw);
+
+        // Assert
+        assert_eq!(call.arguments, serde_json::json!({}));
+        assert!(call.invalid_arguments.is_some());
+    }
+
+    #[test]
+    fn tool_call_invalid_arguments_marker_is_not_serialized() {
+        // Arrange
+        let call = ToolCall::from_raw_arguments("call_1".to_string(), "read".to_string(), "{");
+
+        // Act
+        let json = serde_json::to_value(&call).expect("serialize");
+
+        // Assert
+        assert!(json.get("invalid_arguments").is_none());
     }
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -390,6 +472,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
                 arguments: serde_json::json!({"path": "README.md"}),
+                invalid_arguments: None,
             }]
         );
     }
@@ -431,6 +514,7 @@ mod tests {
                             id: "call_1".to_string(),
                             name: "read".to_string(),
                             arguments: serde_json::json!({"path": "image.png"}),
+                            invalid_arguments: None,
                         }],
                         tool_call_id: None,
                     },

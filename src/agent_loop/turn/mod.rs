@@ -846,6 +846,7 @@ mod tests {
                         id: "call-1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: None,
                 }),
@@ -961,6 +962,7 @@ mod tests {
                 id: "recovery-tool".to_string(),
                 name: "read".to_string(),
                 arguments: serde_json::json!({"path": "config"}),
+                invalid_arguments: None,
             }],
             tool_call_id: None,
         };

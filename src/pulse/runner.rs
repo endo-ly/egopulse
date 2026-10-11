@@ -385,6 +385,7 @@ mod tests {
                     id: format!("pulse-ls-{iteration}"),
                     name: "ls".to_string(),
                     arguments: serde_json::json!({}),
+                    invalid_arguments: None,
                 }],
                 usage: None,
             }));

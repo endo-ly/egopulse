@@ -205,6 +205,7 @@ fn synthetic_tool_call(message_id: &str, index: usize, name: String) -> ToolCall
         id: format!("restored:{message_id}:{index}"),
         name,
         arguments: serde_json::json!({}),
+        invalid_arguments: None,
     }
 }
 
@@ -267,6 +268,7 @@ fn tool_call_message(call: &StoredToolCall) -> ToolCall {
         name: call.tool_name.clone(),
         arguments: serde_json::from_str(&call.tool_input)
             .unwrap_or_else(|_| serde_json::Value::String(call.tool_input.clone())),
+        invalid_arguments: None,
     }
 }
 
@@ -1354,6 +1356,7 @@ mod tests {
                     id: "call-missing".to_string(),
                     name: "read".to_string(),
                     arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    invalid_arguments: None,
                 }],
                 tool_call_id: None,
             },

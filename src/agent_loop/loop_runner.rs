@@ -596,6 +596,7 @@ mod tests {
                     id: format!("cap-ls-{iteration}"),
                     name: "ls".to_string(),
                     arguments: serde_json::json!({}),
+                    invalid_arguments: None,
                 }],
                 usage: None,
             }));
@@ -685,11 +686,13 @@ mod tests {
                             id: "wait-a".to_string(),
                             name: "wait_test".to_string(),
                             arguments: serde_json::json!({"name": "a"}),
+                            invalid_arguments: None,
                         },
                         ToolCall {
                             id: "wait-b".to_string(),
                             name: "wait_test".to_string(),
                             arguments: serde_json::json!({"name": "b"}),
+                            invalid_arguments: None,
                         },
                     ],
                     usage: None,
@@ -1075,6 +1078,7 @@ mod tests {
                 id: "bad-call".to_string(),
                 name: String::new(),
                 arguments: serde_json::json!({}),
+                invalid_arguments: None,
             }],
             usage: None,
         };
@@ -1126,6 +1130,7 @@ mod tests {
                         id: "call-note".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: None,
                 },

@@ -544,6 +544,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             arguments,
+            invalid_arguments: None,
         }
     }
 
@@ -1055,6 +1056,7 @@ mod tests {
                         id: "call-iter-1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 15,
@@ -1348,6 +1350,7 @@ mod tests {
                         id: "call-tc-1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": relative_path}),
+                        invalid_arguments: None,
                     }],
                     usage: None,
                 }),

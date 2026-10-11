@@ -407,6 +407,7 @@ mod tests {
                 id: "call-1".to_string(),
                 name: "search".to_string(),
                 arguments: serde_json::json!({"query": "egopulse"}),
+                invalid_arguments: None,
             }],
             tool_call_id: None,
         };
@@ -477,6 +478,7 @@ mod tests {
                 id: "call-1".to_string(),
                 name: "search".to_string(),
                 arguments: serde_json::json!({"query": "egopulse"}),
+                invalid_arguments: None,
             }],
             tool_call_id: None,
         };

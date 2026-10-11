@@ -469,6 +469,7 @@ mod tests {
                         id: "call_1".to_string(),
                         name: "read".to_string(),
                         arguments: serde_json::json!({"path": "README.md"}),
+                        invalid_arguments: None,
                     }],
                     tool_call_id: None,
                 },

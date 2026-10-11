@@ -502,15 +502,13 @@ impl ChatCompletionAccumulator {
             .tool_calls
             .into_values()
             .map(|slot| {
-                let name = slot.name.unwrap_or_default();
-                let arguments = parse_tool_arguments(&slot.arguments, &name)?;
-                Ok(ToolCall {
-                    id: slot.id.unwrap_or_default(),
-                    name,
-                    arguments,
-                })
+                ToolCall::from_raw_arguments(
+                    slot.id.unwrap_or_default(),
+                    slot.name.unwrap_or_default(),
+                    &slot.arguments,
+                )
             })
-            .collect::<Result<Vec<_>, LlmError>>()?;
+            .collect::<Vec<_>>();
         assemble_response(self.content, self.reasoning_content, tool_calls, self.usage)
     }
 }
@@ -713,11 +711,13 @@ mod tests {
                     id: "call_a".to_string(),
                     name: "read".to_string(),
                     arguments: serde_json::json!({"path": "README.md"}),
+                    invalid_arguments: None,
                 },
                 ToolCall {
                     id: "call_b".to_string(),
                     name: "grep".to_string(),
                     arguments: serde_json::json!({"pattern": "foo"}),
+                    invalid_arguments: None,
                 },
             ]
         );
@@ -768,6 +768,7 @@ mod tests {
                 id: "call_x".to_string(),
                 name: "list".to_string(),
                 arguments: serde_json::json!({}),
+                invalid_arguments: None,
             }]
         );
     }

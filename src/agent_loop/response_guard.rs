@@ -210,6 +210,7 @@ mod tests {
                             id: "call-malformed".to_string(),
                             name: String::new(),
                             arguments: serde_json::json!({}),
+                            invalid_arguments: None,
                         }],
                         usage: None,
                     },
