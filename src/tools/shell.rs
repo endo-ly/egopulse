@@ -15,7 +15,7 @@ use crate::config::secret_ref::read_dotenv;
 use crate::llm::ToolDefinition;
 use crate::skills::{SkillManager, resolve_required_env};
 
-use super::text::{format_size, shell_quote, truncate_tail};
+use super::text::{format_size, truncate_tail};
 use super::{
     DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext,
     ToolResult, command_guard, kill_process_group, path_guard, redact_known_secret_patterns,
@@ -74,17 +74,32 @@ impl BashTool {
         self.workspace_dir.join(".tmp").join("bash")
     }
 
+    /// Spawns `bash -lc <command>` with stdout and stderr both written to `output_path`.
+    ///
+    /// The command is passed verbatim instead of being wrapped in shell syntax,
+    /// so trailing heredoc delimiters and comments keep their meaning and
+    /// bash's own parse errors are captured in the output file.
     fn spawn_bash_command(
         &self,
-        wrapped_command: &str,
+        command: &str,
+        output_path: &Path,
         skill_env: &HashMap<String, String>,
     ) -> Result<tokio::process::Child, String> {
+        let output = fs::File::create(output_path).map_err(|error| {
+            format!(
+                "Failed to create bash output file {}: {error}",
+                output_path.display()
+            )
+        })?;
+        let stderr = output
+            .try_clone()
+            .map_err(|error| format!("Failed to prepare bash output file: {error}"))?;
         let mut cmd = Command::new("bash");
         cmd.arg("-lc")
-            .arg(wrapped_command)
+            .arg(command)
             .current_dir(&self.workspace_dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::from(stderr))
             .process_group(0)
             .kill_on_drop(true);
         if !skill_env.is_empty() {
@@ -153,11 +168,9 @@ impl Tool for BashTool {
             ));
         }
         let temp_path = temp_dir.join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
-        let quoted_temp = shell_quote(&temp_path.to_string_lossy());
-        let wrapped_command = format!("({command}) > {quoted_temp} 2>&1");
 
         let skill_env = self.resolve_env_for_execution(context);
-        let mut child = match self.spawn_bash_command(&wrapped_command, &skill_env) {
+        let mut child = match self.spawn_bash_command(command, &temp_path, &skill_env) {
             Ok(child) => child,
             Err(error) => return ToolResult::error(error),
         };

@@ -203,8 +203,8 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `command: string` 必須
   - `timeout: integer` 任意。秒
 - 挙動:
-  - workspace を cwd にして `bash -lc` で実行する
-  - stdout / stderr は 1 つのログに結合する
+  - workspace を cwd にして、コマンド文字列を加工せず `bash -lc` に渡して実行する。末尾の heredoc デリミタやコメントもそのまま解釈される
+  - stdout / stderr はプロセス起動時に同一の一時ファイルへ割り当て、1 つのログに結合する。bash 自身の構文エラーもこのログに含まれる
   - 出力は末尾側を最大 `2000` 行または `100KB` に tail truncation する
   - truncation が発生した場合は full output を temp file に保存する
   - 最後の 1 行だけで byte limit を超える場合は、その行の末尾だけを返す special case がある
