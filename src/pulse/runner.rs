@@ -18,6 +18,12 @@ use crate::storage::PulseOutputKind;
 use crate::tools::ToolExecutionContext;
 use tracing::warn;
 
+/// Longest backoff a Pulse activation waits before retrying an LLM call.
+///
+/// Pulse scans agents sequentially, so a provider quota wait (a long
+/// `Retry-After`) fails the activation instead of stalling every later Pulse.
+const PULSE_MAX_LLM_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// RAII guard that decrements the active turn counter on drop.
 struct PulseTurnGuard<'a> {
     tracker: &'a crate::runtime::ActiveTurnTracker,
@@ -134,7 +140,6 @@ pub(crate) async fn run_activation_with_snapshot(
     let mut tool_phases = Vec::new();
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
-        let mut empty_reply_retry_attempted = false;
         let request_messages = messages_for_iteration(&messages, iteration);
         let model_runner = ModelRunner::new(ModelStepRequest {
             state: &turn_dependencies,
@@ -153,9 +158,9 @@ pub(crate) async fn run_activation_with_snapshot(
             on_delta: &ignore_delta,
         });
         let phase_response = model_runner
-            .run(&mut empty_reply_retry_attempted, None)
+            .run_with_transient_retry(PULSE_MAX_LLM_RETRY_BACKOFF)
             .await
-            .map_err(|error| error.into_error())?;
+            .map_err(|error| error.into_parts().0)?;
 
         let assistant_phase = match phase_response {
             ModelStep::Final(response) => {
@@ -597,5 +602,97 @@ mod tests {
             crate::agent_loop::message_format::message_to_text(retry_message)
                 .contains("no user-visible text")
         );
+    }
+
+    fn pulse_ok_response() -> Result<crate::llm::MessagesResponse, crate::error::LlmError> {
+        Ok(crate::llm::MessagesResponse {
+            content: "PULSE_OK".to_string(),
+            reasoning_content: None,
+            tool_calls: vec![],
+            usage: None,
+        })
+    }
+
+    fn api_error(status: u16, retry_after_secs: Option<u64>) -> crate::error::LlmError {
+        crate::error::LlmError::ApiError {
+            status: reqwest::StatusCode::from_u16(status).expect("status"),
+            body_preview: "provider error".to_string(),
+            retry_after_secs,
+        }
+    }
+
+    async fn activate_with_responses(
+        state_root: &str,
+        responses: Vec<Result<crate::llm::MessagesResponse, crate::error::LlmError>>,
+    ) -> (
+        Result<ActivationResult, EgoPulseError>,
+        crate::agent_loop::test_support::RecordingProvider,
+    ) {
+        let delays = vec![0; responses.len()];
+        let provider = crate::agent_loop::test_support::RecordingProvider::new(responses, delays);
+        let observer = provider.clone();
+        let state = crate::test_util::build_state_with_config(
+            crate::test_util::test_config(state_root),
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        let surface = HomeSurface {
+            chat_id: 1,
+            channel: "cli".to_string(),
+            external_chat_id: "test-pulse-retry".to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await;
+        (result, observer)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_retries_transient_llm_error() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = vec![Err(api_error(503, None)), pulse_ok_response()];
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        let result = result.expect("activation should recover from a transient error");
+        assert_eq!(result.output_kind, PulseOutputKind::Silent);
+        assert_eq!(observer.seen_messages().len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn activation_fails_fast_when_retry_after_exceeds_backoff_limit() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let responses = vec![Err(api_error(429, Some(3_600))), pulse_ok_response()];
+
+        // Act
+        let (result, observer) =
+            activate_with_responses(dir.path().to_str().expect("utf8"), responses).await;
+
+        // Assert
+        assert!(result.is_err(), "quota wait must not be retried");
+        assert_eq!(observer.seen_messages().len(), 1);
     }
 }

@@ -67,20 +67,6 @@ impl<'a> ModelRunner<'a> {
         Self { request }
     }
 
-    /// Executes one model step, including the shared empty-response recovery.
-    pub(crate) async fn run(
-        &self,
-        empty_retry_attempted: &mut bool,
-        output_published: Option<&AtomicBool>,
-    ) -> Result<ModelStep, ModelStepError> {
-        send_model_step_with_empty_retry(
-            self.request.clone(),
-            empty_retry_attempted,
-            output_published,
-        )
-        .await
-    }
-
     /// Executes one durable model iteration with bounded transport retries.
     pub(crate) async fn run_with_retry(
         &self,
@@ -116,6 +102,44 @@ impl<'a> ModelRunner<'a> {
             });
         }
 
+        let db = self.request.state.db_for(self.request.scope);
+        self.retry_transient_failures(None, || {
+            let db = Arc::clone(&db);
+            let turn_id = turn_id.to_string();
+            async move {
+                let _ =
+                    call_blocking(db, move |db| db.increment_turn_model_attempt(&turn_id)).await;
+            }
+        })
+        .await
+    }
+
+    /// Executes one model step with bounded transport retries for callers that
+    /// have no durable Turn, such as Pulse activations.
+    ///
+    /// A retry whose backoff (including a server `Retry-After`) would exceed
+    /// `max_backoff` is not attempted; the error is returned immediately so a
+    /// long provider quota wait cannot stall the caller.
+    pub(crate) async fn run_with_transient_retry(
+        &self,
+        max_backoff: Duration,
+    ) -> Result<ModelStep, ModelRequestError> {
+        self.retry_transient_failures(Some(max_backoff), || async {})
+            .await
+    }
+
+    /// Shared retry loop: retries retryable LLM errors up to [`MAX_LLM_RETRIES`]
+    /// attempts unless output was already published. `before_retry` runs before
+    /// each backoff so callers can record the attempt.
+    async fn retry_transient_failures<F, Fut>(
+        &self,
+        max_backoff: Option<Duration>,
+        mut before_retry: F,
+    ) -> Result<ModelStep, ModelRequestError>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let output_published = Arc::new(AtomicBool::new(false));
         let mut empty_reply_retry_attempted = false;
         let mut retry_messages = Arc::clone(&self.request.messages);
@@ -142,14 +166,11 @@ impl<'a> ModelRunner<'a> {
                     let published = output_published.load(Ordering::SeqCst);
                     let retryable =
                         matches!(&error, EgoPulseError::Llm(error) if error.is_retryable());
-                    if retryable && !published && attempt < MAX_LLM_RETRIES {
-                        let turn_id_for_attempt = turn_id.to_string();
-                        let _ = call_blocking(
-                            self.request.state.db_for(self.request.scope),
-                            move |db| db.increment_turn_model_attempt(&turn_id_for_attempt),
-                        )
-                        .await;
-                        let backoff = llm_retry_backoff(attempt, &error);
+                    let backoff = llm_retry_backoff(attempt, &error);
+                    let within_backoff_limit = max_backoff.is_none_or(|limit| backoff <= limit);
+                    if retryable && !published && within_backoff_limit && attempt < MAX_LLM_RETRIES
+                    {
+                        before_retry().await;
                         warn!(
                             attempt,
                             max = MAX_LLM_RETRIES,
@@ -215,11 +236,6 @@ impl ModelStepError {
             error,
             retry_messages,
         }
-    }
-
-    /// Returns the underlying error when the caller has no retry policy.
-    pub(crate) fn into_error(self) -> EgoPulseError {
-        self.error
     }
 
     /// Returns the underlying error and the exact messages for the next retry.
@@ -880,7 +896,7 @@ mod tests {
         .await;
         let error = match result {
             Ok(_) => panic!("non-empty invalid response should remain an error"),
-            Err(error) => error.into_error(),
+            Err(error) => error.into_parts().0,
         };
 
         // Assert
