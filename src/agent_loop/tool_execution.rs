@@ -17,6 +17,42 @@ use futures_util::future::join_all;
 /// Maximum number of characters included in tool-result event previews.
 pub(crate) const MAX_TOOL_RESULT_TEXT_CHARS: usize = 200;
 
+/// Number of `guard_denied` tool results allowed per Turn / Pulse activation.
+///
+/// Reaching the limit disables `bash` for the rest of the run and injects a
+/// wrap-up guard so the model reports to the user instead of looking for
+/// workarounds (see E1/S5 in docs/issues/analysis-2026-10.md).
+pub(crate) const GUARD_DENIAL_LIMIT: usize = 3;
+
+/// Counts security-guard denials for one run and flags when the limit is hit.
+#[derive(Default)]
+pub(crate) struct GuardDenialTracker {
+    count: std::sync::atomic::AtomicUsize,
+    limit_reached: std::sync::atomic::AtomicBool,
+}
+
+impl GuardDenialTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records one denial. Returns `true` only on the call that reaches the limit.
+    pub(crate) fn record(&self) -> bool {
+        let previous = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if previous + 1 == GUARD_DENIAL_LIMIT {
+            self.limit_reached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return true;
+        }
+        false
+    }
+
+    /// Whether the denial limit has been reached.
+    pub(crate) fn limit_reached(&self) -> bool {
+        self.limit_reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 type ToolStartHook<'a> = Arc<dyn Fn(&ToolCall) + Send + Sync + 'a>;
 type ToolResultHook<'a> = Arc<dyn Fn(&ExecutedToolCall) + Send + Sync + 'a>;
 
@@ -53,6 +89,7 @@ pub(crate) struct ToolExecutor<'a> {
     runtime: &'a TurnDependencies,
     context: &'a ToolExecutionContext,
     hooks: ToolExecutionHooks<'a>,
+    guard_tracker: Option<Arc<GuardDenialTracker>>,
 }
 
 impl<'a> ToolExecutor<'a> {
@@ -66,7 +103,14 @@ impl<'a> ToolExecutor<'a> {
             runtime,
             context,
             hooks,
+            guard_tracker: None,
         }
+    }
+
+    /// Tracks security-guard denials for the run and stops `bash` at the limit.
+    pub(crate) fn with_guard_denial_tracker(mut self, tracker: Arc<GuardDenialTracker>) -> Self {
+        self.guard_tracker = Some(tracker);
+        self
     }
 
     /// Executes the supplied calls and returns their tool result messages.
@@ -137,6 +181,34 @@ impl<'a> ToolExecutor<'a> {
 
         let tool_start = std::time::Instant::now();
 
+        if self.is_bash_blocked(&tool_call.name) {
+            let result = ToolResult::error_with_kind(
+                crate::tools::ToolErrorKind::GuardDenied,
+                format!(
+                    "[runtime_guard]: bash is disabled for the rest of this run: the security-guard denial limit ({GUARD_DENIAL_LIMIT}) was reached. Treat earlier denials as final and wrap up now: report to the user what you were trying to do, what was blocked, and ask how they want to proceed."
+                ),
+            );
+            let payload = format_tool_result(&tool_call, &result);
+            let message = Message {
+                role: "tool".to_string(),
+                content: tool_message_content(&payload, &result),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call.id.clone()),
+            };
+            let outcome = ExecutedToolCall {
+                tool_call,
+                result,
+                payload,
+                message,
+                duration_ms: tool_start.elapsed().as_millis(),
+            };
+            if let Some(on_result) = &self.hooks.on_result {
+                on_result(&outcome);
+            }
+            return Ok(outcome);
+        }
+
         let (result, payload, executed) = match tool_call.invalid_arguments.as_deref() {
             // The provider sent arguments that are not valid JSON. Report it to
             // the model so it can resend the call instead of failing the Turn.
@@ -151,6 +223,20 @@ impl<'a> ToolExecutor<'a> {
                     .await?
             }
         };
+
+        if let Some(tracker) = &self.guard_tracker
+            && result.error_kind == Some(crate::tools::ToolErrorKind::GuardDenied)
+            && tracker.record()
+        {
+            // Guard denials are final (see Core Instructions). The stop
+            // condition ends guard-evasion loops instead of letting them run
+            // to the iteration limit unnoticed.
+            tracing::warn!(
+                turn_id = %self.context.turn_id,
+                limit = GUARD_DENIAL_LIMIT,
+                "guard denial limit reached; bash is disabled for the rest of this run"
+            );
+        }
 
         let duration_ms = tool_start.elapsed().as_millis();
 
@@ -182,6 +268,15 @@ impl<'a> ToolExecutor<'a> {
         }
 
         Ok(outcome)
+    }
+
+    /// Whether `bash` must be refused because the denial limit is reached.
+    fn is_bash_blocked(&self, tool_name: &str) -> bool {
+        tool_name == "bash"
+            && self
+                .guard_tracker
+                .as_ref()
+                .is_some_and(|tracker| tracker.limit_reached())
     }
 
     /// Claims the ledger slot (for side-effecting Tools) and executes the call.
@@ -362,6 +457,24 @@ mod tests {
             arguments,
             invalid_arguments: None,
         }
+    }
+
+    #[test]
+    fn guard_denial_tracker_flags_limit_once_at_crossing() {
+        // Arrange
+        let tracker = GuardDenialTracker::new();
+
+        // Act & Assert: below the limit nothing is flagged
+        assert!(!tracker.limit_reached());
+        assert!(!tracker.record());
+        assert!(!tracker.record());
+        assert!(!tracker.limit_reached());
+
+        // Act & Assert: the call that reaches the limit flags it exactly once
+        assert!(tracker.record());
+        assert!(tracker.limit_reached());
+        assert!(!tracker.record());
+        assert!(tracker.limit_reached());
     }
 
     #[test]
@@ -691,6 +804,125 @@ mod integration_tests {
         .expect("tool calls");
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].error_kind.as_deref(), Some("guard_denied"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guard_denial_limit_blocks_bash_and_injects_wrap_guard() {
+        // Arrange: three denied bash calls cross the limit; the fourth call
+        // must be refused without execution and the next request must carry
+        // the wrap-up guard.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied_call = || ToolCall {
+            id: format!("call-{}", uuid::Uuid::new_v4()),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": "cat .env"}),
+            invalid_arguments: None,
+        };
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Trying.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![denied_call()],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Retrying.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![denied_call()],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Again.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![denied_call()],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "Once more.".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-blocked".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::json!({"command": "echo should-not-run"}),
+                        invalid_arguments: None,
+                    }],
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "wrapped up".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0, 0, 0],
+        );
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+
+        // Act
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &cli_context("guard-limit"),
+            "read the env file",
+        )
+        .await
+        .expect("turn wraps up after the denial limit");
+
+        // Assert: the wrap-up guard rode along with the fourth request.
+        assert_eq!(reply, "wrapped up");
+        let seen_messages = observer.seen_messages();
+        assert_eq!(seen_messages.len(), 5);
+        let fourth_request = seen_messages[3]
+            .iter()
+            .map(crate::agent_loop::message_format::message_to_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            fourth_request.contains("security-guard denial limit has been reached"),
+            "wrap guard must be injected: {fourth_request}"
+        );
+
+        // Assert: the blocked bash never executed; its tool result reports the
+        // stop condition instead of command output.
+        let blocked_result = seen_messages[4]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("call-blocked"))
+            .expect("blocked call must receive a tool result");
+        let blocked_text = crate::agent_loop::message_format::message_to_text(blocked_result);
+        assert!(
+            blocked_text.contains("bash is disabled for the rest of this run"),
+            "blocked bash must be reported as a tool result: {blocked_text}"
+        );
+
+        // Assert: only the three executed denials are ledgered.
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:guard-limit:agent:default",
+                Some("guard-limit"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let tool_calls = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_tool_calls_for_chat(chat_id)
+        })
+        .await
+        .expect("tool calls");
+        assert_eq!(tool_calls.len(), 3);
+        assert!(
+            tool_calls
+                .iter()
+                .all(|call| call.error_kind.as_deref() == Some("guard_denied"))
+        );
     }
 
     #[tokio::test]

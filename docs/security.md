@@ -40,6 +40,8 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 
 遮断メッセージは方針の最終判断であることを明示し（`This is a policy decision; do not work around it. Ask the user if access is required.`）、値の読み出しなど回避経路の案内は行わない。エージェント側の規範としても、Core Instructions の Security rules に「遮断は最終判断。別構文・動的パス・スクリプト等での回避を試みず、ユーザーに何が遮断されたかを伝えて確認する」と定義されている。
 
+1 Turn / 1 Pulse の `guard_denied` が 3 回に達すると、Run 側の停止条件が発動する。以降その Run での `bash` 実行は阻止され、次の model request に「遮断を最終判断として作業を打ち切り、ユーザーに報告する」runtime guard が注入される。Turn では最終応答がそのままユーザーチャネルに届き、Pulse では報告が Notify 出力としてホームチャネルへ送信される。閾値到達は `warn` ログにも記録される。
+
 ### コマンド検閲
 
 **対象**: `bash` ツール  

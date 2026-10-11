@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::loop_runner::{MAX_TOOL_ITERATIONS, messages_for_iteration};
+use crate::agent_loop::loop_runner::{
+    GUARD_DENIAL_WRAP_GUARD, MAX_TOOL_ITERATIONS, messages_for_iteration,
+};
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest, ignore_delta};
 use crate::agent_loop::tool_execution::{
-    ToolExecutionHooks, ToolExecutor, build_tool_result_phase,
+    GuardDenialTracker, ToolExecutionHooks, ToolExecutor, build_tool_result_phase,
 };
 use crate::conversation::ConversationScope;
 use crate::conversation::SurfaceContext;
@@ -178,6 +180,8 @@ pub(crate) async fn run_activation_with_snapshot(
     let tool_defs = state.tools.definitions_async().await;
     let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
+    let guard_tracker = Arc::new(GuardDenialTracker::new());
+    let mut guard_wrap_injected = false;
 
     for iteration in 1..=MAX_TOOL_ITERATIONS {
         let request_messages = messages_for_iteration(&messages, iteration);
@@ -230,6 +234,7 @@ pub(crate) async fn run_activation_with_snapshot(
             &tool_context,
             ToolExecutionHooks::none(),
         )
+        .with_guard_denial_tracker(Arc::clone(&guard_tracker))
         .execute(&assistant_message_id, assistant_phase.tool_calls.clone())
         .await?;
         let tool_result_phase = build_tool_result_phase(tool_outcomes);
@@ -238,6 +243,16 @@ pub(crate) async fn run_activation_with_snapshot(
             let messages_mut = Arc::make_mut(&mut messages);
             messages_mut.push(assistant_phase.assistant_message.clone());
             messages_mut.extend(tool_result_phase.tool_messages.clone());
+        }
+
+        if guard_tracker.limit_reached() && !guard_wrap_injected {
+            // Same stop condition as the Turn loop: guard denials are final, so
+            // the activation must wrap up instead of seeking workarounds. The
+            // wrap-up summary is user-facing, so the existing Notify path
+            // delivers it to the home channel.
+            guard_wrap_injected = true;
+            let messages_mut = Arc::make_mut(&mut messages);
+            messages_mut.push(Message::text("user", GUARD_DENIAL_WRAP_GUARD));
         }
         tool_phases.push(ToolPhase {
             assistant_message_id,
@@ -405,6 +420,123 @@ mod tests {
             PulseOutputKind::Notify
         );
         assert_eq!(classify_output(""), PulseOutputKind::Silent);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn guard_denial_limit_blocks_bash_and_injects_wrap_guard() {
+        // Arrange: three denied bash calls cross the limit; the fourth call is
+        // refused without execution and the next request carries the wrap-up
+        // guard so the activation reports to the user instead of evading.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let denied_call = |id: &str| crate::llm::ToolCall {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": "cat .env"}),
+            invalid_arguments: None,
+        };
+        let tool_response = |id: &str, content: &str| {
+            Ok(crate::llm::MessagesResponse {
+                content: content.to_string(),
+                reasoning_content: None,
+                tool_calls: vec![denied_call(id)],
+                usage: None,
+            })
+        };
+        let responses = vec![
+            tool_response("pulse-guard-1", "Trying."),
+            tool_response("pulse-guard-2", "Retrying."),
+            tool_response("pulse-guard-3", "Again."),
+            Ok(crate::llm::MessagesResponse {
+                content: "Once more.".to_string(),
+                reasoning_content: None,
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "pulse-guard-blocked".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::json!({"command": "echo should-not-run"}),
+                    invalid_arguments: None,
+                }],
+                usage: None,
+            }),
+            Ok(crate::llm::MessagesResponse {
+                content: "Pulse wrapped up.".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            }),
+        ];
+        let provider =
+            crate::agent_loop::test_support::RecordingProvider::new(responses, vec![0; 5]);
+        let observer = provider.clone();
+        let config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        let state = crate::test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:guard-pulse:agent:default",
+                Some("guard-pulse"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let surface = HomeSurface {
+            chat_id,
+            channel: "cli".to_string(),
+            external_chat_id: "guard-pulse".to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            "",
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+
+        // Act
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            state.config_manager.current_blocking(),
+        )
+        .await
+        .expect("pulse wraps up after the denial limit");
+
+        // Assert: the wrap-up guard rode along with the fourth request.
+        assert_eq!(result.output_text, "Pulse wrapped up.");
+        let seen_messages = observer.seen_messages();
+        assert_eq!(seen_messages.len(), 5);
+        let fourth_request = seen_messages[3].last().expect("wrap guard message");
+        assert!(
+            fourth_request
+                .content
+                .as_text_lossy()
+                .contains(crate::agent_loop::loop_runner::GUARD_DENIAL_WRAP_GUARD)
+        );
+
+        // Assert: the blocked bash never executed; its tool result reports the
+        // stop condition instead of command output.
+        let blocked_result = seen_messages[4]
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("pulse-guard-blocked"))
+            .expect("blocked call must receive a tool result");
+        assert!(
+            blocked_result
+                .content
+                .as_text_lossy()
+                .contains("bash is disabled for the rest of this run")
+        );
     }
 
     #[tokio::test]

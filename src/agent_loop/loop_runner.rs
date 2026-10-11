@@ -12,8 +12,8 @@ use crate::agent_loop::message_format::strip_thinking;
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
 use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_messages};
 use crate::agent_loop::tool_execution::{
-    ExecutedToolCall, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks, ToolExecutor,
-    build_tool_result_phase,
+    ExecutedToolCall, GuardDenialTracker, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks,
+    ToolExecutor, build_tool_result_phase,
 };
 use crate::agent_loop::turn::PreparedTurn;
 use crate::agent_loop::turn::lifecycle::TurnLifecycle;
@@ -37,12 +37,17 @@ pub(crate) const FINAL_RESPONSE_WARNING_GUARD: &str = "[runtime_guard]: The tool
 /// prioritize a concise final response over starting new broad tool work.
 pub(crate) const FINAL_RESPONSE_GUARD: &str = "[runtime_guard]: The tool loop is at its final response window. Provide the best concise answer to the user now. Do not start broad new work; state what was completed and any uncertainty. If this is a Pulse activation and you have used tools, summarize the result instead of returning PULSE_OK.";
 
+/// Runtime guard appended to requests after the security-guard denial limit is
+/// reached. Tells the model to stop working around the denials and report.
+pub(crate) const GUARD_DENIAL_WRAP_GUARD: &str = "[runtime_guard]: The security-guard denial limit has been reached for this run. Treat the denials as final and stop attempting workarounds or further tool work. Wrap up now: report to the user what you were trying to do, what was blocked, and any results obtained, then ask how they want to proceed. If this is a Pulse activation, summarize the outcome instead of returning PULSE_OK.";
+
 /// Mutable conversation state owned by one Agent Loop.
 pub(crate) struct LoopState {
     pub(crate) messages: Arc<Vec<Message>>,
     pub(crate) session_revision: Option<i64>,
     retry_messages: Option<Arc<Vec<Message>>>,
     declarative_retry_attempted: bool,
+    guard_denial_wrap: bool,
 }
 
 impl LoopState {
@@ -52,6 +57,7 @@ impl LoopState {
             session_revision,
             retry_messages: None,
             declarative_retry_attempted: false,
+            guard_denial_wrap: false,
         }
     }
 
@@ -122,6 +128,7 @@ impl<'a> AgentLoop<'a> {
         start_iteration: usize,
     ) -> Result<AgentLoopResult, EgoPulseError> {
         let mut loop_state = LoopState::new(messages, session_revision);
+        let guard_tracker = Arc::new(GuardDenialTracker::new());
 
         for iteration in start_iteration..=MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
@@ -241,11 +248,19 @@ impl<'a> AgentLoop<'a> {
                     continue;
                 }
                 ModelStep::ToolCalls(assistant_phase) => {
-                    self.execute_tool_phase(&mut loop_state, assistant_phase, &message_id)
-                        .await?;
+                    self.execute_tool_phase(
+                        &mut loop_state,
+                        assistant_phase,
+                        &message_id,
+                        &guard_tracker,
+                    )
+                    .await?;
                 }
             }
 
+            if guard_tracker.limit_reached() {
+                loop_state.guard_denial_wrap = true;
+            }
             loop_state.reset_retry_guards_after_tool_phase();
             match maybe_compact_messages(
                 self.state,
@@ -277,6 +292,7 @@ impl<'a> AgentLoop<'a> {
         loop_state: &mut LoopState,
         assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
         assistant_message_id: &str,
+        guard_tracker: &Arc<GuardDenialTracker>,
     ) -> Result<(), EgoPulseError> {
         self.lifecycle.complete_model().await?;
         self.lifecycle.begin_tools().await?;
@@ -294,7 +310,11 @@ impl<'a> AgentLoop<'a> {
             )
             .await?;
         let tool_outcomes = self
-            .execute_tools(assistant_message_id, assistant_phase.tool_calls)
+            .execute_tools(
+                assistant_message_id,
+                assistant_phase.tool_calls,
+                guard_tracker,
+            )
             .await?;
         let persisted = self
             .persistence
@@ -326,6 +346,7 @@ impl<'a> AgentLoop<'a> {
         &self,
         assistant_message_id: &str,
         tool_calls: Vec<ToolCall>,
+        guard_tracker: &Arc<GuardDenialTracker>,
     ) -> Result<Vec<ExecutedToolCall>, EgoPulseError> {
         let start_emitter = self.on_event.clone();
         let result_emitter = self.on_event.clone();
@@ -349,6 +370,7 @@ impl<'a> AgentLoop<'a> {
         };
 
         ToolExecutor::new(self.state, &self.prepared.tool_context, hooks)
+            .with_guard_denial_tracker(Arc::clone(guard_tracker))
             .execute(assistant_message_id, tool_calls)
             .await
     }
@@ -370,7 +392,13 @@ fn request_messages_for_iteration(
         }
     }
 
-    messages_for_iteration(&request_messages, iteration)
+    let request_messages = messages_for_iteration(&request_messages, iteration);
+    if !loop_state.guard_denial_wrap {
+        return request_messages;
+    }
+    let mut messages = (*request_messages).clone();
+    messages.push(Message::text("user", GUARD_DENIAL_WRAP_GUARD));
+    Arc::new(messages)
 }
 
 /// Adds the iteration-specific runtime guard to a request-only copy of `messages`.
