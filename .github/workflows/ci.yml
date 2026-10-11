@@ -19,15 +19,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Read project Rust toolchain
-        id: rust
-        run: python3 -c 'import tomllib; print("toolchain=" + tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])' >> "$GITHUB_OUTPUT"
-
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ steps.rust.outputs.toolchain }}
-          components: clippy, rustfmt
+        run: rustup show active-toolchain
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
