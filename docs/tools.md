@@ -84,11 +84,11 @@ MCP の詳細は以下を参照。
 
 ### Tool 実行台帳
 
-既存 `tool_calls` テーブルを Tool 実行台帳として拡張する（[db.md §tool_calls](./db.md#tool_calls)）。新規台帳テーブルは作らない。`Database`（tool.rs）が claim・状態遷移・input 整合確認・結果再利用・uncertain 判定を担う。
+既存 `tool_calls` テーブルを Tool 実行台帳として拡張する（[db.md §tool_calls](./db.md#tool_calls)）。新規台帳テーブルは作らない。`Database`（tool.rs）が claim・状態遷移・input 整合確認・結果再利用・uncertain 判定を担う。`tool_input` は Tool に渡す元の JSON 構造を保ちつつ、文字列値を既存のシークレット redaction でサニタイズして保存する。実行と `input_hash` には元の入力を使う。Bash の `required_env` は claim 前に解決され、同じ値を入力サニタイズと子プロセス環境に使う。
 
 #### 実行フロー
 
-1. **claim**: Tool 実行前に `claim(turn_id, tool_call_id, canonical_input)` を呼ぶ。`turn_id + tool_call_id` で既存行を検索し、未登録なら `pending` 作成、`running` へ遷移する。canonical input の hash (`input_hash`) を保存し、既存行と hash が異なれば conflict として拒否する。
+1. **claim**: Tool 実行前に `claim(turn_id, tool_call_id, canonical_input)` を呼ぶ。`turn_id + tool_call_id` で既存行を検索し、未登録なら `pending` 作成、`running` へ遷移する。元の canonical input の hash (`input_hash`) を保存し、サニタイズ済み `tool_input` を同時に保存する。既存行と hash が異なれば conflict として拒否する。
 2. **実行**: claim 成功後にのみ Tool を実行する。実行前に台帳行を作ることを保証する。
 3. **結果保存**: 成功時は `succeeded` + sanitized `tool_output` + `finished_at` を同一 transaction で保存する。失敗時は `failed` + `error_kind` + sanitized `error_message` を保存する。
 
@@ -98,7 +98,11 @@ read-only ツール（`is_read_only: true`）は副作用がなく crash 後の�
 
 - 行は `succeeded` / `failed` の終端状態で直接書き込まれ、`pending` / `running` を経由しない。crash recovery の `running` スキャンに影響しない
 - `idempotency_class = read_only`。sanitize 済みの `tool_input` / `tool_output` と `error_kind` を非 read-only 行と同じ形式で保持する
-- `INSERT OR IGNORE` により `(turn_id, id)` の一意性で crash replay 時の重複記録を防ぐ
+- 重複する `(turn_id, id)` は、`input_hash` / `tool_name` / `idempotency_class = read_only` の一致を確認してから既存行を維持する。不一致は conflict とし、並列ブロック全体を rollback する
+
+#### ガード拒否後の停止
+
+1 Run 内で `guard_denied` が 3 回に達すると、後続の Tool 実行をすべて停止する。Turn / Pulse の次の model request では Tool 定義を空にし、停止報告を促す runtime guard を共通処理で付与する。モデルが Tool 要求を返しても実行層で拒否し、未実行要求は台帳に記録しない。拒否回数には実際のポリシー拒否のみを含み、`invalid_input` / `not_found` / `upstream` / `timeout` は加算しない。Pulse が停止報告を生成できない場合や `PULSE_OK` を返す場合は、固定の Notify メッセージをホームチャネルへ送る。
 
 #### error_kind 分類
 
@@ -106,12 +110,12 @@ read-only ツール（`is_read_only: true`）は副作用がなく crash 後の�
 
 | error_kind | 判定元 |
 |---|---|
-| `guard_denied` | `command_guard` / `path_guard` / workspace 外アクセス / web_fetch の SSRF・コンテンツ検閲 |
-| `invalid_input` | 必須パラメータ欠落・スキーマ不一致 |
+| `guard_denied` | `command_guard` / `path_guard` / workspace 外アクセス / web_fetch の URL ポリシー・コンテンツ検閲 |
+| `invalid_input` | 必須パラメータ欠落・スキーマ不一致・不正 URL 構文・Tool 引数 JSON 解析失敗 |
 | `timeout` | bash / web_fetch / grep のタイムアウト |
 | `exit_nonzero` | bash・ripgrep・fd の非 0 終了 |
 | `not_found` | ファイル / パス / スキル / エージェント / ツール不在 |
-| `upstream` | HTTP エラー・MCP transport エラー・チャネル API エラー |
+| `upstream` | DNS 解決失敗・HTTP エラー・MCP transport エラー・チャネル API エラー |
 | `tool_error` | 上記に分類されないその他の失敗 |
 
 #### idempotency 分類
@@ -226,8 +230,8 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `command: string` 必須
   - `timeout: integer` 任意。秒
 - 挙動:
-  - workspace を cwd にして、コマンド文字列を加工せず `bash -lc` に渡して実行する。末尾の heredoc デリミタやコメントもそのまま解釈される
-  - 親プロセスの環境変数は引き継がず、`PATH` / `HOME` / `LANG` / `TERM` と skill の `required_env` の解決値のみを渡す。skill の値は同名の継承キーより優先される
+  - workspace を cwd にして、コマンド文字列を加工せず `bash --noprofile --norc -c` に渡して実行する。ログインシェルやユーザー起動ファイルは使用しない
+  - 親プロセスの環境変数は引き継がず、`PATH` / `HOME` / `LANG` / `TERM` と skill の `required_env` の解決値のみを渡す。skill の値は同名の継承キーより優先される。`BASH_ENV` / `ENV` / `SHELLOPTS` / `BASHOPTS` は skill の宣言からも除外する
   - stdout / stderr はプロセス起動時に同一の一時ファイルへ割り当て、1 つのログに結合する。bash 自身の構文エラーもこのログに含まれる
   - 出力は末尾側を最大 `2000` 行または `100KB` に tail truncation する
   - truncation が発生した場合は full output を temp file に保存する

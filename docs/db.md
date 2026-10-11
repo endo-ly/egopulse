@@ -281,12 +281,12 @@ LLM ツール/ファンクション呼び出しの実行記録。
 | chat_id | INTEGER | NOT NULL, FK, composite PK | chats.chat_id |
 | message_id | TEXT | NOT NULL, composite PK | 対象 assistant メッセージID |
 | tool_name | TEXT | NOT NULL | ツール/ファンクション名 |
-| tool_input | TEXT | NOT NULL | 入力パラメータ（JSON） |
+| tool_input | TEXT | NOT NULL | 入力パラメータ（元の JSON 構造を保ったサニタイズ済み JSON） |
 | tool_output | TEXT | nullable | 出力結果（JSON）。成功時の実行結果保存に使用 |
 | timestamp | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 | turn_id | TEXT | nullable | 所属 Turn（`turn_runs`）。legacy 行は NULL |
 | state | TEXT | NOT NULL DEFAULT 'pending' | Tool実行状態。`pending`/`running`/`succeeded`/`failed`/`uncertain` |
-| input_hash | TEXT | nullable | canonical input の hash。同一call IDでのinput整合確認 |
+| input_hash | TEXT | nullable | 元の canonical input の hash。同一call IDでのinput整合確認 |
 | idempotency_class | TEXT | nullable | 再実行可能性分類。`read_only`/`idempotent`/`non_idempotent` |
 | idempotency_key | TEXT | nullable | idempotent Tool の重複排除 key |
 | started_at | TEXT | nullable | 実行開始時刻 |
@@ -299,7 +299,7 @@ LLM ツール/ファンクション呼び出しの実行記録。
 
 `turn_id + tool_call_id` で Tool Call を一意にし、成功結果を再利用する。NULL の `turn_id`（legacy 行）は index 対象外。
 
-read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に `succeeded` / `failed` の終端状態で直接 INSERT される（`INSERT OR IGNORE` により replay 冪等）。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
+read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に `succeeded` / `failed` の終端状態で直接 INSERT される。replay 時に `(turn_id, id)` の行がすでにある場合は `input_hash` / `tool_name` / `idempotency_class` の一致を検証し、一致すれば既存行を維持、不一致なら conflict としてブロック全体を rollback する。すべての行で `tool_input` はサニタイズ済み JSON、`input_hash` は元の入力から計算される。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
 
 **操作**:
 - `store_tool_call(tool_call)` — INSERT

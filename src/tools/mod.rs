@@ -234,6 +234,9 @@ pub(crate) trait Tool: Send + Sync {
     async fn execute(&self, input: serde_json::Value, context: &ToolExecutionContext)
     -> ToolResult;
 
+    /// Prepares per-call context needed before durable Tool input is sanitized.
+    fn prepare_execution_context(&self, _context: &ToolExecutionContext) {}
+
     /// Whether this tool only reads data without side effects.
     ///
     /// Read-only tools can be executed in parallel when multiple tool calls
@@ -364,7 +367,8 @@ impl ToolRegistry {
         Arc::new(definitions)
     }
 
-    /// Find and execute a tool by name. Returns an error result for unknown tools.
+    /// Dispatches a Tool call whose execution context was prepared before
+    /// durable input was written. Returns an error result for unknown tools.
     ///
     /// Redaction secrets are assembled **after** tool execution so that env vars
     /// resolved by `activate_skill` during the same call are already present in
@@ -428,6 +432,22 @@ impl ToolRegistry {
             append_unique_secrets(&mut secrets, vec![(format!("skill_env.{k}"), v.clone())]);
         }
         secrets
+    }
+
+    /// Sanitizes string values in Tool arguments before they are persisted.
+    pub(crate) fn sanitize_tool_input(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolExecutionContext,
+    ) -> serde_json::Value {
+        sanitize_json_value(input.clone(), &self.redaction_secrets(context))
+    }
+
+    /// Prepares per-tool context required for input redaction and execution.
+    pub(crate) fn prepare_execution_context(&self, name: &str, context: &ToolExecutionContext) {
+        if let Some(&idx) = self.tool_index.get(name) {
+            self.tools[idx].prepare_execution_context(context);
+        }
     }
 
     pub(crate) async fn is_read_only(&self, name: &str) -> bool {
@@ -828,12 +848,14 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::write(workspace.join("notes.txt"), "hello").expect("notes");
         let registry = test_registry(&config);
+        let context = test_context();
+        registry.prepare_execution_context("bash", &context);
 
         let result = registry
             .execute(
                 "bash",
                 json!({"command": "printf 'ok\\n'; cat notes.txt"}),
-                &test_context(),
+                &context,
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
@@ -856,8 +878,10 @@ mod tests {
         let workspace = config.workspace_dir().expect("workspace_dir");
         std::fs::create_dir_all(&workspace).expect("workspace");
         let registry = test_registry(&config);
+        let context = test_context();
+        registry.prepare_execution_context("bash", &context);
         registry
-            .execute("bash", json!({ "command": command }), &test_context())
+            .execute("bash", json!({ "command": command }), &context)
             .await
     }
 
@@ -1305,6 +1329,7 @@ mod tests {
         );
 
         // bash in same context: auto-hydration + activate_skill env both available
+        registry.prepare_execution_context("bash", &context);
         let result = registry
             .execute(
                 "bash",
@@ -1351,6 +1376,7 @@ mod tests {
 
         // Bash should pick up the new skill's required_env without registry recreation
         let fresh_context = test_context();
+        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1394,6 +1420,7 @@ mod tests {
 
         // Fresh context — no activate_skill call
         let fresh_context = test_context();
+        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1428,6 +1455,7 @@ mod tests {
 
         let registry = test_registry(&config);
         let fresh_context = test_context();
+        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1469,6 +1497,7 @@ mod tests {
         let fresh_context = test_context();
 
         // Command prints the secret — must be redacted
+        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",
@@ -1526,6 +1555,7 @@ mod tests {
         assert!(!result.is_error);
 
         // Verify secret is redacted in turn 1 bash
+        registry.prepare_execution_context("bash", &context_turn1);
         let result = registry
             .execute(
                 "bash",
@@ -1586,6 +1616,7 @@ mod tests {
         // Rotate dotenv value — bash must use fresh resolution
         std::fs::write(&env_path, "EGOPULSE_STALE_KEY=rotated-value\n").expect("env");
 
+        registry.prepare_execution_context("bash", &context);
         let result = registry
             .execute(
                 "bash",
@@ -1613,6 +1644,7 @@ mod tests {
         // → bash must not fall back to the stale activate_skill value
         std::fs::write(&env_path, "").expect("env");
 
+        registry.prepare_execution_context("bash", &context);
         let result = registry
             .execute(
                 "bash",
@@ -1645,6 +1677,7 @@ mod tests {
             "orphaned-value".to_string(),
         );
 
+        registry.prepare_execution_context("bash", &fresh_context);
         let result = registry
             .execute(
                 "bash",

@@ -110,8 +110,7 @@ pub(crate) fn check_path(path: &str) -> Result<(), String> {
 /// コマンド文字列内に含まれるパス参照がブロック対象か検査する。
 /// `cat /home/user/.ssh/id_rsa` や `cat .env` などを検知する。
 pub(crate) fn check_command_paths(command: &str) -> Result<(), String> {
-    let without_comments = strip_shell_comments(command);
-    let normalized_command = normalize_command_path_like(&without_comments);
+    let normalized_command = normalize_command_path_like(command);
     for blocked in BLOCKED_ABSOLUTE {
         if contains_path_reference(&normalized_command, blocked) {
             return Err(format!(
@@ -260,48 +259,6 @@ fn check_proc_access(lower: &str) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// クォートの外にあるシェルコメント（行頭または空白直後の `#` から行末まで）を除去する。
-///
-/// コメントは実行されないため、コメント中の自然文に機密語が含まれていても
-/// 字句検査の誤検知になってはいけない。クォート内の `#` は文字列の一部なので残す。
-fn strip_shell_comments(command: &str) -> String {
-    let mut stripped = String::with_capacity(command.len());
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut prev = '\n';
-
-    let mut chars = command.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '\'' if !in_double_quote => {
-                in_single_quote = !in_single_quote;
-                stripped.push(ch);
-                prev = ch;
-            }
-            '"' if !in_single_quote => {
-                in_double_quote = !in_double_quote;
-                stripped.push(ch);
-                prev = ch;
-            }
-            '#' if !in_single_quote && !in_double_quote && matches!(prev, ' ' | '\t' | '\n') => {
-                for skipped in chars.by_ref() {
-                    if skipped == '\n' {
-                        stripped.push('\n');
-                        prev = '\n';
-                        break;
-                    }
-                }
-            }
-            _ => {
-                stripped.push(ch);
-                prev = ch;
-            }
-        }
-    }
-
-    stripped
 }
 
 fn normalize_command_path_like(command: &str) -> String {
@@ -584,33 +541,15 @@ mod tests {
     }
 
     #[test]
-    fn command_path_guard_ignores_unquoted_comments() {
-        // Comments are not executed, so prose inside them must not trigger the guard.
-        let allowed_cases = [
-            "# Check the R2/S3 credentials setup\ngrep -n 'pattern' src/main.rs",
-            "grep -n 'pattern' src/main.rs # the backend stores R2/S3 credentials",
-            "echo start # TODO: read ~/.ssh/id_rsa later",
-        ];
-        for command in allowed_cases {
-            assert!(
-                check_command_paths(command).is_ok(),
-                "should allow: {command}"
-            );
-        }
+    fn command_path_guard_checks_escaped_quotes_and_command_substitutions() {
+        // The escaped quote keeps the argument quoted, so `#` is data and the
+        // command substitution still executes.
+        let command = r#"printf '%s\n' "safe\" # $(cat ~/.ssh/id_rsa)" ; echo done"#;
 
-        // Live references outside comments are still blocked.
-        let blocked_cases = [
-            "echo hi # note\ncat .env",
-            "grep credentials src # list matches",
-            "echo '#' && cat .env",
-            "curl http://example.com/.env#fragment",
-        ];
-        for command in blocked_cases {
-            assert!(
-                check_command_paths(command).is_err(),
-                "should block: {command}"
-            );
-        }
+        assert!(
+            check_command_paths(command).is_err(),
+            "the command substitution still references a blocked path"
+        );
     }
 
     #[test]

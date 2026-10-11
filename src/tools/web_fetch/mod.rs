@@ -112,7 +112,7 @@ impl Tool for WebFetchTool {
         let mut current_url = match url_validation::validate_url(url_str, config) {
             Ok(u) => u,
             Err(e) => {
-                return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, e.to_string());
+                return ToolResult::error_with_kind(ToolErrorKind::from(&e), e.to_string());
             }
         };
 
@@ -120,7 +120,7 @@ impl Tool for WebFetchTool {
         if !config.allow_private_ips {
             if let Some(host) = current_url.host_str() {
                 if let Err(e) = url_validation::resolve_dns_and_validate(host, config).await {
-                    return ToolResult::error_with_kind(ToolErrorKind::GuardDenied, e.to_string());
+                    return ToolResult::error_with_kind(ToolErrorKind::from(&e), e.to_string());
                 }
             }
         }
@@ -178,7 +178,7 @@ impl Tool for WebFetchTool {
                         Ok(u) => u,
                         Err(e) => {
                             return ToolResult::error_with_kind(
-                                ToolErrorKind::GuardDenied,
+                                ToolErrorKind::from(&e),
                                 e.to_string(),
                             );
                         }
@@ -189,7 +189,7 @@ impl Tool for WebFetchTool {
                         if let Err(e) = url_validation::resolve_dns_and_validate(host, config).await
                         {
                             return ToolResult::error_with_kind(
-                                ToolErrorKind::GuardDenied,
+                                ToolErrorKind::from(&e),
                                 e.to_string(),
                             );
                         }
@@ -344,6 +344,21 @@ impl Tool for WebFetchTool {
     }
 }
 
+impl From<&url_validation::UrlValidationError> for ToolErrorKind {
+    fn from(error: &url_validation::UrlValidationError) -> Self {
+        use url_validation::UrlValidationError;
+
+        match error {
+            UrlValidationError::InvalidUrl(_) => Self::InvalidInput,
+            UrlValidationError::SchemeNotAllowed(_)
+            | UrlValidationError::HostBlocked(_)
+            | UrlValidationError::HostNotInAllowlist(_)
+            | UrlValidationError::PrivateIpBlocked(_) => Self::GuardDenied,
+            UrlValidationError::DnsResolutionFailed(_) => Self::Upstream,
+        }
+    }
+}
+
 fn truncate_to_utf8_boundary(buf: &mut Vec<u8>) {
     if buf.is_empty() {
         return;
@@ -458,6 +473,17 @@ mod tests {
         let result = execute(&tool, json!({})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::InvalidInput));
+    }
+
+    #[tokio::test]
+    async fn invalid_url_syntax_is_invalid_input() {
+        let tool = make_tool(test_web_fetch_config());
+
+        let result = execute(&tool, json!({"url": "not a URL"})).await;
+
+        assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::InvalidInput));
     }
 
     #[tokio::test]
@@ -490,6 +516,7 @@ mod tests {
         let result = execute(&tool, json!({"url": "ftp://example.com"})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::GuardDenied));
         assert!(result.content.contains("scheme"));
     }
 
@@ -504,6 +531,7 @@ mod tests {
         let result = execute(&tool, json!({"url": "https://evil.com"})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::GuardDenied));
         assert!(result.content.contains("blocked"));
     }
 
@@ -518,6 +546,7 @@ mod tests {
         let result = execute(&tool, json!({"url": "https://127.0.0.1"})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::GuardDenied));
         assert!(result.content.contains("private") || result.content.contains("loopback"));
     }
 
@@ -679,6 +708,7 @@ mod tests {
         let result = execute(&tool, json!({"url": server.uri()})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::GuardDenied));
         assert!(result.content.contains("content blocked"));
     }
 
@@ -766,6 +796,7 @@ mod tests {
         let result = execute(&tool, json!({"url": server.uri()})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::Upstream));
         assert!(result.content.contains("HTTP 404"));
     }
 
@@ -782,6 +813,7 @@ mod tests {
         let result = execute(&tool, json!({"url": server.uri(), "timeout_secs": 1})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::Timeout));
         assert!(result.content.contains("timed out"));
     }
 
@@ -820,6 +852,7 @@ mod tests {
         let result = execute(&tool, json!({"url": server.uri()})).await;
 
         assert!(result.is_error);
+        assert_eq!(result.error_kind, Some(ToolErrorKind::GuardDenied));
         assert!(result.content.contains("scheme"), "got: {}", result.content);
     }
 
@@ -917,6 +950,42 @@ mod tests {
         truncate_to_utf8_boundary(&mut buf);
         let s = std::str::from_utf8(&buf).expect("valid utf8");
         assert_eq!(s, "あい");
+    }
+
+    #[test]
+    fn url_validation_failures_map_to_policy_or_input_classification() {
+        use url_validation::UrlValidationError;
+
+        let cases = [
+            (
+                UrlValidationError::InvalidUrl("malformed".to_string()),
+                ToolErrorKind::InvalidInput,
+            ),
+            (
+                UrlValidationError::SchemeNotAllowed("ftp".to_string()),
+                ToolErrorKind::GuardDenied,
+            ),
+            (
+                UrlValidationError::HostBlocked("blocked.test".to_string()),
+                ToolErrorKind::GuardDenied,
+            ),
+            (
+                UrlValidationError::HostNotInAllowlist("other.test".to_string()),
+                ToolErrorKind::GuardDenied,
+            ),
+            (
+                UrlValidationError::PrivateIpBlocked("127.0.0.1".to_string()),
+                ToolErrorKind::GuardDenied,
+            ),
+            (
+                UrlValidationError::DnsResolutionFailed("missing.test".to_string()),
+                ToolErrorKind::Upstream,
+            ),
+        ];
+
+        for (error, expected_kind) in cases {
+            assert_eq!(ToolErrorKind::from(&error), expected_kind);
+        }
     }
 
     #[tokio::test]

@@ -74,7 +74,7 @@ impl BashTool {
         self.workspace_dir.join(".tmp").join("bash")
     }
 
-    /// Spawns `bash -lc <command>` with stdout and stderr both written to `output_path`.
+    /// Spawns a non-login, non-interactive Bash without startup files.
     ///
     /// The command is passed verbatim instead of being wrapped in shell syntax,
     /// so trailing heredoc delimiters and comments keep their meaning and
@@ -95,7 +95,9 @@ impl BashTool {
             .try_clone()
             .map_err(|error| format!("Failed to prepare bash output file: {error}"))?;
         let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
+        cmd.arg("--noprofile")
+            .arg("--norc")
+            .arg("-c")
             .arg(command)
             .current_dir(&self.workspace_dir)
             .stdout(Stdio::from(output))
@@ -111,6 +113,7 @@ impl BashTool {
 
 /// bash 子プロセスへ引き継ぐ親プロセスの環境変数。それ以外は渡さない。
 const BASH_INHERITED_ENV_KEYS: &[&str] = &["PATH", "HOME", "LANG", "TERM"];
+const BASH_STARTUP_ENV_KEYS: &[&str] = &["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"];
 
 /// bash 子プロセスに渡す環境変数を構築する。
 ///
@@ -125,6 +128,9 @@ fn bash_child_env(
         .filter(|(key, _)| BASH_INHERITED_ENV_KEYS.contains(&key.as_str()))
         .collect();
     for (key, value) in skill_env {
+        if BASH_STARTUP_ENV_KEYS.contains(&key.as_str()) {
+            continue;
+        }
         env.insert(key.clone(), value.clone());
     }
     env
@@ -134,6 +140,10 @@ fn bash_child_env(
 impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
+    }
+
+    fn prepare_execution_context(&self, context: &ToolExecutionContext) {
+        self.resolve_env_for_execution(context);
     }
 
     fn definition(&self) -> ToolDefinition {
@@ -189,7 +199,7 @@ impl Tool for BashTool {
         }
         let temp_path = temp_dir.join(format!("egopulse-bash-{}.log", uuid::Uuid::new_v4()));
 
-        let skill_env = self.resolve_env_for_execution(context);
+        let skill_env = context.skill_env.lock().expect("skill env lock").clone();
         let mut child = match self.spawn_bash_command(command, &temp_path, &skill_env) {
             Ok(child) => child,
             Err(error) => return ToolResult::error(error),
@@ -336,6 +346,8 @@ fn append_truncation_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvVarGuard;
+    use serial_test::serial;
 
     fn child_env(parent: &[(&str, &str)], skill_env: &[(&str, &str)]) -> HashMap<String, String> {
         let parent_vars = parent
@@ -362,7 +374,16 @@ mod tests {
         ];
 
         // Act
-        let env = child_env(&parent, &[("SKILL_TOKEN", "skill-value")]);
+        let env = child_env(
+            &parent,
+            &[
+                ("SKILL_TOKEN", "skill-value"),
+                ("BASH_ENV", "/tmp/untrusted-env"),
+                ("ENV", "/tmp/untrusted-env"),
+                ("SHELLOPTS", "xtrace"),
+                ("BASHOPTS", "extdebug"),
+            ],
+        );
 
         // Assert
         for key in ["PATH", "HOME", "LANG", "TERM", "SKILL_TOKEN"] {
@@ -372,6 +393,10 @@ mod tests {
             "SSH_AUTH_SOCK",
             "DBUS_SESSION_BUS_ADDRESS",
             "EGOPULSE_S2_CANARY",
+            "BASH_ENV",
+            "ENV",
+            "SHELLOPTS",
+            "BASHOPTS",
         ] {
             assert!(!env.contains_key(key), "should drop {key}");
         }
@@ -400,5 +425,116 @@ mod tests {
 
         // Assert
         assert_eq!(env.get("HOME").map(String::as_str), Some("/skill-home"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_process_uses_only_the_sanitized_environment_without_startup_files() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&home).expect("home");
+        let marker_script = dir.path().join("startup.sh");
+        std::fs::write(&marker_script, "touch \"$HOME/startup-ran\"\n").expect("script");
+        for startup_file in [".bash_profile", ".bashrc"] {
+            std::fs::write(home.join(startup_file), "touch \"$HOME/profile-ran\"\n")
+                .expect("startup file");
+        }
+        let _env_guard = EnvVarGuard::set("HOME", &home)
+            .also_set("EGOPULSE_S2_CANARY", "parent-only")
+            .also_set("BASH_ENV", &marker_script)
+            .also_set("ENV", &marker_script)
+            .also_set("SHELLOPTS", "xtrace")
+            .also_set("BASHOPTS", "extdebug");
+        let skill_env = HashMap::from([
+            ("SKILL_TOKEN".to_string(), "required-dummy".to_string()),
+            (
+                "BASH_ENV".to_string(),
+                marker_script.to_string_lossy().into_owned(),
+            ),
+            (
+                "ENV".to_string(),
+                marker_script.to_string_lossy().into_owned(),
+            ),
+            ("SHELLOPTS".to_string(), "xtrace".to_string()),
+            ("BASHOPTS".to_string(), "extdebug".to_string()),
+        ]);
+        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
+            dir.path().join("skills"),
+            dir.path().join("builtin-skills"),
+        ));
+        let tool = BashTool::new(workspace.clone(), skills, dir.path().join("dotenv"));
+        let output_path = dir.path().join("bash-output.txt");
+        let command = concat!(
+            "printf 'canary=%s skill=%s BASH_ENV=%s ENV=%s\\n' ",
+            "\"${EGOPULSE_S2_CANARY-missing}\" \"$SKILL_TOKEN\" ",
+            "\"${BASH_ENV-unset}\" \"${ENV-unset}\"; ",
+            "printf 'SHELLOPTS=%s BASHOPTS=%s\\n' \"$SHELLOPTS\" \"$BASHOPTS\"; ",
+            "printf 'cwd=%s\\n' \"$PWD\"; printf 'stderr-marker\\n' >&2"
+        );
+
+        // Act
+        let mut child = tool
+            .spawn_bash_command(command, &output_path, &skill_env)
+            .expect("spawn bash");
+        let status = child.wait().await.expect("wait for bash");
+        let output = std::fs::read_to_string(&output_path).expect("output");
+
+        // Assert
+        assert!(status.success(), "{output}");
+        assert!(output.contains("canary=missing"), "{output}");
+        assert!(output.contains("skill=required-dummy"), "{output}");
+        assert!(output.contains("BASH_ENV=unset ENV=unset"), "{output}");
+        assert!(!output.contains("xtrace"), "{output}");
+        assert!(!output.contains("extdebug"), "{output}");
+        assert!(
+            output.contains(&format!("cwd={}", workspace.display())),
+            "{output}"
+        );
+        assert!(
+            output.contains("stderr-marker"),
+            "stderr is captured with stdout"
+        );
+        assert!(!home.join("startup-ran").exists());
+        assert!(!home.join("profile-ran").exists());
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_the_process_group() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
+            dir.path().join("skills"),
+            dir.path().join("builtin-skills"),
+        ));
+        let tool = BashTool::new(workspace, skills, dir.path().join("dotenv"));
+        let marker = dir.path().join("orphan-process-ran");
+        let command = format!("( sleep 2; touch '{}' ) & wait", marker.display());
+        let context = crate::test_util::test_tool_context();
+
+        // Act
+        let result = tool
+            .execute(
+                serde_json::json!({"command": command, "timeout": 1}),
+                &context,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+
+        // Assert
+        assert!(result.is_error);
+        assert_eq!(
+            result.error_kind,
+            Some(super::super::ToolErrorKind::Timeout)
+        );
+        assert!(result.content.contains("timed out after 1 seconds"));
+        assert!(
+            !marker.exists(),
+            "a background process in the timed-out group must not continue"
+        );
     }
 }
