@@ -41,6 +41,7 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 - **Discord マルチボット**: `agent_thread(channel_id, agent_id)` ヘルパーが `{channel_id}:agent:{agent_id}` 形式の `surface_thread` を生成する
 - **Web**: 新規セッションはWebUIで選択中のagentを使用し、既存セッションは `chats.agent_id` を使用する
 - **Telegram / CLI / TUI**: 各チャネルの入力経路で解決されたagentを使用する
+- **保存済み session からの再構成**: Web の既存セッション再開や Pulse の Home Surface のように、保存済みの `external_chat_id`（session key 形式）から `SurfaceContext` を組み立てる経路は、`SurfaceContext::surface_thread_from_session_key()` で `{channel}:` 接頭辞と `:agent:{agent_id}` 接尾辞を除いた生の `surface_thread` を復元する。復元した context の `session_key()` は元の `external_chat_id` と一致する
 
 ### 1.3 Multi-Agent Room 二層アーキテクチャ
 

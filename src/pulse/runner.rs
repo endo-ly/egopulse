@@ -51,6 +51,25 @@ pub(crate) struct ToolPhase {
     pub tool_result_preview: String,
 }
 
+/// Builds the surface context for a Pulse activation on the agent's home surface.
+///
+/// The home surface stores the full session key as `external_chat_id`, so the
+/// raw thread is recovered from it; otherwise tools that derive session keys
+/// from the context (e.g. `agent_send`) would nest the key.
+fn pulse_surface_context(home_surface: &HomeSurface, agent_id: &str) -> SurfaceContext {
+    SurfaceContext::new(
+        home_surface.channel.clone(),
+        agent_id.to_string(),
+        SurfaceContext::surface_thread_from_session_key(
+            &home_surface.channel,
+            &home_surface.external_chat_id,
+            agent_id,
+        ),
+        home_surface.chat_type.clone(),
+        agent_id.to_string(),
+    )
+}
+
 /// Execute a Pulse Activation.
 ///
 /// This runs the Pulse Capsule through the LLM with tool support.
@@ -74,13 +93,7 @@ pub(crate) async fn run_activation_with_snapshot(
         agent_id: agent_id.to_string(),
     };
 
-    let context = SurfaceContext::new(
-        home_surface.channel.clone(),
-        agent_id.to_string(),
-        home_surface.external_chat_id.clone(),
-        home_surface.chat_type.clone(),
-        agent_id.to_string(),
-    );
+    let context = pulse_surface_context(home_surface, agent_id);
 
     let turn_dependencies = state.turn_dependencies();
     let channel_llm = turn_dependencies
@@ -98,7 +111,7 @@ pub(crate) async fn run_activation_with_snapshot(
     let tool_context = ToolExecutionContext {
         chat_id,
         channel: home_surface.channel.clone(),
-        surface_thread: home_surface.external_chat_id.clone(),
+        surface_thread: context.surface_thread.clone(),
         chat_type: home_surface.chat_type.clone(),
         agent_id: agent_id.to_string(),
         channel_log_chat_id: None,
@@ -231,6 +244,24 @@ mod tests {
             external_chat_id: "123".to_string(),
             chat_type: "dm".to_string(),
         }
+    }
+
+    #[test]
+    fn pulse_surface_context_maps_back_to_home_session_key() {
+        // Arrange
+        let home_surface = HomeSurface {
+            chat_id: 25,
+            channel: "discord".to_string(),
+            external_chat_id: "discord:999:agent:vega".to_string(),
+            chat_type: "discord".to_string(),
+        };
+
+        // Act
+        let context = pulse_surface_context(&home_surface, "vega");
+
+        // Assert
+        assert_eq!(context.surface_thread, "999");
+        assert_eq!(context.session_key(), home_surface.external_chat_id);
     }
 
     #[test]

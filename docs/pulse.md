@@ -405,6 +405,7 @@ resolve_home_surface(agent_id, delivery):
 
 - 明示指定時の DB ルックアップは `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
 - 送信可能 channel は Discord / Telegram のみ。Web / CLI は対象外
+- Activation の `SurfaceContext` / Tool 実行コンテキストは、Home Surface の `external_chat_id`（session key 形式）から生の `surface_thread` を復元して構築する。これにより Activation 中の `agent_send` は宛先エージェントの通常 session key（`{channel}:{surface_thread}:agent:{to}`）を解決する
 - Home Surface が解決できない場合は、その run を `skipped` として記録する（LLM は呼ばない）
 
 ### 7.3 注意点
