@@ -625,9 +625,8 @@ mod tests {
     fn parse_params_failures_are_classified_as_invalid_input() {
         // Arrange
         #[derive(serde::Deserialize, Debug)]
-        struct Params {
-            command: String,
-        }
+        #[serde(deny_unknown_fields)]
+        struct Params {}
 
         // Act
         let error = parse_params::<Params>(json!({"nope": 1})).expect_err("must fail");
