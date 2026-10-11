@@ -432,7 +432,9 @@ deadline 付きで停止する。
       │
 6. deadline 超過 task を abort
       │
-7. プロセス終了
+7. MCP server を close（stdio server は process group ごと終了）
+      │
+8. プロセス終了
 ```
 
 ---

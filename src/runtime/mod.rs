@@ -856,6 +856,17 @@ async fn os_shutdown_signal() {
     }
 }
 
+/// Stops the supervisor, then closes MCP servers.
+///
+/// MCP servers are closed after in-flight turns have drained because those
+/// turns may still call MCP tools.
+async fn shutdown_runtime(state: &AppState) {
+    state.supervisor.shutdown().await;
+    if let Some(mcp_manager) = &state.mcp_manager {
+        mcp_manager.write().await.shutdown().await;
+    }
+}
+
 /// Runs the supervision loop until `shutdown_signal` resolves or a critical
 /// task exits.
 ///
@@ -879,7 +890,7 @@ async fn supervise_runtime_until(
                 result = ?outcome.result(),
                 "critical task exited; initiating shutdown"
             );
-            state.supervisor.shutdown().await;
+            shutdown_runtime(state).await;
             return Err(EgoPulseError::Channel(ChannelError::SendFailed(format!(
                 "critical task '{}' exited unexpectedly",
                 outcome.name()
@@ -889,7 +900,7 @@ async fn supervise_runtime_until(
         tokio::select! {
             _ = &mut shutdown_signal => {
                 info!("shutdown signal received");
-                state.supervisor.shutdown().await;
+                shutdown_runtime(state).await;
                 return Ok(());
             },
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}

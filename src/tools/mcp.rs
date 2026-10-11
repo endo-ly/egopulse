@@ -270,6 +270,21 @@ impl McpManager {
         })
     }
 
+    /// Closes every connected server.
+    ///
+    /// Stdio servers get their stdin closed, a short grace period to exit, and
+    /// are then killed together with their process group. Tool lookups return
+    /// "unknown tool" afterwards, so call this only once the runtime has
+    /// drained its turns.
+    pub(crate) async fn shutdown(&mut self) {
+        self.tool_name_index.clear();
+        for server in self.servers.drain(..) {
+            if let Err(error) = server.client.cancel().await {
+                warn!(server = %server.name, %error, "failed to close MCP server");
+            }
+        }
+    }
+
     pub(crate) fn has_failed_servers(&self) -> bool {
         !self.failed_servers.is_empty()
     }
@@ -662,6 +677,17 @@ async fn connect_server(
     }
 }
 
+/// Spawns a stdio MCP server as the leader of its own process group.
+///
+/// Launchers such as `npx` or `uv run` start the actual server as a grandchild.
+/// Running the server in a dedicated group lets transport shutdown kill the
+/// whole tree instead of only the launcher.
+fn spawn_stdio_transport(command: TokioCommand) -> std::io::Result<TokioChildProcess> {
+    let mut command = process_wrap::tokio::CommandWrap::from(command);
+    command.wrap(process_wrap::tokio::ProcessGroup::leader());
+    TokioChildProcess::new(command)
+}
+
 async fn connect_stdio(
     name: &str,
     config: &McpServerConfig,
@@ -680,7 +706,7 @@ async fn connect_stdio(
     cmd.current_dir(workspace_dir);
     cmd.envs(&config.env);
 
-    let child = TokioChildProcess::new(cmd).map_err(|error| McpError::ConnectionFailed {
+    let child = spawn_stdio_transport(cmd).map_err(|error| McpError::ConnectionFailed {
         server: name.to_string(),
         detail: error.to_string(),
     })?;
@@ -801,6 +827,57 @@ mod tests {
     use super::*;
     use crate::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    /// Returns false once the process is gone or only a zombie remains.
+    fn process_running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.chars().next())
+            })
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_shutdown_kills_grandchild_processes() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("grandchild.pid");
+        let mut command = TokioCommand::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & echo $! > \"$1\"; wait")
+            .arg("sh")
+            .arg(&pid_file);
+        let mut transport = spawn_stdio_transport(command).expect("spawn transport");
+        let grandchild_pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(process_running(grandchild_pid));
+
+        // Act
+        transport
+            .graceful_shutdown()
+            .await
+            .expect("shutdown transport");
+
+        // Assert
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_running(grandchild_pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_running(grandchild_pid),
+            "grandchild {grandchild_pid} must not outlive the transport"
+        );
+    }
 
     #[test]
     fn config_paths_include_global_and_workspace() {

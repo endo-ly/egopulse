@@ -908,6 +908,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-exporter-prometheus",
+ "process-wrap",
  "pulldown-cmark",
  "r2d2",
  "rand 0.10.1",
