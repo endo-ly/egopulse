@@ -830,8 +830,45 @@ async fn spawn_runtime_services(state: &Arc<AppState>) {
 }
 
 async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
+    supervise_runtime_until(state, os_shutdown_signal()).await
+}
+
+/// Waits for SIGINT (Ctrl-C) or, on Unix, SIGTERM (sent by `systemctl stop`).
+async fn os_shutdown_signal() {
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {},
+        _ = terminate => {},
+    }
+}
+
+/// Runs the supervision loop until `shutdown_signal` resolves or a critical
+/// task exits.
+///
+/// A shutdown signal is the only graceful stop trigger: channels do not listen
+/// for OS signals themselves and stop through the supervisor's cancellation
+/// token, so their exit during shutdown is never mistaken for a failure.
+async fn supervise_runtime_until(
+    state: &AppState,
+    shutdown_signal: impl std::future::Future<Output = ()>,
+) -> Result<(), EgoPulseError> {
     state.supervisor.start_accepting();
-    info!("Runtime active; waiting for Ctrl-C or channel failure");
+    info!("Runtime active; waiting for a shutdown signal or channel failure");
+    tokio::pin!(shutdown_signal);
 
     loop {
         if let Some(outcome) = state.supervisor.poll_long_lived() {
@@ -850,7 +887,8 @@ async fn supervise_runtime(state: &AppState) -> Result<(), EgoPulseError> {
         }
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut shutdown_signal => {
+                info!("shutdown signal received");
                 state.supervisor.shutdown().await;
                 return Ok(());
             },
@@ -926,6 +964,42 @@ mod tests {
         let b = tempfile::TempDir::new().unwrap();
         let _g1 = InstanceGuard::acquire(a.path()).unwrap();
         let _g2 = InstanceGuard::acquire(b.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_stops_runtime_without_critical_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_config(
+            test_config_for_runtime(dir.path().to_str().expect("utf8").to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+        let channel_token = state.supervisor.shutdown_token();
+        state.supervisor.spawn_long_lived(
+            TaskSpec::new(supervisor::TaskKind::Channel, "web", Criticality::Critical),
+            async move {
+                channel_token.cancelled().await;
+                Ok(())
+            },
+        );
+
+        // Act
+        let result = supervise_runtime_until(&state, async {}).await;
+
+        // Assert
+        assert!(result.is_ok(), "signal-driven shutdown must succeed");
+        assert!(state.supervisor.is_shutting_down());
+        assert!(
+            state
+                .runtime_status
+                .snapshot()
+                .critical_task_failure
+                .is_none(),
+            "a channel stopping during shutdown is not a failure"
+        );
     }
 
     #[test]

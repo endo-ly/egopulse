@@ -404,7 +404,7 @@ TurnExecutor
        │
        └─ 監視ループ (500ms 間隔で critical task 終了をチェック)
           ├─ critical task 終了 → shutdown 開始
-          └─ Ctrl-C → shutdown 開始
+          └─ SIGINT (Ctrl-C) / SIGTERM (systemctl stop) → shutdown 開始
 ```
 
 ### 停止
@@ -413,7 +413,7 @@ TurnExecutor
 deadline 付きで停止する。
 
 ```text
-1. shutdown 開始 (Ctrl-C / critical task 終了)
+1. shutdown 開始 (SIGINT / SIGTERM / critical task 終了)
       │
 2. accepting_inputs = false / shutdown_started = true
    ├─ 新規 Turn 受付拒否 (submit gate)
@@ -425,8 +425,8 @@ deadline 付きで停止する。
    └─ deadline 超過分は abort (次回起動時に recovery で failed/uncertain へ)
       │
 4. root CancellationToken を cancel
-   ├─ MCP reconnect / agent turn worker / schedulers / Web が graceful 停止
-   └─ Discord / Telegram は自身の Ctrl-C handler または deadline 後 abort
+   ├─ MCP reconnect / agent turn worker / schedulers が graceful 停止
+   └─ Web / Discord / Telegram も root token の cancel で graceful 停止（チャネルは OS シグナルを直接待たない）
       │
 5. 長寿命 task を deadline (default 15s) まで待って drain
       │

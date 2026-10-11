@@ -528,7 +528,7 @@ config.agents = [a,b]  → 指定 agent のみ
 ### Scheduler と channel の関係
 
 - scheduler は外部チャネルがなくても Local Runtime API とともに起動する
-- Ctrl-C / channel failure 時に scheduler も既存 task shutdown 経路で停止する
+- シャットダウンシグナル（SIGINT / SIGTERM）または channel failure 時に scheduler も既存 task shutdown 経路で停止する
 
 ---
 
