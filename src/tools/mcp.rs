@@ -683,10 +683,92 @@ async fn connect_server(
 /// Launchers such as `npx` or `uv run` start the actual server as a grandchild.
 /// Running the server in a dedicated group lets transport shutdown kill the
 /// whole tree instead of only the launcher.
-fn spawn_stdio_transport(command: TokioCommand) -> std::io::Result<TokioChildProcess> {
+fn spawn_stdio_transport(command: TokioCommand) -> std::io::Result<StdioTransport> {
     let mut command = process_wrap::tokio::CommandWrap::from(command);
     command.wrap(process_wrap::tokio::ProcessGroup::leader());
-    TokioChildProcess::new(command)
+    let inner = TokioChildProcess::new(command)?;
+    let pgid = inner.id().expect("newly spawned process has a PID");
+    Ok(StdioTransport {
+        inner,
+        pgid: Some(pgid),
+    })
+}
+
+/// Keeps the dedicated group alive as a shutdown responsibility even after
+/// rmcp has reaped its launcher. Orphaned descendants are not waitable children
+/// of this process, so process-wrap's wait alone cannot account for them.
+struct StdioTransport {
+    inner: TokioChildProcess,
+    pgid: Option<u32>,
+}
+
+impl StdioTransport {
+    async fn graceful_shutdown(&mut self) -> std::io::Result<()> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let result = self.inner.graceful_shutdown().await;
+        if let Some(pgid) = self.pgid {
+            // The descendants also receive EOF on stdin. Give them the same
+            // grace deadline as the launcher before stopping any survivors.
+            while process_group_exists(pgid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if process_group_exists(pgid) {
+                signal_process_group(pgid, libc::SIGKILL)?;
+            }
+            self.pgid = None;
+        }
+        result
+    }
+}
+
+fn process_group_exists(pgid: u32) -> bool {
+    // SAFETY: positive pgid is the leader PID of our dedicated process group;
+    // signal 0 checks existence without changing process state.
+    unsafe { libc::kill(-(pgid as i32), 0) == 0 }
+}
+
+fn signal_process_group(pgid: u32, signal: i32) -> std::io::Result<()> {
+    // SAFETY: only a dedicated process group created by spawn_stdio_transport
+    // is addressed, never the runtime's own group.
+    if unsafe { libc::kill(-(pgid as i32), signal) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            let _ = signal_process_group(pgid, libc::SIGKILL);
+        }
+    }
+}
+
+impl rmcp::transport::Transport<RoleClient> for StdioTransport {
+    type Error = std::io::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<RoleClient>>> + Send
+    {
+        self.inner.receive()
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.graceful_shutdown()
+    }
 }
 
 async fn connect_stdio(
@@ -830,6 +912,7 @@ mod tests {
     use serial_test::serial;
 
     /// Returns false once the process is gone or only a zombie remains.
+    #[cfg(target_os = "linux")]
     fn process_running(pid: u32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
@@ -841,6 +924,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(target_os = "linux")]
     async fn stdio_transport_shutdown_kills_grandchild_processes() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -852,21 +936,27 @@ mod tests {
             .arg("sh")
             .arg(&pid_file);
         let mut transport = spawn_stdio_transport(command).expect("spawn transport");
-        let grandchild_pid = loop {
-            if let Some(pid) = std::fs::read_to_string(&pid_file)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok())
-            {
-                break pid;
+        let parent = transport.inner.id().expect("pid");
+        let _cleanup = TestProcessGroup(parent);
+        let grandchild_pid = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok())
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
+        })
+        .await
+        .expect("launcher must publish child PID");
         assert!(process_running(grandchild_pid));
 
         // Act
-        transport
-            .graceful_shutdown()
+        timeout(Duration::from_secs(5), transport.graceful_shutdown())
             .await
+            .expect("shutdown must not hang")
             .expect("shutdown transport");
 
         // Assert
@@ -878,6 +968,142 @@ mod tests {
             !process_running(grandchild_pid),
             "grandchild {grandchild_pid} must not outlive the transport"
         );
+        assert!(!process_running(parent));
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestProcessGroup(u32);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestProcessGroup {
+        fn drop(&mut self) {
+            // SAFETY: this PID names a dedicated group created by this test.
+            unsafe {
+                libc::kill(-(self.0 as i32), libc::SIGKILL);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn stdio_transport_shutdown_kills_child_after_launcher_exits() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("child.pid");
+        let mut command = TokioCommand::new("sh");
+        command
+            .arg("-c")
+            .arg("sleep 60 & echo $! > \"$1\"; exit 0")
+            .arg("sh")
+            .arg(&pid_file);
+        let mut transport = spawn_stdio_transport(command).expect("transport");
+        let parent = transport.inner.id().expect("parent pid");
+        let _cleanup = TestProcessGroup(parent);
+        let child = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = text.trim().parse::<u32>() {
+                        if !process_running(parent) {
+                            break pid;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("launcher must exit first");
+        assert!(process_running(child));
+
+        // Act
+        timeout(Duration::from_secs(5), transport.graceful_shutdown())
+            .await
+            .expect("shutdown must not hang")
+            .expect("shutdown");
+
+        // Assert
+        timeout(Duration::from_secs(2), async {
+            while process_running(child) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("child must not outlive transport");
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn manager_cancels_multiple_stdio_servers_concurrently_and_preserves_graceful_exit() {
+        // Arrange: real MCP handshakes, including a launcher which leaves a
+        // live server behind, an unresponsive tree and an EOF-aware server.
+        let dir = tempfile::tempdir().unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_server.py");
+        let mut manager = McpManager {
+            servers: Vec::new(),
+            failed_servers: Vec::new(),
+            tool_name_index: HashMap::new(),
+        };
+        let mut cleanups = Vec::new();
+        let mut pids = Vec::new();
+        for mode in ["early", "waiting", "graceful"] {
+            let config: McpServerConfig = serde_json::from_value(serde_json::json!({
+                "transport": "stdio", "command": "python3", "args": [fixture, dir.path(), mode]
+            }))
+            .unwrap();
+            // Install failure cleanup before connecting (including handshake failures).
+            let connecting = connect_stdio(mode, &config, dir.path());
+            let (connected, launcher) = tokio::join!(connecting, async {
+                timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Ok(text) =
+                            std::fs::read_to_string(dir.path().join(format!("{mode}.launcher")))
+                        {
+                            break TestProcessGroup(text.trim().parse().unwrap());
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap()
+            });
+            cleanups.push(launcher);
+            let (client, tools) = connected.unwrap();
+            let pid: u32 = std::fs::read_to_string(dir.path().join(format!("{mode}.pid")))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert!(process_running(pid));
+            pids.push(pid);
+            manager.servers.push(ConnectedServer {
+                name: mode.to_string(),
+                config,
+                client,
+                cached_tools: tools,
+            });
+        }
+
+        // Act: two stubborn groups each require 3s; sequential close exceeds 5s.
+        timeout(Duration::from_secs(5), manager.shutdown())
+            .await
+            .expect("parallel shutdown must be bounded");
+
+        // Assert
+        timeout(Duration::from_secs(2), async {
+            while pids.iter().any(|pid| process_running(*pid)) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("all servers must stop");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("graceful.closed")).unwrap(),
+            "closed"
+        );
+        assert!(manager.servers.is_empty());
+        assert!(manager.tool_name_index.is_empty());
+        assert!(cleanups.iter().all(|group| !process_running(group.0)));
     }
 
     #[test]
