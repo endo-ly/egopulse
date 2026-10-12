@@ -135,7 +135,7 @@ Bash は `--noprofile --norc -c` で起動し、ログイン設定や起動フ�
   - `channels.<channel>.telegram_bots.<bot_id>.token`（Telegram）
   - `webhooks.receivers.<receiver_id>.token`
   - `codex.bearer_token`（`openai-codex` プロバイダー使用時）
-  - `mcp.<server>.headers.<key>` / `mcp.<server>.env.<key>`（接続済み MCP server の解決後の値。`Authorization: Bearer <token>` は値全体に加えて `<token>` 単体も登録する）
+  - `mcp.<server>.headers.<key>` / `mcp.<server>.env.<key>`（`mcp.json` / `mcp.d` にある全 server 定義の解決後の値。接続に失敗した server や、後続の定義に上書きされた server も含む。`Authorization: Bearer <token>` は値全体に加えて `<token>` 単体も登録する）
   - `dotenv.<KEY>`（`.env` の全値。更新時刻でキャッシュし、変更はツール結果ごとに反映される）
   - `skill_env.<KEY>`（Turn に注入された skill の `required_env` の値）
 - 秘密参照（`{ "source": "env" | "exec" }`）で宣言された値は、長さに関わらず登録する

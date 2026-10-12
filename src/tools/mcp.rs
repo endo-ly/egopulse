@@ -115,6 +115,23 @@ impl ResolvedMcpSecrets {
         })
     }
 
+    /// 解決できない値を飛ばして解決する。接続には使わず、リダクション対象の収集専用。
+    fn resolve_lenient(config: &McpServerConfig, dotenv: &HashMap<String, String>) -> Self {
+        let lenient = |values: &HashMap<String, StringOrRef>| {
+            values
+                .iter()
+                .filter_map(|(key, value)| {
+                    let resolved = resolve_string_or_ref(Some(value.clone()), dotenv).ok()??;
+                    Some((key.clone(), resolved))
+                })
+                .collect()
+        };
+        Self {
+            env: lenient(&config.env),
+            headers: lenient(&config.headers),
+        }
+    }
+
     /// リダクション対象にする値を `mcp.<server>.<kind>.<key>` 名で返す。
     ///
     /// 参照で宣言された値は秘密として扱い、リテラルは長さとエントロピーが
@@ -203,6 +220,9 @@ struct FailedServer {
 pub(crate) struct McpManager {
     dotenv_path: PathBuf,
     secrets: McpSecrets,
+    /// Redaction entries for every server definition in the config files,
+    /// connected or not: the files stay readable even while a server is down.
+    configured_secrets: Vec<(String, String)>,
     servers: Vec<ConnectedServer>,
     failed_servers: Vec<FailedServer>,
     /// Pre-computed index: sanitized tool name → (server index, original tool name).
@@ -227,11 +247,14 @@ pub(crate) fn mcp_config_paths(workspace_dir: &Path) -> Result<Vec<PathBuf>, Con
     ])
 }
 
-pub(crate) fn load_and_merge_mcp_configs(
+/// Every server definition found in the config files in precedence order,
+/// including definitions a later file overrides. Collecting into a map lets
+/// later definitions (workspace over global) win.
+fn load_all_server_configs(
     workspace_dir: &Path,
-) -> Result<HashMap<String, McpServerConfig>, ConfigError> {
+) -> Result<Vec<(String, McpServerConfig)>, ConfigError> {
     let paths = mcp_config_paths(workspace_dir)?;
-    let mut merged: HashMap<String, McpServerConfig> = HashMap::new();
+    let mut all = Vec::new();
 
     for path in &paths {
         if path.is_dir() {
@@ -250,9 +273,7 @@ pub(crate) fn load_and_merge_mcp_configs(
                             continue;
                         }
                     };
-                    for (name, server_config) in file_config.mcp_servers {
-                        merged.insert(name, server_config);
-                    }
+                    all.extend(file_config.mcp_servers);
                 }
             }
         } else if path.extension().is_some_and(|ext| ext == "json") && path.exists() {
@@ -263,13 +284,11 @@ pub(crate) fn load_and_merge_mcp_configs(
                     continue;
                 }
             };
-            for (name, server_config) in file_config.mcp_servers {
-                merged.insert(name, server_config);
-            }
+            all.extend(file_config.mcp_servers);
         }
     }
 
-    Ok(merged)
+    Ok(all)
 }
 
 fn read_mcp_config_file(path: &Path) -> Result<McpConfigFile, McpError> {
@@ -320,7 +339,9 @@ impl McpManager {
         workspace_dir: &Path,
         dotenv_path: PathBuf,
     ) -> Result<Self, ConfigError> {
-        let configs = load_and_merge_mcp_configs(workspace_dir)?;
+        let file_configs = load_all_server_configs(workspace_dir)?;
+        let configured_secrets = collect_configured_secrets(&file_configs, &dotenv_path).await;
+        let configs: HashMap<String, McpServerConfig> = file_configs.into_iter().collect();
         let mut servers = Vec::new();
         let mut failed_servers = Vec::new();
 
@@ -366,6 +387,7 @@ impl McpManager {
         let manager = Self {
             dotenv_path,
             secrets: McpSecrets::default(),
+            configured_secrets,
             servers,
             failed_servers,
             tool_name_index,
@@ -381,11 +403,12 @@ impl McpManager {
     }
 
     fn publish_secrets(&self) {
-        let entries = self
-            .servers
-            .iter()
-            .flat_map(|server| server.resolved.redaction_entries(&server.name))
-            .collect();
+        let mut entries = self.configured_secrets.clone();
+        entries.extend(
+            self.servers
+                .iter()
+                .flat_map(|server| server.resolved.redaction_entries(&server.name)),
+        );
         self.secrets.replace(entries);
     }
 
@@ -806,6 +829,26 @@ async fn connect_server(
     Ok((client, tools, resolved))
 }
 
+/// 設定ファイルにある全 server 定義（上書きされたものを含む）の秘密値を集める。
+async fn collect_configured_secrets(
+    file_configs: &[(String, McpServerConfig)],
+    dotenv_path: &Path,
+) -> Vec<(String, String)> {
+    let file_configs = file_configs.to_vec();
+    let dotenv_path = dotenv_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let dotenv = read_dotenv(&dotenv_path);
+        file_configs
+            .iter()
+            .flat_map(|(name, config)| {
+                ResolvedMcpSecrets::resolve_lenient(config, &dotenv).redaction_entries(name)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// `exec` 参照はコマンドを同期実行するため、ランタイムを塞がないよう別スレッドで解決する。
 async fn resolve_server_secrets(
     name: &str,
@@ -1146,6 +1189,7 @@ mod tests {
         let mut manager = McpManager {
             dotenv_path: PathBuf::new(),
             secrets: McpSecrets::default(),
+            configured_secrets: Vec::new(),
             servers: Vec::new(),
             failed_servers: Vec::new(),
             tool_name_index: HashMap::new(),
@@ -1264,7 +1308,10 @@ mod tests {
 
         let _home = EnvVarGuard::set("HOME", dir.path());
 
-        let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
+        let configs = load_all_server_configs(&workspace)
+            .expect("load_all_server_configs")
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         assert_eq!(configs.len(), 2);
         assert!(configs.contains_key("shared"));
         assert!(configs.contains_key("local"));
@@ -1285,7 +1332,10 @@ mod tests {
 
         let _home = EnvVarGuard::set("HOME", dir.path());
 
-        let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
+        let configs = load_all_server_configs(&workspace)
+            .expect("load_all_server_configs")
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         assert!(configs.is_empty());
     }
 
@@ -1304,7 +1354,10 @@ mod tests {
 
         let _home = EnvVarGuard::set("HOME", dir.path());
 
-        let configs = load_and_merge_mcp_configs(&workspace).expect("load_and_merge_mcp_configs");
+        let configs = load_all_server_configs(&workspace)
+            .expect("load_all_server_configs")
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         assert_eq!(configs.len(), 1);
         assert!(configs.contains_key("good"));
     }
@@ -1431,6 +1484,50 @@ mod tests {
         // Assert
         let error = result.err().expect("unresolved ref").to_string();
         assert!(error.contains("secret resolution failed"), "{error}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manager_redacts_secrets_of_servers_that_failed_or_were_overridden() {
+        // Arrange: the global definition is overridden by the workspace one and
+        // the surviving server cannot start; both config files stay readable.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join(".egopulse");
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::write(
+            state_root.join("mcp.json"),
+            r#"{"mcpServers":{"remote":{"transport":"stdio","command":"/nonexistent/mcp","env":{"GLOBAL_KEY":"Zk3pQ9vLm2XrT8wYb4Nc"}}}}"#,
+        )
+        .expect("write global");
+        std::fs::write(
+            workspace.join("mcp.json"),
+            r#"{"mcpServers":{"remote":{"transport":"stdio","command":"/nonexistent/mcp","env":{"WS_KEY":{"source":"env","id":"MCP_TEST_WS_KEY"}}}}}"#,
+        )
+        .expect("write workspace");
+        let dotenv_path = state_root.join(".env");
+        std::fs::write(&dotenv_path, "MCP_TEST_WS_KEY=short\n").expect("write dotenv");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        // Act
+        let manager = McpManager::new(&workspace, dotenv_path)
+            .await
+            .expect("manager");
+
+        // Assert
+        assert!(manager.has_failed_servers());
+        let mut secrets = manager.secrets().snapshot();
+        secrets.sort();
+        assert_eq!(
+            secrets,
+            vec![
+                (
+                    "mcp.remote.env.GLOBAL_KEY".to_string(),
+                    "Zk3pQ9vLm2XrT8wYb4Nc".to_string()
+                ),
+                ("mcp.remote.env.WS_KEY".to_string(), "short".to_string()),
+            ]
+        );
     }
 
     #[test]

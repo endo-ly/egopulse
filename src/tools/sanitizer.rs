@@ -47,7 +47,7 @@ const MIN_PLAUSIBLE_SECRET_LEN: usize = 12;
 const MIN_PLAUSIBLE_SECRET_ENTROPY: f64 = 3.0;
 
 /// 文字列の Shannon エントロピー（bit/文字）。
-pub(crate) fn shannon_entropy(value: &str) -> f64 {
+pub(super) fn shannon_entropy(value: &str) -> f64 {
     let mut counts = std::collections::HashMap::<char, usize>::new();
     let mut total = 0usize;
     for ch in value.chars() {
@@ -75,7 +75,7 @@ pub(crate) fn is_plausible_secret_value(value: &str) -> bool {
 }
 
 /// 環境変数・設定キー名が秘密を保持していそうか。
-pub(crate) fn is_secret_like_key(name: &str) -> bool {
+pub(super) fn is_secret_like_key(name: &str) -> bool {
     static SECRET_KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(SECRET_KEY_PATTERN).expect("secret key pattern")
     });
