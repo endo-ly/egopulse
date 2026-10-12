@@ -39,6 +39,52 @@ pub(crate) const SECRET_PATTERNS: &[&str] = &[
     "rk_live_",
 ];
 
+/// 明示的な秘密参照ではない値（リテラル・`.env` の全値）を値ベースのリダクション
+/// 対象にする最小長。`PORT=8080` や `true` のようなありふれた値を除外する。
+const MIN_PLAUSIBLE_SECRET_LEN: usize = 12;
+
+/// 同上のエントロピー下限（bit/文字）。
+const MIN_PLAUSIBLE_SECRET_ENTROPY: f64 = 3.0;
+
+/// 文字列の Shannon エントロピー（bit/文字）。
+pub(crate) fn shannon_entropy(value: &str) -> f64 {
+    let mut counts = std::collections::HashMap::<char, usize>::new();
+    let mut total = 0usize;
+    for ch in value.chars() {
+        *counts.entry(ch).or_default() += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let total = total as f64;
+    counts
+        .values()
+        .map(|&count| {
+            let p = count as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// 秘密参照を経ない値が、値ベースのリダクション対象にできる程度の長さと
+/// ランダム性を持つか。
+pub(crate) fn is_plausible_secret_value(value: &str) -> bool {
+    value.chars().count() >= MIN_PLAUSIBLE_SECRET_LEN
+        && shannon_entropy(value) >= MIN_PLAUSIBLE_SECRET_ENTROPY
+}
+
+/// 環境変数・設定キー名が秘密を保持していそうか。
+pub(crate) fn is_secret_like_key(name: &str) -> bool {
+    static SECRET_KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(SECRET_KEY_PATTERN).expect("secret key pattern")
+    });
+    SECRET_KEY.is_match(name)
+}
+
+/// 秘密を保持していそうなキー名の部分一致パターン。
+const SECRET_KEY_PATTERN: &str = r"(?i)(api[_-]?key|secret|token|passw(?:or)?d|authorization|access[_-]?key|private[_-]?key|credential)";
+
 /// Config から収集したシークレット値で出力をリダクションする。
 pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> String {
     if secrets.is_empty() {

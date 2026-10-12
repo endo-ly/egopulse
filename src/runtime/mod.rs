@@ -379,12 +379,16 @@ async fn build_runtime_tooling(
     channels: &Arc<ChannelRegistry>,
 ) -> Result<RuntimeTooling, EgoPulseError> {
     let workspace_dir = config.workspace_dir()?;
-    let mcp_manager = Arc::new(tokio::sync::RwLock::new(
-        crate::tools::mcp::McpManager::new(&workspace_dir).await?,
-    ));
+    let mcp = crate::tools::mcp::McpManager::new(
+        &workspace_dir,
+        crate::config::secret_ref::dotenv_path(std::path::Path::new(&config.state_root)),
+    )
+    .await?;
+    let mcp_secrets = mcp.secrets();
+    let mcp_manager = Arc::new(tokio::sync::RwLock::new(mcp));
 
     let mut tools = build_tool_registry(config, &deps.skills, config_manager);
-    tools.set_mcp_manager(Arc::clone(&mcp_manager));
+    tools.set_mcp_manager(Arc::clone(&mcp_manager), mcp_secrets);
     tools.register_tool(Box::new(crate::tools::SendAttachmentTool::new(
         workspace_dir.clone(),
         Arc::clone(channels),
@@ -992,7 +996,9 @@ mod tests {
                 None,
             );
             state.mcp_manager = Some(Arc::new(tokio::sync::RwLock::new(
-                crate::tools::mcp::McpManager::new(&root).await.unwrap(),
+                crate::tools::mcp::McpManager::new(&root, root.join(".env"))
+                    .await
+                    .unwrap(),
             )));
             assert_eq!(
                 state

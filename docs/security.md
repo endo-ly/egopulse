@@ -135,6 +135,11 @@ Bash は `--noprofile --norc -c` で起動し、ログイン設定や起動フ�
   - `channels.<channel>.telegram_bots.<bot_id>.token`（Telegram）
   - `webhooks.receivers.<receiver_id>.token`
   - `codex.bearer_token`（`openai-codex` プロバイダー使用時）
+  - `mcp.<server>.headers.<key>` / `mcp.<server>.env.<key>`（接続済み MCP server の解決後の値。`Authorization: Bearer <token>` は値全体に加えて `<token>` 単体も登録する）
+  - `dotenv.<KEY>`（`.env` の全値。更新時刻でキャッシュし、変更はツール結果ごとに反映される）
+  - `skill_env.<KEY>`（Turn に注入された skill の `required_env` の値）
+- 秘密参照（`{ "source": "env" | "exec" }`）で宣言された値は、長さに関わらず登録する
+- 参照を経ないリテラル（MCP の平文値、`.env` の全値）は、12 文字以上かつ Shannon エントロピー 3.0 bit/文字以上のものだけ登録する。`PORT=8080` や `true` のようなありふれた値で出力が崩れることを防ぐ。キー名が秘密を示すのに条件を満たさない `.env` の値は、キー名のみを起動時に `warn` に出す
 - `file_token` / `file_auth_token` の YAML 表現は秘密値の正本として使わない
 - 空文字列は登録しない（誤検出防止）
 - 同じ値が複数経路に存在する場合は値で deduplicate し、置換結果を決定的にする
@@ -185,7 +190,8 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | `.env` 系のパスガード | `cat .env` での直接読み取り不可 | 値はツール経由で注入済み |
 | 出力リダクション | シークレット値が結果に含まれない | `[REDACTED:KEY_NAME]` として表示 |
 | Compaction Archive | 会話アーカイブにシークレットが含まれる | 二層 redaction 適用 + ファイルパーミッション `0600` |
-| 値ベースリダクションの対象外 | Config に登録されていないシークレットはマスクされない | パターンベースで補完 |
+| 値ベースリダクションの対象外 | Config・MCP・`.env` に存在しない秘密（他プロセスの環境変数など）はマスクされない | パターンベースで補完 |
+| MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。OS 隔離がないため、bash で同じ値を読む経路を塞げない | OS レベルの隔離（未実施）が前提 |
 
 ---
 

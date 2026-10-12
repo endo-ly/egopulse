@@ -7,6 +7,7 @@
 mod activate_skill;
 mod agent_send;
 mod command_guard;
+mod dotenv_secrets;
 mod files;
 pub(crate) mod mcp;
 mod path_guard;
@@ -286,8 +287,10 @@ pub(crate) struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     tool_index: std::collections::HashMap<String, usize>,
     config_secrets: Vec<(String, String)>,
+    dotenv_secrets: DotenvSecrets,
     config_manager: Option<Arc<crate::config::ConfigManager>>,
     mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
+    mcp_secrets: Option<crate::tools::mcp::McpSecrets>,
 }
 
 impl ToolRegistry {
@@ -304,8 +307,10 @@ impl ToolRegistry {
                     tool_index: build_tool_index(&tools),
                     tools,
                     config_secrets: collect_config_secrets(config),
+                    dotenv_secrets: DotenvSecrets::new(dotenv_path(Path::new(&config.state_root))),
                     config_manager: None,
                     mcp_manager: None,
+                    mcp_secrets: None,
                 };
             }
         };
@@ -336,8 +341,10 @@ impl ToolRegistry {
             tool_index: build_tool_index(&tools),
             tools,
             config_secrets: collect_config_secrets(config),
+            dotenv_secrets: DotenvSecrets::new(dotenv_path(Path::new(&config.state_root))),
             config_manager: None,
             mcp_manager: None,
+            mcp_secrets: None,
         }
     }
 
@@ -357,11 +364,15 @@ impl ToolRegistry {
         self.tool_index.insert(name, idx);
     }
 
+    /// Binds the registry to the MCP manager and the resolved MCP header/env
+    /// values the manager publishes for output redaction.
     pub(crate) fn set_mcp_manager(
         &mut self,
         mcp_manager: Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>,
+        mcp_secrets: crate::tools::mcp::McpSecrets,
     ) {
         self.mcp_manager = Some(mcp_manager);
+        self.mcp_secrets = Some(mcp_secrets);
     }
 
     /// Collect tool definitions asynchronously, wrapped in `Arc` for cheap sharing.
@@ -460,10 +471,18 @@ impl ToolRegistry {
             (None, Some(snapshot)) => collect_config_secrets(&snapshot.config),
             (None, None) => self.config_secrets.clone(),
         };
-        let env = context.skill_env.lock().expect("skill env lock");
-        for (k, v) in env.iter() {
-            append_unique_secrets(&mut secrets, vec![(format!("skill_env.{k}"), v.clone())]);
+        {
+            let env = context.skill_env.lock().expect("skill env lock");
+            for (k, v) in env.iter() {
+                append_unique_secrets(&mut secrets, vec![(format!("skill_env.{k}"), v.clone())]);
+            }
         }
+        // Appended last: a value that is also named above keeps its more
+        // specific label.
+        if let Some(mcp_secrets) = &self.mcp_secrets {
+            append_unique_secrets(&mut secrets, mcp_secrets.snapshot());
+        }
+        append_unique_secrets(&mut secrets, self.dotenv_secrets.secrets());
         secrets
     }
 
@@ -536,6 +555,8 @@ fn append_unique_secrets(secrets: &mut Vec<(String, String)>, additional: Vec<(S
         }
     }
 }
+
+use dotenv_secrets::DotenvSecrets;
 
 pub(crate) use activate_skill::ActivateSkillTool;
 pub(crate) use agent_send::AgentSendTool;
@@ -649,6 +670,37 @@ mod tests {
             config,
             Arc::new(SkillManager::from_dirs(skills_dir.clone(), skills_dir)),
         )
+    }
+
+    #[test]
+    #[serial]
+    fn tool_input_redacts_dotenv_and_mcp_values() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        std::fs::write(
+            dir.path().join(".env"),
+            "OTHER_SERVICE_KEY=Zk3pQ9vLm2XrT8wYb4Nc\nPORT=8080\n",
+        )
+        .expect("write dotenv");
+        let mut registry = test_registry(&config);
+        let mcp_secrets = crate::tools::mcp::McpSecrets::default();
+        mcp_secrets.replace(vec![(
+            "mcp.remote.headers.Authorization".to_string(),
+            "Qw8eRt5yUi2oPa7sDf3g".to_string(),
+        )]);
+        registry.mcp_secrets = Some(mcp_secrets);
+        let input = json!({"command": "curl -H 'x: Zk3pQ9vLm2XrT8wYb4Nc' -H 'a: Qw8eRt5yUi2oPa7sDf3g' :8080"});
+
+        // Act
+        let sanitized = registry.sanitize_tool_input(&input, &test_context());
+
+        // Assert
+        assert_eq!(
+            sanitized["command"],
+            "curl -H 'x: [REDACTED:dotenv.OTHER_SERVICE_KEY]' -H 'a: [REDACTED:mcp.remote.headers.Authorization]' :8080"
+        );
     }
 
     #[test]

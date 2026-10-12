@@ -27,8 +27,10 @@ use rmcp::transport::{
 };
 
 use crate::config::default_state_root;
+use crate::config::secret_ref::{ResolvedValue, StringOrRef, read_dotenv, resolve_string_or_ref};
 use crate::error::{ConfigError, EgoPulseError, McpError};
 use crate::llm::ToolDefinition;
+use crate::tools::is_plausible_secret_value;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
@@ -86,10 +88,100 @@ pub(crate) struct McpServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, StringOrRef>,
     pub endpoint: Option<String>,
     #[serde(default)]
-    pub headers: HashMap<String, String>,
+    pub headers: HashMap<String, StringOrRef>,
+}
+
+/// `env` / `headers` の値を解決した結果。
+///
+/// 参照（`{"source": "env"|"exec", ...}`）の解決値は接続のたびに作り直すため、
+/// 設定の `McpServerConfig` とは別に保持する。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ResolvedMcpSecrets {
+    env: HashMap<String, ResolvedValue>,
+    headers: HashMap<String, ResolvedValue>,
+}
+
+impl ResolvedMcpSecrets {
+    fn resolve(
+        config: &McpServerConfig,
+        dotenv: &HashMap<String, String>,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
+            env: resolve_values(&config.env, dotenv)?,
+            headers: resolve_values(&config.headers, dotenv)?,
+        })
+    }
+
+    /// リダクション対象にする値を `mcp.<server>.<kind>.<key>` 名で返す。
+    ///
+    /// 参照で宣言された値は秘密として扱い、リテラルは長さとエントロピーが
+    /// 十分な場合だけ対象にする。`Authorization: Bearer <token>` は
+    /// 値全体に加えて `<token>` 単体も対象にする。
+    fn redaction_entries(&self, server: &str) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        for (kind, values) in [("env", &self.env), ("headers", &self.headers)] {
+            for (key, resolved) in values {
+                let label = format!("mcp.{server}.{kind}.{key}");
+                let include = |value: &str| match resolved {
+                    ResolvedValue::Literal(_) => is_plausible_secret_value(value),
+                    ResolvedValue::EnvRef { .. } | ResolvedValue::ExecRef { .. } => {
+                        !value.is_empty()
+                    }
+                };
+                let value = resolved.value();
+                if include(value) {
+                    entries.push((label.clone(), value.to_string()));
+                }
+                if let Some(credential) = auth_scheme_credential(value)
+                    && include(credential)
+                {
+                    entries.push((format!("{label}.credential"), credential.to_string()));
+                }
+            }
+        }
+        entries
+    }
+}
+
+fn resolve_values(
+    values: &HashMap<String, StringOrRef>,
+    dotenv: &HashMap<String, String>,
+) -> Result<HashMap<String, ResolvedValue>, ConfigError> {
+    let mut resolved = HashMap::with_capacity(values.len());
+    for (key, value) in values {
+        if let Some(value) = resolve_string_or_ref(Some(value.clone()), dotenv)? {
+            resolved.insert(key.clone(), value);
+        }
+    }
+    Ok(resolved)
+}
+
+/// `Bearer <token>` のような認証スキーム付きの値から `<token>` を取り出す。
+fn auth_scheme_credential(value: &str) -> Option<&str> {
+    let (scheme, credential) = value.split_once(char::is_whitespace)?;
+    let credential = credential.trim();
+    (["bearer", "basic", "token"]
+        .iter()
+        .any(|known| scheme.eq_ignore_ascii_case(known))
+        && !credential.is_empty())
+    .then_some(credential)
+}
+
+/// 解決済みの MCP `env` / `headers` 値を、ツール出力のリダクションと共有する。
+#[derive(Clone, Default)]
+pub(crate) struct McpSecrets(Arc<std::sync::RwLock<Vec<(String, String)>>>);
+
+impl McpSecrets {
+    pub(crate) fn snapshot(&self) -> Vec<(String, String)> {
+        self.0.read().expect("mcp secrets lock").clone()
+    }
+
+    pub(super) fn replace(&self, entries: Vec<(String, String)>) {
+        *self.0.write().expect("mcp secrets lock") = entries;
+    }
 }
 
 fn default_request_timeout_secs() -> u64 {
@@ -109,6 +201,8 @@ struct FailedServer {
 }
 
 pub(crate) struct McpManager {
+    dotenv_path: PathBuf,
+    secrets: McpSecrets,
     servers: Vec<ConnectedServer>,
     failed_servers: Vec<FailedServer>,
     /// Pre-computed index: sanitized tool name → (server index, original tool name).
@@ -118,6 +212,7 @@ pub(crate) struct McpManager {
 struct ConnectedServer {
     name: String,
     config: McpServerConfig,
+    resolved: ResolvedMcpSecrets,
     client: DynClient,
     cached_tools: Vec<Tool>,
 }
@@ -220,14 +315,18 @@ fn sha2_short(input: &str) -> String {
 }
 
 impl McpManager {
-    pub(crate) async fn new(workspace_dir: &Path) -> Result<Self, ConfigError> {
+    /// `dotenv_path` は MCP 設定の秘密参照（`{"source": "env", ...}`）の解決元。
+    pub(crate) async fn new(
+        workspace_dir: &Path,
+        dotenv_path: PathBuf,
+    ) -> Result<Self, ConfigError> {
         let configs = load_and_merge_mcp_configs(workspace_dir)?;
         let mut servers = Vec::new();
         let mut failed_servers = Vec::new();
 
         for (name, config) in &configs {
-            match connect_server(name, config, workspace_dir).await {
-                Ok((client, tools)) => {
+            match connect_server(name, config, workspace_dir, &dotenv_path).await {
+                Ok((client, tools, resolved)) => {
                     let filtered_tools = filter_tools_for_server(name, &tools);
                     let tool_display_names: Vec<String> = filtered_tools
                         .iter()
@@ -242,6 +341,7 @@ impl McpManager {
                     servers.push(ConnectedServer {
                         name: name.clone(),
                         config: (*config).clone(),
+                        resolved,
                         client,
                         cached_tools: filtered_tools,
                     });
@@ -263,11 +363,30 @@ impl McpManager {
             "MCP initialization complete"
         );
         let tool_name_index = build_tool_name_index(&servers);
-        Ok(Self {
+        let manager = Self {
+            dotenv_path,
+            secrets: McpSecrets::default(),
             servers,
             failed_servers,
             tool_name_index,
-        })
+        };
+        manager.publish_secrets();
+        Ok(manager)
+    }
+
+    /// Handle to the resolved header/env values of connected servers, kept
+    /// current across reconnects, for output redaction.
+    pub(crate) fn secrets(&self) -> McpSecrets {
+        self.secrets.clone()
+    }
+
+    fn publish_secrets(&self) {
+        let entries = self
+            .servers
+            .iter()
+            .flat_map(|server| server.resolved.redaction_entries(&server.name))
+            .collect();
+        self.secrets.replace(entries);
     }
 
     /// Closes every connected server concurrently.
@@ -278,6 +397,7 @@ impl McpManager {
     /// drained its turns.
     pub(crate) async fn shutdown(&mut self) {
         self.tool_name_index.clear();
+        self.secrets.replace(Vec::new());
         let closes = self.servers.drain(..).map(|server| async move {
             if let Err(error) = server.client.cancel().await {
                 warn!(server = %server.name, %error, "failed to close MCP server");
@@ -301,6 +421,7 @@ impl McpManager {
         &mut self,
         name: String,
         config: McpServerConfig,
+        resolved: ResolvedMcpSecrets,
         client: DynClient,
         tools: Vec<Tool>,
     ) -> bool {
@@ -330,10 +451,12 @@ impl McpManager {
         self.servers.push(ConnectedServer {
             name,
             config,
+            resolved,
             client,
             cached_tools: filtered_tools,
         });
         self.tool_name_index = build_tool_name_index(&self.servers);
+        self.publish_secrets();
         true
     }
 
@@ -523,9 +646,9 @@ pub(crate) async fn run_reconnect_loop(
             continue;
         }
 
-        let reconnect_targets = {
+        let (reconnect_targets, dotenv_path) = {
             let guard = mcp_manager.read().await;
-            guard.failed_server_configs()
+            (guard.failed_server_configs(), guard.dotenv_path.clone())
         };
         if reconnect_targets.is_empty() {
             retry_secs = INITIAL_RETRY_SECS;
@@ -536,13 +659,13 @@ pub(crate) async fn run_reconnect_loop(
         for (name, config) in reconnect_targets {
             let connection_result = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                result = connect_server(&name, &config, &workspace_dir) => result,
+                result = connect_server(&name, &config, &workspace_dir, &dotenv_path) => result,
             };
             match connection_result {
-                Ok((client, tools)) => {
+                Ok((client, tools, resolved)) => {
                     let applied = {
                         let mut guard = mcp_manager.write().await;
-                        guard.apply_reconnected_server(name, config, client, tools)
+                        guard.apply_reconnected_server(name, config, resolved, client, tools)
                     };
                     reconnected += usize::from(applied);
                 }
@@ -667,15 +790,40 @@ fn filter_tools_for_server(server_name: &str, tools: &[Tool]) -> Vec<Tool> {
     filtered_tools
 }
 
+/// 秘密参照を解決してから接続する。参照が解決できないサーバーは接続せず、
+/// 平文へのフォールバックもしない。
 async fn connect_server(
     name: &str,
     config: &McpServerConfig,
     workspace_dir: &Path,
-) -> Result<(DynClient, Vec<Tool>), McpError> {
-    match config.transport {
-        TransportType::Stdio => connect_stdio(name, config, workspace_dir).await,
-        TransportType::StreamableHttp => connect_http(name, config).await,
-    }
+    dotenv_path: &Path,
+) -> Result<(DynClient, Vec<Tool>, ResolvedMcpSecrets), McpError> {
+    let resolved = resolve_server_secrets(name, config, dotenv_path).await?;
+    let (client, tools) = match config.transport {
+        TransportType::Stdio => connect_stdio(name, config, &resolved, workspace_dir).await?,
+        TransportType::StreamableHttp => connect_http(name, config, &resolved).await?,
+    };
+    Ok((client, tools, resolved))
+}
+
+/// `exec` 参照はコマンドを同期実行するため、ランタイムを塞がないよう別スレッドで解決する。
+async fn resolve_server_secrets(
+    name: &str,
+    config: &McpServerConfig,
+    dotenv_path: &Path,
+) -> Result<ResolvedMcpSecrets, McpError> {
+    let config = config.clone();
+    let dotenv_path = dotenv_path.to_path_buf();
+    let to_error = |detail: String| McpError::ConnectionFailed {
+        server: name.to_string(),
+        detail,
+    };
+    tokio::task::spawn_blocking(move || {
+        ResolvedMcpSecrets::resolve(&config, &read_dotenv(&dotenv_path))
+    })
+    .await
+    .map_err(|error| to_error(format!("secret resolution task failed: {error}")))?
+    .map_err(|error| to_error(format!("secret resolution failed: {error}")))
 }
 
 /// Spawns a stdio MCP server as the leader of its own process group.
@@ -774,6 +922,7 @@ impl rmcp::transport::Transport<RoleClient> for StdioTransport {
 async fn connect_stdio(
     name: &str,
     config: &McpServerConfig,
+    resolved: &ResolvedMcpSecrets,
     workspace_dir: &Path,
 ) -> Result<(DynClient, Vec<Tool>), McpError> {
     let command_str = config
@@ -787,7 +936,7 @@ async fn connect_stdio(
     let mut cmd = TokioCommand::new(command_str);
     cmd.args(&config.args);
     cmd.current_dir(workspace_dir);
-    cmd.envs(&config.env);
+    cmd.envs(resolved.env.iter().map(|(key, value)| (key, value.value())));
 
     let child = spawn_stdio_transport(cmd).map_err(|error| McpError::ConnectionFailed {
         server: name.to_string(),
@@ -835,6 +984,7 @@ async fn connect_stdio(
 async fn connect_http(
     name: &str,
     config: &McpServerConfig,
+    resolved: &ResolvedMcpSecrets,
 ) -> Result<(DynClient, Vec<Tool>), McpError> {
     let endpoint = config
         .endpoint
@@ -847,7 +997,8 @@ async fn connect_http(
     let mut transport_config =
         StreamableHttpClientTransportConfig::with_uri(endpoint).reinit_on_expired_session(true);
 
-    for (key, value) in &config.headers {
+    for (key, value) in &resolved.headers {
+        let value = value.value();
         if key.eq_ignore_ascii_case("authorization") {
             transport_config = transport_config.auth_header(value);
         } else if let (Ok(header_name), Ok(header_value)) =
@@ -908,6 +1059,7 @@ async fn connect_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::secret_ref::SecretSource;
     use crate::test_env::EnvVarGuard;
     use serial_test::serial;
 
@@ -992,6 +1144,8 @@ mod tests {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_server.py");
         let mut manager = McpManager {
+            dotenv_path: PathBuf::new(),
+            secrets: McpSecrets::default(),
             servers: Vec::new(),
             failed_servers: Vec::new(),
             tool_name_index: HashMap::new(),
@@ -1004,7 +1158,8 @@ mod tests {
             }))
             .unwrap();
             // Install failure cleanup before connecting (including handshake failures).
-            let connecting = connect_stdio(mode, &config, dir.path());
+            let resolved = ResolvedMcpSecrets::default();
+            let connecting = connect_stdio(mode, &config, &resolved, dir.path());
             let (connected, launcher) = tokio::join!(connecting, async {
                 timeout(Duration::from_secs(2), async {
                     loop {
@@ -1031,6 +1186,7 @@ mod tests {
             manager.servers.push(ConnectedServer {
                 name: mode.to_string(),
                 config,
+                resolved: ResolvedMcpSecrets::default(),
                 client,
                 cached_tools: tools,
             });
@@ -1182,8 +1338,145 @@ mod tests {
             Some("http://127.0.0.1:8080/mcp")
         );
         assert_eq!(
-            config.headers.get("Authorization").unwrap(),
-            "Bearer token123"
+            config.headers.get("Authorization"),
+            Some(&StringOrRef::Literal("Bearer token123".to_string()))
+        );
+    }
+
+    fn server_config(value: serde_json::Value) -> McpServerConfig {
+        serde_json::from_value(value).expect("server config")
+    }
+
+    fn dotenv(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_headers_and_env_accept_secret_refs() {
+        // Arrange
+        let config = server_config(serde_json::json!({
+            "transport": "streamable_http",
+            "endpoint": "http://127.0.0.1:8080/mcp",
+            "headers": {"Authorization": {"source": "env", "id": "EGOGRAPH_AUTH"}},
+            "env": {"TOKEN": {"source": "exec", "command": "echo x"}, "MODE": "plain"}
+        }));
+
+        // Assert
+        assert!(matches!(
+            config.headers["Authorization"],
+            StringOrRef::Ref(SecretSource::Env { .. })
+        ));
+        assert!(matches!(
+            config.env["TOKEN"],
+            StringOrRef::Ref(SecretSource::Exec { .. })
+        ));
+        assert_eq!(config.env["MODE"], StringOrRef::Literal("plain".into()));
+    }
+
+    #[test]
+    fn resolve_reads_env_refs_from_dotenv() {
+        // Arrange
+        let config = server_config(serde_json::json!({
+            "transport": "streamable_http",
+            "endpoint": "http://127.0.0.1:8080/mcp",
+            "headers": {"Authorization": {"source": "env", "id": "MCP_TEST_AUTH_FROM_DOTENV"}}
+        }));
+        let dotenv = dotenv(&[("MCP_TEST_AUTH_FROM_DOTENV", "Bearer abc123XYZ")]);
+
+        // Act
+        let resolved = ResolvedMcpSecrets::resolve(&config, &dotenv).expect("resolve");
+
+        // Assert
+        assert_eq!(
+            resolved.headers["Authorization"].value(),
+            "Bearer abc123XYZ"
+        );
+    }
+
+    #[test]
+    fn resolve_fails_when_env_ref_is_missing() {
+        let config = server_config(serde_json::json!({
+            "transport": "streamable_http",
+            "endpoint": "http://127.0.0.1:8080/mcp",
+            "headers": {"Authorization": {"source": "env", "id": "MCP_TEST_UNSET_REFERENCE"}}
+        }));
+
+        let error = ResolvedMcpSecrets::resolve(&config, &HashMap::new()).expect_err("unresolved");
+
+        assert!(error.to_string().contains("MCP_TEST_UNSET_REFERENCE"));
+    }
+
+    #[tokio::test]
+    async fn connect_server_does_not_connect_when_a_secret_ref_is_unresolved() {
+        // Arrange: nothing listens on the endpoint; a connection attempt would
+        // time out instead of failing on the unresolved reference.
+        let dir = tempfile::tempdir().unwrap();
+        let config = server_config(serde_json::json!({
+            "transport": "streamable_http",
+            "endpoint": "http://127.0.0.1:9/mcp",
+            "headers": {"Authorization": {"source": "env", "id": "MCP_TEST_UNSET_REFERENCE"}}
+        }));
+
+        // Act
+        let result = timeout(
+            Duration::from_secs(5),
+            connect_server("remote", &config, dir.path(), &dir.path().join(".env")),
+        )
+        .await
+        .expect("must fail fast");
+
+        // Assert
+        let error = result.err().expect("unresolved ref").to_string();
+        assert!(error.contains("secret resolution failed"), "{error}");
+    }
+
+    #[test]
+    fn redaction_entries_trust_refs_and_filter_literals() {
+        // Arrange
+        let config = server_config(serde_json::json!({
+            "transport": "streamable_http",
+            "endpoint": "http://127.0.0.1:8080/mcp",
+            "headers": {
+                "Authorization": {"source": "env", "id": "MCP_TEST_AUTH"},
+                "X-Short-Ref": {"source": "env", "id": "MCP_TEST_SHORT"},
+                "X-Literal-Secret": "Zk3pQ9vLm2XrT8wYb4Nc",
+                "X-Client": "web"
+            }
+        }));
+        let dotenv = dotenv(&[
+            ("MCP_TEST_AUTH", "Bearer Qw8eRt5yUi2oPa7sDf3g"),
+            ("MCP_TEST_SHORT", "abc"),
+        ]);
+        let resolved = ResolvedMcpSecrets::resolve(&config, &dotenv).expect("resolve");
+
+        // Act
+        let mut entries = resolved.redaction_entries("remote");
+        entries.sort();
+
+        // Assert
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "mcp.remote.headers.Authorization".to_string(),
+                    "Bearer Qw8eRt5yUi2oPa7sDf3g".to_string()
+                ),
+                (
+                    "mcp.remote.headers.Authorization.credential".to_string(),
+                    "Qw8eRt5yUi2oPa7sDf3g".to_string()
+                ),
+                (
+                    "mcp.remote.headers.X-Literal-Secret".to_string(),
+                    "Zk3pQ9vLm2XrT8wYb4Nc".to_string()
+                ),
+                (
+                    "mcp.remote.headers.X-Short-Ref".to_string(),
+                    "abc".to_string()
+                ),
+            ]
         );
     }
 
