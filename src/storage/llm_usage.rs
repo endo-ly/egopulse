@@ -24,8 +24,8 @@ impl Database {
         let created_at = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO llm_usage_logs
-                (chat_id, caller_channel, provider, model, input_tokens, output_tokens, total_tokens, request_kind, estimated_tokens, has_tools, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (chat_id, caller_channel, provider, model, input_tokens, output_tokens, total_tokens, request_kind, estimated_tokens, has_tools, cached_input_tokens, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 entry.chat_id,
                 entry.caller_channel,
@@ -37,6 +37,7 @@ impl Database {
                 entry.request_kind,
                 entry.estimated_tokens,
                 entry.has_tools,
+                entry.cached_input_tokens,
                 created_at,
             ],
         )?;
@@ -142,11 +143,46 @@ mod tests {
             request_kind: "agent_loop",
             estimated_tokens: estimated,
             has_tools,
+            cached_input_tokens: None,
         })
         .expect("log usage");
         // created_at has sub-ms resolution, but a small sleep guarantees a
         // strictly increasing ordering for the deterministic assertions below.
         std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    #[test]
+    fn log_llm_usage_stores_cached_input_tokens_and_null_when_unreported() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        // Act
+        for (chat_id, cached) in [(1, Some(80)), (2, Some(0)), (3, None)] {
+            db.log_llm_usage(&LlmUsageLogEntry {
+                chat_id,
+                caller_channel: "tui",
+                provider: "openai",
+                model: "gpt-4",
+                input_tokens: 100,
+                output_tokens: 1,
+                request_kind: "agent_loop",
+                estimated_tokens: 0,
+                has_tools: false,
+                cached_input_tokens: cached,
+            })
+            .expect("log usage");
+        }
+
+        // Assert
+        let conn = db.get_conn().expect("pool");
+        let stored: Vec<Option<i64>> = conn
+            .prepare("SELECT cached_input_tokens FROM llm_usage_logs ORDER BY chat_id")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<_, _>>()
+            .expect("rows");
+        assert_eq!(stored, vec![Some(80), Some(0), None]);
     }
 
     #[test]
@@ -163,6 +199,7 @@ mod tests {
             request_kind: "agent_loop",
             estimated_tokens: 0,
             has_tools: false,
+            cached_input_tokens: None,
         })
         .expect("log usage");
 
@@ -194,6 +231,7 @@ mod tests {
                 request_kind: kind,
                 estimated_tokens: 0,
                 has_tools: false,
+                cached_input_tokens: None,
             })
             .expect("log usage");
         }
@@ -279,6 +317,7 @@ mod tests {
             request_kind: "agent_loop",
             estimated_tokens: 100,
             has_tools: true,
+            cached_input_tokens: None,
         })
         .expect("log agent_loop");
         db.log_llm_usage(&LlmUsageLogEntry {
@@ -291,6 +330,7 @@ mod tests {
             request_kind: "compaction",
             estimated_tokens: 100,
             has_tools: false,
+            cached_input_tokens: None,
         })
         .expect("log compaction");
 

@@ -21,11 +21,13 @@ pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResp
     );
     let reasoning_content = choice.message.reasoning_content;
     let usage = body.usage.and_then(|u| {
+        let cached_input_tokens = u.prompt_tokens_details.and_then(|d| d.cached_tokens);
         u.prompt_tokens
             .zip(u.completion_tokens)
             .map(|(pt, ct)| LlmUsage {
                 input_tokens: pt,
                 output_tokens: ct,
+                cached_input_tokens,
             })
     });
 
@@ -115,11 +117,13 @@ pub(crate) fn parse_responses_response(
         reasoning_content: None,
         tool_calls,
         usage: body.usage.and_then(|u| {
+            let cached_input_tokens = u.input_tokens_details.and_then(|d| d.cached_tokens);
             u.input_tokens
                 .zip(u.output_tokens)
                 .map(|(it, ot)| LlmUsage {
                     input_tokens: it,
                     output_tokens: ot,
+                    cached_input_tokens,
                 })
         }),
     })
@@ -578,6 +582,14 @@ pub(crate) struct OpenAiUsage {
     pub(crate) prompt_tokens: Option<i64>,
     #[serde(default)]
     pub(crate) completion_tokens: Option<i64>,
+    #[serde(default)]
+    pub(crate) prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PromptTokensDetails {
+    #[serde(default)]
+    pub(crate) cached_tokens: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -598,7 +610,15 @@ pub(crate) struct ResponsesApiUsage {
     #[serde(default)]
     pub(crate) output_tokens: Option<i64>,
     #[serde(default)]
+    pub(crate) input_tokens_details: Option<ResponsesInputTokensDetails>,
+    #[serde(default)]
     pub(crate) output_tokens_details: Option<ResponsesOutputTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResponsesInputTokensDetails {
+    #[serde(default)]
+    pub(crate) cached_tokens: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -712,7 +732,7 @@ event: response.created
 data: {"type":"response.created","response":{"output":[]}}
 
 event: response.completed
-data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2}}}
+data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":1}}}}
 "#;
 
         let parsed = parse_codex_responses_payload(payload).expect("payload");
@@ -724,6 +744,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"message","role
             Some(LlmUsage {
                 input_tokens: 1,
                 output_tokens: 2,
+                cached_input_tokens: Some(1),
             })
         );
     }
@@ -810,6 +831,7 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
             Some(LlmUsage {
                 input_tokens: 5,
                 output_tokens: 10,
+                cached_input_tokens: None,
             })
         );
     }

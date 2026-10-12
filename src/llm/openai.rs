@@ -412,9 +412,14 @@ fn is_deepseek_base_url(base_url: &str) -> bool {
 fn parse_chat_completion_usage(usage: &serde_json::Value) -> Option<LlmUsage> {
     let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_i64())?;
     let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_i64())?;
+    let cached_input_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|v| v.as_i64());
     Some(LlmUsage {
         input_tokens: prompt_tokens,
         output_tokens: completion_tokens,
+        cached_input_tokens,
     })
 }
 
@@ -616,7 +621,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"ファイルを\"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"確認します\",\"reasoning_content\":\"考えている\"}}]}\n\n",
             "data: {\"choices\":[]}\n\n",
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n",
             "data: [DONE]\n\n",
             "garbage line\n",
         );
@@ -658,6 +663,7 @@ mod tests {
             Some(LlmUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: Some(8),
             })
         );
         assert!(response.tool_calls.is_empty());
@@ -837,6 +843,7 @@ mod tests {
             Some(LlmUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cached_input_tokens: None,
             })
         );
     }
@@ -901,6 +908,7 @@ mod tests {
             Some(LlmUsage {
                 input_tokens: 3,
                 output_tokens: 7,
+                cached_input_tokens: None,
             })
         );
     }

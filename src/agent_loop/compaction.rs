@@ -415,6 +415,7 @@ async fn log_summarizer_usage(
     let model = llm.model_name().to_string();
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
+    let cached_input_tokens = usage.cached_input_tokens;
     let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
     crate::runtime::metrics::inc_llm_tokens_total("output", &provider, output_tokens);
@@ -429,6 +430,7 @@ async fn log_summarizer_usage(
             request_kind: "compaction",
             estimated_tokens,
             has_tools: false,
+            cached_input_tokens,
         })
     })
     .await
@@ -1619,6 +1621,7 @@ mod tests {
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 100,
                         output_tokens: 200,
+                        cached_input_tokens: None,
                     }),
                 }),
                 Ok(MessagesResponse {
@@ -1758,6 +1761,7 @@ mod tests {
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 500,
                         output_tokens: 20,
+                        cached_input_tokens: None,
                     }),
                 }),
                 Ok(MessagesResponse {

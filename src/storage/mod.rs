@@ -692,6 +692,9 @@ pub(crate) struct LlmUsageLogEntry<'a> {
     pub estimated_tokens: i64,
     /// Whether the request payload included tool definitions.
     pub has_tools: bool,
+    /// Prompt tokens served from the provider's prompt cache. `None` when the
+    /// provider does not report it.
+    pub cached_input_tokens: Option<i64>,
 }
 
 const _: () = {

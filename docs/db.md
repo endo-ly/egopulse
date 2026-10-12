@@ -332,10 +332,11 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 | request_kind | TEXT | NOT NULL DEFAULT 'agent_loop' | リクエスト種別 |
 | estimated_tokens | INTEGER | NOT NULL DEFAULT 0 | 生推定トークン数（chars/3）。補正係数の再構築に使用 |
 | has_tools | INTEGER | NOT NULL DEFAULT 0 | tool 定義を含む payload か（0/1） |
+| cached_input_tokens | INTEGER | NULL | `input_tokens` のうち prompt cache から供給された分。Provider が報告しない場合は NULL、報告して 0 の場合は 0 |
 | created_at | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 
 **操作**:
-- `log_llm_usage(chat_id, caller_channel, provider, model, input_tokens, output_tokens, request_kind, estimated_tokens, has_tools)` — INSERT（total_tokens は自動計算）
+- `log_llm_usage(chat_id, caller_channel, provider, model, input_tokens, output_tokens, request_kind, estimated_tokens, has_tools, cached_input_tokens)` — INSERT（total_tokens は自動計算）
 - `load_calibration_observations(limit_per_key)` — 補正係数再構築用の観測を最近 N 件/キー取得（oldest-first）
 - `get_llm_usage_summary(chat_id, since)` — 集計サマリ（requests, input/output/total tokens, last_request_at）
 - `get_llm_usage_by_model(chat_id, since)` — モデル別集計（total_tokens 降順）
@@ -729,7 +730,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `16`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `17`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
