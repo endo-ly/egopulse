@@ -83,7 +83,7 @@ pub(crate) fn is_secret_like_key(name: &str) -> bool {
 }
 
 /// 秘密を保持していそうなキー名の部分一致パターン。
-const SECRET_KEY_PATTERN: &str = r"(?i)(api[_-]?key|secret|token|passw(?:or)?d|authorization|access[_-]?key|private[_-]?key|credential)";
+pub(super) const SECRET_KEY_PATTERN: &str = r"(?i)(api[_-]?key|secret|token|passw(?:or)?d|authorization|access[_-]?key|private[_-]?key|credential)";
 
 /// Config から収集したシークレット値で出力をリダクションする。
 pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> String {
@@ -141,9 +141,13 @@ pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
     result
 }
 
+/// prefix ベースと文脈ベースのパターンリダクションを順に適用する。
+pub(crate) fn redact_secret_patterns(output: &str) -> String {
+    super::contextual_redaction::redact_contextual_secrets(&redact_known_secret_patterns(output))
+}
+
 pub(crate) fn sanitize_output_string(output: &str, secrets: &[(String, String)]) -> String {
-    let redacted = redact_secrets(output, secrets);
-    redact_known_secret_patterns(&redacted)
+    redact_secret_patterns(&redact_secrets(output, secrets))
 }
 
 pub(crate) fn sanitize_message_content(
@@ -318,6 +322,24 @@ mod tests {
         // Assert
         assert!(result.contains("[REDACTED:provider.openai.api_key]"));
         assert!(!result.contains("sk-abc123"));
+    }
+
+    /// sanitize_output_string: 登録済みの値・prefix・文脈の三層が順に適用される。
+    #[test]
+    fn test_sanitize_output_string_applies_value_prefix_and_context_layers() {
+        let secrets = vec![(
+            "provider.p.api_key".to_string(),
+            "registered-value".to_string(),
+        )];
+        let input =
+            "a=registered-value b=sk-abc123def c: OTHER_SECRET=Zk3pQ9vLm2XrT8wYb4NcHd6Fs1Jg";
+
+        let output = sanitize_output_string(input, &secrets);
+
+        assert_eq!(
+            output,
+            "a=[REDACTED:provider.p.api_key] b=[REDACTED:secret] c: OTHER_SECRET=[REDACTED:secret]"
+        );
     }
 
     /// redact_secrets: 空のシークレットリストでは入力が変更されない。

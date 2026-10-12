@@ -169,12 +169,27 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | `sk_test_` | Stripe Test Secret Key |
 | `rk_live_` | Stripe Live Restricted Key |
 
+#### 文脈ベースリダクション
+
+prefix を持たない値や Config に登録されていない値も、周囲の文脈が秘密の保持を示す場合に `[REDACTED:secret]` へ置換する。値ベース・prefix ベースの後に適用する。bash の標準出力にも同じ処理を適用する。
+
+| 規則 | 検出する形 | 置換条件 |
+|---|---|---|
+| 代入形 | `KEY=VALUE`、`key: value`、`"key": "value"`。キー名が `api_key` / `secret` / `token` / `password` / `passwd` / `authorization` / `access_key` / `private_key` / `credential` を部分一致で含む（大文字小文字不問、`-` / `_` 区切り不問） | 値が 20 文字以上、Shannon エントロピー 3.5 bit/文字以上、lower / upper / digit のうち 2 種以上を含む |
+| Authorization | `Authorization: Bearer / Basic / Token <値>` | 値が 8 文字以上 |
+| Bearer | ヘッダー名を伴わない `Bearer <値>` | 値が 16 文字以上かつ文字クラス 2 種以上 |
+| URL クエリ | `?` / `&` の後の `access_token` / `id_token` / `refresh_token` / `token` / `api_key` / `apikey` / `sig` / `signature` / `code` / `x-amz-signature` / `x-amz-credential` / `x-amz-security-token` | 値が 8 文字以上 |
+
+- 代入形は、パス（`/`、`./`、`../`、`~` 始まり）、URL（`http(s)://` 始まり）、プレースホルダー（`$`、`{`、`*` 始まり、`REDACTED` を含む値）を置換しない。小文字だけの snake_case の単語（`authorization_code_flow` など）や数字だけの値も、文字クラスの条件で置換しない
+- `ps eww` や環境変数ダンプのように `KEY=VALUE` が空白区切りで並ぶ出力は、代入形で 1 件ずつ検出される
+- 偽陽性（秘密ではない値が伏せられる）は出力が欠けるだけで済むため許容し、偽陰性（漏洩）を避ける方向に倒す。秘密風の代入行を `read` した後にその行を `edit` する場合は、伏せられた値が `old_string` と一致しない
+
 #### 保証範囲と限界
 
 現時点の出力リダクションは、上記のとおり Config に登録された既知の秘密値と well-known パターンを対象とする。これは「ツール出力経由の偶発的・低レベルな秘密露出」に対する防御であり、Shell ツールの OS sandbox ではない。
 
 - Shell ツール（`bash` / `write` / `edit`）によるプロセス外への秘密書き出しは、本リダクションでは防げない。OS レベルの隔離は現時点では未実施である。
-- LLM への Prompt Injection により Agent が秘密値を加工・断片化して出力する経路を完全に封止する保証はない。パターンベース・値ベースの二層リダクションは可能な限り広く覆うが、完全な exfiltration 防止を主張しない。
+- LLM への Prompt Injection により Agent が秘密値を加工・断片化して出力する経路を完全に封止する保証はない。値ベース・prefix ベース・文脈ベースのリダクションは可能な限り広く覆うが、完全な exfiltration 防止を主張しない。
 - ツール実行そのものを禁止・隔離する境界は事前検査（コマンド・パス検閲）で担う。OS sandbox は現時点では未実施である。
 
 ---
@@ -189,8 +204,8 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | `/proc/<pid>/*` のブロック | 他プロセスの内部情報読み取り不可 | なし |
 | `.env` 系のパスガード | `cat .env` での直接読み取り不可 | 値はツール経由で注入済み |
 | 出力リダクション | シークレット値が結果に含まれない | `[REDACTED:KEY_NAME]` として表示 |
-| Compaction Archive | 会話アーカイブにシークレットが含まれる | 二層 redaction 適用 + ファイルパーミッション `0600` |
-| 値ベースリダクションの対象外 | Config・MCP・`.env` に存在しない秘密（他プロセスの環境変数など）はマスクされない | パターンベースで補完 |
+| Compaction Archive | 会話アーカイブにシークレットが含まれる | 三層 redaction（値・prefix・文脈）適用 + ファイルパーミッション `0600` |
+| 値ベースリダクションの対象外 | Config・MCP・`.env` に存在しない秘密（他プロセスの環境変数など）はマスクされない | prefix ベース・文脈ベースで補完 |
 | MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。OS 隔離がないため、bash で同じ値を読む経路を塞げない | OS レベルの隔離（未実施）が前提 |
 
 ---

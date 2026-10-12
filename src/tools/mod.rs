@@ -7,6 +7,7 @@
 mod activate_skill;
 mod agent_send;
 mod command_guard;
+mod contextual_redaction;
 mod dotenv_secrets;
 mod files;
 pub(crate) mod mcp;

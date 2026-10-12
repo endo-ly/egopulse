@@ -410,7 +410,7 @@ Respond to the latest user message after this summary.
 
 ### Secret Redaction
 
-要約入力・出力の両方に二層 redaction を適用（`src/tools/sanitizer.rs`）。summary やログに credential が含まれないことを保証する。archive は verbatim 保存であり、redaction 保証対象外。
+要約入力・出力の両方に三層 redaction（値・prefix・文脈）を適用（`src/tools/sanitizer.rs`）。summary やログに credential が含まれないことを保証する。archive は verbatim 保存であり、redaction 保証対象外。
 
 ---
 

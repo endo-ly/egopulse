@@ -279,7 +279,7 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 
 **要約呼び出し**: 専用 system prompt（[system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
 
-**Secret redaction**: 要約入力・出力の両方に二層 redaction を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照。
+**Secret redaction**: 要約入力・出力の両方に三層 redaction（値・prefix・文脈）を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照。
 
 **Compact 後の形**:
 1. `user`: reference-only ヘッダー付き summary（ヘッダー全文は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照）
@@ -321,7 +321,7 @@ compaction 発火時は、compact 前の全文会話を markdown として archi
 ### 秘匿情報に関する注意
 
 archive はローカル監査用の sensitive artifact であるが、**secret redaction を適用する**。
-要約入力・出力と同様に、起動時に Config から収集したシークレット値（API キー、auth トークン等）と well-known パターン（`sk-`, `ghp_` 等）の二層リダクションを archive 全文に適用し、`[REDACTED:key]` / `[REDACTED:secret]` に置換する。
+要約入力・出力と同様に、起動時に Config から収集したシークレット値（API キー、auth トークン等）、well-known パターン（`sk-`, `ghp_` 等）、文脈（`KEY=VALUE` のキー名、`Authorization`、URL クエリ）の三層リダクションを archive 全文に適用し、`[REDACTED:key]` / `[REDACTED:secret]` に置換する。
 
 さらに、archive ファイルのパーミッションは `0600`（owner 読み書きのみ）に設定される。
 
