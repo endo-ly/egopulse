@@ -21,6 +21,7 @@ pub(crate) struct DotenvSecrets {
 
 struct CachedSecrets {
     modified: SystemTime,
+    len: u64,
     secrets: Vec<(String, String)>,
 }
 
@@ -36,18 +37,22 @@ impl DotenvSecrets {
     ///
     /// ファイルが存在しない場合は空を返す。
     pub(crate) fn secrets(&self) -> Vec<(String, String)> {
-        let Ok(modified) = std::fs::metadata(&self.path).and_then(|meta| meta.modified()) else {
+        let Ok((modified, len)) = std::fs::metadata(&self.path)
+            .and_then(|meta| meta.modified().map(|modified| (modified, meta.len())))
+        else {
             return Vec::new();
         };
         let mut cache = self.cache.lock().expect("dotenv secrets lock");
         if let Some(cached) = cache.as_ref()
             && cached.modified == modified
+            && cached.len == len
         {
             return cached.secrets.clone();
         }
         let secrets = collect_dotenv_secrets(&read_dotenv(&self.path));
         *cache = Some(CachedSecrets {
             modified,
+            len,
             secrets: secrets.clone(),
         });
         secrets
