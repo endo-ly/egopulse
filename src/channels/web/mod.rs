@@ -413,6 +413,9 @@ pub(crate) async fn run_server(
     })?;
 
     tracing::info!("EgoPulse server listening on http://{}", addr);
+    state
+        .runtime_status
+        .update_channel("web", crate::runtime::status::ChannelState::Running);
 
     let web_state = WebState {
         config_path: state.config_path.clone(),
@@ -727,6 +730,57 @@ mod tests {
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         });
         (router, app_state)
+    }
+
+    #[tokio::test]
+    async fn run_server_marks_web_channel_running_once_listening() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let state = Arc::new(build_state_with_config(
+            config,
+            Some(Arc::new(FakeProvider {
+                responses: std::sync::Mutex::new(vec![]),
+            })),
+            None,
+            None,
+            None,
+        ));
+        let shutdown = state.supervisor.shutdown_token();
+        let server = tokio::spawn(crate::channels::web::run_server(
+            Arc::clone(&state),
+            "127.0.0.1",
+            0,
+            shutdown,
+        ));
+
+        // Act: wait until the listening server marks the channel as running
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let running = loop {
+            let running_now = state
+                .runtime_status
+                .snapshot()
+                .channels
+                .get("web")
+                .is_some_and(|channel| {
+                    matches!(channel.state, crate::runtime::status::ChannelState::Running)
+                });
+            if running_now {
+                break true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        // Assert
+        assert!(
+            running,
+            "web channel should be Running once the server is listening"
+        );
+        state.supervisor.shutdown_token().cancel();
+        server.await.expect("server task").expect("server result");
     }
 
     #[tokio::test]

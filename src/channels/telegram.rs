@@ -1153,6 +1153,7 @@ pub(crate) async fn start_telegram_bot_for_bot(
         .config
         .default_agent
         .clone();
+    let runtime_status = Arc::clone(&state.runtime_status);
     let telegram_handler = Arc::new(TelegramHandler {
         app_state: state,
         bot_id: bot_id.to_string(),
@@ -1168,6 +1169,7 @@ pub(crate) async fn start_telegram_bot_for_bot(
     let handler = Update::filter_message().endpoint(handle_message);
 
     let listener = teloxide::update_listeners::polling_default(bot.clone()).await;
+    runtime_status.update_channel("telegram", crate::runtime::status::ChannelState::Running);
     let listener_error_handler = teloxide::error_handlers::LoggingErrorHandler::with_custom_text(
         "An error from the Telegram update listener".to_string(),
     );

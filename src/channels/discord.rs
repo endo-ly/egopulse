@@ -994,6 +994,9 @@ impl EventHandler for Handler {
             "Discord bot ({}) connected as {}",
             snapshot.config.default_agent, ready.user.name
         );
+        self.app_state
+            .runtime_status
+            .update_channel("discord", crate::runtime::status::ChannelState::Running);
 
         let commands: Vec<serenity::builder::CreateCommand> = crate::slash_commands::all_commands()
             .iter()
