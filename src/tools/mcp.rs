@@ -115,20 +115,23 @@ impl ResolvedMcpSecrets {
         })
     }
 
-    /// 解決できない値を飛ばして解決する。接続には使わず、リダクション対象の収集専用。
-    fn resolve_lenient(config: &McpServerConfig, dotenv: &HashMap<String, String>) -> Self {
-        let lenient = |values: &HashMap<String, StringOrRef>| {
+    /// 設定ファイルに書かれたリテラル値だけを取り出す。参照は解決しない
+    /// （`exec` を実行しない）。リダクション対象の収集専用。
+    fn literals(config: &McpServerConfig) -> Self {
+        let literals = |values: &HashMap<String, StringOrRef>| {
             values
                 .iter()
-                .filter_map(|(key, value)| {
-                    let resolved = resolve_string_or_ref(Some(value.clone()), dotenv).ok()??;
-                    Some((key.clone(), resolved))
+                .filter_map(|(key, value)| match value {
+                    StringOrRef::Literal(literal) => {
+                        Some((key.clone(), ResolvedValue::Literal(literal.clone())))
+                    }
+                    StringOrRef::Ref(_) => None,
                 })
                 .collect()
         };
         Self {
-            env: lenient(&config.env),
-            headers: lenient(&config.headers),
+            env: literals(&config.env),
+            headers: literals(&config.headers),
         }
     }
 
@@ -220,8 +223,9 @@ struct FailedServer {
 pub(crate) struct McpManager {
     dotenv: DotenvFile,
     secrets: McpSecrets,
-    /// Redaction entries for every server definition in the config files,
-    /// connected or not: the files stay readable even while a server is down.
+    /// Redaction entries for the literal values of every server definition in
+    /// the config files, connected or not: the files stay readable even while
+    /// a server is down.
     configured_secrets: Vec<(String, String)>,
     servers: Vec<ConnectedServer>,
     failed_servers: Vec<FailedServer>,
@@ -337,7 +341,7 @@ impl McpManager {
     /// `dotenv` は MCP 設定の秘密参照（`{"source": "env", ...}`）の解決元。
     pub(crate) async fn new(workspace_dir: &Path, dotenv: DotenvFile) -> Result<Self, ConfigError> {
         let file_configs = load_all_server_configs(workspace_dir)?;
-        let configured_secrets = collect_configured_secrets(&file_configs, &dotenv).await;
+        let configured_secrets = collect_configured_secrets(&file_configs);
         let configs: HashMap<String, McpServerConfig> = file_configs.into_iter().collect();
         let mut servers = Vec::new();
         let mut failed_servers = Vec::new();
@@ -826,24 +830,16 @@ async fn connect_server(
     Ok((client, tools, resolved))
 }
 
-/// 設定ファイルにある全 server 定義（上書きされたものを含む）の秘密値を集める。
-async fn collect_configured_secrets(
-    file_configs: &[(String, McpServerConfig)],
-    dotenv: &DotenvFile,
-) -> Vec<(String, String)> {
-    let file_configs = file_configs.to_vec();
-    let dotenv = dotenv.clone();
-    tokio::task::spawn_blocking(move || {
-        let dotenv = dotenv.read();
-        file_configs
-            .iter()
-            .flat_map(|(name, config)| {
-                ResolvedMcpSecrets::resolve_lenient(config, &dotenv).redaction_entries(name)
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default()
+/// 設定ファイルにある全 server 定義（上書きされたものを含む）のリテラル値を集める。
+///
+/// server が停止中でも設定ファイルは読めるため、そこに書かれた値を伏せる。
+/// 参照の値はファイルに無い（`env` は `.env` にあり別途伏せる。`exec` は接続時に
+/// 解決した値を伏せる）ため解決せず、使われない定義の `exec` も実行しない。
+fn collect_configured_secrets(file_configs: &[(String, McpServerConfig)]) -> Vec<(String, String)> {
+    file_configs
+        .iter()
+        .flat_map(|(name, config)| ResolvedMcpSecrets::literals(config).redaction_entries(name))
+        .collect()
 }
 
 /// `exec` 参照はコマンドを同期実行するため、ランタイムを塞がないよう別スレッドで解決する。
@@ -1483,24 +1479,34 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn manager_redacts_secrets_of_servers_that_failed_or_were_overridden() {
+    async fn manager_redacts_literals_of_every_definition_without_resolving_refs() {
         // Arrange: the global definition is overridden by the workspace one and
         // the surviving server cannot start; both config files stay readable.
+        // The overridden definition carries an `exec` ref that leaves a marker.
         let dir = tempfile::tempdir().expect("tempdir");
         let state_root = dir.path().join(".egopulse");
         let workspace = state_root.join("workspace");
         std::fs::create_dir_all(&workspace).expect("workspace dir");
-        std::fs::write(
-            state_root.join("mcp.json"),
-            r#"{"mcpServers":{"remote":{"transport":"stdio","command":"/nonexistent/mcp","env":{"GLOBAL_KEY":"Zk3pQ9vLm2XrT8wYb4Nc"}}}}"#,
-        )
-        .expect("write global");
+        let marker = dir.path().join("overridden-exec-ran");
+        let global = serde_json::json!({"mcpServers": {"remote": {
+            "transport": "stdio",
+            "command": "/nonexistent/mcp",
+            "env": {
+                "GLOBAL_KEY": "Zk3pQ9vLm2XrT8wYb4Nc",
+                "GLOBAL_EXEC": {"source": "exec", "command": format!("touch '{}'; echo value", marker.display())}
+            }
+        }}});
+        std::fs::write(state_root.join("mcp.json"), global.to_string()).expect("write global");
         std::fs::write(
             workspace.join("mcp.json"),
-            r#"{"mcpServers":{"remote":{"transport":"stdio","command":"/nonexistent/mcp","env":{"WS_KEY":{"source":"env","id":"MCP_TEST_WS_KEY"}}}}}"#,
+            r#"{"mcpServers":{"remote":{"transport":"stdio","command":"/nonexistent/mcp","env":{"WS_KEY":{"source":"env","id":"MCP_TEST_WS_KEY"},"WS_LITERAL":"Qw8eRt5yUi2oPa7sDf3g"}}}}"#,
         )
         .expect("write workspace");
-        std::fs::write(state_root.join(".env"), "MCP_TEST_WS_KEY=short\n").expect("write dotenv");
+        std::fs::write(
+            state_root.join(".env"),
+            "MCP_TEST_WS_KEY=Hj4kLm9nBv2cXz7qWe5r\n",
+        )
+        .expect("write dotenv");
         let _home = EnvVarGuard::set("HOME", dir.path());
 
         // Act
@@ -1518,8 +1524,15 @@ mod tests {
                     "mcp.remote.env.GLOBAL_KEY".to_string(),
                     "Zk3pQ9vLm2XrT8wYb4Nc".to_string()
                 ),
-                ("mcp.remote.env.WS_KEY".to_string(), "short".to_string()),
+                (
+                    "mcp.remote.env.WS_LITERAL".to_string(),
+                    "Qw8eRt5yUi2oPa7sDf3g".to_string()
+                ),
             ]
+        );
+        assert!(
+            !marker.exists(),
+            "the exec ref of an overridden definition must not run"
         );
     }
 
