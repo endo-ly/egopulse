@@ -227,7 +227,14 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
         .map_err(|error| CliError::Runtime(EgoPulseError::Logging(error)))?;
 
     if let Some(prompt) = prompt {
-        return run_headless(config, cli.session.as_deref(), cli.continue_, &prompt).await;
+        return run_headless(
+            config,
+            resolved_config_path,
+            cli.session.as_deref(),
+            cli.continue_,
+            &prompt,
+        )
+        .await;
     }
 
     match &cli.command {
@@ -346,14 +353,16 @@ fn select_ask_target(
     Ok(AskTarget::OneShot)
 }
 
+/// `config_path` は Runtime に渡し、Config と対になる `.env` をツールが使えるようにする。
 async fn run_headless(
     config: Config,
+    config_path: Option<std::path::PathBuf>,
     session: Option<&str>,
     continue_: bool,
     prompt: &str,
 ) -> Result<(), CliError> {
     let (target, existing_state) = if continue_ {
-        let state = runtime::build_app_state(config.clone())
+        let state = runtime::build_app_state_with_path(config.clone(), config_path.clone())
             .await
             .map_err(CliError::Runtime)?;
         let session_names = runtime::list_session_names(&state)
@@ -371,7 +380,7 @@ async fn run_headless(
         AskTarget::Session(session) => {
             let state = match existing_state {
                 Some(state) => state,
-                None => runtime::build_app_state(config)
+                None => runtime::build_app_state_with_path(config, config_path)
                     .await
                     .map_err(CliError::Runtime)?,
             };
