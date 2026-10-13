@@ -14,8 +14,6 @@ pub(crate) mod wizard;
 
 pub(crate) use error::SetupWizardError;
 
-use std::path::PathBuf;
-
 use crate::error::EgoPulseError;
 
 /// Runs the interactive setup wizard and writes the resulting configuration file.
@@ -28,8 +26,8 @@ use crate::error::EgoPulseError;
 ///
 /// Returns `Err(EgoPulseError::SetupWizard(_))` when the wizard fails due to
 /// prompt I/O, validation, config save, or config path resolution errors.
-pub async fn run_setup_wizard(config_path: Option<PathBuf>) -> Result<(), EgoPulseError> {
-    match wizard::run(config_path) {
+pub async fn run_setup_wizard() -> Result<(), EgoPulseError> {
+    match wizard::run() {
         Ok(()) => Ok(()),
         Err(SetupWizardError::Aborted) => Ok(()),
         Err(error) => Err(EgoPulseError::from(error)),

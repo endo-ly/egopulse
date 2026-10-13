@@ -731,6 +731,7 @@ mod tests {
                 usage: Some(crate::llm::LlmUsage {
                     input_tokens: 50,
                     output_tokens: 25,
+                    cached_input_tokens: None,
                 }),
             })],
             vec![0],

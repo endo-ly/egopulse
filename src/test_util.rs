@@ -112,7 +112,12 @@ pub(crate) fn build_state_with_config(
         llm_override,
         channels: channels.unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
         skills: Arc::clone(&skills),
-        tools: Arc::new(ToolRegistry::new(&config, skills)),
+        tools: Arc::new(ToolRegistry::new(
+            &config,
+            skills,
+            state_root_dotenv(&config),
+            unisolated_bash(),
+        )),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents: Arc::new(crate::agent_loop::prompt::SoulAgentsLoader::new(&config)),
@@ -190,7 +195,12 @@ pub(crate) fn build_state_for_restart_simulation(
         llm_override,
         channels: channels.unwrap_or_else(|| Arc::new(ChannelRegistry::new())),
         skills: Arc::clone(&skills),
-        tools: Arc::new(ToolRegistry::new(&config, skills)),
+        tools: Arc::new(ToolRegistry::new(
+            &config,
+            skills,
+            state_root_dotenv(&config),
+            unisolated_bash(),
+        )),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
         soul_agents: Arc::new(crate::agent_loop::prompt::SoulAgentsLoader::new(&config)),
@@ -236,4 +246,17 @@ pub(crate) fn test_tool_context() -> crate::tools::ToolExecutionContext {
         config_snapshot: None,
         tool_call_id: String::new(),
     }
+}
+
+/// The secrets file of a test config, laid out as in production: the config
+/// file and its `.env` live directly under the state root.
+pub(crate) fn state_root_dotenv(config: &Config) -> crate::config::secret_ref::DotenvFile {
+    crate::config::secret_ref::DotenvFile::for_config(Some(
+        &std::path::Path::new(&config.state_root).join("egopulse.config.yaml"),
+    ))
+}
+
+/// Tests run bash directly; the sandbox has its own tests.
+pub(crate) fn unisolated_bash() -> crate::tools::BashSandbox {
+    crate::tools::BashSandbox::unisolated("tests run bash without a sandbox")
 }

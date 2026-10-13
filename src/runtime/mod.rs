@@ -379,12 +379,12 @@ async fn build_runtime_tooling(
     channels: &Arc<ChannelRegistry>,
 ) -> Result<RuntimeTooling, EgoPulseError> {
     let workspace_dir = config.workspace_dir()?;
-    let mcp_manager = Arc::new(tokio::sync::RwLock::new(
-        crate::tools::mcp::McpManager::new(&workspace_dir).await?,
-    ));
+    let mcp = crate::tools::mcp::McpManager::new(&workspace_dir, config_manager.dotenv()).await?;
+    let mcp_secrets = mcp.secrets();
+    let mcp_manager = Arc::new(tokio::sync::RwLock::new(mcp));
 
     let mut tools = build_tool_registry(config, &deps.skills, config_manager);
-    tools.set_mcp_manager(Arc::clone(&mcp_manager));
+    tools.set_mcp_manager(Arc::clone(&mcp_manager), mcp_secrets);
     tools.register_tool(Box::new(crate::tools::SendAttachmentTool::new(
         workspace_dir.clone(),
         Arc::clone(channels),
@@ -414,7 +414,12 @@ fn build_tool_registry(
     skills: &Arc<SkillManager>,
     config_manager: &Arc<ConfigManager>,
 ) -> ToolRegistry {
-    let mut tools = ToolRegistry::new(config, Arc::clone(skills));
+    let dotenv = config_manager.dotenv();
+    let bash_sandbox = crate::tools::BashSandbox::detect(crate::tools::ProtectedPaths {
+        runtime_dir: config.runtime_dir(),
+        secrets_file: dotenv.path().map(std::path::Path::to_path_buf),
+    });
+    let mut tools = ToolRegistry::new(config, Arc::clone(skills), dotenv, bash_sandbox);
     tools.set_config_manager(Arc::clone(config_manager));
     tools
 }
@@ -992,7 +997,9 @@ mod tests {
                 None,
             );
             state.mcp_manager = Some(Arc::new(tokio::sync::RwLock::new(
-                crate::tools::mcp::McpManager::new(&root).await.unwrap(),
+                crate::tools::mcp::McpManager::new(&root, Default::default())
+                    .await
+                    .unwrap(),
             )));
             assert_eq!(
                 state

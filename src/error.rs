@@ -133,7 +133,7 @@ pub enum ConfigError {
     #[error("config_not_found: {path}")]
     ConfigNotFound { path: PathBuf },
     #[error(
-        "config_auto_discovery_failed: no egopulse.config.yaml found. searched={searched_paths:?}. run 'egopulse setup' or pass --config <PATH>"
+        "config_auto_discovery_failed: no egopulse.config.yaml found. searched={searched_paths:?}. run 'egopulse setup'"
     )]
     AutoConfigNotFound { searched_paths: Vec<PathBuf> },
     #[error("config_read_failed: {path}: {source}")]

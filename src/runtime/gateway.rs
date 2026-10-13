@@ -202,10 +202,7 @@ pub enum GatewayAction {
     Restart,
 }
 
-fn resolve_config_for_service(cli_config: Option<&Path>) -> Result<PathBuf, EgoPulseError> {
-    if let Some(path) = cli_config {
-        return Ok(resolve_cli_config_path(path));
-    }
+fn resolve_config_for_service() -> Result<PathBuf, EgoPulseError> {
     Config::resolve_config_path()
         .map_err(EgoPulseError::Config)?
         .ok_or_else(|| {
@@ -213,17 +210,6 @@ fn resolve_config_for_service(cli_config: Option<&Path>) -> Result<PathBuf, EgoP
                 "No configuration found. Run 'egopulse setup' first, then retry.".into(),
             )
         })
-}
-
-/// Resolves a CLI config path to an absolute filesystem path.
-pub fn resolve_cli_config_path(path: &std::path::Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
 }
 
 fn systemd_escape_env(value: &str) -> String {
@@ -241,21 +227,14 @@ fn systemd_escape_env(value: &str) -> String {
 }
 
 /// systemd ユニットファイルの内容を生成する。
+///
+/// Config は固定の場所から読まれるため、`ExecStart` に Config のパスは含めない。
 fn render_systemd_unit(
     exe_path: &str,
-    config_path: &std::path::Path,
+    working_dir: &Path,
     service_env: &BTreeMap<String, String>,
 ) -> String {
-    let config_arg = config_path.to_string_lossy();
-    let escaped_config = config_arg.replace('\\', "\\\\").replace('"', "\\\"");
-    let working_dir = config_path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".egopulse").to_string_lossy().to_string())
-                .unwrap_or_else(|| ".".to_string())
-        });
+    let working_dir = working_dir.to_string_lossy();
 
     let mut env_lines = String::new();
     for (key, value) in service_env {
@@ -272,7 +251,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={working_dir}
-ExecStart={exe_path} --config \"{escaped_config}\" run
+ExecStart={exe_path} run
 {env_lines}\
 Restart=always
 RestartSec=10
@@ -419,8 +398,8 @@ fn restart_installed_service() -> Result<(), EgoPulseError> {
 // Live status collection and rendering
 // ---------------------------------------------------------------------------
 
-async fn fetch_live_status(cli_config: Option<&Path>) -> Option<LiveGatewayStatus> {
-    let config = resolve_config_for_service(cli_config).ok()?;
+async fn fetch_live_status() -> Option<LiveGatewayStatus> {
+    let config = resolve_config_for_service().ok()?;
     let loaded = Config::load_allow_missing_api_key(Some(&config)).ok()?;
     let auth_token = loaded.web_auth_token()?.to_owned();
     let base_url = format!("http://127.0.0.1:{}", loaded.web_port());
@@ -591,6 +570,7 @@ fn append_health_status(
     }
 
     append_mcp_status(health, out);
+    append_bash_sandbox_status(health, out);
 
     if let Some(active_turns) = health.get("active_turns").and_then(|v| v.as_u64()) {
         out.push_str(&format!("Active Turns: {active_turns}\n"));
@@ -631,6 +611,21 @@ fn append_mcp_status(health: &serde_json::Value, out: &mut String) {
         ));
     } else if failed > 0 {
         out.push_str(&format!("          {failed} failed\n"));
+    }
+}
+
+fn append_bash_sandbox_status(health: &serde_json::Value, out: &mut String) {
+    let Some(sandbox) = health
+        .get("bash_sandbox")
+        .filter(|sandbox| !sandbox.is_null())
+    else {
+        return;
+    };
+    if sandbox["enabled"].as_bool().unwrap_or(false) {
+        out.push_str("Bash sandbox ● enabled\n");
+    } else {
+        let reason = sandbox["reason"].as_str().unwrap_or("unknown reason");
+        out.push_str(&format!("Bash sandbox ✗ disabled ({reason})\n"));
     }
 }
 
@@ -797,11 +792,11 @@ ACTIONS:
 // Gateway command dispatch
 // ---------------------------------------------------------------------------
 
-fn install_service(cli_config: Option<&Path>) -> Result<(), EgoPulseError> {
+fn install_service() -> Result<(), EgoPulseError> {
     let systemd = SystemdUserService::connect()?;
     let exe_path = std::env::current_exe()
         .map_err(|e| EgoPulseError::Internal(format!("failed to resolve binary path: {e}")))?;
-    let config_path = resolve_config_for_service(cli_config)?;
+    let config_path = resolve_config_for_service()?;
     if !config_path.exists() {
         return Err(EgoPulseError::Internal(format!(
             "Config not found at: {}. Run 'egopulse setup' first, then retry.",
@@ -817,9 +812,12 @@ fn install_service(cli_config: Option<&Path>) -> Result<(), EgoPulseError> {
         .map_err(|e| EgoPulseError::Internal(format!("failed to create unit directory: {e}")))?;
 
     let already_installed = unit.exists();
+    let working_dir = config_path
+        .parent()
+        .ok_or_else(|| EgoPulseError::Internal("invalid config file path".into()))?;
     let unit_content = render_systemd_unit(
         &exe_path.to_string_lossy(),
-        &config_path,
+        working_dir,
         &build_service_env(),
     );
     std::fs::write(&unit, unit_content)
@@ -869,7 +867,7 @@ fn uninstall_service() -> Result<(), EgoPulseError> {
     Ok(())
 }
 
-async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<(), EgoPulseError> {
+async fn show_gateway_status(json: bool) -> Result<(), EgoPulseError> {
     let systemd = SystemdUserService::connect()?;
     let is_active_output = systemd.command(&["is-active", SERVICE_NAME])?;
     let state = String::from_utf8_lossy(&is_active_output.stdout)
@@ -878,7 +876,7 @@ async fn show_gateway_status(cli_config: Option<&Path>, json: bool) -> Result<()
     let is_active = state == "active";
 
     if is_active {
-        match fetch_live_status(cli_config).await {
+        match fetch_live_status().await {
             Some(status) if json => {
                 let merged =
                     merge_health_and_telemetry_values(&status.status, Some(&status.telemetry));
@@ -927,21 +925,18 @@ fn restart_service_action() -> Result<(), EgoPulseError> {
 /// # Errors
 ///
 /// Returns an error when systemd operations or configuration resolution fail.
-pub async fn run_gateway(
-    cli_config: Option<&Path>,
-    action: Option<GatewayAction>,
-) -> Result<(), EgoPulseError> {
+pub async fn run_gateway(action: Option<GatewayAction>) -> Result<(), EgoPulseError> {
     let Some(action) = action else {
         print_gateway_help();
         return Ok(());
     };
 
     match action {
-        GatewayAction::Install => install_service(cli_config),
+        GatewayAction::Install => install_service(),
         GatewayAction::Start => start_service(),
         GatewayAction::Stop => stop_service(),
         GatewayAction::Uninstall => uninstall_service(),
-        GatewayAction::Status { json } => show_gateway_status(cli_config, json).await,
+        GatewayAction::Status { json } => show_gateway_status(json).await,
         GatewayAction::Restart => restart_service_action(),
     }
 }
@@ -1394,7 +1389,7 @@ mod tests {
 
     #[test]
     fn render_systemd_unit_preserves_service_contract() {
-        let config_path = PathBuf::from("/home/user/.egopulse/egopulse.config.yaml");
+        let working_dir = PathBuf::from("/home/user/.egopulse");
         let mut service_env = BTreeMap::new();
         service_env.insert("HOME".to_string(), "/home/user".to_string());
         service_env.insert(
@@ -1403,11 +1398,10 @@ mod tests {
         );
 
         let unit =
-            render_systemd_unit("/home/user/.local/bin/egopulse", &config_path, &service_env);
+            render_systemd_unit("/home/user/.local/bin/egopulse", &working_dir, &service_env);
 
-        assert!(unit.contains(
-            "ExecStart=/home/user/.local/bin/egopulse --config \"/home/user/.egopulse/egopulse.config.yaml\" run"
-        ));
+        assert!(unit.contains("ExecStart=/home/user/.local/bin/egopulse run\n"));
+        assert!(unit.contains("WorkingDirectory=/home/user/.egopulse\n"));
         assert!(unit.contains("Restart=always"));
         assert!(unit.contains("RestartSec=10"));
         assert!(unit.contains("KillMode=process"));
@@ -1417,23 +1411,10 @@ mod tests {
 
         let without_env = render_systemd_unit(
             "/home/user/.local/bin/egopulse",
-            &config_path,
+            &working_dir,
             &BTreeMap::new(),
         );
         assert!(!without_env.contains("Environment="));
-    }
-
-    #[test]
-    fn render_systemd_unit_escapes_config_path_with_special_chars() {
-        let config_path = PathBuf::from("/tmp/ego pulse/config dir/egopulse.config.yaml");
-        let unit = render_systemd_unit(
-            "/home/user/.local/bin/egopulse",
-            &config_path,
-            &BTreeMap::new(),
-        );
-
-        assert!(unit.contains("/tmp/ego pulse/config dir/egopulse.config.yaml"));
-        assert!(unit.contains("WantedBy=default.target"));
     }
 
     #[test]
@@ -1653,6 +1634,25 @@ mod tests {
         assert!(
             output.contains("1h 0m 0s"),
             "expected 1h uptime, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_shows_the_bash_sandbox_state() {
+        let status = |sandbox: serde_json::Value| {
+            format_gateway_status(
+                &serde_json::json!({ "ok": true, "bash_sandbox": sandbox }).to_string(),
+                None,
+            )
+        };
+
+        let enabled = status(serde_json::json!({ "enabled": true }));
+        let disabled = status(serde_json::json!({ "enabled": false, "reason": "bwrap missing" }));
+
+        assert!(enabled.contains("Bash sandbox ● enabled"), "{enabled}");
+        assert!(
+            disabled.contains("Bash sandbox ✗ disabled (bwrap missing)"),
+            "{disabled}"
         );
     }
 

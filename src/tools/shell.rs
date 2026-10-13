@@ -8,17 +8,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-use crate::config::secret_ref::read_dotenv;
+use crate::config::secret_ref::DotenvFile;
 use crate::llm::ToolDefinition;
 use crate::skills::{SkillManager, resolve_required_env};
 
+use super::bash_sandbox::BashSandbox;
 use super::text::{format_size, truncate_tail};
 use super::{
     DEFAULT_BASH_TIMEOUT_SECS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, Tool, ToolExecutionContext,
-    ToolResult, command_guard, kill_process_group, path_guard, redact_known_secret_patterns,
+    ToolResult, command_guard, kill_process_group, path_guard, redact_secret_patterns,
     schema_object,
 };
 
@@ -30,20 +30,23 @@ pub(crate) struct BashTool {
     /// consistent with dynamic skill discovery (skills added at runtime are
     /// picked up without restart).
     skill_manager: Arc<SkillManager>,
-    /// Path to the runtime dotenv file used for fallback resolution.
-    dotenv_path: PathBuf,
+    /// Secrets file used for fallback resolution.
+    dotenv: DotenvFile,
+    sandbox: BashSandbox,
 }
 
 impl BashTool {
     pub(crate) fn new(
         workspace_dir: PathBuf,
         skill_manager: Arc<SkillManager>,
-        dotenv_path: PathBuf,
+        dotenv: DotenvFile,
+        sandbox: BashSandbox,
     ) -> Self {
         Self {
             workspace_dir,
             skill_manager,
-            dotenv_path,
+            dotenv,
+            sandbox,
         }
     }
 
@@ -61,8 +64,7 @@ impl BashTool {
         let resolved = if keys.is_empty() {
             HashMap::new()
         } else {
-            let dotenv = read_dotenv(&self.dotenv_path);
-            resolve_required_env(&keys, &dotenv)
+            resolve_required_env(&keys, &self.dotenv.read())
         };
 
         *context.skill_env.lock().expect("skill env lock") = resolved.clone();
@@ -126,7 +128,7 @@ impl BashTool {
         };
 
         let output = read_temp_output(&temp_path);
-        let output = redact_known_secret_patterns(&output);
+        let output = redact_secret_patterns(&output);
         let (mut text, details) = render_bash_output(&output, &temp_path);
 
         if !status.success() {
@@ -171,12 +173,8 @@ impl BashTool {
         let stderr = output
             .try_clone()
             .map_err(|error| format!("Failed to prepare bash output file: {error}"))?;
-        let mut cmd = Command::new("bash");
-        cmd.arg("--noprofile")
-            .arg("--norc")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.workspace_dir)
+        let mut cmd = self.sandbox.bash_command(command);
+        cmd.current_dir(&self.workspace_dir)
             .stdout(Stdio::from(output))
             .stderr(Stdio::from(stderr))
             .process_group(0)
@@ -452,7 +450,12 @@ mod tests {
             skills_dir,
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace, skills, dotenv_path);
+        let tool = BashTool::new(
+            workspace,
+            skills,
+            DotenvFile::for_config(Some(&dir.path().join("egopulse.config.yaml"))),
+            crate::test_util::unisolated_bash(),
+        );
         let context = crate::test_util::test_tool_context();
 
         // Act
@@ -474,6 +477,45 @@ mod tests {
                 .get("EGOPULSE_DIRECT_BASH_ENV")
                 .map(String::as_str),
             Some("resolved-value")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn bash_output_redacts_secrets_identified_by_context() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let skills = Arc::new(crate::skills::SkillManager::from_dirs(
+            dir.path().join("skills"),
+            dir.path().join("builtin-skills"),
+        ));
+        let tool = BashTool::new(
+            workspace,
+            skills,
+            DotenvFile::default(),
+            crate::test_util::unisolated_bash(),
+        );
+
+        // Act
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "printf 'SERVICE_API_KEY=%s PORT=8080' Zk3pQ9vLm2XrT8wYb4NcHd6Fs1Jg"
+                }),
+                &crate::test_util::test_tool_context(),
+            )
+            .await;
+
+        // Assert
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result
+                .content
+                .contains("SERVICE_API_KEY=[REDACTED:secret] PORT=8080"),
+            "{}",
+            result.content
         );
     }
 
@@ -515,7 +557,12 @@ mod tests {
             dir.path().join("skills"),
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace.clone(), skills, dir.path().join("dotenv"));
+        let tool = BashTool::new(
+            workspace.clone(),
+            skills,
+            DotenvFile::default(),
+            crate::test_util::unisolated_bash(),
+        );
         let output_path = dir.path().join("bash-output.txt");
         let command = concat!(
             "printf 'canary=%s skill=%s BASH_ENV=%s ENV=%s\\n' ",
@@ -561,7 +608,12 @@ mod tests {
             dir.path().join("skills"),
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace, skills, dir.path().join("dotenv"));
+        let tool = BashTool::new(
+            workspace,
+            skills,
+            DotenvFile::default(),
+            crate::test_util::unisolated_bash(),
+        );
         let marker = dir.path().join("orphan-process-ran");
         let command = format!("( sleep 2; touch '{}' ) & wait", marker.display());
         let context = crate::test_util::test_tool_context();

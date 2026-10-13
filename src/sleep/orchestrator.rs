@@ -1981,6 +1981,7 @@ mod tests {
                     Some(LlmUsage {
                         input_tokens: self.input_tokens,
                         output_tokens: self.output_tokens,
+                        cached_input_tokens: None,
                     })
                 } else {
                     None
@@ -3093,6 +3094,7 @@ mod tests {
                 usage: Some(LlmUsage {
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens: None,
                 }),
             })
         }

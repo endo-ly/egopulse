@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -309,8 +309,31 @@ fn parse_dotenv_contents(contents: &str) -> HashMap<String, String> {
     map
 }
 
-pub(crate) fn dotenv_path(config_dir: &Path) -> std::path::PathBuf {
-    config_dir.join(".env")
+/// 秘密の実値を保存する `.env`。Config ファイルと同じディレクトリに置く。
+///
+/// Config ファイルを持たない構成（テストなど）では存在せず、読み取りは空になる。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DotenvFile {
+    path: Option<PathBuf>,
+}
+
+impl DotenvFile {
+    pub(crate) fn for_config(config_path: Option<&Path>) -> Self {
+        Self {
+            path: config_path
+                .and_then(Path::parent)
+                .map(|dir| dir.join(".env")),
+        }
+    }
+
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// 内容を読む。ファイルが無い場合は空を返す。
+    pub(crate) fn read(&self) -> HashMap<String, String> {
+        self.path.as_deref().map(read_dotenv).unwrap_or_default()
+    }
 }
 
 pub(crate) fn save_dotenv(
@@ -420,6 +443,28 @@ mod tests {
     use crate::test_env::EnvVarGuard;
     use serial_test::serial;
     use std::io::Write as IoWrite;
+
+    #[test]
+    fn dotenv_file_lives_next_to_the_config_file() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "KEY=value\n").expect("write dotenv");
+
+        // Act
+        let dotenv = DotenvFile::for_config(Some(&dir.path().join("egopulse.config.yaml")));
+
+        // Assert
+        assert_eq!(dotenv.path(), Some(dir.path().join(".env").as_path()));
+        assert_eq!(dotenv.read().get("KEY").map(String::as_str), Some("value"));
+    }
+
+    #[test]
+    fn dotenv_file_is_absent_without_a_config_file() {
+        let dotenv = DotenvFile::for_config(None);
+
+        assert_eq!(dotenv.path(), None);
+        assert!(dotenv.read().is_empty());
+    }
 
     #[test]
     #[serial]

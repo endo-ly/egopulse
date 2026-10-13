@@ -1229,7 +1229,12 @@ mod integration_tests {
             config.user_skills_dir().expect("user_skills_dir"),
             config.skills_dir().expect("skills_dir"),
         ));
-        let registry = crate::tools::ToolRegistry::new(&config, skills);
+        let registry = crate::tools::ToolRegistry::new(
+            &config,
+            skills,
+            crate::test_util::state_root_dotenv(&config),
+            crate::test_util::unisolated_bash(),
+        );
 
         assert!(registry.is_read_only("read").await);
         assert!(registry.is_read_only("grep").await);

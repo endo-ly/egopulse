@@ -39,6 +39,52 @@ pub(crate) const SECRET_PATTERNS: &[&str] = &[
     "rk_live_",
 ];
 
+/// 明示的な秘密参照ではない値（リテラル・`.env` の全値）を値ベースのリダクション
+/// 対象にする最小長。`PORT=8080` や `true` のようなありふれた値を除外する。
+const MIN_PLAUSIBLE_SECRET_LEN: usize = 12;
+
+/// 同上のエントロピー下限（bit/文字）。
+const MIN_PLAUSIBLE_SECRET_ENTROPY: f64 = 3.0;
+
+/// 文字列の Shannon エントロピー（bit/文字）。
+pub(super) fn shannon_entropy(value: &str) -> f64 {
+    let mut counts = std::collections::HashMap::<char, usize>::new();
+    let mut total = 0usize;
+    for ch in value.chars() {
+        *counts.entry(ch).or_default() += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return 0.0;
+    }
+    let total = total as f64;
+    counts
+        .values()
+        .map(|&count| {
+            let p = count as f64 / total;
+            -p * p.log2()
+        })
+        .sum()
+}
+
+/// 秘密参照を経ない値が、値ベースのリダクション対象にできる程度の長さと
+/// ランダム性を持つか。
+pub(crate) fn is_plausible_secret_value(value: &str) -> bool {
+    value.chars().count() >= MIN_PLAUSIBLE_SECRET_LEN
+        && shannon_entropy(value) >= MIN_PLAUSIBLE_SECRET_ENTROPY
+}
+
+/// 環境変数・設定キー名が秘密を保持していそうか。
+pub(super) fn is_secret_like_key(name: &str) -> bool {
+    static SECRET_KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(SECRET_KEY_PATTERN).expect("secret key pattern")
+    });
+    SECRET_KEY.is_match(name)
+}
+
+/// 秘密を保持していそうなキー名の部分一致パターン。
+pub(super) const SECRET_KEY_PATTERN: &str = r"(?i)(api[_-]?key|secret|token|passw(?:or)?d|authorization|access[_-]?key|private[_-]?key|credential)";
+
 /// Config から収集したシークレット値で出力をリダクションする。
 pub(crate) fn redact_secrets(output: &str, secrets: &[(String, String)]) -> String {
     if secrets.is_empty() {
@@ -95,9 +141,13 @@ pub(crate) fn redact_known_secret_patterns(output: &str) -> String {
     result
 }
 
+/// prefix ベースと文脈ベースのパターンリダクションを順に適用する。
+pub(crate) fn redact_secret_patterns(output: &str) -> String {
+    super::contextual_redaction::redact_contextual_secrets(&redact_known_secret_patterns(output))
+}
+
 pub(crate) fn sanitize_output_string(output: &str, secrets: &[(String, String)]) -> String {
-    let redacted = redact_secrets(output, secrets);
-    redact_known_secret_patterns(&redacted)
+    redact_secret_patterns(&redact_secrets(output, secrets))
 }
 
 pub(crate) fn sanitize_message_content(
@@ -272,6 +322,24 @@ mod tests {
         // Assert
         assert!(result.contains("[REDACTED:provider.openai.api_key]"));
         assert!(!result.contains("sk-abc123"));
+    }
+
+    /// sanitize_output_string: 登録済みの値・prefix・文脈の三層が順に適用される。
+    #[test]
+    fn test_sanitize_output_string_applies_value_prefix_and_context_layers() {
+        let secrets = vec![(
+            "provider.p.api_key".to_string(),
+            "registered-value".to_string(),
+        )];
+        let input =
+            "a=registered-value b=sk-abc123def c: OTHER_SECRET=Zk3pQ9vLm2XrT8wYb4NcHd6Fs1Jg";
+
+        let output = sanitize_output_string(input, &secrets);
+
+        assert_eq!(
+            output,
+            "a=[REDACTED:provider.p.api_key] b=[REDACTED:secret] c: OTHER_SECRET=[REDACTED:secret]"
+        );
     }
 
     /// redact_secrets: 空のシークレットリストでは入力が変更されない。

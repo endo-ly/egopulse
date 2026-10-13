@@ -169,7 +169,7 @@ systemd unit ファイルの自動生成・配置・有効化まで一括実行�
 egopulse gateway install
 ```
 
-`--config` を指定した場合、その絶対パスが unit に埋め込まれる。省略時は `~/.egopulse/egopulse.config.yaml` が使われる。
+unit は Config のパスを持たない。Runtime は固定の場所（`~/.egopulse/egopulse.config.yaml`）から Config を読む。
 
 削除:
 
@@ -218,7 +218,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/egopulse --config "%h/.egopulse/egopulse.config.yaml" run
+ExecStart=%h/.local/bin/egopulse run
 Restart=always
 RestartSec=10
 Environment=HOME=%h

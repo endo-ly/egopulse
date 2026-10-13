@@ -509,6 +509,7 @@ async fn log_llm_usage(
     let failure_message = request.usage_log_failure;
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
+    let cached_input_tokens = usage.cached_input_tokens;
     let estimated_tokens: i64 = raw_estimate.try_into().unwrap_or(0);
 
     crate::runtime::metrics::inc_llm_tokens_total("input", &provider, input_tokens);
@@ -525,6 +526,7 @@ async fn log_llm_usage(
             request_kind,
             estimated_tokens,
             has_tools,
+            cached_input_tokens,
         })
     })
     .await
@@ -725,6 +727,7 @@ mod tests {
                 usage: Some(crate::llm::LlmUsage {
                     input_tokens: 10,
                     output_tokens: 20,
+                    cached_input_tokens: Some(4),
                 }),
             })],
             vec![0],
@@ -775,6 +778,17 @@ mod tests {
                 assert_eq!(input_tokens, 10);
                 assert_eq!(output_tokens, 20);
                 assert_eq!(total_tokens, 30);
+                let cached: Option<i64> = state
+                    .db
+                    .get_conn()
+                    .expect("conn")
+                    .query_row(
+                        "SELECT cached_input_tokens FROM llm_usage_logs WHERE chat_id = ?1",
+                        [chat_id],
+                        |row| row.get(0),
+                    )
+                    .expect("cached_input_tokens");
+                assert_eq!(cached, Some(4));
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -795,6 +809,7 @@ mod tests {
                 usage: Some(crate::llm::LlmUsage {
                     input_tokens: 1_000,
                     output_tokens: 20,
+                    cached_input_tokens: None,
                 }),
             })],
             vec![0],
@@ -1051,6 +1066,7 @@ mod tests {
                 usage: Some(crate::llm::LlmUsage {
                     input_tokens: 1_000,
                     output_tokens: 20,
+                    cached_input_tokens: None,
                 }),
             })],
             vec![0],
@@ -1130,6 +1146,7 @@ mod tests {
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 15,
                         output_tokens: 25,
+                        cached_input_tokens: None,
                     }),
                 }),
                 Ok(MessagesResponse {
@@ -1139,6 +1156,7 @@ mod tests {
                     usage: Some(crate::llm::LlmUsage {
                         input_tokens: 30,
                         output_tokens: 40,
+                        cached_input_tokens: None,
                     }),
                 }),
             ],

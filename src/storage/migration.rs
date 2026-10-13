@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 16;
+pub(super) const SCHEMA_VERSION: i64 = 17;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -976,6 +976,18 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 16;
     }
 
+    if version < 17 {
+        let tx = conn.unchecked_transaction()?;
+
+        // NULL = the provider did not report cached input tokens; 0 = reported
+        // and nothing was served from the prompt cache.
+        add_column_if_missing(&tx, "llm_usage_logs", "cached_input_tokens", "INTEGER")?;
+
+        set_schema_version_in_tx(&tx, 17, "add llm_usage_logs.cached_input_tokens")?;
+        tx.commit()?;
+        version = 17;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -983,7 +995,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 6;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 7;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1301,6 +1313,17 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         )?;
         tx.commit()?;
         version = 6;
+    }
+
+    if version < 7 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Mirrored from the primary DB.
+        add_column_if_missing(&tx, "llm_usage_logs", "cached_input_tokens", "INTEGER")?;
+
+        set_schema_version_in_tx(&tx, 7, "add llm_usage_logs.cached_input_tokens (secret db)")?;
+        tx.commit()?;
+        version = 7;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
@@ -2802,5 +2825,60 @@ mod tests {
             )
             .expect("turn_runs presence");
         assert_eq!(turn_table, 1);
+    }
+
+    fn llm_usage_has_cached_input_tokens(conn: &rusqlite::Connection) -> bool {
+        conn.prepare("PRAGMA table_info(llm_usage_logs)")
+            .expect("table_info")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("columns")
+            .any(|name| name.expect("column name") == "cached_input_tokens")
+    }
+
+    #[test]
+    fn migration_v17_adds_nullable_cached_input_tokens_and_keeps_rows() {
+        // Arrange: a v16 database holding a usage row recorded before the column existed.
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        super::run_migrations(&conn).expect("fresh migrations");
+        conn.execute_batch("ALTER TABLE llm_usage_logs DROP COLUMN cached_input_tokens")
+            .expect("drop column");
+        conn.execute(
+            "INSERT INTO llm_usage_logs
+                (chat_id, caller_channel, provider, model, input_tokens, output_tokens, total_tokens, created_at)
+             VALUES (1, 'web', 'p', 'm', 10, 5, 15, '2026-10-01T00:00:00Z')",
+            [],
+        )
+        .expect("legacy row");
+        super::set_schema_version(&conn, 16, "test v16 baseline").expect("set v16");
+
+        // Act
+        super::run_migrations(&conn).expect("upgrade to v17");
+
+        // Assert
+        assert!(llm_usage_has_cached_input_tokens(&conn));
+        let cached: Option<i64> = conn
+            .query_row(
+                "SELECT cached_input_tokens FROM llm_usage_logs",
+                [],
+                |row| row.get(0),
+            )
+            .expect("legacy row survives");
+        assert_eq!(cached, None);
+    }
+
+    #[test]
+    fn secret_migration_v7_adds_cached_input_tokens() {
+        // Arrange
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        super::run_secret_migrations(&conn).expect("fresh migrations");
+        conn.execute_batch("ALTER TABLE llm_usage_logs DROP COLUMN cached_input_tokens")
+            .expect("drop column");
+        super::set_schema_version(&conn, 6, "test v6 baseline").expect("set v6");
+
+        // Act
+        super::run_secret_migrations(&conn).expect("upgrade to v7");
+
+        // Assert
+        assert!(llm_usage_has_cached_input_tokens(&conn));
     }
 }

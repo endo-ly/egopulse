@@ -2,6 +2,16 @@
 
 EgoPulse は単一バイナリとして配布されます。Linux（x86_64 / arm64）と macOS（Apple Silicon）に対応しています。
 
+## 推奨パッケージ（Linux）
+
+Linux では、`bash` ツールの子プロセスを bubblewrap (`bwrap`) で隔離し、EgoPulse の私有データと秘密を見えなくします。`/usr/bin` などのシステムのディレクトリに入れてください。
+
+```sh
+sudo apt install bubblewrap   # Debian / Ubuntu
+```
+
+`bwrap` が無い、または起動できない環境（ユーザー名前空間が制限されている場合など）では、`bash` は隔離せずに実行されます。その状態は起動時のログと `/api/status` の `bash_sandbox` で確認できます。詳細は [security.md §7](./security.md#7-bash-の隔離) を参照してください。
+
 ## ワンライナーでインストール
 
 ```sh

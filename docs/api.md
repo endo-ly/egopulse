@@ -100,11 +100,12 @@ Authorization: Bearer <channels.web.auth_token>
   },
   "active_turns": 2,
   "recent_errors_count": 3,
-  "instance_lock": { "held": true }
+  "instance_lock": { "held": true },
+  "bash_sandbox": { "enabled": true }
 }
 ```
 
-`version`、`uptime_secs`、`pid`、DB / channel / task / active turn の状態、MCP の接続済み・失敗サーバー、recent error 件数、critical task failure を返す。接続済みサーバーには transport と利用可能な tool 名を、失敗サーバーにはエラー概要を含める。`instance_lock` は lock の保有状態だけを返し、lock file の絶対パスは含めない。
+`version`、`uptime_secs`、`pid`、DB / channel / task / active turn の状態、MCP の接続済み・失敗サーバー、recent error 件数、critical task failure を返す。接続済みサーバーには transport と利用可能な tool 名を、失敗サーバーにはエラー概要を含める。`instance_lock` は lock の保有状態だけを返し、lock file の絶対パスは含めない。`bash_sandbox` は bash 子プロセスの隔離が有効かを返し、無効な場合は `reason` に理由を含める（[security.md §7](./security.md#7-bash-の隔離)）。
 
 ---
 

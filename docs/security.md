@@ -10,6 +10,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 4. [制約事項](#4-制約事項)
 5. [Secret Mode 隔離戦略](#5-secret-mode-隔離戦略)
 6. [Local API の trust boundary](#6-local-api-の-trust-boundary)
+7. [Bash の隔離](#7-bash-の隔離)
 
 ---
 
@@ -25,6 +26,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 │  └ パス検閲     (全ツール)       │
 ├─────────────────────────────────┤
 │  ツール実行                      │
+│  └ bash の隔離  (bash のみ, §7)  │
 ├─────────────────────────────────┤
 │  事後処理                        │
 │  └ 出力リダクション (全ツール)    │
@@ -135,6 +137,11 @@ Bash は `--noprofile --norc -c` で起動し、ログイン設定や起動フ�
   - `channels.<channel>.telegram_bots.<bot_id>.token`（Telegram）
   - `webhooks.receivers.<receiver_id>.token`
   - `codex.bearer_token`（`openai-codex` プロバイダー使用時）
+  - `mcp.<server>.headers.<key>` / `mcp.<server>.env.<key>`（接続済み server の解決後の値と、`mcp.json` / `mcp.d` にある全 server 定義のリテラル値。リテラル値は接続に失敗した server や後続の定義に上書きされた server も含む。リテラル値の収集では秘密参照を解決せず、`exec` も実行しない。`Authorization: Bearer <token>` は値全体に加えて `<token>` 単体も登録する）
+  - `dotenv.<KEY>`（`.env` の全値。更新時刻でキャッシュし、変更はツール結果ごとに反映される）
+  - `skill_env.<KEY>`（Turn に注入された skill の `required_env` の値）
+- 秘密参照（`{ "source": "env" | "exec" }`）で宣言された値は、長さに関わらず登録する
+- 参照を経ないリテラル（MCP の平文値、`.env` の全値）は、12 文字以上かつ Shannon エントロピー 3.0 bit/文字以上のものだけ登録する。`PORT=8080` や `true` のようなありふれた値で出力が崩れることを防ぐ。キー名が秘密を示すのに条件を満たさない `.env` の値は、キー名のみを起動時に `warn` に出す
 - `file_token` / `file_auth_token` の YAML 表現は秘密値の正本として使わない
 - 空文字列は登録しない（誤検出防止）
 - 同じ値が複数経路に存在する場合は値で deduplicate し、置換結果を決定的にする
@@ -164,12 +171,27 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | `sk_test_` | Stripe Test Secret Key |
 | `rk_live_` | Stripe Live Restricted Key |
 
+#### 文脈ベースリダクション
+
+prefix を持たない値や Config に登録されていない値も、周囲の文脈が秘密の保持を示す場合に `[REDACTED:secret]` へ置換する。値ベース・prefix ベースの後に適用する。bash の標準出力にも同じ処理を適用する。
+
+| 規則 | 検出する形 | 置換条件 |
+|---|---|---|
+| 代入形 | `KEY=VALUE`、`key: value`、`"key": "value"`。キー名が `api_key` / `secret` / `token` / `password` / `passwd` / `authorization` / `access_key` / `private_key` / `credential` を部分一致で含む（大文字小文字不問、`-` / `_` 区切り不問） | 値が 20 文字以上、Shannon エントロピー 3.5 bit/文字以上、lower / upper / digit のうち 2 種以上を含む |
+| Authorization | `Authorization: Bearer / Basic / Token <値>` | 値が 8 文字以上 |
+| Bearer | ヘッダー名を伴わない `Bearer <値>` | 値が 16 文字以上かつ文字クラス 2 種以上 |
+| URL クエリ | `?` / `&` の後の `access_token` / `id_token` / `refresh_token` / `token` / `api_key` / `apikey` / `sig` / `signature` / `code` / `x-amz-signature` / `x-amz-credential` / `x-amz-security-token` | 値が 8 文字以上 |
+
+- 代入形は、パス（`/`、`./`、`../`、`~` 始まり）、URL（`http(s)://` 始まり）、プレースホルダー（`$`、`{`、`*` 始まり、`REDACTED` を含む値）を置換しない。小文字だけの snake_case の単語（`authorization_code_flow` など）や数字だけの値も、文字クラスの条件で置換しない
+- `ps eww` や環境変数ダンプのように `KEY=VALUE` が空白区切りで並ぶ出力は、代入形で 1 件ずつ検出される
+- 偽陽性（秘密ではない値が伏せられる）は出力が欠けるだけで済むため許容し、偽陰性（漏洩）を避ける方向に倒す。秘密風の代入行を `read` した後にその行を `edit` する場合は、伏せられた値が `old_string` と一致しない
+
 #### 保証範囲と限界
 
 現時点の出力リダクションは、上記のとおり Config に登録された既知の秘密値と well-known パターンを対象とする。これは「ツール出力経由の偶発的・低レベルな秘密露出」に対する防御であり、Shell ツールの OS sandbox ではない。
 
 - Shell ツール（`bash` / `write` / `edit`）によるプロセス外への秘密書き出しは、本リダクションでは防げない。OS レベルの隔離は現時点では未実施である。
-- LLM への Prompt Injection により Agent が秘密値を加工・断片化して出力する経路を完全に封止する保証はない。パターンベース・値ベースの二層リダクションは可能な限り広く覆うが、完全な exfiltration 防止を主張しない。
+- LLM への Prompt Injection により Agent が秘密値を加工・断片化して出力する経路を完全に封止する保証はない。値ベース・prefix ベース・文脈ベースのリダクションは可能な限り広く覆うが、完全な exfiltration 防止を主張しない。
 - ツール実行そのものを禁止・隔離する境界は事前検査（コマンド・パス検閲）で担う。OS sandbox は現時点では未実施である。
 
 ---
@@ -184,8 +206,10 @@ Well-known なシークレットプレフィックスに一致する文字列を
 | `/proc/<pid>/*` のブロック | 他プロセスの内部情報読み取り不可 | なし |
 | `.env` 系のパスガード | `cat .env` での直接読み取り不可 | 値はツール経由で注入済み |
 | 出力リダクション | シークレット値が結果に含まれない | `[REDACTED:KEY_NAME]` として表示 |
-| Compaction Archive | 会話アーカイブにシークレットが含まれる | 二層 redaction 適用 + ファイルパーミッション `0600` |
-| 値ベースリダクションの対象外 | Config に登録されていないシークレットはマスクされない | パターンベースで補完 |
+| Compaction Archive | 会話アーカイブにシークレットが含まれる | 三層 redaction（値・prefix・文脈）適用 + ファイルパーミッション `0600` |
+| 値ベースリダクションの対象外 | Config・MCP・`.env` に存在しない秘密（他プロセスの環境変数など）はマスクされない | prefix ベース・文脈ベースで補完 |
+| bash の隔離 | `.env` と `<state_root>/runtime/`（DB・バックアップ・会話アーカイブ・Local API のソケット）を bash から読めない | 方針メッセージが表示される。必要な値は skill の `required_env` で注入し、それ以外はユーザーに依頼する |
+| MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。Runtime が解決した値を自前のエンドポイントへ送らせる意図的な迂回は防げない | §7 の対象外（意図的な迂回） |
 
 ---
 
@@ -242,4 +266,53 @@ Runtime と TUI の間の Local API は、`<state_root>/runtime/egopulse.sock` �
 - Slash Command の実行
 - Tool 実行中の follow-up 入力の登録
 
+bash の子プロセスからは、§7 の隔離によりソケットが見えない（Linux で隔離が有効な場合）。
+
 Local API の Turn は Session の Channel identity を維持するが、TUI Client が所有する応答は接続中の Client へ配送し、元の Channel Adapter へ自動送信しない。`state_root` は絶対パスで指定し、Runtime と TUI の endpoint 解決基準を一致させる。
+
+---
+
+## 7. Bash の隔離
+
+**対象**: `bash`（Linux）  
+**実装**: [bash_sandbox.rs](../../egopulse/src/tools/bash_sandbox.rs)
+
+字句検査（§2）はスクリプトの作成や動的なパス組み立てで迂回できる。bash の子プロセスは bubblewrap (`bwrap`) の中で起動し、EgoPulse の私有データと秘密を OS レベルで見えなくする。
+
+### 守る範囲
+
+- **守る**: エージェントがふつうの手段（`cat`、`sqlite3`、スクリプト、`ps`）で EgoPulse の私有データと秘密に触れること
+- **守らない**: 隔離を破ること自体を目的とした意図的な迂回（`systemd-run` や `docker` で隔離の外にプロセスを起動する、ディスク装置を直接読む、など）
+- 隠した場所に触れると方針メッセージ（`This path is hidden from bash by EgoPulse's security policy. ...`）が見え、回避せずユーザーに依頼するよう促す
+
+### 隠すもの
+
+| 対象 | 場所 | 隠し方 |
+|---|---|---|
+| Runtime の私有ディレクトリ | `<state_root>/runtime/` | tmpfs で覆い、`HIDDEN_BY_POLICY.txt` だけを置いて読み取り専用にする。DB・secret DB・バックアップ・会話アーカイブ・Local API のソケット・後から作られるファイルをまとめて隠す |
+| 秘密ファイル | 設定ファイルと同じディレクトリの `.env` | 方針メッセージを読み取り専用で重ねる（存在する場合のみ） |
+
+設定ファイルと MCP の設定ファイルは隠さない。秘密は SecretRef で `.env` に置き、これらのファイルには参照だけを書く。他のツールが使う認証情報も隠さない。
+
+### 仕組み
+
+- ホストのファイルシステムはそのまま見せる。PID・ネットワーク・`/run` は分離しないため、`systemctl`、`journalctl`、tmux（呼び出しをまたいで残るセッションを含む）は通常どおり使える
+- Capability は、Docker が root のコンテナに既定で与える組から `CAP_MKNOD` を除いたものに絞る。パッケージ管理などの通常の root 作業は動く。マウント操作（`CAP_SYS_ADMIN`）、他プロセスの検査（`CAP_SYS_PTRACE`）、ファイルハンドル経由の読み取り（`CAP_DAC_READ_SEARCH`）は持たないため、隠したマウントの解除、`/proc/<pid>/root` や `/proc/<pid>/fd` を経由した読み取り、より多くの Capability を持つプロセス（root で動く通常のサービスなど）の環境変数の読み取りは拒否される
+- `bwrap` はシステムのディレクトリ（`/usr/bin`、`/usr/local/bin`、`/bin`）からだけ探す。`PATH` 上の偽の実行ファイルを掴まないため
+
+### 隔離できない場合
+
+起動時に、Linux であること、`bwrap` が見つかること、隠すパスのマウントを含む本番と同じ構成で実際に起動できることを確かめる。満たさない場合は bash を隔離せずに実行し、次の方法で知らせる。
+
+- 起動時の `warn` ログ（理由付き）
+- `/api/status` の `bash_sandbox`（`{"enabled": false, "reason": "..."}`）と `egopulse gateway status` の表示
+
+### 残るリスク
+
+- `systemd-run` や `docker` など、隔離の外でプロセスを起動する手段を使った迂回
+- ディスク装置を直接読む経路
+- 設定を保存すると `.env` が置き換えられ、それ以前から動き続けているプロセス（tmux のセッションなど）からは新しい `.env` が見える
+- 設定ファイル・MCP の設定ファイルに平文で書いた秘密の利用（出力リダクションはされる）
+- ネットワークは制限しないため、ローカルで動く他サービスへのアクセス
+- Capability を絞って起動されたプロセスの環境変数は、sandbox 側の Capability がそれを包含する場合に読める
+

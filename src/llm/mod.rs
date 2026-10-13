@@ -170,6 +170,8 @@ impl Message {
 pub(crate) struct LlmUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// `input_tokens` のうち prompt cache から供給された分。Provider が報告しない場合は `None`。
+    pub cached_input_tokens: Option<i64>,
 }
 
 /// Parsed response from the LLM containing text and/or tool calls.
@@ -648,8 +650,42 @@ mod tests {
             Some(super::LlmUsage {
                 input_tokens: 10,
                 output_tokens: 20,
+                cached_input_tokens: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_openai_response_extracts_cached_tokens() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{"message": {"content": "hello", "tool_calls": null}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 64}
+            }
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+
+        assert_eq!(
+            response.usage.map(|u| u.cached_input_tokens),
+            Some(Some(64))
+        );
+    }
+
+    #[test]
+    fn parse_openai_response_leaves_cached_tokens_unset_when_unreported() {
+        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{"message": {"content": "hello", "tool_calls": null}}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {}}
+        }))
+        .unwrap();
+
+        let response = super::parse_openai_response(body).unwrap();
+
+        assert_eq!(response.usage.map(|u| u.cached_input_tokens), Some(None));
     }
 
     #[test]
@@ -710,6 +746,7 @@ mod tests {
             Some(super::LlmUsage {
                 input_tokens: 15,
                 output_tokens: 25,
+                cached_input_tokens: None,
             })
         );
     }

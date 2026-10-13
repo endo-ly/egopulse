@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::metrics;
 use crate::runtime::status::{AuditError, ChannelHealth, ChannelState, StatusSnapshot, TurnRecord};
+use crate::tools::BashSandboxStatus;
 use crate::tools::mcp::McpStatus;
 
 use super::WebState;
@@ -38,6 +39,7 @@ pub(crate) struct DetailedStatusResponse {
     owned_task_count: usize,
     channels: std::collections::HashMap<String, ChannelHealth>,
     mcp: McpStatus,
+    bash_sandbox: BashSandboxStatus,
     active_turns: usize,
     recent_errors_count: usize,
     instance_lock: InstanceLockStatus,
@@ -113,6 +115,7 @@ pub(super) async fn status(state: State<WebState>) -> Json<DetailedStatusRespons
         owned_task_count: snapshot.owned_task_count,
         channels: snapshot.channels,
         mcp: build_mcp_status(&state).await,
+        bash_sandbox: state.app_state.tools.bash_sandbox_status().clone(),
         active_turns,
         recent_errors_count: snapshot.recent_errors.len(),
         instance_lock: InstanceLockStatus {
@@ -383,6 +386,20 @@ mod tests {
         assert!(json.get("mcp").is_some());
         assert_eq!(json["mcp"]["connected"], serde_json::json!([]));
         assert_eq!(json["mcp"]["failed"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_bash_sandbox_state() {
+        let state = test_state();
+
+        let Json(resp) = status(State(state)).await;
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["bash_sandbox"]["enabled"], serde_json::json!(false));
+        assert_eq!(
+            json["bash_sandbox"]["reason"],
+            serde_json::json!("tests run bash without a sandbox")
+        );
     }
 
     #[tokio::test]

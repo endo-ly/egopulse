@@ -77,6 +77,37 @@ MCP (Model Context Protocol) の設定・接続・ツール動的公開の仕様
 **`stdio`**: `command`, `args`, `env`
 **`streamable_http`**: `endpoint`, `headers`
 
+#### 秘密の指定
+
+`env` と `headers` の値は、文字列リテラルか秘密参照で指定する。秘密参照は Config（`egopulse.config.yaml`）と同じ形式で、`.env` またはプロセス環境変数から値を解決する。
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "transport": "streamable_http",
+      "endpoint": "http://127.0.0.1:8080/mcp",
+      "headers": {
+        "Authorization": { "source": "env", "id": "REMOTE_MCP_AUTHORIZATION" }
+      }
+    }
+  }
+}
+```
+
+```dotenv
+# ~/.egopulse/.env
+REMOTE_MCP_AUTHORIZATION=Bearer <token>
+```
+
+- `source: "exec"` は `command` の標準出力を値にする
+- `Bearer <token>` のような認証スキーム付きの値は、参照先の値に `Bearer ` を含めて保存する
+- 解決は接続のたびに行う。再接続時には `.env` の更新が反映される
+- 参照が解決できない server は接続せず、`failed` として扱う。リテラルへのフォールバックはしない
+- 解決後の値はツール出力・ツール入力の記録から `[REDACTED:mcp.<server>.<headers|env>.<key>]` として伏せられる（[security.md](./security.md#値ベースリダクション)）
+
+平文のリテラルは動作するが、`mcp.json` を読むだけで秘密が見えるため、秘密は参照で指定する。
+
 ### 設定例
 
 #### `stdio`
