@@ -6,6 +6,7 @@
 
 mod activate_skill;
 mod agent_send;
+mod bash_sandbox;
 mod command_guard;
 mod contextual_redaction;
 mod dotenv_secrets;
@@ -288,6 +289,7 @@ pub(crate) struct ToolRegistry {
     tool_index: std::collections::HashMap<String, usize>,
     config_secrets: Vec<(String, String)>,
     dotenv_secrets: DotenvSecrets,
+    bash_sandbox_status: BashSandboxStatus,
     config_manager: Option<Arc<crate::config::ConfigManager>>,
     mcp_manager: Option<Arc<tokio::sync::RwLock<crate::tools::mcp::McpManager>>>,
     mcp_secrets: Option<crate::tools::mcp::McpSecrets>,
@@ -297,12 +299,14 @@ impl ToolRegistry {
     /// Instantiate all built-in tools scoped to the configured workspace.
     ///
     /// `dotenv` is the secrets file that skill `required_env` values and
-    /// output redaction read from.
+    /// output redaction read from; `bash_sandbox` decides how bash children run.
     pub(crate) fn new(
         config: &Config,
         skill_manager: Arc<SkillManager>,
         dotenv: DotenvFile,
+        bash_sandbox: BashSandbox,
     ) -> Self {
+        let bash_sandbox_status = bash_sandbox.status();
         let workspace_dir = match config.workspace_dir() {
             Ok(dir) => dir,
             Err(error) => {
@@ -316,6 +320,7 @@ impl ToolRegistry {
                     tools,
                     config_secrets: collect_config_secrets(config),
                     dotenv_secrets: DotenvSecrets::new(dotenv),
+                    bash_sandbox_status,
                     config_manager: None,
                     mcp_manager: None,
                     mcp_secrets: None,
@@ -335,6 +340,7 @@ impl ToolRegistry {
                 workspace_dir.clone(),
                 Arc::clone(&skill_manager),
                 dotenv.clone(),
+                bash_sandbox,
             )),
             Box::new(EditTool::new(workspace_dir.clone())),
             Box::new(WriteTool::new(workspace_dir.clone())),
@@ -349,10 +355,16 @@ impl ToolRegistry {
             tools,
             config_secrets: collect_config_secrets(config),
             dotenv_secrets: DotenvSecrets::new(dotenv),
+            bash_sandbox_status,
             config_manager: None,
             mcp_manager: None,
             mcp_secrets: None,
         }
+    }
+
+    /// How bash children run, for status reporting.
+    pub(crate) fn bash_sandbox_status(&self) -> &BashSandboxStatus {
+        &self.bash_sandbox_status
     }
 
     /// Binds the registry to the shared configuration manager.
@@ -565,6 +577,8 @@ fn append_unique_secrets(secrets: &mut Vec<(String, String)>, additional: Vec<(S
 
 use dotenv_secrets::DotenvSecrets;
 
+pub(crate) use bash_sandbox::{BashSandbox, BashSandboxStatus, ProtectedPaths};
+
 pub(crate) use activate_skill::ActivateSkillTool;
 pub(crate) use agent_send::AgentSendTool;
 pub(crate) use web_fetch::WebFetchTool;
@@ -677,6 +691,7 @@ mod tests {
             config,
             Arc::new(SkillManager::from_dirs(skills_dir.clone(), skills_dir)),
             crate::test_util::state_root_dotenv(config),
+            crate::test_util::unisolated_bash(),
         )
     }
 
@@ -1154,6 +1169,7 @@ mod tests {
             &initial,
             skills,
             crate::test_util::state_root_dotenv(&initial),
+            crate::test_util::unisolated_bash(),
         );
         registry.set_config_manager(manager);
         registry.register_tool(Box::new(StaticTool {

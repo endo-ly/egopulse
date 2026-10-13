@@ -414,7 +414,12 @@ fn build_tool_registry(
     skills: &Arc<SkillManager>,
     config_manager: &Arc<ConfigManager>,
 ) -> ToolRegistry {
-    let mut tools = ToolRegistry::new(config, Arc::clone(skills), config_manager.dotenv());
+    let dotenv = config_manager.dotenv();
+    let bash_sandbox = crate::tools::BashSandbox::detect(crate::tools::ProtectedPaths {
+        runtime_dir: config.runtime_dir(),
+        secrets_file: dotenv.path().map(std::path::Path::to_path_buf),
+    });
+    let mut tools = ToolRegistry::new(config, Arc::clone(skills), dotenv, bash_sandbox);
     tools.set_config_manager(Arc::clone(config_manager));
     tools
 }

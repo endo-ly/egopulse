@@ -116,6 +116,7 @@ pub(crate) fn build_state_with_config(
             &config,
             skills,
             state_root_dotenv(&config),
+            unisolated_bash(),
         )),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
@@ -198,6 +199,7 @@ pub(crate) fn build_state_for_restart_simulation(
             &config,
             skills,
             state_root_dotenv(&config),
+            unisolated_bash(),
         )),
         mcp_manager: None,
         assets: Arc::new(AssetStore::new(&config.assets_dir()).expect("assets")),
@@ -252,4 +254,9 @@ pub(crate) fn state_root_dotenv(config: &Config) -> crate::config::secret_ref::D
     crate::config::secret_ref::DotenvFile::for_config(Some(
         &std::path::Path::new(&config.state_root).join("egopulse.config.yaml"),
     ))
+}
+
+/// Tests run bash directly; the sandbox has its own tests.
+pub(crate) fn unisolated_bash() -> crate::tools::BashSandbox {
+    crate::tools::BashSandbox::unisolated("tests run bash without a sandbox")
 }

@@ -232,6 +232,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `timeout: integer` 任意。秒
 - 挙動:
   - workspace を cwd にして、コマンド文字列を加工せず `bash --noprofile --norc -c` に渡して実行する。ログインシェルやユーザー起動ファイルは使用しない
+  - Linux では bubblewrap の中で起動し、`.env` と `<state_root>/runtime/` を方針メッセージに差し替える。隔離できない環境では隔離せずに実行する（[security.md §7](./security.md#7-bash-の隔離)）
   - 親プロセスの環境変数は引き継がず、`PATH` / `HOME` / `LANG` / `TERM` と skill の `required_env` の解決値のみを渡す。skill の値は同名の継承キーより優先される。`BASH_ENV` / `ENV` / `SHELLOPTS` / `BASHOPTS` は skill の宣言からも除外する
   - stdout / stderr はプロセス起動時に同一の一時ファイルへ割り当て、1 つのログに結合する。bash 自身の構文エラーもこのログに含まれる
   - 出力は末尾側を最大 `2000` 行または `100KB` に tail truncation する

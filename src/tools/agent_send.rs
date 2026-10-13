@@ -1233,6 +1233,7 @@ mod integration_tests {
             &config,
             skills,
             crate::test_util::state_root_dotenv(&config),
+            crate::test_util::unisolated_bash(),
         );
 
         assert!(registry.is_read_only("read").await);

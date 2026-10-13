@@ -10,6 +10,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 4. [制約事項](#4-制約事項)
 5. [Secret Mode 隔離戦略](#5-secret-mode-隔離戦略)
 6. [Local API の trust boundary](#6-local-api-の-trust-boundary)
+7. [Bash の隔離](#7-bash-の隔離)
 
 ---
 
@@ -25,6 +26,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 │  └ パス検閲     (全ツール)       │
 ├─────────────────────────────────┤
 │  ツール実行                      │
+│  └ bash の隔離  (bash のみ, §7)  │
 ├─────────────────────────────────┤
 │  事後処理                        │
 │  └ 出力リダクション (全ツール)    │
@@ -206,7 +208,8 @@ prefix を持たない値や Config に登録されていない値も、周囲�
 | 出力リダクション | シークレット値が結果に含まれない | `[REDACTED:KEY_NAME]` として表示 |
 | Compaction Archive | 会話アーカイブにシークレットが含まれる | 三層 redaction（値・prefix・文脈）適用 + ファイルパーミッション `0600` |
 | 値ベースリダクションの対象外 | Config・MCP・`.env` に存在しない秘密（他プロセスの環境変数など）はマスクされない | prefix ベース・文脈ベースで補完 |
-| MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。OS 隔離がないため、bash で同じ値を読む経路を塞げない | OS レベルの隔離（未実施）が前提 |
+| bash の隔離 | `.env` と `<state_root>/runtime/`（DB・バックアップ・会話アーカイブ・Local API のソケット）を bash から読めない | 方針メッセージが表示される。必要な値は skill の `required_env` で注入し、それ以外はユーザーに依頼する |
+| MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。Runtime が解決した値を自前のエンドポイントへ送らせる意図的な迂回は防げない | §7 の対象外（意図的な迂回） |
 
 ---
 
@@ -263,4 +266,53 @@ Runtime と TUI の間の Local API は、`<state_root>/runtime/egopulse.sock` �
 - Slash Command の実行
 - Tool 実行中の follow-up 入力の登録
 
+bash の子プロセスからは、§7 の隔離によりソケットが見えない（Linux で隔離が有効な場合）。
+
 Local API の Turn は Session の Channel identity を維持するが、TUI Client が所有する応答は接続中の Client へ配送し、元の Channel Adapter へ自動送信しない。`state_root` は絶対パスで指定し、Runtime と TUI の endpoint 解決基準を一致させる。
+
+---
+
+## 7. Bash の隔離
+
+**対象**: `bash`（Linux）  
+**実装**: [bash_sandbox.rs](../../egopulse/src/tools/bash_sandbox.rs)
+
+字句検査（§2）はスクリプトの作成や動的なパス組み立てで迂回できる。bash の子プロセスは bubblewrap (`bwrap`) の中で起動し、EgoPulse の私有データと秘密を OS レベルで見えなくする。
+
+### 守る範囲
+
+- **守る**: エージェントがふつうの手段（`cat`、`sqlite3`、スクリプト、`ps`）で EgoPulse の私有データと秘密に触れること
+- **守らない**: 隔離を破ること自体を目的とした意図的な迂回（`systemd-run` や `docker` で隔離の外にプロセスを起動する、ディスク装置を直接読む、など）
+- 隠した場所に触れると方針メッセージ（`This path is hidden from bash by EgoPulse's security policy. ...`）が見え、回避せずユーザーに依頼するよう促す
+
+### 隠すもの
+
+| 対象 | 場所 | 隠し方 |
+|---|---|---|
+| Runtime の私有ディレクトリ | `<state_root>/runtime/` | tmpfs で覆い、`HIDDEN_BY_POLICY.txt` だけを置いて読み取り専用にする。DB・secret DB・バックアップ・会話アーカイブ・Local API のソケット・後から作られるファイルをまとめて隠す |
+| 秘密ファイル | 設定ファイルと同じディレクトリの `.env` | 方針メッセージを読み取り専用で重ねる（存在する場合のみ） |
+
+設定ファイルと MCP の設定ファイルは隠さない。秘密は SecretRef で `.env` に置き、これらのファイルには参照だけを書く。他のツールが使う認証情報も隠さない。
+
+### 仕組み
+
+- ホストのファイルシステムはそのまま見せる。PID・ネットワーク・`/run` は分離しないため、`systemctl`、`journalctl`、tmux（呼び出しをまたいで残るセッションを含む）は通常どおり使える
+- Capability は、Docker が root のコンテナに既定で与える組から `CAP_MKNOD` を除いたものに絞る。パッケージ管理などの通常の root 作業は動く。マウント操作（`CAP_SYS_ADMIN`）、他プロセスの検査（`CAP_SYS_PTRACE`）、ファイルハンドル経由の読み取り（`CAP_DAC_READ_SEARCH`）は持たないため、隠したマウントの解除、`/proc/<pid>/root` や `/proc/<pid>/fd` を経由した読み取り、より多くの Capability を持つプロセス（root で動く通常のサービスなど）の環境変数の読み取りは拒否される
+- `bwrap` はシステムのディレクトリ（`/usr/bin`、`/usr/local/bin`、`/bin`）からだけ探す。`PATH` 上の偽の実行ファイルを掴まないため
+
+### 隔離できない場合
+
+起動時に、Linux であること、`bwrap` が見つかること、実際に起動できることを確かめる。満たさない場合は bash を隔離せずに実行し、次の方法で知らせる。
+
+- 起動時の `warn` ログ（理由付き）
+- `/api/status` の `bash_sandbox`（`{"enabled": false, "reason": "..."}`）と `egopulse gateway status` の表示
+
+### 残るリスク
+
+- `systemd-run` や `docker` など、隔離の外でプロセスを起動する手段を使った迂回
+- ディスク装置を直接読む経路
+- 設定を保存すると `.env` が置き換えられ、それ以前から動き続けているプロセス（tmux のセッションなど）からは新しい `.env` が見える
+- 設定ファイル・MCP の設定ファイルに平文で書いた秘密の利用（出力リダクションはされる）
+- ネットワークは制限しないため、ローカルで動く他サービスへのアクセス
+- Capability を絞って起動されたプロセスの環境変数は、sandbox 側の Capability がそれを包含する場合に読める
+

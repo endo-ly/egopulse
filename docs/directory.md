@@ -44,6 +44,7 @@
 ├── runtime/
 │   ├── egopulse.db
 │   ├── egopulse.sock      # 稼働中 Runtime の Local API Unix socket
+│   ├── bash-sandbox-hidden.txt  # bash の隔離で隠した場所に見せる方針メッセージ
 │   ├── assets/
 │   ├── groups/
 │   │   ├── telegram/

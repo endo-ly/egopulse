@@ -570,6 +570,7 @@ fn append_health_status(
     }
 
     append_mcp_status(health, out);
+    append_bash_sandbox_status(health, out);
 
     if let Some(active_turns) = health.get("active_turns").and_then(|v| v.as_u64()) {
         out.push_str(&format!("Active Turns: {active_turns}\n"));
@@ -610,6 +611,21 @@ fn append_mcp_status(health: &serde_json::Value, out: &mut String) {
         ));
     } else if failed > 0 {
         out.push_str(&format!("          {failed} failed\n"));
+    }
+}
+
+fn append_bash_sandbox_status(health: &serde_json::Value, out: &mut String) {
+    let Some(sandbox) = health
+        .get("bash_sandbox")
+        .filter(|sandbox| !sandbox.is_null())
+    else {
+        return;
+    };
+    if sandbox["enabled"].as_bool().unwrap_or(false) {
+        out.push_str("Bash sandbox ● enabled\n");
+    } else {
+        let reason = sandbox["reason"].as_str().unwrap_or("unknown reason");
+        out.push_str(&format!("Bash sandbox ✗ disabled ({reason})\n"));
     }
 }
 
@@ -1618,6 +1634,25 @@ mod tests {
         assert!(
             output.contains("1h 0m 0s"),
             "expected 1h uptime, got: {output}"
+        );
+    }
+
+    #[test]
+    fn format_gateway_status_shows_the_bash_sandbox_state() {
+        let status = |sandbox: serde_json::Value| {
+            format_gateway_status(
+                &serde_json::json!({ "ok": true, "bash_sandbox": sandbox }).to_string(),
+                None,
+            )
+        };
+
+        let enabled = status(serde_json::json!({ "enabled": true }));
+        let disabled = status(serde_json::json!({ "enabled": false, "reason": "bwrap missing" }));
+
+        assert!(enabled.contains("Bash sandbox ● enabled"), "{enabled}");
+        assert!(
+            disabled.contains("Bash sandbox ✗ disabled (bwrap missing)"),
+            "{disabled}"
         );
     }
 
