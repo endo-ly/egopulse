@@ -379,11 +379,7 @@ async fn build_runtime_tooling(
     channels: &Arc<ChannelRegistry>,
 ) -> Result<RuntimeTooling, EgoPulseError> {
     let workspace_dir = config.workspace_dir()?;
-    let mcp = crate::tools::mcp::McpManager::new(
-        &workspace_dir,
-        crate::config::secret_ref::dotenv_path(std::path::Path::new(&config.state_root)),
-    )
-    .await?;
+    let mcp = crate::tools::mcp::McpManager::new(&workspace_dir, config_manager.dotenv()).await?;
     let mcp_secrets = mcp.secrets();
     let mcp_manager = Arc::new(tokio::sync::RwLock::new(mcp));
 
@@ -418,7 +414,7 @@ fn build_tool_registry(
     skills: &Arc<SkillManager>,
     config_manager: &Arc<ConfigManager>,
 ) -> ToolRegistry {
-    let mut tools = ToolRegistry::new(config, Arc::clone(skills));
+    let mut tools = ToolRegistry::new(config, Arc::clone(skills), config_manager.dotenv());
     tools.set_config_manager(Arc::clone(config_manager));
     tools
 }
@@ -996,7 +992,7 @@ mod tests {
                 None,
             );
             state.mcp_manager = Some(Arc::new(tokio::sync::RwLock::new(
-                crate::tools::mcp::McpManager::new(&root, root.join(".env"))
+                crate::tools::mcp::McpManager::new(&root, Default::default())
                     .await
                     .unwrap(),
             )));

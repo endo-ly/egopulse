@@ -5,7 +5,6 @@
 //! `sleep` は手動 sleep batch 実行を担当する。
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
 
 use chrono::Datelike;
 use chrono::TimeZone;
@@ -61,9 +60,6 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
     subcommand_precedence_over_arg = true
 )]
 struct Cli {
-    /// Explicit config file path (absolute or relative)
-    #[arg(long, global = true, value_name = "PATH")]
-    config: Option<PathBuf>,
     /// Run a non-interactive prompt and print only the response.
     #[arg(short = 'p', long = "print")]
     print: bool,
@@ -172,28 +168,19 @@ async fn run() -> Result<(), CliError> {
 
     // setup は設定ファイル未作成でも実行できるよう、通常の設定解決フローに入る前に分岐する。
     if matches!(cli.command, Some(Command::Setup)) {
-        return setup::run_setup_wizard(cli.config.clone())
-            .await
-            .map_err(Into::into);
+        return setup::run_setup_wizard().await.map_err(Into::into);
     }
 
     match cli.command {
-        Some(Command::Run) => run_foreground(cli.config.as_deref())
-            .await
-            .map_err(Into::into),
-        Some(Command::Gateway { action }) => gateway::run_gateway(cli.config.as_deref(), action)
-            .await
-            .map_err(Into::into),
+        Some(Command::Run) => run_foreground().await.map_err(Into::into),
+        Some(Command::Gateway { action }) => gateway::run_gateway(action).await.map_err(Into::into),
         Some(Command::Update) => gateway::run_update().await.map_err(Into::into),
         _ => run_with_config(&cli).await,
     }
 }
 
-async fn run_foreground(cli_config: Option<&std::path::Path>) -> Result<(), EgoPulseError> {
-    let resolved_config_path = match cli_config {
-        Some(path) => Some(gateway::resolve_cli_config_path(path)),
-        None => Config::resolve_config_path().map_err(EgoPulseError::Config)?,
-    };
+async fn run_foreground() -> Result<(), EgoPulseError> {
+    let resolved_config_path = Config::resolve_config_path().map_err(EgoPulseError::Config)?;
     let config = Config::load_allow_missing_api_key(resolved_config_path.as_deref())?;
     init_logging(config.log_level())?;
     let state = runtime::build_app_state_with_path(config, resolved_config_path).await?;
@@ -208,25 +195,22 @@ async fn run_with_config(cli: &Cli) -> Result<(), CliError> {
         None
     };
 
-    let resolved_config_path = match cli.config.as_deref() {
-        Some(path) => Some(gateway::resolve_cli_config_path(path)),
-        None => match Config::resolve_config_path() {
-            Ok(path) => path,
-            Err(ConfigError::AutoConfigNotFound { .. }) => {
-                // 引数なし起動だけは初回体験を優先し、エラーではなく setup への案内を返す。
-                if is_tui_launch(cli) {
-                    eprintln!("No configuration found. Run 'egopulse setup' to create one.");
-                    return Ok(());
-                }
-                let searched_path = default_config_path()
-                    .map_err(|error| CliError::Runtime(EgoPulseError::Config(error)))?;
-                return Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound {
-                    searched_paths: vec![searched_path],
-                })
-                .into());
+    let resolved_config_path = match Config::resolve_config_path() {
+        Ok(path) => path,
+        Err(ConfigError::AutoConfigNotFound { .. }) => {
+            // 引数なし起動だけは初回体験を優先し、エラーではなく setup への案内を返す。
+            if is_tui_launch(cli) {
+                eprintln!("No configuration found. Run 'egopulse setup' to create one.");
+                return Ok(());
             }
-            Err(e) => return Err(EgoPulseError::Config(e).into()),
-        },
+            let searched_path = default_config_path()
+                .map_err(|error| CliError::Runtime(EgoPulseError::Config(error)))?;
+            return Err(EgoPulseError::Config(ConfigError::AutoConfigNotFound {
+                searched_paths: vec![searched_path],
+            })
+            .into());
+        }
+        Err(e) => return Err(EgoPulseError::Config(e).into()),
     };
 
     if prompt.is_none() && cli.command.is_none() {
@@ -518,6 +502,13 @@ mod tests {
     #[test]
     fn session_conflicts_with_subcommands() {
         let result = parse_cli_from(&["egopulse", "--session", "local", "run"]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_path_option_is_rejected() {
+        let result = Cli::try_parse_from(["egopulse", "--config", "/tmp/egopulse.yaml", "run"]);
 
         assert!(result.is_err());
     }

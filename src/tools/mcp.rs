@@ -27,7 +27,7 @@ use rmcp::transport::{
 };
 
 use crate::config::default_state_root;
-use crate::config::secret_ref::{ResolvedValue, StringOrRef, read_dotenv, resolve_string_or_ref};
+use crate::config::secret_ref::{DotenvFile, ResolvedValue, StringOrRef, resolve_string_or_ref};
 use crate::error::{ConfigError, EgoPulseError, McpError};
 use crate::llm::ToolDefinition;
 use crate::tools::is_plausible_secret_value;
@@ -218,7 +218,7 @@ struct FailedServer {
 }
 
 pub(crate) struct McpManager {
-    dotenv_path: PathBuf,
+    dotenv: DotenvFile,
     secrets: McpSecrets,
     /// Redaction entries for every server definition in the config files,
     /// connected or not: the files stay readable even while a server is down.
@@ -334,19 +334,16 @@ fn sha2_short(input: &str) -> String {
 }
 
 impl McpManager {
-    /// `dotenv_path` は MCP 設定の秘密参照（`{"source": "env", ...}`）の解決元。
-    pub(crate) async fn new(
-        workspace_dir: &Path,
-        dotenv_path: PathBuf,
-    ) -> Result<Self, ConfigError> {
+    /// `dotenv` は MCP 設定の秘密参照（`{"source": "env", ...}`）の解決元。
+    pub(crate) async fn new(workspace_dir: &Path, dotenv: DotenvFile) -> Result<Self, ConfigError> {
         let file_configs = load_all_server_configs(workspace_dir)?;
-        let configured_secrets = collect_configured_secrets(&file_configs, &dotenv_path).await;
+        let configured_secrets = collect_configured_secrets(&file_configs, &dotenv).await;
         let configs: HashMap<String, McpServerConfig> = file_configs.into_iter().collect();
         let mut servers = Vec::new();
         let mut failed_servers = Vec::new();
 
         for (name, config) in &configs {
-            match connect_server(name, config, workspace_dir, &dotenv_path).await {
+            match connect_server(name, config, workspace_dir, &dotenv).await {
                 Ok((client, tools, resolved)) => {
                     let filtered_tools = filter_tools_for_server(name, &tools);
                     let tool_display_names: Vec<String> = filtered_tools
@@ -385,7 +382,7 @@ impl McpManager {
         );
         let tool_name_index = build_tool_name_index(&servers);
         let manager = Self {
-            dotenv_path,
+            dotenv,
             secrets: McpSecrets::default(),
             configured_secrets,
             servers,
@@ -669,9 +666,9 @@ pub(crate) async fn run_reconnect_loop(
             continue;
         }
 
-        let (reconnect_targets, dotenv_path) = {
+        let (reconnect_targets, dotenv) = {
             let guard = mcp_manager.read().await;
-            (guard.failed_server_configs(), guard.dotenv_path.clone())
+            (guard.failed_server_configs(), guard.dotenv.clone())
         };
         if reconnect_targets.is_empty() {
             retry_secs = INITIAL_RETRY_SECS;
@@ -682,7 +679,7 @@ pub(crate) async fn run_reconnect_loop(
         for (name, config) in reconnect_targets {
             let connection_result = tokio::select! {
                 _ = shutdown.cancelled() => return Ok(()),
-                result = connect_server(&name, &config, &workspace_dir, &dotenv_path) => result,
+                result = connect_server(&name, &config, &workspace_dir, &dotenv) => result,
             };
             match connection_result {
                 Ok((client, tools, resolved)) => {
@@ -819,9 +816,9 @@ async fn connect_server(
     name: &str,
     config: &McpServerConfig,
     workspace_dir: &Path,
-    dotenv_path: &Path,
+    dotenv: &DotenvFile,
 ) -> Result<(DynClient, Vec<Tool>, ResolvedMcpSecrets), McpError> {
-    let resolved = resolve_server_secrets(name, config, dotenv_path).await?;
+    let resolved = resolve_server_secrets(name, config, dotenv).await?;
     let (client, tools) = match config.transport {
         TransportType::Stdio => connect_stdio(name, config, &resolved, workspace_dir).await?,
         TransportType::StreamableHttp => connect_http(name, config, &resolved).await?,
@@ -832,12 +829,12 @@ async fn connect_server(
 /// 設定ファイルにある全 server 定義（上書きされたものを含む）の秘密値を集める。
 async fn collect_configured_secrets(
     file_configs: &[(String, McpServerConfig)],
-    dotenv_path: &Path,
+    dotenv: &DotenvFile,
 ) -> Vec<(String, String)> {
     let file_configs = file_configs.to_vec();
-    let dotenv_path = dotenv_path.to_path_buf();
+    let dotenv = dotenv.clone();
     tokio::task::spawn_blocking(move || {
-        let dotenv = read_dotenv(&dotenv_path);
+        let dotenv = dotenv.read();
         file_configs
             .iter()
             .flat_map(|(name, config)| {
@@ -853,20 +850,18 @@ async fn collect_configured_secrets(
 async fn resolve_server_secrets(
     name: &str,
     config: &McpServerConfig,
-    dotenv_path: &Path,
+    dotenv: &DotenvFile,
 ) -> Result<ResolvedMcpSecrets, McpError> {
     let config = config.clone();
-    let dotenv_path = dotenv_path.to_path_buf();
+    let dotenv = dotenv.clone();
     let to_error = |detail: String| McpError::ConnectionFailed {
         server: name.to_string(),
         detail,
     };
-    tokio::task::spawn_blocking(move || {
-        ResolvedMcpSecrets::resolve(&config, &read_dotenv(&dotenv_path))
-    })
-    .await
-    .map_err(|error| to_error(format!("secret resolution task failed: {error}")))?
-    .map_err(|error| to_error(format!("secret resolution failed: {error}")))
+    tokio::task::spawn_blocking(move || ResolvedMcpSecrets::resolve(&config, &dotenv.read()))
+        .await
+        .map_err(|error| to_error(format!("secret resolution task failed: {error}")))?
+        .map_err(|error| to_error(format!("secret resolution failed: {error}")))
 }
 
 /// Spawns a stdio MCP server as the leader of its own process group.
@@ -1187,7 +1182,7 @@ mod tests {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp_stdio_server.py");
         let mut manager = McpManager {
-            dotenv_path: PathBuf::new(),
+            dotenv: DotenvFile::default(),
             secrets: McpSecrets::default(),
             configured_secrets: Vec::new(),
             servers: Vec::new(),
@@ -1476,7 +1471,7 @@ mod tests {
         // Act
         let result = timeout(
             Duration::from_secs(5),
-            connect_server("remote", &config, dir.path(), &dir.path().join(".env")),
+            connect_server("remote", &config, dir.path(), &DotenvFile::default()),
         )
         .await
         .expect("must fail fast");
@@ -1505,14 +1500,12 @@ mod tests {
             r#"{"mcpServers":{"remote":{"transport":"stdio","command":"/nonexistent/mcp","env":{"WS_KEY":{"source":"env","id":"MCP_TEST_WS_KEY"}}}}}"#,
         )
         .expect("write workspace");
-        let dotenv_path = state_root.join(".env");
-        std::fs::write(&dotenv_path, "MCP_TEST_WS_KEY=short\n").expect("write dotenv");
+        std::fs::write(state_root.join(".env"), "MCP_TEST_WS_KEY=short\n").expect("write dotenv");
         let _home = EnvVarGuard::set("HOME", dir.path());
 
         // Act
-        let manager = McpManager::new(&workspace, dotenv_path)
-            .await
-            .expect("manager");
+        let dotenv = DotenvFile::for_config(Some(&state_root.join("egopulse.config.yaml")));
+        let manager = McpManager::new(&workspace, dotenv).await.expect("manager");
 
         // Assert
         assert!(manager.has_failed_servers());

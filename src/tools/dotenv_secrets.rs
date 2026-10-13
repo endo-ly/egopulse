@@ -4,18 +4,17 @@
 //! ツール出力から伏せるため、ファイルの更新時刻でキャッシュしながら
 //! ツール結果ごとに最新の内容を反映する。
 
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use tracing::warn;
 
-use crate::config::secret_ref::read_dotenv;
+use crate::config::secret_ref::DotenvFile;
 
 use super::sanitizer::{is_plausible_secret_value, is_secret_like_key};
 
 pub(crate) struct DotenvSecrets {
-    path: PathBuf,
+    dotenv: DotenvFile,
     cache: Mutex<Option<CachedSecrets>>,
 }
 
@@ -26,9 +25,9 @@ struct CachedSecrets {
 }
 
 impl DotenvSecrets {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(dotenv: DotenvFile) -> Self {
         Self {
-            path,
+            dotenv,
             cache: Mutex::new(None),
         }
     }
@@ -37,7 +36,10 @@ impl DotenvSecrets {
     ///
     /// ファイルが存在しない場合は空を返す。
     pub(crate) fn secrets(&self) -> Vec<(String, String)> {
-        let Ok((modified, len)) = std::fs::metadata(&self.path)
+        let Some(path) = self.dotenv.path() else {
+            return Vec::new();
+        };
+        let Ok((modified, len)) = std::fs::metadata(path)
             .and_then(|meta| meta.modified().map(|modified| (modified, meta.len())))
         else {
             return Vec::new();
@@ -49,7 +51,7 @@ impl DotenvSecrets {
         {
             return cached.secrets.clone();
         }
-        let secrets = collect_dotenv_secrets(&read_dotenv(&self.path));
+        let secrets = collect_dotenv_secrets(&self.dotenv.read());
         *cache = Some(CachedSecrets {
             modified,
             len,
@@ -94,6 +96,11 @@ fn strip_matching_quotes(value: &str) -> &str {
 mod tests {
     use super::*;
 
+    /// The secrets file paired with a config file placed in `dir`.
+    fn dotenv_in(dir: &std::path::Path) -> DotenvFile {
+        DotenvFile::for_config(Some(&dir.join("egopulse.config.yaml")))
+    }
+
     #[test]
     fn collects_plausible_values_and_skips_common_ones() {
         // Arrange
@@ -104,7 +111,7 @@ mod tests {
             "OTHER_SERVICE_KEY=Zk3pQ9vLm2XrT8wYb4Nc\nPORT=8080\nDEBUG=true\nQUOTED=\"Ab9xQ2mLp7ZkT4vWc8Nd\"\n",
         )
         .expect("write");
-        let source = DotenvSecrets::new(path);
+        let source = DotenvSecrets::new(dotenv_in(dir.path()));
 
         // Act
         let secrets = source.secrets();
@@ -129,7 +136,7 @@ mod tests {
     fn missing_file_yields_no_secrets() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let source = DotenvSecrets::new(dir.path().join(".env"));
+        let source = DotenvSecrets::new(dotenv_in(dir.path()));
 
         assert!(source.secrets().is_empty());
     }
@@ -140,7 +147,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".env");
         std::fs::write(&path, "A_KEY=Zk3pQ9vLm2XrT8wYb4Nc\n").expect("write");
-        let source = DotenvSecrets::new(path.clone());
+        let source = DotenvSecrets::new(dotenv_in(dir.path()));
         assert_eq!(source.secrets().len(), 1);
 
         // Act

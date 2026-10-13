@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use super::Config;
 use super::ModelConfig;
-use super::secret_ref::{CONFIG_SOURCE_GENERATION_PREFIX, ResolvedValue, dotenv_path, save_dotenv};
+use super::secret_ref::{CONFIG_SOURCE_GENERATION_PREFIX, DotenvFile, ResolvedValue, save_dotenv};
 use crate::error::{ConfigError, EgoPulseError};
 
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -688,7 +688,9 @@ where
 
 fn save_config_sources_locked(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
     let dotenv_entries = collect_dotenv_entries(config);
-    let env_path = yaml_path.parent().map(dotenv_path);
+    let env_path = DotenvFile::for_config(Some(yaml_path))
+        .path()
+        .map(Path::to_path_buf);
     let generation = uuid::Uuid::new_v4().to_string();
 
     let yaml_backup = read_file_for_restore(yaml_path)?;
@@ -751,13 +753,12 @@ fn read_source_generation(path: &Path, allow_missing: bool) -> Result<Option<Str
 
 pub(crate) fn validate_source_generation(yaml_path: &Path) -> Result<(), ConfigError> {
     let yaml_generation = read_source_generation(yaml_path, false)?;
-    let dotenv_path =
-        yaml_path
-            .parent()
-            .map(dotenv_path)
-            .ok_or_else(|| ConfigError::ConfigNotFound {
-                path: yaml_path.to_path_buf(),
-            })?;
+    let dotenv_path = DotenvFile::for_config(Some(yaml_path))
+        .path()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| ConfigError::ConfigNotFound {
+            path: yaml_path.to_path_buf(),
+        })?;
     let dotenv_generation = read_source_generation(&dotenv_path, true)?;
 
     if yaml_generation != dotenv_generation

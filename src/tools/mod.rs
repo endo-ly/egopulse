@@ -27,14 +27,13 @@ pub(crate) use shell::*;
 pub(crate) use text::*;
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 
 use crate::config::Config;
-use crate::config::secret_ref::dotenv_path;
+use crate::config::secret_ref::DotenvFile;
 use crate::conversation::ConversationScope;
 use crate::llm::ToolDefinition;
 use crate::skills::SkillManager;
@@ -296,19 +295,27 @@ pub(crate) struct ToolRegistry {
 
 impl ToolRegistry {
     /// Instantiate all built-in tools scoped to the configured workspace.
-    pub(crate) fn new(config: &Config, skill_manager: Arc<SkillManager>) -> Self {
+    ///
+    /// `dotenv` is the secrets file that skill `required_env` values and
+    /// output redaction read from.
+    pub(crate) fn new(
+        config: &Config,
+        skill_manager: Arc<SkillManager>,
+        dotenv: DotenvFile,
+    ) -> Self {
         let workspace_dir = match config.workspace_dir() {
             Ok(dir) => dir,
             Err(error) => {
                 tracing::warn!("failed to resolve workspace dir: {error}");
-                let env_path = dotenv_path(Path::new(&config.state_root));
-                let tools: Vec<Box<dyn Tool>> =
-                    vec![Box::new(ActivateSkillTool::new(skill_manager, env_path))];
+                let tools: Vec<Box<dyn Tool>> = vec![Box::new(ActivateSkillTool::new(
+                    skill_manager,
+                    dotenv.clone(),
+                ))];
                 return Self {
                     tool_index: build_tool_index(&tools),
                     tools,
                     config_secrets: collect_config_secrets(config),
-                    dotenv_secrets: DotenvSecrets::new(dotenv_path(Path::new(&config.state_root))),
+                    dotenv_secrets: DotenvSecrets::new(dotenv),
                     config_manager: None,
                     mcp_manager: None,
                     mcp_secrets: None,
@@ -322,27 +329,26 @@ impl ToolRegistry {
             );
         }
 
-        let env_path = dotenv_path(Path::new(&config.state_root));
         let tools: Vec<Box<dyn Tool>> = vec![
             Box::new(ReadTool::new(workspace_dir.clone())),
             Box::new(BashTool::new(
                 workspace_dir.clone(),
                 Arc::clone(&skill_manager),
-                env_path.clone(),
+                dotenv.clone(),
             )),
             Box::new(EditTool::new(workspace_dir.clone())),
             Box::new(WriteTool::new(workspace_dir.clone())),
             Box::new(GrepTool::new(workspace_dir.clone())),
             Box::new(FindTool::new(workspace_dir.clone())),
             Box::new(LsTool::new(workspace_dir)),
-            Box::new(ActivateSkillTool::new(skill_manager, env_path)),
+            Box::new(ActivateSkillTool::new(skill_manager, dotenv.clone())),
             Box::new(WebFetchTool::new(Arc::new(config.clone()))),
         ];
         Self {
             tool_index: build_tool_index(&tools),
             tools,
             config_secrets: collect_config_secrets(config),
-            dotenv_secrets: DotenvSecrets::new(dotenv_path(Path::new(&config.state_root))),
+            dotenv_secrets: DotenvSecrets::new(dotenv),
             config_manager: None,
             mcp_manager: None,
             mcp_secrets: None,
@@ -670,6 +676,7 @@ mod tests {
         ToolRegistry::new(
             config,
             Arc::new(SkillManager::from_dirs(skills_dir.clone(), skills_dir)),
+            crate::test_util::state_root_dotenv(config),
         )
     }
 
@@ -1143,7 +1150,11 @@ mod tests {
             initial.user_skills_dir().expect("user skills dir"),
             skills_dir,
         ));
-        let mut registry = ToolRegistry::new(&initial, skills);
+        let mut registry = ToolRegistry::new(
+            &initial,
+            skills,
+            crate::test_util::state_root_dotenv(&initial),
+        );
         registry.set_config_manager(manager);
         registry.register_tool(Box::new(StaticTool {
             name: "rotated_secret",

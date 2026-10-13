@@ -8,8 +8,7 @@ use url::Url;
 
 use super::ModelConfig;
 use super::secret_ref::{
-    ResolvedValue, StringOrRef, WEB_AUTH_TOKEN_ENV_NAME, dotenv_path, read_dotenv,
-    resolve_string_or_ref,
+    DotenvFile, ResolvedValue, StringOrRef, WEB_AUTH_TOKEN_ENV_NAME, resolve_string_or_ref,
 };
 use super::{
     AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DatabaseConfig,
@@ -237,7 +236,7 @@ pub(super) fn build_config(
         None => Config::resolve_config_path()?,
     };
 
-    let dotenv = load_dotenv(resolved_config_path.as_deref());
+    let dotenv = DotenvFile::for_config(resolved_config_path.as_deref()).read();
 
     let file_config = read_file_config(resolved_config_path.as_deref())?;
     if let Some(path) = resolved_config_path.as_deref() {
@@ -504,16 +503,6 @@ pub(super) fn validate_runtime_candidate(config: &Config) -> Result<(), ConfigEr
     validate_webhook_receivers(config)?;
 
     Ok(())
-}
-
-fn load_dotenv(config_path: Option<&Path>) -> HashMap<String, String> {
-    let Some(path) = config_path else {
-        return HashMap::new();
-    };
-    let Some(parent) = path.parent() else {
-        return HashMap::new();
-    };
-    read_dotenv(&dotenv_path(parent))
 }
 
 fn read_file_config(path: Option<&Path>) -> Result<FileConfig, ConfigError> {

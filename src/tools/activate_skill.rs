@@ -2,13 +2,12 @@
 //!
 //! スキルの完全な手順を名前でオンデマンド読み込みする。
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::json;
 
-use crate::config::secret_ref::read_dotenv;
+use crate::config::secret_ref::DotenvFile;
 use crate::llm::ToolDefinition;
 use crate::skills::{LoadedSkill, SkillManager, resolve_required_env};
 
@@ -17,14 +16,14 @@ use super::{Tool, ToolExecutionContext, ToolResult, parse_params, schema_object}
 /// Loads a skill's full instructions on demand by name.
 pub(crate) struct ActivateSkillTool {
     skill_manager: Arc<SkillManager>,
-    dotenv_path: PathBuf,
+    dotenv: DotenvFile,
 }
 
 impl ActivateSkillTool {
-    pub(crate) fn new(skill_manager: Arc<SkillManager>, dotenv_path: PathBuf) -> Self {
+    pub(crate) fn new(skill_manager: Arc<SkillManager>, dotenv: DotenvFile) -> Self {
         Self {
             skill_manager,
-            dotenv_path,
+            dotenv,
         }
     }
 }
@@ -76,7 +75,7 @@ impl Tool for ActivateSkillTool {
                 instructions,
             }) => {
                 if !metadata.required_env.is_empty() {
-                    let dotenv = read_dotenv(&self.dotenv_path);
+                    let dotenv = self.dotenv.read();
                     let resolved = resolve_required_env(&metadata.required_env, &dotenv);
                     let resolved_keys: Vec<&str> = resolved.keys().map(|k| k.as_str()).collect();
                     let missing: Vec<&String> = metadata

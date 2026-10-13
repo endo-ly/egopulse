@@ -608,11 +608,11 @@ pub(crate) fn run_with_source_and_sink(
 /// # Errors
 ///
 /// [`run_with_source_and_sink`] に準ずる。
-pub(crate) fn run(config_path: Option<PathBuf>) -> Result<(), SetupWizardError> {
+pub(crate) fn run() -> Result<(), SetupWizardError> {
     run_with_source_and_sink(
         &DialoguerPromptSource::new(),
         &DialoguerOutputSink::new(),
-        config_path,
+        None,
     )
 }
 

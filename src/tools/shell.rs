@@ -11,7 +11,7 @@ use serde_json::json;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
-use crate::config::secret_ref::read_dotenv;
+use crate::config::secret_ref::DotenvFile;
 use crate::llm::ToolDefinition;
 use crate::skills::{SkillManager, resolve_required_env};
 
@@ -30,20 +30,20 @@ pub(crate) struct BashTool {
     /// consistent with dynamic skill discovery (skills added at runtime are
     /// picked up without restart).
     skill_manager: Arc<SkillManager>,
-    /// Path to the runtime dotenv file used for fallback resolution.
-    dotenv_path: PathBuf,
+    /// Secrets file used for fallback resolution.
+    dotenv: DotenvFile,
 }
 
 impl BashTool {
     pub(crate) fn new(
         workspace_dir: PathBuf,
         skill_manager: Arc<SkillManager>,
-        dotenv_path: PathBuf,
+        dotenv: DotenvFile,
     ) -> Self {
         Self {
             workspace_dir,
             skill_manager,
-            dotenv_path,
+            dotenv,
         }
     }
 
@@ -61,8 +61,7 @@ impl BashTool {
         let resolved = if keys.is_empty() {
             HashMap::new()
         } else {
-            let dotenv = read_dotenv(&self.dotenv_path);
-            resolve_required_env(&keys, &dotenv)
+            resolve_required_env(&keys, &self.dotenv.read())
         };
 
         *context.skill_env.lock().expect("skill env lock") = resolved.clone();
@@ -452,7 +451,11 @@ mod tests {
             skills_dir,
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace, skills, dotenv_path);
+        let tool = BashTool::new(
+            workspace,
+            skills,
+            DotenvFile::for_config(Some(&dir.path().join("egopulse.config.yaml"))),
+        );
         let context = crate::test_util::test_tool_context();
 
         // Act
@@ -488,7 +491,7 @@ mod tests {
             dir.path().join("skills"),
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace, skills, dir.path().join(".env"));
+        let tool = BashTool::new(workspace, skills, DotenvFile::default());
 
         // Act
         let result = tool
@@ -549,7 +552,7 @@ mod tests {
             dir.path().join("skills"),
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace.clone(), skills, dir.path().join("dotenv"));
+        let tool = BashTool::new(workspace.clone(), skills, DotenvFile::default());
         let output_path = dir.path().join("bash-output.txt");
         let command = concat!(
             "printf 'canary=%s skill=%s BASH_ENV=%s ENV=%s\\n' ",
@@ -595,7 +598,7 @@ mod tests {
             dir.path().join("skills"),
             dir.path().join("builtin-skills"),
         ));
-        let tool = BashTool::new(workspace, skills, dir.path().join("dotenv"));
+        let tool = BashTool::new(workspace, skills, DotenvFile::default());
         let marker = dir.path().join("orphan-process-ran");
         let command = format!("( sleep 2; touch '{}' ) & wait", marker.display());
         let context = crate::test_util::test_tool_context();

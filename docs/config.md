@@ -671,8 +671,8 @@ Config YAML の値を環境変数で上書き可能。環境変数が設定さ�
 
 | 用途 | パス | 備考 |
 |---|---|---|
-| 設定ファイル | `~/.egopulse/egopulse.config.yaml` | 環境変数で変更不可 |
-| シークレットファイル | `~/.egopulse/.env` | `KEY=VALUE`（1 行 1 エントリ、`#` コメント対応）。パーミッション `0600`。`source: env` の SecretRef が参照（§5） |
+| 設定ファイル | `~/.egopulse/egopulse.config.yaml` | 固定。CLI オプション・環境変数で変更不可 |
+| シークレットファイル | `~/.egopulse/.env` | 設定ファイルと同じディレクトリに置く。`state_root` を変更しても場所は変わらない。`KEY=VALUE`（1 行 1 エントリ、`#` コメント対応）。パーミッション `0600`。`source: env` の SecretRef、skill の `required_env`、MCP 設定の秘密参照が参照する（§5） |
 | データディレクトリ | `~/.egopulse/data` | SQLite 等 |
 | ワークスペース | `~/.egopulse/workspace` | セッション・履歴データ |
 

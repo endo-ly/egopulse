@@ -139,9 +139,9 @@ pub(crate) fn source_fingerprint(path: &Path) -> Result<String, ConfigError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let dotenv = path
-        .parent()
-        .map(super::secret_ref::dotenv_path)
+    let dotenv = super::secret_ref::DotenvFile::for_config(Some(path))
+        .path()
+        .map(Path::to_path_buf)
         .map(|dotenv_path| match std::fs::read(&dotenv_path) {
             Ok(content) => Ok(content),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -187,6 +187,11 @@ impl ConfigManager {
             config_path: config_path.map(Path::to_path_buf),
             changes,
         }
+    }
+
+    /// The secrets file paired with the managed config file.
+    pub(crate) fn dotenv(&self) -> super::secret_ref::DotenvFile {
+        super::secret_ref::DotenvFile::for_config(self.config_path.as_deref())
     }
 
     /// Returns a clone of the current snapshot reference.
@@ -487,6 +492,22 @@ mod tests {
         crate::config::persist::save_config_with_secrets(&config, &path).expect("save config");
         let manager = ConfigManager::new(config, Some(&path));
         (dir, manager, path)
+    }
+
+    #[test]
+    fn dotenv_follows_the_config_file_not_the_state_root() {
+        // Arrange: the state root points elsewhere than the config directory.
+        let config = crate::test_util::test_config("/srv/egopulse-state");
+        let config_path = Path::new("/home/user/.egopulse/egopulse.config.yaml");
+
+        // Act
+        let manager = ConfigManager::new(config, Some(config_path));
+
+        // Assert
+        assert_eq!(
+            manager.dotenv().path(),
+            Some(Path::new("/home/user/.egopulse/.env"))
+        );
     }
 
     #[test]
