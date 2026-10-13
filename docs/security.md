@@ -302,7 +302,7 @@ Local API の Turn は Session の Channel identity を維持するが、TUI Cli
 
 ### 隔離できない場合
 
-起動時に、Linux であること、`bwrap` が見つかること、実際に起動できることを確かめる。満たさない場合は bash を隔離せずに実行し、次の方法で知らせる。
+起動時に、Linux であること、`bwrap` が見つかること、隠すパスのマウントを含む本番と同じ構成で実際に起動できることを確かめる。満たさない場合は bash を隔離せずに実行し、次の方法で知らせる。
 
 - 起動時の `warn` ログ（理由付き）
 - `/api/status` の `bash_sandbox`（`{"enabled": false, "reason": "..."}`）と `egopulse gateway status` の表示

@@ -118,9 +118,6 @@ impl BashSandbox {
                 search_dirs.join(", ")
             ));
         };
-        if let Err(reason) = probe(&bwrap) {
-            return Self::unisolated(reason);
-        }
         let message_file = protected.runtime_dir.join(MESSAGE_FILE_NAME);
         if let Err(error) = std::fs::create_dir_all(&protected.runtime_dir)
             .and_then(|()| std::fs::write(&message_file, HIDDEN_MESSAGE))
@@ -130,11 +127,15 @@ impl BashSandbox {
                 message_file.display()
             ));
         }
-        Self::Isolated(BwrapSandbox {
+        let sandbox = BwrapSandbox {
             bwrap,
             message_file,
             protected,
-        })
+        };
+        match sandbox.verify() {
+            Ok(()) => Self::Isolated(sandbox),
+            Err(reason) => Self::unisolated(reason),
+        }
     }
 
     pub(crate) fn status(&self) -> BashSandboxStatus {
@@ -191,6 +192,26 @@ impl BwrapSandbox {
         args.push("--".into());
         args
     }
+
+    /// 本番と同じ引数（隠すパスのマウントを含む）で実際に起動できるかを確かめる。
+    /// インストール済みでも、ユーザー名前空間が制限された環境や、マウントが
+    /// 許されない環境では起動できないことがある。
+    fn verify(&self) -> Result<(), String> {
+        let output = std::process::Command::new(&self.bwrap)
+            .args(self.args())
+            .arg("true")
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("failed to run {}: {error}", self.bwrap.display()))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} cannot start the sandbox: {}",
+            self.bwrap.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }
 
 fn ro_bind(source: &Path, dest: &Path) -> [OsString; 3] {
@@ -215,26 +236,6 @@ fn find_bwrap(search_dirs: &[&str]) -> Option<PathBuf> {
         .iter()
         .map(|dir| Path::new(dir).join("bwrap"))
         .find(|path| path.is_file())
-}
-
-/// 実際に起動できるかを確かめる。インストール済みでも、ユーザー名前空間が
-/// 制限された環境では起動できないことがある。
-fn probe(bwrap: &Path) -> Result<(), String> {
-    let mut args = base_args();
-    args.extend(["--".into(), "true".into()]);
-    let output = std::process::Command::new(bwrap)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("failed to run {}: {error}", bwrap.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "{} cannot start a sandbox: {}",
-        bwrap.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    ))
 }
 
 #[cfg(test)]
@@ -384,6 +385,29 @@ mod tests {
             "{status:?}"
         );
         assert_eq!(sandbox.bash_command("true").as_std().get_program(), "bash");
+    }
+
+    #[test]
+    fn verification_runs_the_production_mounts() {
+        // Arrange: the message file the hiding binds from is missing, so only a
+        // check that sets up the real mounts can notice the sandbox is broken.
+        let fixture = fixture();
+        let Some(BashSandbox::Isolated(working)) = real_sandbox(fixture.protected.clone()) else {
+            eprintln!("skipped: bwrap is not usable here");
+            return;
+        };
+        let broken = BwrapSandbox {
+            bwrap: working.bwrap.clone(),
+            message_file: fixture.root.join("missing-message.txt"),
+            protected: fixture.protected.clone(),
+        };
+
+        // Act
+        let result = broken.verify();
+
+        // Assert
+        assert!(working.verify().is_ok());
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
