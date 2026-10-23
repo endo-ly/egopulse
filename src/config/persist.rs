@@ -106,6 +106,8 @@ struct SerializableSleepBatch {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,6 +502,7 @@ impl From<&Config> for SerializableConfig {
                     Some(SerializableSleepBatch {
                         provider: sb.provider.as_ref().map(|p| p.to_string()),
                         model: sb.model.clone(),
+                        reasoning_effort: sb.reasoning_effort.clone(),
                         enabled: sb.enabled,
                         schedule: sb.schedule.clone(),
                         agents: sb

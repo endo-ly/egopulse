@@ -2489,6 +2489,33 @@ sleep_batch:
 
 #[test]
 #[serial]
+fn resolve_sleep_batch_llm_uses_reasoning_effort_when_set() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+sleep_batch:
+  reasoning_effort: " high ""#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let resolved = config.resolve_sleep_batch_llm().expect("resolve");
+    assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+}
+
+#[test]
+#[serial]
 fn resolve_sleep_batch_llm_falls_back_to_global_default_model() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -2589,6 +2616,7 @@ fn persist_preserves_sleep_batch_config() {
         sleep_batch: super::SleepBatchConfig {
             provider: Some(super::ProviderId::new("deepseek")),
             model: Some("deepseek-chat-v3".to_string()),
+            reasoning_effort: Some("high".to_string()),
             ..Default::default()
         },
         pulse: super::PulseConfig::default(),
@@ -2603,6 +2631,7 @@ fn persist_preserves_sleep_batch_config() {
     assert!(yaml.contains("sleep_batch:"));
     assert!(yaml.contains("provider: deepseek"));
     assert!(yaml.contains("model: deepseek-chat-v3"));
+    assert!(yaml.contains("reasoning_effort: high"));
 }
 
 // --- Step 2: Sleep Batch Scheduler Config tests ---

@@ -288,6 +288,7 @@ impl ResolvedLlmConfig {
 pub(crate) struct SleepBatchConfig {
     pub provider: Option<ProviderId>,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub enabled: bool,
     pub schedule: Option<String>,
     pub agents: Option<Vec<AgentId>>,
@@ -300,6 +301,7 @@ impl Default for SleepBatchConfig {
         Self {
             provider: None,
             model: None,
+            reasoning_effort: None,
             enabled: false,
             schedule: None,
             agents: None,

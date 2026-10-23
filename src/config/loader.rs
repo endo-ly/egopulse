@@ -123,6 +123,7 @@ struct FileAgentConfig {
 struct FileSleepBatchConfig {
     provider: Option<String>,
     model: Option<String>,
+    reasoning_effort: Option<String>,
     enabled: Option<bool>,
     schedule: Option<String>,
     agents: Option<Vec<String>>,
@@ -857,6 +858,7 @@ fn normalize_sleep_batch(
     let config = SleepBatchConfig {
         provider,
         model: normalize_string(fb.model),
+        reasoning_effort: normalize_string(fb.reasoning_effort),
         enabled,
         schedule,
         agents: resolved_agents,

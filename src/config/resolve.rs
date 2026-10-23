@@ -131,7 +131,7 @@ impl Config {
             base_url: provider.base_url.clone(),
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
-            reasoning_effort: None,
+            reasoning_effort: self.sleep_batch.reasoning_effort.clone(),
         })
     }
 

@@ -196,6 +196,7 @@ sleep_batch:
   enabled: true
   provider: openrouter
   model: openai/gpt-4o-mini
+  reasoning_effort: high
   schedule: "04:00"
   agents:
     - default
@@ -378,6 +379,7 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 | `sleep_batch.enabled` | `bool` | 任意 | `false` | Sleep Batch 機能の有効/無効 |
 | `sleep_batch.provider` | `string \| null` | 任意 | `null` | Sleep Batch 用プロバイダー ID。`providers` マップ内のキーを参照。`null` の場合は `default_provider` にフォールバック |
 | `sleep_batch.model` | `string \| null` | 任意 | `null` | Sleep Batch 用モデル名。`null` の場合は `default_model`、さらにプロバイダーの `default_model` にフォールバック |
+| `sleep_batch.reasoning_effort` | `string \| null` | 任意 | `null` | Sleep Batch 用の推論量。設定時は Chat Completions の `reasoning_effort`、Responses API の `reasoning.effort` へそのまま渡す |
 | `sleep_batch.schedule` | `string \| null` | 任意 | `null` | 自動実行時刻（`HH:MM` 形式、例: `04:00`）。`enabled: true` 時は必須 |
 | `sleep_batch.agents` | `list \| null` | 任意 | `null` | 実行対象 agent ID のリスト。`null` は全 agent（default_agent 優先）。空リストは実行なし |
 | `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 失敗時の最大再試行回数 |
