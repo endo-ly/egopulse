@@ -108,6 +108,9 @@ providers:
       source: env
       id: OPENROUTER_API_KEY
     default_model: anthropic/claude-sonnet-4
+    # 全リクエストに付与する追加 HTTP ヘッダ（任意）
+    headers:
+      x-client-name: egopulse
     models:
       anthropic/claude-sonnet-4:
         context_window_tokens: 200000
@@ -272,6 +275,7 @@ web_fetch:
 | `api_key` | `string \| SecretRef \| null` | 条件付き | API 認証キー。`localhost` 系および `openai-codex` プリセットでは不要（OAuth セッショントークンを自動利用）。SecretRef 使用可能（§5）。秘匿フィールド |
 | `default_model` | `string` | **必須** | このプロバイダーのデフォルトモデル |
 | `models` | `map<string, ModelConfig>` | 任意 | 利用可能なモデル一覧。各モデルにメタデータを設定可能 |
+| `headers` | `map<string, string>` | 任意 | 全リクエストに付与する追加 HTTP ヘッダ。ヘッダ名は小文字に正規化される。同じ名前の既定ヘッダ（`Authorization` 等）がある場合はここでの指定が優先される |
 
 #### `ModelConfig` のフィールド
 
@@ -280,6 +284,22 @@ web_fetch:
 | `context_window_tokens` | `usize` | 任意 | `default_context_window_tokens` に従う | このモデルの context window のトークン数。未設定時はグローバルフォールバックを使用 |
 | `model_instructions` | `string` | 任意 | なし | モデル固有の追加指示（インライン）。system prompt の `<soul>` セクションと Core Instructions の間に `<model-instructions>` タグで注入される。`model_instructions_file` と排他（両立時は起動エラー） |
 | `model_instructions_file` | `string` | 任意 | なし | モデル固有の追加指示を記述したファイルパス。相対パスは設定ファイルのディレクトリ基点で解決（絶対パスも可）。`model_instructions` と排他 |
+
+`headers` は静的なリクエストヘッダをプロバイダー単位で付与する。値は固定文字列で、SecretRef は使用できない。例えば OpenCode Go は、会話ごとに安定したセッション ID を `x-opencode-session` で要求するため、次のように設定する。
+
+```yaml
+providers:
+  opencode-go:
+    base_url: https://opencode.ai/inference/go/openai/v1
+    api_key:
+      source: env
+      id: OPENCODE_GO_API_KEY
+    default_model: glm-5.3
+    headers:
+      x-opencode-session: UUID
+```
+
+セッション ID は認証情報ではない。固定値でも動作するが、ルーティングとプロンプトキャッシュの最適化は会話ごとに異なる値の方が効率的に働く。
 
 ### 3.3 Web チャネル（`channels.web`）
 

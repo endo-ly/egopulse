@@ -29,6 +29,7 @@ impl Config {
                 .clone()
                 .unwrap_or_else(|| provider.default_model.clone()),
             reasoning_effort: None,
+            headers: provider.headers.clone(),
         }
     }
 
@@ -90,6 +91,7 @@ impl Config {
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
             reasoning_effort: agent.reasoning_effort.clone(),
+            headers: provider.headers.clone(),
         })
     }
 
@@ -132,6 +134,7 @@ impl Config {
             api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
             model,
             reasoning_effort: self.sleep_batch.reasoning_effort.clone(),
+            headers: provider.headers.clone(),
         })
     }
 

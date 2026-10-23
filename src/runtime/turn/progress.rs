@@ -1118,6 +1118,7 @@ mod tests {
             )),
             model: "gpt-4o-mini".to_string(),
             reasoning_effort: None,
+            headers: Default::default(),
         })
         .expect("provider");
 

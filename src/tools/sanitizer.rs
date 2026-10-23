@@ -572,6 +572,7 @@ mod tests {
                 api_key: Some(ResolvedValue::Literal("openai-api-key".to_string())),
                 default_model: "gpt-4o".to_string(),
                 models: std::collections::HashMap::new(),
+                headers: Default::default(),
             },
         );
         config.providers.insert(
@@ -582,6 +583,7 @@ mod tests {
                 api_key: None,
                 default_model: "codex-mini".to_string(),
                 models: std::collections::HashMap::new(),
+                headers: Default::default(),
             },
         );
         config.providers.insert(
@@ -592,6 +594,7 @@ mod tests {
                 api_key: Some(ResolvedValue::Literal(String::new())),
                 default_model: "model".to_string(),
                 models: std::collections::HashMap::new(),
+                headers: Default::default(),
             },
         );
 
@@ -721,6 +724,7 @@ mod tests {
                 api_key: Some(ResolvedValue::Literal("sk-prod-123".to_string())),
                 default_model: "gpt-4o".to_string(),
                 models: std::collections::HashMap::new(),
+                headers: Default::default(),
             },
         );
         config.channels.insert(

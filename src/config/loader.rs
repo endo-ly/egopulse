@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,6 +34,7 @@ struct FileProviderConfig {
     api_key: Option<StringOrRef>,
     default_model: Option<String>,
     models: Option<HashMap<String, Option<ModelConfig>>>,
+    headers: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1066,6 +1067,8 @@ fn normalize_provider_map(
 
         validate_model_instructions(key.as_str(), &models)?;
 
+        let headers = normalize_provider_headers(key.as_str(), file_provider.headers)?;
+
         let api_key = resolve_string_or_ref(file_provider.api_key, dotenv)?;
         if !allow_missing_api_key
             && api_key.is_none()
@@ -1084,8 +1087,45 @@ fn normalize_provider_map(
                 api_key,
                 default_model,
                 models,
+                headers,
             },
         );
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_provider_headers(
+    provider: &str,
+    headers: Option<HashMap<String, String>>,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let mut normalized = BTreeMap::new();
+
+    for (raw_name, value) in headers.unwrap_or_default() {
+        let name =
+            reqwest::header::HeaderName::from_bytes(raw_name.as_bytes()).map_err(|error| {
+                ConfigError::InvalidProviderHeader {
+                    provider: provider.to_string(),
+                    header: raw_name.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        reqwest::header::HeaderValue::from_str(&value).map_err(|error| {
+            ConfigError::InvalidProviderHeader {
+                provider: provider.to_string(),
+                header: raw_name.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+
+        let canonical = name.as_str().to_string();
+        if normalized.insert(canonical, value).is_some() {
+            return Err(ConfigError::InvalidProviderHeader {
+                provider: provider.to_string(),
+                header: raw_name,
+                reason: "duplicate header name".to_string(),
+            });
+        }
     }
 
     Ok(normalized)

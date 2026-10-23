@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use secrecy::SecretString;
@@ -211,6 +211,8 @@ pub(crate) struct ProviderConfig {
     pub api_key: Option<ResolvedValue>,
     pub default_model: String,
     pub models: HashMap<String, ModelConfig>,
+    /// Extra HTTP headers sent with every request to this provider.
+    pub headers: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for ProviderConfig {
@@ -221,6 +223,7 @@ impl std::fmt::Debug for ProviderConfig {
             .field("api_key", &debug_secret(self.api_key.as_ref()))
             .field("default_model", &self.default_model)
             .field("models", &self.models)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -233,6 +236,7 @@ pub(crate) struct ResolvedLlmConfig {
     pub api_key: Option<SecretString>,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    pub headers: BTreeMap<String, String>,
 }
 
 impl std::fmt::Debug for ResolvedLlmConfig {
@@ -244,6 +248,7 @@ impl std::fmt::Debug for ResolvedLlmConfig {
             .field("api_key", &debug_secret(self.api_key.as_ref()))
             .field("model", &self.model)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -255,6 +260,7 @@ impl PartialEq for ResolvedLlmConfig {
             && self.base_url == other.base_url
             && self.model == other.model
             && self.reasoning_effort == other.reasoning_effort
+            && self.headers == other.headers
     }
 }
 
@@ -277,6 +283,7 @@ impl ResolvedLlmConfig {
         self.base_url.hash(&mut hasher);
         self.model.hash(&mut hasher);
         self.reasoning_effort.hash(&mut hasher);
+        self.headers.hash(&mut hasher);
         if let Some(key) = &self.api_key {
             secrecy::ExposeSecret::expose_secret(key).hash(&mut hasher);
         }

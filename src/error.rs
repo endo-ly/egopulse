@@ -180,6 +180,12 @@ pub enum ConfigError {
     MissingProviderBaseUrl { provider: String },
     #[error("missing_provider_default_model: {provider}")]
     MissingProviderDefaultModel { provider: String },
+    #[error("invalid_provider_header: provider={provider} header={header}: {reason}")]
+    InvalidProviderHeader {
+        provider: String,
+        header: String,
+        reason: String,
+    },
     #[error("invalid_provider_reference: {provider}")]
     InvalidProviderReference { provider: String },
     #[error("invalid_base_url")]

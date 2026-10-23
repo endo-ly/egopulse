@@ -94,6 +94,9 @@ providers:
     models:
       gpt-4o-mini: {}
       gpt-5: {}
+    headers:
+      X-Test-Session: egopulse-test
+      x-api-version: "2026-01-01"
   local:
     label: Local OpenAI-compatible
     base_url: http://127.0.0.1:1234/v1
@@ -150,6 +153,65 @@ fn loads_provider_based_config() {
         web_llm.api_key.as_ref().map(ExposeSecret::expose_secret),
         Some("sk-openai")
     );
+    assert_eq!(
+        web_llm.headers.get("x-test-session").map(String::as_str),
+        Some("egopulse-test")
+    );
+    assert_eq!(
+        web_llm.headers.get("x-api-version").map(String::as_str),
+        Some("2026-01-01")
+    );
+}
+
+#[test]
+#[serial]
+fn rejects_invalid_provider_header_name() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = sample_config().replace("X-Test-Session: egopulse-test", "bad header: value");
+    let file_path = write_config(&temp_dir, &body);
+
+    let error = Config::load(Some(&file_path)).expect_err("invalid header name");
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidProviderHeader { ref provider, header, .. }
+            if provider == "openai" && header == "bad header"
+    ));
+}
+
+#[test]
+#[serial]
+fn rejects_invalid_provider_header_value() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let body = sample_config().replace(
+        "x-api-version: \"2026-01-01\"",
+        "x-api-version: \"bad\\x01value\"",
+    );
+    let file_path = write_config(&temp_dir, &body);
+
+    let error = Config::load(Some(&file_path)).expect_err("invalid header value");
+
+    assert!(matches!(
+        error,
+        ConfigError::InvalidProviderHeader { ref provider, header, .. }
+            if provider == "openai" && header == "x-api-version"
+    ));
+}
+
+#[test]
+#[serial]
+fn provider_debug_redacts_header_values() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(&temp_dir, sample_config());
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let debug = format!("{:?}", config.global_provider());
+    assert!(debug.contains("x-test-session"));
+    assert!(!debug.contains("egopulse-test"));
 }
 
 #[test]
@@ -486,6 +548,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
                     api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
                     default_model: "gpt-5".to_string(),
                     models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+                    headers: Default::default(),
                 },
             ),
             (
@@ -496,6 +559,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
                     api_key: None,
                     default_model: "qwen2.5".to_string(),
                     models: HashMap::new(),
+                    headers: Default::default(),
                 },
             ),
         ]),
@@ -842,6 +906,7 @@ fn persists_agents_without_discord_config_surface() {
                 api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
                 default_model: "gpt-5".to_string(),
                 models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+                headers: Default::default(),
             },
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
@@ -1663,6 +1728,7 @@ fn discord_bots_preserve_secret_refs_on_save() {
                 api_key: Some(lit_val("OPENAI_API_KEY", "sk-test")),
                 default_model: "gpt-5".to_string(),
                 models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+                headers: Default::default(),
             },
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
@@ -2314,6 +2380,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                     ),
                     ("gpt-4o-mini".to_string(), ModelConfig::default()),
                 ]),
+                headers: Default::default(),
             },
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
@@ -2576,6 +2643,7 @@ fn persist_preserves_sleep_batch_config() {
             )),
             default_model: "gpt-4o-mini".to_string(),
             models: HashMap::new(),
+            headers: Default::default(),
         },
     );
     providers.insert(
@@ -2588,6 +2656,7 @@ fn persist_preserves_sleep_batch_config() {
             )),
             default_model: "deepseek-chat".to_string(),
             models: HashMap::new(),
+            headers: Default::default(),
         },
     );
 
@@ -2869,6 +2938,7 @@ fn persist_preserves_sleep_batch_scheduler_config() {
             )),
             default_model: "gpt-4o-mini".to_string(),
             models: HashMap::new(),
+            headers: Default::default(),
         },
     );
 
@@ -3228,6 +3298,7 @@ fn minimal_config_with_channels(
             api_key: None,
             default_model: "gpt-5".to_string(),
             models: std::collections::HashMap::new(),
+            headers: Default::default(),
         },
     );
     let mut agents = std::collections::HashMap::new();
@@ -3280,6 +3351,7 @@ fn profile_config(
             )),
             default_model: "gpt-4o-mini".to_string(),
             models: HashMap::new(),
+            headers: Default::default(),
         },
     );
     providers.insert(
@@ -3290,6 +3362,7 @@ fn profile_config(
             api_key: None,
             default_model: "qwen2.5".to_string(),
             models: HashMap::new(),
+            headers: Default::default(),
         },
     );
 

@@ -127,8 +127,13 @@ pub(crate) fn save_config(
         .as_ref()
         .map(|c| c.providers.clone())
         .unwrap_or_default();
+    let provider_key = ProviderId::new(&provider_id);
+    let existing_headers = providers
+        .get(&provider_key)
+        .map(|provider| provider.headers.clone())
+        .unwrap_or_default();
     providers.insert(
-        ProviderId::new(&provider_id),
+        provider_key,
         ProviderConfig {
             label: provider_label.clone(),
             base_url: base_url.clone(),
@@ -142,6 +147,7 @@ pub(crate) fn save_config(
             },
             default_model: preset_default_model,
             models: preset_models,
+            headers: existing_headers,
         },
     );
 
@@ -832,6 +838,42 @@ channels:
         assert!(
             loaded.providers.contains_key(&ProviderId::new("openai")),
             "existing non-default provider must be preserved"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_config_preserves_existing_provider_headers() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let config_path = temp_dir.path().join("egopulse.config.yaml");
+        let existing_yaml = "default_provider: ollama\n\
+             providers:\n\
+             \x20 ollama:\n\
+             \x20   label: Ollama\n\
+             \x20   base_url: http://127.0.0.1:11434/v1\n\
+             \x20   default_model: llama3.2\n\
+             \x20   headers:\n\
+             \x20     x-opencode-session: egopulse-session\n\
+             agents:\n\
+             \x20 default:\n\
+             \x20   label: Default\n";
+        std::fs::write(&config_path, existing_yaml).expect("write existing config");
+        let parsed_yaml: yaml_serde::Value =
+            yaml_serde::from_str(existing_yaml).expect("parse existing yaml");
+
+        let inputs = ollama_inputs("Partner");
+        save_config(&inputs, Some(&parsed_yaml), &config_path).expect("save config");
+
+        let loaded = Config::load_allow_missing_api_key(Some(&config_path)).expect("load config");
+        assert_eq!(
+            loaded
+                .providers
+                .get(&ProviderId::new("ollama"))
+                .expect("ollama provider")
+                .headers
+                .get("x-opencode-session")
+                .map(String::as_str),
+            Some("egopulse-session")
         );
     }
 

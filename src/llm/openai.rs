@@ -18,6 +18,7 @@ pub(crate) struct OpenAiProvider {
     provider: String,
     account_id: Option<String>,
     is_codex: bool,
+    extra_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 impl OpenAiProvider {
@@ -50,6 +51,17 @@ impl OpenAiProvider {
             )
         };
 
+        let mut extra_headers = Vec::with_capacity(config.headers.len());
+        for (name, value) in &config.headers {
+            let parsed_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                LlmError::InitFailed(format!("invalid header name '{name}': {error}"))
+            })?;
+            let parsed_value = HeaderValue::from_str(value).map_err(|error| {
+                LlmError::InitFailed(format!("invalid value for header '{name}': {error}"))
+            })?;
+            extra_headers.push((parsed_name, parsed_value));
+        }
+
         Ok(Self {
             http,
             api_key,
@@ -59,6 +71,7 @@ impl OpenAiProvider {
             provider: config.provider.clone(),
             account_id,
             is_codex,
+            extra_headers,
         })
     }
 
@@ -177,6 +190,10 @@ impl OpenAiProvider {
             let auth_value = HeaderValue::from_str(&format!("Bearer {api_key}"))
                 .map_err(|error| LlmError::RequestConstructionFailed(error.to_string()))?;
             headers.insert(AUTHORIZATION, auth_value);
+        }
+
+        for (name, value) in &self.extra_headers {
+            headers.insert(name.clone(), value.clone());
         }
 
         Ok(headers)
@@ -607,6 +624,7 @@ mod tests {
                 .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             model: model.to_string(),
             reasoning_effort: None,
+            headers: Default::default(),
         }
     }
 
@@ -881,6 +899,7 @@ mod tests {
             api_key: None,
             model: "gpt-5.3-codex".to_string(),
             reasoning_effort: Some("high".to_string()),
+            headers: Default::default(),
         };
         let provider = OpenAiProvider::new(&codex_config).expect("provider");
 

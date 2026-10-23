@@ -290,6 +290,7 @@ mod tests {
                 .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
             model: model.to_string(),
             reasoning_effort: None,
+            headers: Default::default(),
         }
     }
 
@@ -329,6 +330,41 @@ mod tests {
 
         assert_eq!(response.content, "hello back");
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sends_configured_provider_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("x-opencode-session", "egopulse-musa"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "hello back"
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut llm_config = config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        );
+        llm_config.headers.insert(
+            "x-opencode-session".to_string(),
+            "egopulse-musa".to_string(),
+        );
+        let provider = create_provider(&llm_config).expect("provider");
+
+        let response = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect("response");
+
+        assert_eq!(response.content, "hello back");
     }
 
     #[test]

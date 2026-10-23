@@ -225,6 +225,8 @@ struct SerializableProvider {
     default_model: String,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     models: HashMap<String, ModelConfig>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    headers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -346,6 +348,7 @@ impl From<&Config> for SerializableConfig {
                         api_key: api_key_value,
                         default_model: p.default_model.clone(),
                         models: p.models.clone(),
+                        headers: p.headers.clone(),
                     },
                 )
             })
@@ -942,6 +945,7 @@ mod tests {
                 api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
                 default_model: "gpt-5".to_string(),
                 models: HashMap::from([("gpt-5".to_string(), ModelConfig::default())]),
+                headers: Default::default(),
             },
         );
 
@@ -1096,6 +1100,39 @@ mod tests {
         let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
         assert!(loaded.pulse.enabled);
         assert_eq!(loaded.pulse.tick_interval_secs, 120);
+    }
+
+    #[test]
+    fn save_and_load_preserves_provider_headers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let mut config = sample_config();
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("openai provider")
+            .headers
+            .insert(
+                "x-opencode-session".to_string(),
+                "egopulse-session".to_string(),
+            );
+
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("x-opencode-session: egopulse-session"));
+
+        let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
+        assert_eq!(
+            loaded
+                .providers
+                .get("openai")
+                .expect("openai provider")
+                .headers
+                .get("x-opencode-session")
+                .map(String::as_str),
+            Some("egopulse-session")
+        );
     }
 
     #[test]

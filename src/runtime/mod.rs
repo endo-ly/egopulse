@@ -1182,6 +1182,7 @@ mod tests {
             )),
             model: model.to_string(),
             reasoning_effort: None,
+            headers: Default::default(),
         }
     }
 
@@ -1192,12 +1193,17 @@ mod tests {
         different_api_key.api_key = Some(secrecy::SecretString::new(
             "sk-other".to_string().into_boxed_str(),
         ));
+        let mut different_headers = base.clone();
+        different_headers
+            .headers
+            .insert("x-opencode-session".to_string(), "other".to_string());
 
         for different in [
             resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1"),
             resolved_config("openai", "gpt-4o-mini", "https://api.openai.com/v1"),
             resolved_config("openai", "gpt-4o", "https://proxy.example.com/v1"),
             different_api_key,
+            different_headers,
         ] {
             assert_ne!(
                 base.cache_key_with_revision(0),

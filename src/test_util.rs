@@ -35,6 +35,7 @@ pub(crate) fn test_config(state_root: &str) -> Config {
                     "gpt-4o-mini".to_string(),
                     crate::config::ModelConfig::default(),
                 )]),
+                headers: Default::default(),
             },
         )]),
         state_root: state_root.to_string(),

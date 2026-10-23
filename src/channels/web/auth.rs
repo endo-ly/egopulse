@@ -191,6 +191,7 @@ mod tests {
                         "gpt-4o-mini".to_string(),
                         crate::config::ModelConfig::default(),
                     )]),
+                    headers: Default::default(),
                 },
             )]),
             state_root: ".egopulse".to_string(),

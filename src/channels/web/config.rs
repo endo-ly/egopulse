@@ -281,6 +281,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
                     api_key,
                     default_model,
                     models,
+                    headers: std::collections::BTreeMap::new(),
                 },
             );
         }
@@ -396,6 +397,7 @@ mod tests {
                     api_key: None,
                     default_model: "gpt-4o-mini".to_string(),
                     models: HashMap::from([("gpt-4o-mini".to_string(), ModelConfig::default())]),
+                    headers: Default::default(),
                 },
             )]),
             state_root: "/tmp/egopulse-test".to_string(),
