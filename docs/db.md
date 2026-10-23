@@ -730,7 +730,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `17`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `18`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
@@ -741,7 +741,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
 5. `set_schema_version(conn, 6, "description")` または transaction 用 helper を呼び出し
 
-> **Note**: 現行のコードラインでは v1 から v16 までを順に適用する。以下は主要なマイグレーションの履歴。
+> **Note**: 現行のコードラインでは v1 から v18 までを順に適用する。以下は主要なマイグレーションの履歴。
 
 #### v3: add episode_events table + 4 indexes
 

@@ -251,6 +251,23 @@ impl StoredMessage {
         Self::new(chat_id, sender_id, content, SenderKind::User, None)
     }
 
+    /// Creates an assistant tool-result preview row for text-only channels.
+    ///
+    /// The row links to the assistant message that issued the tool calls. The
+    /// link lets structured UIs hide the text preview without dropping the
+    /// narration, and lets transcript restoration pair each result with its
+    /// call. Every producer of tool-result previews must use this constructor.
+    pub(crate) fn tool_result_preview(
+        chat_id: i64,
+        sender_id: String,
+        content: String,
+        parent_message_id: String,
+    ) -> Self {
+        let mut message = Self::assistant(chat_id, sender_id, content);
+        message.parent_message_id = Some(parent_message_id);
+        message
+    }
+
     pub(crate) fn system(chat_id: i64, content: String) -> Self {
         Self::new(
             chat_id,

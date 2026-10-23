@@ -308,10 +308,11 @@ async fn persist_notification_with_session(
                 ConversationScope::Normal,
                 StoredMessage {
                     id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
-                    ..StoredMessage::assistant(
+                    ..StoredMessage::tool_result_preview(
                         chat_id,
                         agent_id.to_string(),
                         truncate_by_chars(&phase.tool_result_preview, MAX_TOOL_RESULT_TEXT_CHARS),
+                        phase.assistant_message_id.clone(),
                     )
                 },
                 phase.tool_messages.clone(),
@@ -721,6 +722,11 @@ mod tests {
             .iter()
             .find(|message| message.content == "ok")
             .expect("tool result persisted");
+        assert_eq!(
+            tool_result.parent_message_id.as_deref(),
+            Some("assistant-tool-1"),
+            "tool result preview must link to its issuing assistant message"
+        );
         let final_response = messages
             .iter()
             .find(|message| message.content == notification_text)

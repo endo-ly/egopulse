@@ -222,13 +222,13 @@ impl<'a> TurnPersistence<'a> {
 
         let mut messages_with_tools = messages;
         messages_with_tools.extend(tool_messages.iter().cloned());
-        let mut tool_summary = StoredMessage::assistant(
+        let mut tool_summary = StoredMessage::tool_result_preview(
             self.chat_id,
             self.context.agent_id.clone(),
             tool_result_preview,
+            assistant_message_id.to_string(),
         );
         tool_summary.turn_id = Some(self.turn_id.clone());
-        tool_summary.parent_message_id = Some(assistant_message_id.to_string());
         persist_phase_messages(
             self.runtime,
             self.context.scope,

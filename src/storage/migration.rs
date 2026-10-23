@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 17;
+pub(super) const SCHEMA_VERSION: i64 = 18;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -986,6 +986,45 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         set_schema_version_in_tx(&tx, 17, "add llm_usage_logs.cached_input_tokens")?;
         tx.commit()?;
         version = 17;
+    }
+
+    if version < 18 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Pulse persisted tool-result previews without a parent link, so
+        // structured UIs rendered the text preview alongside the tool cards.
+        // Link each preview to the nearest preceding Pulse assistant message;
+        // run order comes from the per-chat `seq` assigned by the commit path.
+        tx.execute(
+            "UPDATE messages
+             SET parent_message_id = (
+                 SELECT assistant.id
+                 FROM messages AS assistant
+                 WHERE assistant.chat_id = messages.chat_id
+                   AND assistant.id LIKE 'pulse-assistant-%'
+                   AND assistant.seq < messages.seq
+                 ORDER BY assistant.seq DESC
+                 LIMIT 1
+             )
+             WHERE messages.id LIKE 'pulse-tools-%'
+               AND messages.parent_message_id IS NULL
+               AND EXISTS (
+                   SELECT 1
+                   FROM messages AS assistant
+                   WHERE assistant.chat_id = messages.chat_id
+                     AND assistant.id LIKE 'pulse-assistant-%'
+                     AND assistant.seq < messages.seq
+               )",
+            [],
+        )?;
+
+        set_schema_version_in_tx(
+            &tx,
+            18,
+            "link pulse tool result previews to their assistant message",
+        )?;
+        tx.commit()?;
+        version = 18;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -2864,6 +2903,58 @@ mod tests {
             )
             .expect("legacy row survives");
         assert_eq!(cached, None);
+    }
+
+    #[test]
+    fn migration_v18_backfills_pulse_tool_preview_parent_links() {
+        // Arrange: a v17 database holding two Pulse tool phases and an
+        // ordinary answer that merely starts with the preview marker.
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        super::run_migrations(&conn).expect("fresh migrations");
+        conn.execute(
+            "INSERT INTO chats (chat_id, chat_type, last_message_time, agent_id)
+             VALUES (1, 'private', '2026-10-23T17:37:00Z', 'lyre')",
+            [],
+        )
+        .expect("insert chat");
+        for (id, content, seq) in [
+            ("pulse-assistant-1", "first [tool_call] read", 1),
+            ("pulse-tools-1", "[tool_result]: first", 2),
+            ("pulse-assistant-2", "second [tool_call] read", 3),
+            ("pulse-tools-2", "[tool_result]: second", 4),
+            ("ordinary-1", "[tool_result]: ただの説明文です", 5),
+        ] {
+            conn.execute(
+                "INSERT INTO messages
+                    (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+                 VALUES (?1, 1, 'lyre', ?2, 'assistant', '2026-10-23T17:37:00Z', 'message', ?3)",
+                rusqlite::params![id, content, seq],
+            )
+            .expect("insert message");
+        }
+        super::set_schema_version(&conn, 17, "test v17 baseline").expect("set v17");
+
+        // Act
+        super::run_migrations(&conn).expect("upgrade to v18");
+
+        // Assert
+        let parent = |id: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT parent_message_id FROM messages WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("parent lookup")
+        };
+        assert_eq!(
+            parent("pulse-tools-1").as_deref(),
+            Some("pulse-assistant-1")
+        );
+        assert_eq!(
+            parent("pulse-tools-2").as_deref(),
+            Some("pulse-assistant-2")
+        );
+        assert_eq!(parent("ordinary-1"), None);
     }
 
     #[test]
