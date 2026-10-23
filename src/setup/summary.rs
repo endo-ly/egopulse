@@ -134,10 +134,10 @@ pub(crate) fn save_config(
         .unwrap_or_default();
     providers.insert(
         provider_key,
-        ProviderConfig {
-            label: provider_label.clone(),
-            base_url: base_url.clone(),
-            api_key: if api_key.is_empty() {
+        ProviderConfig::new(
+            provider_label.clone(),
+            base_url.clone(),
+            if api_key.is_empty() {
                 None
             } else {
                 Some(env_resolved_value(
@@ -145,10 +145,10 @@ pub(crate) fn save_config(
                     api_key.clone(),
                 ))
             },
-            default_model: preset_default_model,
-            models: preset_models,
-            headers: existing_headers,
-        },
+            preset_default_model,
+            preset_models,
+        )
+        .with_headers(existing_headers),
     );
 
     let discord_bots: Option<HashMap<crate::config::BotId, crate::config::DiscordBotConfig>> =

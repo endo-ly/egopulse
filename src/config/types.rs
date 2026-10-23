@@ -215,6 +215,32 @@ pub(crate) struct ProviderConfig {
     pub headers: BTreeMap<String, String>,
 }
 
+impl ProviderConfig {
+    /// Creates a provider definition without extra request headers.
+    pub(crate) fn new(
+        label: String,
+        base_url: String,
+        api_key: Option<ResolvedValue>,
+        default_model: String,
+        models: HashMap<String, ModelConfig>,
+    ) -> Self {
+        Self {
+            label,
+            base_url,
+            api_key,
+            default_model,
+            models,
+            headers: BTreeMap::new(),
+        }
+    }
+
+    /// Adds extra HTTP headers to this provider definition.
+    pub(crate) fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+        self.headers = headers;
+        self
+    }
+}
+
 impl std::fmt::Debug for ProviderConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderConfig")
@@ -267,6 +293,27 @@ impl PartialEq for ResolvedLlmConfig {
 impl Eq for ResolvedLlmConfig {}
 
 impl ResolvedLlmConfig {
+    /// Builds a resolved config from a provider definition and the selected model.
+    pub(crate) fn from_provider(
+        provider_id: String,
+        provider: &ProviderConfig,
+        model: String,
+        reasoning_effort: Option<String>,
+    ) -> Self {
+        Self {
+            provider: provider_id,
+            label: provider.label.clone(),
+            base_url: provider.base_url.clone(),
+            api_key: provider
+                .api_key
+                .as_ref()
+                .map(ResolvedValue::to_secret_string),
+            model,
+            reasoning_effort,
+            headers: provider.headers.clone(),
+        }
+    }
+
     /// Cache key that mixes in the `ConfigSnapshot` revision.
     ///
     /// When `revision` is `0` this produces the same value as the old

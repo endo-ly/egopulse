@@ -616,16 +616,7 @@ mod tests {
     use super::{OpenAiProvider, consume_chat_completion_stream, consume_responses_stream};
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
-        ResolvedLlmConfig {
-            provider: "test".to_string(),
-            label: "Test".to_string(),
-            base_url,
-            api_key: api_key
-                .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
-            model: model.to_string(),
-            reasoning_effort: None,
-            headers: Default::default(),
-        }
+        crate::test_util::llm_config("test", model, base_url, api_key)
     }
 
     fn message(content: &str) -> Arc<Vec<Message>> {
@@ -892,15 +883,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let codex_config = ResolvedLlmConfig {
-            provider: "openai-codex".to_string(),
-            label: "Codex".to_string(),
-            base_url: format!("{}/v1", server.uri()),
-            api_key: None,
-            model: "gpt-5.3-codex".to_string(),
-            reasoning_effort: Some("high".to_string()),
-            headers: Default::default(),
-        };
+        let mut codex_config = crate::test_util::llm_config(
+            "openai-codex",
+            "gpt-5.3-codex",
+            format!("{}/v1", server.uri()),
+            None,
+        );
+        codex_config.reasoning_effort = Some("high".to_string());
         let provider = OpenAiProvider::new(&codex_config).expect("provider");
 
         let recorded = Arc::new(Mutex::new(Vec::<String>::new()));

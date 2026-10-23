@@ -566,36 +566,33 @@ mod tests {
         let mut config = base_config(dir.path().to_str().expect("path"));
         config.providers.insert(
             ProviderId::new("openai"),
-            ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(ResolvedValue::Literal("openai-api-key".to_string())),
-                default_model: "gpt-4o".to_string(),
-                models: std::collections::HashMap::new(),
-                headers: Default::default(),
-            },
+            ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(ResolvedValue::Literal("openai-api-key".to_string())),
+                "gpt-4o".to_string(),
+                std::collections::HashMap::new(),
+            ),
         );
         config.providers.insert(
             ProviderId::new("openai-codex"),
-            ProviderConfig {
-                label: "Codex".to_string(),
-                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-                api_key: None,
-                default_model: "codex-mini".to_string(),
-                models: std::collections::HashMap::new(),
-                headers: Default::default(),
-            },
+            ProviderConfig::new(
+                "Codex".to_string(),
+                "https://chatgpt.com/backend-api/codex".to_string(),
+                None,
+                "codex-mini".to_string(),
+                std::collections::HashMap::new(),
+            ),
         );
         config.providers.insert(
             ProviderId::new("empty"),
-            ProviderConfig {
-                label: "Empty".to_string(),
-                base_url: "https://example.com".to_string(),
-                api_key: Some(ResolvedValue::Literal(String::new())),
-                default_model: "model".to_string(),
-                models: std::collections::HashMap::new(),
-                headers: Default::default(),
-            },
+            ProviderConfig::new(
+                "Empty".to_string(),
+                "https://example.com".to_string(),
+                Some(ResolvedValue::Literal(String::new())),
+                "model".to_string(),
+                std::collections::HashMap::new(),
+            ),
         );
 
         let mut discord_bots = std::collections::HashMap::new();
@@ -718,14 +715,13 @@ mod tests {
         let mut config = base_config(dir.path().to_str().expect("path"));
         config.providers.insert(
             ProviderId::new("openai"),
-            ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(ResolvedValue::Literal("sk-prod-123".to_string())),
-                default_model: "gpt-4o".to_string(),
-                models: std::collections::HashMap::new(),
-                headers: Default::default(),
-            },
+            ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(ResolvedValue::Literal("sk-prod-123".to_string())),
+                "gpt-4o".to_string(),
+                std::collections::HashMap::new(),
+            ),
         );
         config.channels.insert(
             ChannelName::new("discord"),

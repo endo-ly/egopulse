@@ -26,17 +26,16 @@ pub(crate) fn test_config(state_root: &str) -> Config {
         default_model: Some("gpt-4o-mini".to_string()),
         providers: std::collections::HashMap::from([(
             ProviderId::new("openai"),
-            ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(ResolvedValue::Literal("sk-test".to_string())),
-                default_model: "gpt-4o-mini".to_string(),
-                models: std::collections::HashMap::from([(
+            ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(ResolvedValue::Literal("sk-test".to_string())),
+                "gpt-4o-mini".to_string(),
+                std::collections::HashMap::from([(
                     "gpt-4o-mini".to_string(),
                     crate::config::ModelConfig::default(),
                 )]),
-                headers: Default::default(),
-            },
+            ),
         )]),
         state_root: state_root.to_string(),
         log_level: "info".to_string(),
@@ -73,6 +72,31 @@ pub(crate) fn test_config(state_root: &str) -> Config {
 }
 
 use std::path::Path;
+
+/// 最小限のプロバイダ定義からテスト用 `ResolvedLlmConfig` を生成する。
+pub(crate) fn llm_config(
+    provider: &str,
+    model: &str,
+    base_url: impl Into<String>,
+    api_key: Option<&str>,
+) -> crate::config::ResolvedLlmConfig {
+    let provider_config = ProviderConfig::new(
+        provider.to_string(),
+        base_url.into(),
+        api_key.map(|value| ResolvedValue::Literal(value.to_string())),
+        model.to_string(),
+        std::collections::HashMap::from([(
+            model.to_string(),
+            crate::config::ModelConfig::default(),
+        )]),
+    );
+    crate::config::ResolvedLlmConfig::from_provider(
+        provider.to_string(),
+        &provider_config,
+        model.to_string(),
+        None,
+    )
+}
 
 /// テスト用 AppState を構築する。LLM プロバイダを注入可能。
 pub(crate) fn build_state_with_provider(

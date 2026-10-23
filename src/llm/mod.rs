@@ -282,16 +282,7 @@ mod tests {
     }
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
-        ResolvedLlmConfig {
-            provider: "test".to_string(),
-            label: "Test".to_string(),
-            base_url,
-            api_key: api_key
-                .map(|value| secrecy::SecretString::new(value.to_string().into_boxed_str())),
-            model: model.to_string(),
-            reasoning_effort: None,
-            headers: Default::default(),
-        }
+        crate::test_util::llm_config("test", model, base_url, api_key)
     }
 
     #[tokio::test]

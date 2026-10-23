@@ -275,14 +275,7 @@ fn apply_provider_updates(config: &mut Config, updates: HashMap<String, Provider
 
             config.providers.insert(
                 ProviderId::new(&id),
-                ProviderConfig {
-                    label,
-                    base_url,
-                    api_key,
-                    default_model,
-                    models,
-                    headers: std::collections::BTreeMap::new(),
-                },
+                ProviderConfig::new(label, base_url, api_key, default_model, models),
             );
         }
     }
@@ -391,14 +384,13 @@ mod tests {
             default_model: None,
             providers: HashMap::from([(
                 ProviderId::new("openai"),
-                ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: None,
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: HashMap::from([("gpt-4o-mini".to_string(), ModelConfig::default())]),
-                    headers: Default::default(),
-                },
+                ProviderConfig::new(
+                    "OpenAI".to_string(),
+                    "https://api.openai.com/v1".to_string(),
+                    None,
+                    "gpt-4o-mini".to_string(),
+                    HashMap::from([("gpt-4o-mini".to_string(), ModelConfig::default())]),
+                ),
             )]),
             state_root: "/tmp/egopulse-test".to_string(),
             log_level: "info".to_string(),

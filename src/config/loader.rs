@@ -1081,14 +1081,8 @@ fn normalize_provider_map(
 
         normalized.insert(
             key,
-            ProviderConfig {
-                label,
-                base_url,
-                api_key,
-                default_model,
-                models,
-                headers,
-            },
+            ProviderConfig::new(label, base_url, api_key, default_model, models)
+                .with_headers(headers),
         );
     }
 

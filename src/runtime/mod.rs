@@ -1173,17 +1173,7 @@ mod tests {
     }
 
     fn resolved_config(provider: &str, model: &str, base_url: &str) -> ResolvedLlmConfig {
-        ResolvedLlmConfig {
-            provider: provider.to_string(),
-            label: format!("{provider} label"),
-            base_url: base_url.to_string(),
-            api_key: Some(secrecy::SecretString::new(
-                "sk-test".to_string().into_boxed_str(),
-            )),
-            model: model.to_string(),
-            reasoning_effort: None,
-            headers: Default::default(),
-        }
+        crate::test_util::llm_config(provider, model, base_url, Some("sk-test"))
     }
 
     #[test]

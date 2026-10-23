@@ -182,17 +182,16 @@ mod tests {
             default_model: Some("gpt-4o-mini".to_string()),
             providers: std::collections::HashMap::from([(
                 ProviderId::new("local"),
-                ProviderConfig {
-                    label: "Local".to_string(),
-                    base_url: "http://127.0.0.1:1234/v1".to_string(),
-                    api_key: None,
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: std::collections::HashMap::from([(
+                ProviderConfig::new(
+                    "Local".to_string(),
+                    "http://127.0.0.1:1234/v1".to_string(),
+                    None,
+                    "gpt-4o-mini".to_string(),
+                    std::collections::HashMap::from([(
                         "gpt-4o-mini".to_string(),
                         crate::config::ModelConfig::default(),
                     )]),
-                    headers: Default::default(),
-                },
+                ),
             )]),
             state_root: ".egopulse".to_string(),
             log_level: "info".to_string(),

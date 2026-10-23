@@ -939,14 +939,13 @@ mod tests {
         let mut providers = HashMap::new();
         providers.insert(
             ProviderId::new("openai"),
-            ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
-                default_model: "gpt-5".to_string(),
-                models: HashMap::from([("gpt-5".to_string(), ModelConfig::default())]),
-                headers: Default::default(),
-            },
+            ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                "gpt-5".to_string(),
+                HashMap::from([("gpt-5".to_string(), ModelConfig::default())]),
+            ),
         );
 
         let mut channels = HashMap::new();

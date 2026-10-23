@@ -19,18 +19,14 @@ impl Config {
     /// Resolves the global default provider/model pair used by CLI/TUI.
     pub(crate) fn resolve_global_llm(&self) -> ResolvedLlmConfig {
         let provider = self.global_provider();
-        ResolvedLlmConfig {
-            provider: self.default_provider.to_string(),
-            label: provider.label.clone(),
-            base_url: provider.base_url.clone(),
-            api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
-            model: self
-                .default_model
+        ResolvedLlmConfig::from_provider(
+            self.default_provider.to_string(),
+            provider,
+            self.default_model
                 .clone()
                 .unwrap_or_else(|| provider.default_model.clone()),
-            reasoning_effort: None,
-            headers: provider.headers.clone(),
-        }
+            None,
+        )
     }
 
     /// Resolves the provider/model pair for a specific agent and channel.
@@ -84,15 +80,12 @@ impl Config {
             .or_else(|| self.default_model.clone())
             .unwrap_or_else(|| provider.default_model.clone());
 
-        Ok(ResolvedLlmConfig {
-            provider: provider_name,
-            label: provider.label.clone(),
-            base_url: provider.base_url.clone(),
-            api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
+        Ok(ResolvedLlmConfig::from_provider(
+            provider_name,
+            provider,
             model,
-            reasoning_effort: agent.reasoning_effort.clone(),
-            headers: provider.headers.clone(),
-        })
+            agent.reasoning_effort.clone(),
+        ))
     }
 
     /// Resolves the provider/model pair for sleep batch LLM processing.
@@ -127,15 +120,12 @@ impl Config {
             .or_else(|| self.default_model.clone())
             .unwrap_or_else(|| provider.default_model.clone());
 
-        Ok(ResolvedLlmConfig {
-            provider: provider_id.to_string(),
-            label: provider.label.clone(),
-            base_url: provider.base_url.clone(),
-            api_key: provider.api_key.as_ref().map(|rv| rv.to_secret_string()),
+        Ok(ResolvedLlmConfig::from_provider(
+            provider_id.to_string(),
+            provider,
             model,
-            reasoning_effort: self.sleep_batch.reasoning_effort.clone(),
-            headers: provider.headers.clone(),
-        })
+            self.sleep_batch.reasoning_effort.clone(),
+        ))
     }
 
     /// Returns `true` if the web channel is enabled.

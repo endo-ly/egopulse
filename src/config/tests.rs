@@ -542,25 +542,23 @@ fn save_load_round_trip_preserves_agent_profiles() {
         providers: HashMap::from([
             (
                 super::ProviderId::new("openai"),
-                super::ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
-                    default_model: "gpt-5".to_string(),
-                    models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
-                    headers: Default::default(),
-                },
+                super::ProviderConfig::new(
+                    "OpenAI".to_string(),
+                    "https://api.openai.com/v1".to_string(),
+                    Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                    "gpt-5".to_string(),
+                    HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+                ),
             ),
             (
                 super::ProviderId::new("local"),
-                super::ProviderConfig {
-                    label: "Local".to_string(),
-                    base_url: "http://127.0.0.1:1234/v1".to_string(),
-                    api_key: None,
-                    default_model: "qwen2.5".to_string(),
-                    models: HashMap::new(),
-                    headers: Default::default(),
-                },
+                super::ProviderConfig::new(
+                    "Local".to_string(),
+                    "http://127.0.0.1:1234/v1".to_string(),
+                    None,
+                    "qwen2.5".to_string(),
+                    HashMap::new(),
+                ),
             ),
         ]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
@@ -900,14 +898,13 @@ fn persists_agents_without_discord_config_surface() {
         default_model: None,
         providers: std::collections::HashMap::from([(
             super::ProviderId::new("openai"),
-            super::ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
-                default_model: "gpt-5".to_string(),
-                models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
-                headers: Default::default(),
-            },
+            super::ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                "gpt-5".to_string(),
+                HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+            ),
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
@@ -1722,14 +1719,13 @@ fn discord_bots_preserve_secret_refs_on_save() {
         default_model: None,
         providers: HashMap::from([(
             super::ProviderId::new("openai"),
-            super::ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(lit_val("OPENAI_API_KEY", "sk-test")),
-                default_model: "gpt-5".to_string(),
-                models: HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
-                headers: Default::default(),
-            },
+            super::ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(lit_val("OPENAI_API_KEY", "sk-test")),
+                "gpt-5".to_string(),
+                HashMap::from([("gpt-5".to_string(), super::ModelConfig::default())]),
+            ),
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
@@ -2365,12 +2361,12 @@ fn persists_provider_model_contexts_without_secret_leak() {
         default_model: None,
         providers: HashMap::from([(
             super::ProviderId::new("openai"),
-            super::ProviderConfig {
-                label: "OpenAI".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key: Some(env_resolved_value("OPENAI_API_KEY", "sk-secret-key-12345")),
-                default_model: "gpt-5".to_string(),
-                models: HashMap::from([
+            super::ProviderConfig::new(
+                "OpenAI".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(env_resolved_value("OPENAI_API_KEY", "sk-secret-key-12345")),
+                "gpt-5".to_string(),
+                HashMap::from([
                     (
                         "gpt-5".to_string(),
                         ModelConfig {
@@ -2380,8 +2376,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                     ),
                     ("gpt-4o-mini".to_string(), ModelConfig::default()),
                 ]),
-                headers: Default::default(),
-            },
+            ),
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
@@ -2635,29 +2630,27 @@ fn persist_preserves_sleep_batch_config() {
     let mut providers = HashMap::new();
     providers.insert(
         super::ProviderId::new("openai"),
-        super::ProviderConfig {
-            label: "OpenAI".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+        super::ProviderConfig::new(
+            "OpenAI".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            Some(super::secret_ref::ResolvedValue::Literal(
                 "sk-test".to_string(),
             )),
-            default_model: "gpt-4o-mini".to_string(),
-            models: HashMap::new(),
-            headers: Default::default(),
-        },
+            "gpt-4o-mini".to_string(),
+            HashMap::new(),
+        ),
     );
     providers.insert(
         super::ProviderId::new("deepseek"),
-        super::ProviderConfig {
-            label: "DeepSeek".to_string(),
-            base_url: "https://api.deepseek.com/v1".to_string(),
-            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+        super::ProviderConfig::new(
+            "DeepSeek".to_string(),
+            "https://api.deepseek.com/v1".to_string(),
+            Some(super::secret_ref::ResolvedValue::Literal(
                 "sk-ds".to_string(),
             )),
-            default_model: "deepseek-chat".to_string(),
-            models: HashMap::new(),
-            headers: Default::default(),
-        },
+            "deepseek-chat".to_string(),
+            HashMap::new(),
+        ),
     );
 
     let config = Config {
@@ -2930,16 +2923,15 @@ fn persist_preserves_sleep_batch_scheduler_config() {
     let mut providers = HashMap::new();
     providers.insert(
         super::ProviderId::new("openai"),
-        super::ProviderConfig {
-            label: "OpenAI".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+        super::ProviderConfig::new(
+            "OpenAI".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            Some(super::secret_ref::ResolvedValue::Literal(
                 "sk-test".to_string(),
             )),
-            default_model: "gpt-4o-mini".to_string(),
-            models: HashMap::new(),
-            headers: Default::default(),
-        },
+            "gpt-4o-mini".to_string(),
+            HashMap::new(),
+        ),
     );
 
     let mut agents = HashMap::new();
@@ -3292,14 +3284,13 @@ fn minimal_config_with_channels(
     let mut providers = std::collections::HashMap::new();
     providers.insert(
         super::ProviderId::new("openai"),
-        super::ProviderConfig {
-            label: "OpenAI".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: None,
-            default_model: "gpt-5".to_string(),
-            models: std::collections::HashMap::new(),
-            headers: Default::default(),
-        },
+        super::ProviderConfig::new(
+            "OpenAI".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            None,
+            "gpt-5".to_string(),
+            std::collections::HashMap::new(),
+        ),
     );
     let mut agents = std::collections::HashMap::new();
     agents.insert(
@@ -3343,27 +3334,25 @@ fn profile_config(
     let mut providers = HashMap::new();
     providers.insert(
         super::ProviderId::new("openai"),
-        super::ProviderConfig {
-            label: "OpenAI".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            api_key: Some(super::secret_ref::ResolvedValue::Literal(
+        super::ProviderConfig::new(
+            "OpenAI".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            Some(super::secret_ref::ResolvedValue::Literal(
                 "sk-openai".to_string(),
             )),
-            default_model: "gpt-4o-mini".to_string(),
-            models: HashMap::new(),
-            headers: Default::default(),
-        },
+            "gpt-4o-mini".to_string(),
+            HashMap::new(),
+        ),
     );
     providers.insert(
         super::ProviderId::new("local"),
-        super::ProviderConfig {
-            label: "Local".to_string(),
-            base_url: "http://127.0.0.1:1234/v1".to_string(),
-            api_key: None,
-            default_model: "qwen2.5".to_string(),
-            models: HashMap::new(),
-            headers: Default::default(),
-        },
+        super::ProviderConfig::new(
+            "Local".to_string(),
+            "http://127.0.0.1:1234/v1".to_string(),
+            None,
+            "qwen2.5".to_string(),
+            HashMap::new(),
+        ),
     );
 
     let mut agents: HashMap<super::AgentId, super::AgentConfig> =

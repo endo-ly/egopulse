@@ -1058,7 +1058,6 @@ mod tests {
         use std::time::Duration;
 
         use crate::agent_loop::process_turn_with_events;
-        use crate::config::ResolvedLlmConfig;
         use crate::llm::OpenAiProvider;
 
         use wiremock::matchers::{method, path};
@@ -1109,17 +1108,12 @@ mod tests {
             .await;
 
         // Build a real OpenAiProvider pointed at the wiremock server.
-        let provider = OpenAiProvider::new(&ResolvedLlmConfig {
-            provider: "test".to_string(),
-            label: "Test".to_string(),
-            base_url: format!("{}/v1", server.uri()),
-            api_key: Some(secrecy::SecretString::new(
-                "sk-test".to_string().into_boxed_str(),
-            )),
-            model: "gpt-4o-mini".to_string(),
-            reasoning_effort: None,
-            headers: Default::default(),
-        })
+        let provider = OpenAiProvider::new(&crate::test_util::llm_config(
+            "test",
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
         .expect("provider");
 
         let dir = tempfile::tempdir().expect("tempdir");

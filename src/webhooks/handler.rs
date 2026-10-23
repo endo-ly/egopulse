@@ -249,14 +249,13 @@ mod tests {
             default_model: None,
             providers: std::collections::HashMap::from([(
                 ProviderId::new("openai"),
-                ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: None,
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: std::collections::HashMap::new(),
-                    headers: Default::default(),
-                },
+                ProviderConfig::new(
+                    "OpenAI".to_string(),
+                    "https://api.openai.com/v1".to_string(),
+                    None,
+                    "gpt-4o-mini".to_string(),
+                    std::collections::HashMap::new(),
+                ),
             )]),
             state_root: "/tmp/test".to_string(),
             log_level: "info".to_string(),
@@ -303,14 +302,13 @@ mod tests {
             default_model: None,
             providers: std::collections::HashMap::from([(
                 ProviderId::new("openai"),
-                ProviderConfig {
-                    label: "OpenAI".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    api_key: None,
-                    default_model: "gpt-4o-mini".to_string(),
-                    models: std::collections::HashMap::new(),
-                    headers: Default::default(),
-                },
+                ProviderConfig::new(
+                    "OpenAI".to_string(),
+                    "https://api.openai.com/v1".to_string(),
+                    None,
+                    "gpt-4o-mini".to_string(),
+                    std::collections::HashMap::new(),
+                ),
             )]),
             state_root: "/tmp/test".to_string(),
             log_level: "info".to_string(),
