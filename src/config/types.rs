@@ -373,22 +373,14 @@ impl SleepBatchConfig {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PulseConfig {
-    pub enabled: bool,
     pub tick_interval_secs: u64,
 }
 
 impl Default for PulseConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             tick_interval_secs: 60,
         }
-    }
-}
-
-impl PulseConfig {
-    pub(crate) fn scheduler_enabled(&self) -> bool {
-        self.enabled
     }
 }
 

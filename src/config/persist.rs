@@ -126,8 +126,6 @@ struct SerializableRetry {
 
 #[derive(Serialize)]
 struct SerializablePulse {
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    enabled: bool,
     #[serde(skip_serializing_if = "is_default_pulse_tick_interval")]
     tick_interval: String,
 }
@@ -525,11 +523,10 @@ impl From<&Config> for SerializableConfig {
             },
             pulse: {
                 let pulse = &config.pulse;
-                if !pulse.enabled && pulse.tick_interval_secs == 60 {
+                if pulse.tick_interval_secs == 60 {
                     None
                 } else {
                     Some(SerializablePulse {
-                        enabled: pulse.enabled,
                         tick_interval: format_duration_secs(pulse.tick_interval_secs),
                     })
                 }
@@ -1086,18 +1083,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("egopulse.config.yaml");
         let mut config = sample_config();
-        config.pulse.enabled = true;
         config.pulse.tick_interval_secs = 120;
 
         save_config_with_secrets(&config, &path).expect("save config");
 
         let yaml = fs::read_to_string(&path).expect("yaml");
         assert!(yaml.contains("pulse:"));
-        assert!(yaml.contains("enabled: true"));
         assert!(yaml.contains("tick_interval: 2m"));
 
         let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
-        assert!(loaded.pulse.enabled);
         assert_eq!(loaded.pulse.tick_interval_secs, 120);
     }
 

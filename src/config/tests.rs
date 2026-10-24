@@ -795,7 +795,7 @@ fn loads_minimal_config_defaults() {
     assert!(config.sleep_batch.provider.is_none());
     assert!(!config.sleep_batch.enabled);
     assert!(config.sleep_batch.agents.is_none());
-    assert!(!config.pulse().enabled);
+    assert_eq!(config.pulse().tick_interval_secs, 60);
     assert_eq!(config.timezone, "UTC");
 }
 
@@ -3015,8 +3015,7 @@ fn pulse_config_loads_runtime_fields() {
     let file_path = write_config(
         &temp_dir,
         &pulse_config_yml(
-            r#"  enabled: true
-  tick_interval: "2m"
+            r#"  tick_interval: "2m"
 "#,
         ),
     );
@@ -3025,7 +3024,6 @@ fn pulse_config_loads_runtime_fields() {
     let config = Config::load(Some(&file_path)).expect("load config");
 
     // Assert
-    assert!(config.pulse().enabled);
     assert_eq!(config.pulse().tick_interval_secs, 120);
 }
 
@@ -3035,13 +3033,7 @@ fn pulse_config_rejects_invalid_tick_interval() {
     // Arrange
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        &pulse_config_yml(
-            r#"  enabled: true
-  tick_interval: "0s""#,
-        ),
-    );
+    let file_path = write_config(&temp_dir, &pulse_config_yml(r#"  tick_interval: "0s""#));
 
     // Act
     let error = Config::load(Some(&file_path)).expect_err("should fail");

@@ -187,7 +187,7 @@ src/
 ├── pulse/               # Pulse（注意活性化）
 │   ├── mod.rs           # モジュール公開
 │   ├── scheduler.rs     # 時間・due_key 判定の Scheduler
-│   ├── definition.rs    # PULSE.md パース・検証
+│   ├── definition.rs    # PULSE.yaml パース・検証・保存
 │   ├── capsule.rs       # Pulse Capsule 構築・実行
 │   ├── runner.rs        # Activation 実行・PULSE_OK 判定
 │   ├── output.rs        # 出力・保存処理

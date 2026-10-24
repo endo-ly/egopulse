@@ -232,6 +232,7 @@ Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）の
 
 - Secret スコープのチャットメッセージは `episodic.md` 等に昇格しない
 - PULSE は Secret スコープのチャットで発火・投稿しない
+- `pulse` ツールは Secret 会話からの呼び出しを拒否する（Pulse の実行・配送は通常スコープで行われるため、秘匿内容の取り込みを構造的に防ぐ）
 
 ### 5.3 ログ Redaction
 

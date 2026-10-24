@@ -16,9 +16,10 @@
 10. [activate_skill](#10-activate_skill)
 11. [send_attachment](#11-send_attachment)
 12. [agent_send](#12-agent_send)
-13. [Skill Catalog](#13-skill-catalog)
-14. [web_fetch](#14-web_fetch)
-15. [セキュリティガード](#15-セキュリティガード)
+13. [pulse](#13-pulse)
+14. [Skill Catalog](#14-skill-catalog)
+15. [web_fetch](#15-web_fetch)
+16. [セキュリティガード](#16-セキュリティガード)
 
 ---
 
@@ -41,7 +42,7 @@
 
 registry に登録される tool は次の通り。`agent_send` は常に登録される。
 
-#### 常時登録（10個）
+#### 常時登録（11個）
 
 - `read`
 - `bash`
@@ -53,6 +54,7 @@ registry に登録される tool は次の通り。`agent_send` は常に登録�
 - `activate_skill`
 - `send_attachment`
 - `web_fetch`
+- `pulse`
 
 #### 条件付き登録
 
@@ -446,7 +448,32 @@ Environment variables:
 
 実装: [egopulse/src/tools/agent_send.rs](../../egopulse/src/tools/agent_send.rs)
 
-## 13. Skill Catalog
+## 13. `pulse`
+
+- 目的: エージェントが自分の Pulse 設定（`agents/{agent_id}/PULSE.yaml`）を構造的に参照・編集できるようにする。会話の中で「毎日 9時に」と頼まれた設定をエージェントが行うための唯一の書き込み経路。ツール description 自体がエージェント向け Pulse 知識の正本（[pulse.md §3.3](./pulse.md#33-agent-による-pulse-操作pulse-ツール)）
+- 入力:
+  - `op: string` 必須。`list` / `add` / `update` / `remove` / `enable` / `disable`
+  - `id: string`。update / remove で必須。enable / disable では省略可（省略時は agent レベルの `enabled` 切替）
+  - `schedule: object`。add / update で使用。`kind`（daily / weekly / interval / once）と `at`（HH:MM）、kind ごとに `day` / `interval_days` / `date`
+  - `attention: string`。add で必須。その時間に注意を向ける対象（実行命令ではない）
+  - `delivery: object`。省略時は現在の会話（チャネルが Discord / Telegram の場合）。送信可能チャネル以外で省略した場合はエラーになり、明示指定を促す
+- 挙動:
+  - Secret 会話からは呼び出せない（エラーを返す）。Pulse の実行・配送は通常スコープで行われるため
+  - 操作対象は常に実行中の自エージェント（他エージェントの PULSE.yaml は操作しない）
+  - 書き込みは serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は発生しない。load → 変更 → save は排他ゲート内で実行され、並行操作でも更新消失はしない。バリデーションエラー（時刻形式・id 重複・`once` 過去日・DST で存在しない時刻等）はツールエラーとして返り、エージェントが会話内で自己修正できる
+  - `list` は各 intention の schedule・enabled・次回発火判定を返す。判定は scheduler と同一（カレンダー候補 + `pulse_runs` 実行履歴）で、時刻到達かつ未実行は `due now (pending next scan)`、実行済み期間は `already attempted for current period`、`once` 実行済みは `already attempted (no automatic retry)`。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す。PULSE.yaml が手編集で破損している場合はパースエラーを報告する
+  - `once` は `date + at` が過去の add / update を拒否する。発火が成功すると、実行時点の内容が現在の定義と一致する場合にのみ自動アーカイブ（ファイルから除去）される。失敗・skipped、activation 中の変更があった場合はファイルに残る（自動リトライなし）
+- 成功時: 操作結果のテキスト（`add` は id と次回発火見積もりを含む）
+- 主な失敗:
+  - `"pulse: missing required parameter ..."` — 必須引数の欠落
+  - `"pulse: intention id '<id>' already exists"` / `"no intention '<id>'"` — id の重複・不存在
+  - `"pulse: notifications can only be delivered to Discord or Telegram ..."` — 配送先を解決できない
+  - `"pulse: the pulse tool is not available in secret conversations ..."` — Secret 会話からの呼び出し
+  - `"pulse: PULSE.yaml could not be parsed ..."` — 手編集によるファイル破損
+
+実装: [egopulse/src/tools/pulse.rs](../../egopulse/src/tools/pulse.rs)
+
+## 14. Skill Catalog
 
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
@@ -455,7 +482,7 @@ Environment variables:
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 
-## 14. `web_fetch`
+## 15. `web_fetch`
 
 - 目的: URL からコンテンツを取得し、HTML を Markdown に変換して返す
 - 入力:
@@ -500,7 +527,7 @@ Environment variables:
 
 実装: [egopulse/src/tools/web_fetch/mod.rs](../../egopulse/src/tools/web_fetch/mod.rs)
 
-## 15. セキュリティガード
+## 16. セキュリティガード
 
 AI エージェントによるシークレット窃取を防ぐ多層防御。コマンド検閲・パス検閲・出力リダクションの 3 層で構成。
 

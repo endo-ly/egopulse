@@ -212,7 +212,6 @@ sleep_batch:
 # Pulse 設定（§3.8）
 # ========================================
 pulse:
-  enabled: true
   tick_interval: "1h"
 
 # ========================================
@@ -407,12 +406,11 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 
 ### 3.8 Pulse 設定（`pulse`）
 
-Pulse（注意活性化）のスケジューラ設定。
+Pulse（注意活性化）のスケジューラ設定。Pulse の有効 / 無効は agent 単位（`agents/{agent_id}/PULSE.yaml` の `enabled`、[pulse.md §3.1](./pulse.md#31-pulyaml)）でのみ制御され、グローバルスイッチは存在しない。Pulse は常設の runtime 機能であり、tick ループは常に回る。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
-| `pulse.enabled` | `bool` | 任意 | `false` | Pulse 機能の有効/無効 |
-| `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`） |
+| `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の基本周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`）。`once` の次回発火がこの周期内にある場合はその時刻に起床する |
 
 ### 3.9 DB バックアップ設定（`db.backup`）
 
@@ -916,4 +914,3 @@ Provider cache key に Config revision を含める。credential や base URL �
 |---|---|---|
 | DB schema version | `db_meta.schema_version`（[db.md](./db.md#db_meta)） | SQLite スキーマのマイグレーション版数。未対応版は起動を拒否 |
 | Config revision | `ConfigSnapshot.revision` | 設定世代の識別番号。同一 revision は同一 Config 内容を保証 |
-| Pulse definition version | `PULSE.md` front matter `version`（[pulse.md](./pulse.md)） | Pulse 定義フォーマットの版数。未対応版は読込を拒否 |

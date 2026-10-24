@@ -30,6 +30,7 @@
 │   └── alice/
 │       ├── SOUL.md
 │       ├── AGENTS.md
+│       ├── PULSE.yaml
 │       └── memory/
 │           ├── episodic.md
 │           ├── semantic.md
@@ -89,7 +90,7 @@ TUI は `src/channels/tui/` に責務別に分割されている。Inline viewpo
 | `SOUL.md` | デフォルト人格定義。system prompt の先頭に注入される |
 | `souls/` | 複数人格定義。チャネルやチャットに人格を紐付ける場合に使用 |
 | `AGENTS.md` | グローバルルール。全チャットで共有 |
-| `agents/` | エージェント別設定。各 `agents/{agent_id}/` 配下に SOUL.md / AGENTS.md / memory/ を配置 |
+| `agents/` | エージェント別設定。各 `agents/{agent_id}/` 配下に SOUL.md / AGENTS.md / PULSE.yaml / memory/ を配置 |
 | `mcp.json` | MCP サーバー定義 |
 | `mcp.d/` | MCP 追加設定ファイル群 |
 

@@ -422,7 +422,6 @@ mod tests {
         let capsule = build_capsule(
             "lyre",
             &intention,
-            "notes",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -555,7 +554,6 @@ mod tests {
         let capsule = build_capsule(
             "default",
             &test_intention(),
-            "",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -675,7 +673,6 @@ mod tests {
         let capsule = build_capsule(
             "default",
             &test_intention(),
-            "",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -756,7 +753,6 @@ mod tests {
         let capsule = build_capsule(
             "default",
             &test_intention(),
-            "",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -834,7 +830,6 @@ mod tests {
         let capsule = build_capsule(
             "default",
             &test_intention(),
-            "",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -982,7 +977,6 @@ mod tests {
             let capsule = build_capsule(
                 "default",
                 &test_intention(),
-                "",
                 &[],
                 &surface,
                 "2026-05-10T09:00:00+09:00",
@@ -1090,7 +1084,6 @@ mod tests {
         let capsule = build_capsule(
             "default",
             &test_intention(),
-            "",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",

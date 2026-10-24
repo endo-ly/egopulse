@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
 use crate::config::AgentId;
@@ -54,17 +54,13 @@ fn extract_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// Run a single pulse scan across all configured agents.
 ///
 /// For each agent:
-/// 1. Load PULSE.md → parse intentions
+/// 1. Load PULSE.yaml → parse intentions
 /// 2. For each intention → check due → evaluate gate → resolve home surface →
 ///    build capsule → run activation → handle output
 /// 3. If parse error for one agent → warn and continue to next agent
 /// 4. If execution error for one intention → warn and continue to next intention
 pub(crate) async fn run_pulse_scan(state: &AppState) {
     let snapshot = state.config_manager.current_blocking();
-    let pulse_cfg = snapshot.config.pulse();
-    if !pulse_cfg.scheduler_enabled() {
-        return;
-    }
 
     let timezone = snapshot.config.timezone.as_str();
 
@@ -84,7 +80,7 @@ pub(crate) async fn run_pulse_scan(state: &AppState) {
     }
 }
 
-/// Scan a single agent's PULSE.md and process all due intentions.
+/// Scan a single agent's PULSE.yaml and process all due intentions.
 async fn scan_agent(
     state: &AppState,
     state_root: &Path,
@@ -99,11 +95,16 @@ async fn scan_agent(
             warn!(
                 agent_id = %agent_id,
                 error = %e,
-                "pulse scan: failed to load PULSE.md, skipping agent"
+                "pulse scan: failed to load PULSE.yaml, skipping agent"
             );
             return;
         }
     };
+
+    if !definition.enabled {
+        tracing::debug!(agent_id = %agent_id, "pulse scan: agent pulse is disabled, skipping");
+        return;
+    }
 
     if definition.intentions.is_empty() {
         return;
@@ -115,7 +116,6 @@ async fn scan_agent(
             agent_id,
             intention,
             definition.default_delivery.as_ref(),
-            &definition.body,
             timezone,
             now,
             PULSE_ACTIVATION_TIMEOUT,
@@ -134,7 +134,6 @@ async fn process_intention_with_activation_timeout(
     agent_id: &AgentId,
     intention: &super::definition::TemporalIntention,
     default_delivery: Option<&super::definition::DeliverySpec>,
-    pulse_body: &str,
     timezone: &str,
     now: chrono::DateTime<Utc>,
     activation_timeout: Duration,
@@ -239,9 +238,12 @@ async fn process_intention_with_activation_timeout(
     {
         Ok(Some(surface)) => surface,
         Ok(None) => {
-            if let Err(e) =
-                update_run_skipped(&state.db, &pulse_run_id, "no sendable home surface").await
-            {
+            let reason = if explicit_delivery.is_some() {
+                "explicit delivery could not be resolved"
+            } else {
+                "no sendable home surface"
+            };
+            if let Err(e) = update_run_skipped(&state.db, &pulse_run_id, reason).await {
                 warn!(
                     pulse_run_id = %pulse_run_id,
                     error = %e,
@@ -278,7 +280,6 @@ async fn process_intention_with_activation_timeout(
     let capsule = super::capsule::build_capsule(
         agent_id_str,
         intention,
-        pulse_body,
         &recent_messages,
         &home_surface,
         &now_rfc3339,
@@ -291,7 +292,7 @@ async fn process_intention_with_activation_timeout(
             agent_id_str,
             &capsule,
             &home_surface,
-            snapshot,
+            Arc::clone(&snapshot),
         ),
         activation_timeout,
     )
@@ -333,6 +334,48 @@ async fn process_intention_with_activation_timeout(
             error = %e,
             "pulse scan: output handling failed"
         );
+        return;
+    }
+
+    // 9. Archive fired `once` intentions on success. A failed or skipped run
+    //    leaves the intention in place so the agent can inspect and repair it.
+    //    The archive only removes the intention when the file still holds the
+    //    exact definition that ran, so an edit made during the activation (e.g.
+    //    a reschedule to tomorrow) survives.
+    if matches!(
+        intention.schedule,
+        super::definition::TemporalSchedule::Once { .. }
+    ) {
+        let state_root = snapshot.config.state_root.clone();
+        let _guard = super::definition::pulse_file_lock();
+        match super::definition::archive_intention(
+            std::path::Path::new(&state_root),
+            agent_id_str,
+            intention,
+        ) {
+            Ok(true) => {
+                tracing::info!(
+                    agent_id = agent_id_str,
+                    intention_id = %intention.id,
+                    "pulse scan: archived fired once intention"
+                );
+            }
+            Ok(false) => {
+                tracing::info!(
+                    agent_id = agent_id_str,
+                    intention_id = %intention.id,
+                    "pulse scan: once intention changed during activation, keeping it"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    agent_id = agent_id_str,
+                    intention_id = %intention.id,
+                    error = %e,
+                    "pulse scan: failed to archive fired once intention"
+                );
+            }
+        }
     }
 }
 
@@ -410,8 +453,14 @@ async fn load_last_success_started_at(
 
 /// Run the pulse scheduler tick loop.
 ///
-/// Sleeps for the configured tick interval between scans. Runs until
-/// `shutdown` is cancelled, at which point it returns promptly.
+/// Scans every `tick_interval`. `daily` / `weekly` / `interval` intentions
+/// fire on the first scan after their time, because they are directions of
+/// attention. A `once` intention is an appointment-style reminder, so the loop
+/// wakes at its exact due instant (still bounded by `tick_interval` when the
+/// reminder is further away), and a definition save through the pulse tool
+/// wakes the loop immediately so newly added reminders are honored within the
+/// same tick window. Runs until `shutdown` is cancelled, at which point it
+/// returns promptly.
 pub(crate) async fn run_pulse_scheduler(
     state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -422,20 +471,11 @@ pub(crate) async fn run_pulse_scheduler(
     loop {
         let snapshot = state.config_manager.current_blocking();
         let pulse = snapshot.config.pulse();
-        if !pulse.scheduler_enabled() {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    info!("pulse scheduler: shutdown requested, exiting loop");
-                    return;
-                }
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    continue;
-                }
-            }
-        }
+        let tick_interval = Duration::from_secs(pulse.tick_interval_secs);
+
+        let now = Utc::now();
+        let earliest_once = earliest_once_due(&snapshot, now);
+        let delay = next_scan_delay(now, tick_interval, earliest_once);
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -448,9 +488,77 @@ pub(crate) async fn run_pulse_scheduler(
                 }
                 continue;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(pulse.tick_interval_secs)) => {}
+            _ = super::definition::pulse_changed().notified() => {}
+            _ = tokio::time::sleep(delay) => {}
         }
         run_pulse_scan(&state).await;
+    }
+}
+
+/// Compute the earliest strictly-future `once` due instant across all agents.
+///
+/// Only `once` intentions participate: they are appointment-style reminders
+/// whose stated time matters, so the scheduler wakes at that instant instead of
+/// waiting for the next tick. Recurring kinds keep the ambient scan cadence.
+/// Disabled agents, disabled intentions, and unreadable definitions are
+/// ignored here; the scan itself reports parse failures.
+fn earliest_once_due(
+    snapshot: &crate::config::manager::ConfigSnapshot,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let state_root = Path::new(&snapshot.config.state_root);
+    let timezone = snapshot.config.timezone.as_str();
+    let mut earliest: Option<DateTime<Utc>> = None;
+
+    for agent_id in snapshot.config.agents.keys() {
+        let Ok(definition) =
+            super::definition::load_pulse_definition(state_root, agent_id.as_str())
+        else {
+            continue;
+        };
+        if !definition.enabled {
+            continue;
+        }
+
+        for intention in &definition.intentions {
+            if !intention.enabled {
+                continue;
+            }
+            if !matches!(
+                intention.schedule,
+                super::definition::TemporalSchedule::Once { .. }
+            ) {
+                continue;
+            }
+            let Some(due) = super::definition::estimate_next_due(intention, now, timezone, None)
+            else {
+                continue;
+            };
+            if due <= now {
+                continue;
+            }
+            earliest = Some(earliest.map_or(due, |current| current.min(due)));
+        }
+    }
+
+    earliest
+}
+
+/// Delay until the next scan: the exact `once` due instant when it falls inside
+/// the tick window, otherwise the tick interval. Clamped to at least one second
+/// so boundary instants cannot spin the loop.
+fn next_scan_delay(
+    now: DateTime<Utc>,
+    tick_interval: Duration,
+    earliest_once: Option<DateTime<Utc>>,
+) -> Duration {
+    let fallback = tick_interval.max(Duration::from_secs(1));
+    match earliest_once {
+        Some(due) if due > now => (due - now)
+            .to_std()
+            .unwrap_or(fallback)
+            .clamp(Duration::from_secs(1), fallback),
+        _ => fallback,
     }
 }
 
@@ -480,7 +588,7 @@ mod tests {
         config.pulse = pulse_config;
 
         config.agents.clear();
-        for (agent_id, pulse_md_content) in &agents {
+        for (agent_id, pulse_yaml_content) in &agents {
             config.agents.insert(
                 AgentId::new(agent_id),
                 AgentConfig {
@@ -488,10 +596,11 @@ mod tests {
                     ..Default::default()
                 },
             );
-            if !pulse_md_content.is_empty() {
+            if !pulse_yaml_content.is_empty() {
                 let agents_dir = dir.path().join("agents").join(agent_id);
                 fs::create_dir_all(&agents_dir).expect("create agent dir");
-                fs::write(agents_dir.join("PULSE.md"), pulse_md_content).expect("write PULSE.md");
+                fs::write(agents_dir.join("PULSE.yaml"), pulse_yaml_content)
+                    .expect("write PULSE.yaml");
             }
         }
 
@@ -508,35 +617,187 @@ mod tests {
         )
     }
 
-    fn enabled_pulse_config() -> PulseConfig {
+    fn default_pulse_config() -> PulseConfig {
         PulseConfig {
-            enabled: true,
             tick_interval_secs: 60,
         }
     }
 
-    fn valid_daily_pulse_md() -> String {
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .expect("valid utc")
+    }
+
+    // --- next scan delay tests (once reservation) ---
+
+    #[test]
+    fn next_scan_delay_wakes_at_once_due_inside_tick_window() {
+        // Arrange: tick 30m, once due in 20m → wake at the due instant
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let due = now + chrono::Duration::minutes(20);
+
+        // Act
+        let delay = next_scan_delay(now, Duration::from_secs(30 * 60), Some(due));
+
+        // Assert
+        assert_eq!(delay, Duration::from_secs(20 * 60));
+    }
+
+    #[test]
+    fn next_scan_delay_uses_tick_interval_when_once_due_is_further_away() {
+        // Arrange: tick 30m, once due in 50m
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let due = now + chrono::Duration::minutes(50);
+
+        // Act
+        let delay = next_scan_delay(now, Duration::from_secs(30 * 60), Some(due));
+
+        // Assert: the loop must still wake every tick to re-evaluate
+        assert_eq!(delay, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn next_scan_delay_ignores_past_or_current_once_due() {
+        // Arrange: a stale or just-due instant must not spin the loop
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let tick = Duration::from_secs(30 * 60);
+
+        // Act + Assert
+        assert_eq!(
+            next_scan_delay(now, tick, Some(now - chrono::Duration::hours(1))),
+            tick
+        );
+        assert_eq!(next_scan_delay(now, tick, Some(now)), tick);
+        assert_eq!(next_scan_delay(now, tick, None), tick);
+    }
+
+    #[test]
+    fn next_scan_delay_clamps_sub_second_once_due_to_one_second() {
+        // Arrange
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let due = now + chrono::Duration::milliseconds(300);
+
+        // Act
+        let delay = next_scan_delay(now, Duration::from_secs(30 * 60), Some(due));
+
+        // Assert
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn earliest_once_due_picks_the_soonest_once_across_agents() {
+        // Arrange: agent-a has a far-future once, agent-b a nearer one, and
+        // recurring intentions must not participate at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_a = "\
+intentions:
+  - id: far_reminder
+    schedule:
+      kind: once
+      date: \"2999-01-03\"
+      at: \"00:00\"
+    attention: far
+";
+        let agent_b = "\
+intentions:
+  - id: daily_check
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: recurring
+  - id: near_reminder
+    schedule:
+      kind: once
+      date: \"2999-01-02\"
+      at: \"00:00\"
+    attention: near
+";
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("agent-a", agent_a), ("agent-b", agent_b)],
+        );
+        let snapshot = state.config_manager.current_blocking();
+        let now = utc(2026, 5, 10, 0, 0, 0);
+
+        // Act
+        let earliest = earliest_once_due(&snapshot, now);
+
+        // Assert: the 2999-01-02 once wins over 2999-01-03 and the daily is ignored
+        let expected = super::super::definition::estimate_next_due(
+            &super::super::definition::load_pulse_definition(
+                std::path::Path::new(&snapshot.config.state_root),
+                "agent-b",
+            )
+            .expect("load agent-b")
+            .intentions[1],
+            now,
+            "UTC",
+            None,
+        );
+        assert_eq!(earliest, expected);
+        assert!(earliest.is_some(), "a future once must be reported");
+    }
+
+    #[test]
+    fn earliest_once_due_ignores_disabled_agents_and_intentions() {
+        // Arrange: only recurring + disabled once exist
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disabled_agent = "\
+enabled: false
+intentions:
+  - id: reminder
+    schedule:
+      kind: once
+      date: \"2999-01-01\"
+      at: \"00:00\"
+    attention: disabled agent
+";
+        let disabled_intention = "\
+intentions:
+  - id: daily_check
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: recurring only
+  - id: paused_reminder
+    enabled: false
+    schedule:
+      kind: once
+      date: \"2999-01-01\"
+      at: \"00:00\"
+    attention: paused
+";
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("agent-a", disabled_agent), ("agent-b", disabled_intention)],
+        );
+        let snapshot = state.config_manager.current_blocking();
+
+        // Act
+        let earliest = earliest_once_due(&snapshot, utc(2026, 5, 10, 0, 0, 0));
+
+        // Assert
+        assert_eq!(earliest, None);
+    }
+
+    fn valid_daily_pulse_yaml() -> String {
         "\
----
-version: 1
 intentions:
   - id: morning_review
     schedule:
       kind: daily
       at: \"00:00\"
     attention: Check today.
----
-
-# Notes
-Some notes.
 "
         .to_string()
     }
 
-    fn valid_interval_pulse_md() -> String {
+    fn valid_interval_pulse_yaml() -> String {
         "\
----
-version: 1
 intentions:
   - id: periodic_report
     schedule:
@@ -544,12 +805,24 @@ intentions:
       interval_days: 3
       at: \"00:00\"
     attention: Periodic report.
----
-
-# Notes
-Some notes.
 "
         .to_string()
+    }
+
+    fn valid_once_pulse_yaml() -> String {
+        // Today at 00:00 local time: due any moment of the current day.
+        let today = chrono::Utc::now().format("%Y-%m-%d");
+        format!(
+            "\
+intentions:
+  - id: one_shot_reminder
+    schedule:
+      kind: once
+      date: \"{today}\"
+      at: \"00:00\"
+    attention: One-shot reminder.
+"
+        )
     }
 
     /// Inserts a terminal `success` pulse_run with an explicit `started_at`,
@@ -604,14 +877,28 @@ Some notes.
     }
 
     #[tokio::test]
-    async fn scheduler_disabled_exits_without_scan() {
-        // Arrange
+    async fn scheduler_skips_agent_when_pulse_disabled() {
+        // Arrange: agent-level `enabled: false` suppresses the whole agent
         let dir = tempfile::tempdir().expect("tempdir");
-        let pulse_config = PulseConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let state = build_pulse_state(&dir, pulse_config, vec![("default", "")]);
+        let disabled_pulse_yaml = "\
+enabled: false
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: Check today.
+";
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("default", disabled_pulse_yaml)],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
 
         // Act
         run_pulse_scan(&state).await;
@@ -620,7 +907,7 @@ Some notes.
         assert_eq!(
             count_agent_runs(&state.db, "default"),
             0,
-            "disabled scheduler should not create any runs"
+            "disabled agent pulse should not create any runs"
         );
     }
 
@@ -630,10 +917,10 @@ Some notes.
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
+            default_pulse_config(),
             vec![
-                ("agent-a", &valid_daily_pulse_md()),
-                ("agent-b", &valid_daily_pulse_md()),
+                ("agent-a", &valid_daily_pulse_yaml()),
+                ("agent-b", &valid_daily_pulse_yaml()),
             ],
         );
 
@@ -668,8 +955,8 @@ Some notes.
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", &valid_daily_pulse_md())],
+            default_pulse_config(),
+            vec![("default", &valid_daily_pulse_yaml())],
         );
 
         let _chat = state
@@ -694,19 +981,19 @@ Some notes.
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let invalid_yaml = "\
----
-version: not_a_number
 intentions:
-  - bad
----
-body
+  - id: bad_time
+    schedule:
+      kind: daily
+      at: \"25:00\"
+    attention: test
 ";
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
+            default_pulse_config(),
             vec![
                 ("agent-a", invalid_yaml),
-                ("agent-b", &valid_daily_pulse_md()),
+                ("agent-b", &valid_daily_pulse_yaml()),
             ],
         );
 
@@ -722,7 +1009,7 @@ body
         assert_eq!(
             count_agent_runs(&state.db, "agent-a"),
             0,
-            "agent-a with invalid PULSE.md should have no runs"
+            "agent-a with invalid PULSE.yaml should have no runs"
         );
         assert_eq!(
             count_agent_runs(&state.db, "agent-b"),
@@ -737,8 +1024,8 @@ body
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", &valid_interval_pulse_md())],
+            default_pulse_config(),
+            vec![("default", &valid_interval_pulse_yaml())],
         );
 
         let _chat = state
@@ -763,8 +1050,8 @@ body
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", &valid_interval_pulse_md())],
+            default_pulse_config(),
+            vec![("default", &valid_interval_pulse_yaml())],
         );
 
         let _chat = state
@@ -798,8 +1085,8 @@ body
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", &valid_interval_pulse_md())],
+            default_pulse_config(),
+            vec![("default", &valid_interval_pulse_yaml())],
         );
 
         let _chat = state
@@ -827,24 +1114,11 @@ body
         );
     }
 
-    #[test]
-    fn runtime_starts_pulse_scheduler_when_enabled() {
-        // Arrange
-        let pulse_config = enabled_pulse_config();
-
-        // Assert
-        assert!(
-            pulse_config.scheduler_enabled(),
-            "pulse config should be enabled"
-        );
-    }
-
     #[tokio::test]
     async fn runtime_starts_with_local_api_when_external_channels_are_disabled() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
-        config.pulse = enabled_pulse_config();
         config.channels.clear();
         let socket_path =
             crate::runtime::local_api::socket_path(std::path::Path::new(&config.state_root));
@@ -880,10 +1154,10 @@ body
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
+            default_pulse_config(),
             vec![
-                ("agent-a", &valid_daily_pulse_md()),
-                ("agent-b", &valid_daily_pulse_md()),
+                ("agent-a", &valid_daily_pulse_yaml()),
+                ("agent-b", &valid_daily_pulse_yaml()),
             ],
         );
 
@@ -989,9 +1263,7 @@ body
     async fn scheduler_skips_disabled_intention() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let disabled_pulse_md = "\
----
-version: 1
+        let disabled_pulse_yaml = "\
 intentions:
   - id: morning_review
     enabled: false
@@ -999,15 +1271,11 @@ intentions:
       kind: daily
       at: \"00:00\"
     attention: Check today.
----
-
-# Notes
-Some notes.
 ";
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", disabled_pulse_md)],
+            default_pulse_config(),
+            vec![("default", disabled_pulse_yaml)],
         );
 
         let _chat = state
@@ -1030,9 +1298,7 @@ Some notes.
     async fn scheduler_runs_only_enabled_intentions_when_mixed() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let mixed_pulse_md = "\
----
-version: 1
+        let mixed_pulse_yaml = "\
 intentions:
   - id: active_check
     schedule:
@@ -1045,14 +1311,11 @@ intentions:
       kind: daily
       at: \"00:00\"
     attention: Paused one.
----
-
-# Notes
 ";
         let state = build_pulse_state(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", mixed_pulse_md)],
+            default_pulse_config(),
+            vec![("default", mixed_pulse_yaml)],
         );
 
         let _chat = state
@@ -1081,6 +1344,87 @@ intentions:
             .expect("intention_id");
         drop(conn);
         assert_eq!(intention_id, "active_check");
+    }
+
+    #[tokio::test]
+    async fn once_intention_is_archived_after_successful_run() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("default", &valid_once_pulse_yaml())],
+        );
+
+        let _chat = state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .expect("chat");
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert: the run succeeded and the intention was removed from the file
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "once intention should fire exactly once"
+        );
+        assert_eq!(
+            latest_run_status(&state.db, "default"),
+            PulseRunStatus::Success
+        );
+
+        let definition = super::super::definition::load_pulse_definition(
+            std::path::Path::new(dir.path().to_str().expect("utf8")),
+            "default",
+        )
+        .expect("load pulse definition");
+        assert!(
+            definition.intentions.is_empty(),
+            "fired once intention should be archived, got: {:?}",
+            definition
+                .intentions
+                .iter()
+                .map(|intention| intention.id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn once_intention_stays_when_notification_fails() {
+        // Arrange: no sendable home surface → run is skipped, intention stays
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("default", &valid_once_pulse_yaml())],
+        );
+
+        // Act
+        run_pulse_scan(&state).await;
+
+        // Assert
+        assert_eq!(
+            count_agent_runs(&state.db, "default"),
+            1,
+            "run should be recorded as skipped"
+        );
+        assert_eq!(
+            latest_run_status(&state.db, "default"),
+            PulseRunStatus::Skipped
+        );
+
+        let definition = super::super::definition::load_pulse_definition(
+            std::path::Path::new(dir.path().to_str().expect("utf8")),
+            "default",
+        )
+        .expect("load pulse definition");
+        assert_eq!(
+            definition.intentions.len(),
+            1,
+            "skipped once intention must stay in the file for conversational repair"
+        );
     }
 
     #[tokio::test]
@@ -1190,8 +1534,8 @@ intentions:
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state_with_llm(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", &valid_daily_pulse_md())],
+            default_pulse_config(),
+            vec![("default", &valid_daily_pulse_yaml())],
             Arc::new(PendingLlm),
         );
 
@@ -1216,7 +1560,6 @@ intentions:
                 &agent_id,
                 intention,
                 definition.default_delivery.as_ref(),
-                &definition.body,
                 "UTC",
                 now,
                 Duration::from_millis(100),
@@ -1249,8 +1592,8 @@ intentions:
         let dir = tempfile::tempdir().expect("tempdir");
         let state = build_pulse_state_with_llm(
             &dir,
-            enabled_pulse_config(),
-            vec![("default", &valid_daily_pulse_md())],
+            default_pulse_config(),
+            vec![("default", &valid_daily_pulse_yaml())],
             Arc::new(PanickingLlm),
         );
 
@@ -1275,7 +1618,6 @@ intentions:
                 &agent_id,
                 intention,
                 definition.default_delivery.as_ref(),
-                &definition.body,
                 "UTC",
                 now,
                 Duration::from_secs(60),

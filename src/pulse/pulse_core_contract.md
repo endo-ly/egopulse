@@ -10,7 +10,7 @@ If the surfaced intention calls for checking, reporting, summarizing, reminding,
 
 ## Rules
 - Read the Temporal Intention first. It is the purpose to evaluate and satisfy.
-- Review the provided Pulse Notes, memory, recent context, and tool results as supporting context.
+- Review the Temporal Intention, memory, recent context, and tool results as supporting context.
 - If the intention is still relevant and asks for a result, produce user-facing output.
 - If the intention requires current/external information, use tools before deciding when appropriate.
 - Return PULSE_OK only when the intention has been evaluated and there is truly nothing useful to tell or do now.

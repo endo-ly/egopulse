@@ -405,6 +405,11 @@ async fn build_runtime_tooling(
         Arc::clone(config_manager),
     )));
 
+    tools.register_tool(Box::new(crate::tools::PulseTool::new(
+        Arc::clone(config_manager),
+        Arc::clone(&deps.db),
+    )));
+
     Ok(RuntimeTooling {
         tools: Arc::new(tools),
         mcp_manager,

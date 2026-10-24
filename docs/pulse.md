@@ -100,19 +100,21 @@ Pulse:
 ```text
 ┌──────────────────────────────┐
 │         Pulse Scheduler       │
-│  tick_interval ごとに起動     │
+│ tick_interval ごと / once 時刻 │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
-│       Load agents/*/PULSE.md  │
-│  front matter + body を読む    │
+│      Load agents/*/PULSE.yaml │
+│   document 全体を読む          │
+│  （enabled: false は skip）    │
 └──────────────┬───────────────┘
                │
                ▼
 ┌──────────────────────────────┐
 │        Temporal Due Resolver  │
-│ daily / weekly / interval 判定     │
+│ daily / weekly / interval /   │
+│ once 判定                     │
 └──────────────┬───────────────┘
                │ due
                ▼
@@ -130,7 +132,7 @@ Pulse:
                ▼
 ┌──────────────────────────────┐
 │        Pulse Capsule Builder  │
-│ contract + intention + notes   │
+│  contract + intention + ctx    │
 └──────────────┬───────────────┘
                │
                ▼
@@ -150,9 +152,9 @@ Pulse:
 
 ## 3. ファイル責務
 
-### 3.1 `PULSE.md`
+### 3.1 `PULSE.yaml`
 
-Pulse は agent 配下の `PULSE.md` を使う。
+Pulse は agent 配下の `PULSE.yaml` を使う。
 
 ```text
 ~/.egopulse/
@@ -160,19 +162,17 @@ Pulse は agent 配下の `PULSE.md` を使う。
     └── {agent_id}/
         ├── SOUL.md
         ├── AGENTS.md
-        ├── PULSE.md
+        ├── PULSE.yaml
         └── memory/
             ├── episodic.md
             ├── semantic.md
             └── prospective.md
 ```
 
-`PULSE.md` は二層構造にする。ファイルに内容を書く場合は YAML front matter を必須とし、
-front matter なしの Markdown 本文だけの定義はパースエラーとして扱う。
+ファイルは純粋な YAML ドキュメントである（front matter は使わない）。
 
-```md
----
-version: 1
+```yaml
+enabled: true
 default_delivery:
   channel: discord
   external_chat_id: "1234567890123456789"
@@ -193,57 +193,70 @@ intentions:
       at: "21:00"
     attention: |
       週の振り返り。
----
-
-# PULSE
-
-## Notes
-
-- trivial な変化では通知しない。
-- 大きな作業は開始しない。
-- 通知する価値がなければ PULSE_OK。
 ```
 
 | 領域 | 役割 |
 |---|---|
-| front matter | 非LLMで due 判定するための構造化 Temporal Intention |
-| Markdown body | LLM に渡す柔らかい注意メモ |
+| `enabled` | agent 単位の Pulse 有効化スイッチ（省略時 `true`）。`false` のとき scheduler はその agent を skip し、`pulse` ツールは `list` / `enable` のみ応答する |
+| `default_delivery` / `intentions` | 非LLMで due 判定するための構造化 Temporal Intention |
 | binary embedded contract | Pulse の内部契約・安全制約・出力契約 |
 
-#### version 検証
+Pulse 定義に version フィールドは存在しない。形式の正本はこのドキュメントと runtime の実装であり、runtime が書き込むファイルは常に自力でパースできることが保証される（[§3.3](#33-agent-による-pulse-操作pulse-ツール)）。
 
-front matter の `version` は Pulse 定義フォーマットの版数である。runtime は `SUPPORTED_PULSE_VERSION`（現行 `1`）との一致を検証し、不一致の定義は `pulse_unsupported_version` エラーで読込を拒否する。未対応版を実行せず、読み取りだけで無視しない。
-
-これは DB schema version（[db.md](./db.md#db_meta)）や Config revision（[config.md §12.6](./config.md#126-3つのバージョン概念の区別)）とは独立した概念である。
-
-`PULSE.md` に内部仕様を詰め込まない。
+`PULSE.yaml` に内部仕様を詰め込まない。
 Pulse の内部契約はバイナリ側に埋め込む。
 
 ### 3.2 Config
 
-`egopulse.config.yaml` には runtime 設定だけを置く。
+`egopulse.config.yaml` には runtime 設定だけを置く。Pulse の有効 / 無効は agent 単位（`PULSE.yaml` の `enabled`）でのみ制御され、グローバルスイッチは存在しない。Pulse は常設の runtime 機能であり、scheduler の tick ループは常に回る。
 
 ```yaml
 pulse:
-  enabled: true
   tick_interval: "1m"
 ```
 
 | 設定 | 役割 |
 |---|---|
-| `pulse.enabled` | Pulse 全体の有効化（デフォルト `false`） |
-| `pulse.tick_interval` | due scan の周期（Duration 形式: `30s`, `1m`, `1h`。デフォルト `1m`） |
+| `pulse.tick_interval` | due scan の基本周期（Duration 形式: `30s`, `1m`, `1h`。デフォルト `1m`）。`once` の次回発火がこの周期内にある場合、scheduler はその時刻に起床する（発火は tick に依存しない） |
 
 due 判定の timezone は `pulse` 配下には設定しない。トップレベルの `timezone`（[config.md](./config.md)）を使用する。
 
 Temporal Intention の中身は config に置かない。
-それは agent の注意方針なので、`agents/{agent_id}/PULSE.md` に置く。
+それは agent の注意方針なので、`agents/{agent_id}/PULSE.yaml` に置く。
+
+### 3.3 Agent による Pulse 操作（`pulse` ツール）
+
+Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エージェントは会話の中で「毎日 9時にこれを確認して」「明日の 10時にリマインドして」と言われると、このツールで intention を設定する。ファイルへの書き込みはすべてツール経由とし、エージェントが PULSE.yaml を直接 write/edit することはない。
+
+**実装**: [`src/tools/pulse.rs`](../src/tools/pulse.rs)。ツール description 自体がエージェント向けの Pulse 知識の正本である（system prompt や skill への Pulse 専門セクションは存在しない）。
+
+| op | 引数 | 動作 |
+|---|---|---|
+| `list` | — | 現在の設定を表示。各 intention の schedule・enabled・次回発火見積もり、agent の enabled 状態。パースエラー（手編集による破損）もここで報告される |
+| `add` | `schedule` + `attention`、`id` / `delivery` は省略可 | intention を作成。`id` 省略時は schedule から自動採番（重複時は接尾辞）。`delivery` 省略時は**現在の会話**が使われる（チャネルが Discord/Telegram の場合）。`once` は未来日のみ可 |
+| `update` | `id` + `schedule` / `attention` / `delivery` | intention を変更 |
+| `remove` | `id` | intention を削除 |
+| `enable` / `disable` | `id` 省略可 | `id` あり: その intention のON/OFF。`id` なし: agent レベルの `enabled` 切替 |
+
+挙動の固定ルール:
+
+- **バリデーションエラーはツールエラー文字列として返る**（`HH:MM` 不正、id 重複、`interval_days < 1`、曜日不正、非対応チャネル等）。エージェントは会話の中で自己修正できる
+- **Secret 会話からは利用できない**: Pulse の実行・配送は Normal スコープで行われるため、Secret 会話からの呼び出しはエラーになる（秘匿内容の意図しない漏洩を防ぐ）。Pulse の設定は通常の会話から行う
+- **書き込みは serialize → parse round-trip → atomic rename**。ツールが書いたファイルがパースできない状態は原理的に発生しない
+- **並行書き込みは直列化される**: load → 変更 → save をプロセス共通の排他ゲート内で行うため、複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない
+- **`add` の delivery デフォルトは現在の会話**。TUI / Web など送信可能チャネル以外で頼まれた場合は intention を作らず、Discord / Telegram の配送先を問い返す
+- **同日の再発火はしない**: daily の `due_key` は日付単位のため、09:00 発火済みの日に 10:00 に変更しても当日は再発火しない。再発火させたい場合は id を変える
+- **発火見込みの表示は scheduler と同じ判定**: `list` / `add` の次回発火テキストは、カレンダー候補（`estimate_next_due`）に実行履歴（`pulse_runs` / due_key）を加えた scheduler と同一の判定で作る。時刻到達かつ未実行は `due now (pending next scan)`、候補が実行済み期間に属する場合は `already attempted for current period`、`once` 実行済みは `already attempted (no automatic retry)` と表示する。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す
+- **`once` は成功時に自動アーカイブされる**: run 成功後、実行時点の内容が現在の PULSE.yaml と一致する場合にのみ PULSE.yaml から除去される。activation 中にユーザーが再スケジュールした場合はそちらを優先して残す。失敗・skipped の場合はファイルに残り、`list` で可視化されるため、エージェントが原因を説明して `remove` → `add` で再設定する。自動リトライはしない
+- **v1 は自 agent のみ操作可能**（他 agent の PULSE.yaml は操作しない）。将来的な委譲拡張の余地は `agent_id` 引数の追加として残す
+- 編集は次の tick で反映される。再起動は不要。保存が成功すると scheduler へ起床信号が送られるため、`once` を追加した場合も次の tick を待たずに指定時刻へ起床する
+- Pulse Activation 中の自己編集も許可される（activation が active turn を保持するため、通常 turn との書き込み競合は発生しない）
 
 ---
 
 ## 4. Temporal Intention 仕様
 
-対応する schedule は以下の 3 種類。
+対応する schedule は以下の 4 種類。
 
 ### 4.1 daily
 
@@ -290,18 +303,37 @@ schedule:
 
 初回（`last_success = None`）は時刻判定のみで due になる。
 
-### 4.4 validation
+### 4.4 once
+
+指定した日付の `at` に 1 回だけ発火する単発リマインダ。
+
+```yaml
+schedule:
+  kind: once
+  date: "2026-05-12"
+  at: "18:00"
+```
+
+- `add` 時に `date + at` が過去のものは拒否される（ツール経由の場合）。タイムゾーンの DST 移行で存在しないローカル時刻も同様に拒否される
+- 発火は対象日の `at` **ちょうど**（秒精度）に行われる。`once` は予約型リマインダであり、時刻そのものが意味を持つため、scheduler は `tick_interval` を待たずに次回 due 時刻へ起床する（[§3.2](#32-config)）
+- **成功した run の後に intention は自動アーカイブされる**（PULSE.yaml から除去される）。単発リマインドが設定の残余を残さないため。activation 中に内容が変更されていた場合はアーカイブせず変更後の定義を残す
+- 失敗・skipped の場合は intention はファイルに残る。`due_key` は対象日を消耗するため自動リトライはせず、エージェントが `list` で検知して会話的に再設定する
+
+### 4.5 validation
 
 | 項目 | 仕様 |
 |---|---|
+| `enabled`（document） | `true` / `false`。省略時 `true`。`false` のとき scheduler はその agent を skip する |
 | `id` | agent 内で一意 |
-| `enabled` | `true` / `false`。省略時 `true`。`false` のときその intention の due 判定・実行をスキップする |
-| `schedule.kind` | `daily` / `weekly` / `interval` |
+| `enabled`（intention） | `true` / `false`。省略時 `true`。`false` のときその intention の due 判定・実行をスキップする |
+| `schedule.kind` | `daily` / `weekly` / `interval` / `once` |
 | `daily.at` | `HH:MM` |
 | `weekly.day` | `mon`〜`sun` |
 | `weekly.at` | `HH:MM` |
 | `interval.interval_days` | `1` 以上の整数 |
 | `interval.at` | `HH:MM` |
+| `once.date` | `YYYY-MM-DD` |
+| `once.at` | `HH:MM` |
 | `attention` | LLM に渡す注意対象。実行命令ではない |
 | `default_delivery` | 省略可能。agent レベルのデフォルト配送先 |
 | `default_delivery.channel` | `discord` / `telegram` のみ |
@@ -337,6 +369,11 @@ interval:
   かつ due_key 未実行
   ※ 前回成功日 = pulse_runs.status='success' の最新 started_at
   ※ 前回成功日が無い（初回）場合は日付条件をスキップ（時刻判定のみ）
+
+once:
+  今日のローカル日付 == date
+  かつ 今日の日付 + at <= now
+  かつ due_key 未実行
 ```
 
 ### 5.2 due_key
@@ -348,8 +385,11 @@ interval:
 | daily | `lyre:morning_review:2026-05-10` |
 | weekly | `kitara:weekly_reflection:2026-W19` |
 | interval | `lyre:periodic_report:2026-05-10` |
+| once | `lyre:dentist_reminder:2026-05-12`（設定日固定） |
 
 `interval` の `due_key` は評価日（今日のローカル日付）。前回成功日ではない。これにより、失敗した日は `due_key` が消費され、翌日は別の `due_key` で再評価される（意図駆動リトライ）。
+
+`once` の `due_key` は設定日固定。最初の run（status によらず）が消費するため、失敗時に同一日の再発火はしない。再設定は `remove` → `add` で行う（[§3.3](#33-agent-による-pulse-操作pulse-ツール)）。
 
 ---
 
@@ -397,10 +437,13 @@ resolve_home_surface(agent_id, delivery):
 1. delivery が明示指定されていれば（intention.delivery → default_delivery）、
    channel:external_chat_id を DB から検索
    （channel が送信可能な discord/telegram の場合のみ）
-2. 見つからなければ警告ログを出し、自動解決へフォールバック
-3. 自動解決: chats から agent_id に一致する最新 chat を探す
-4. channel adapter が存在し、送信可能なら採用
-5. どれも見つからなければ skipped（"no sendable home surface"）
+   - 見つからなければ自動解決へフォールバックしない。
+     その run は skipped（"explicit delivery could not be resolved"）。
+     ユーザーが指定した配送先を暗黙に変更しないため
+2. delivery が省略された場合のみ自動解決:
+   chats から agent_id に一致する最新 chat を探す
+3. channel adapter が存在し、送信可能なら採用
+4. どれも見つからなければ skipped（"no sendable home surface"）
 ```
 
 - 明示指定時の DB ルックアップは `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
@@ -430,7 +473,6 @@ Pulse Activation は通常 session の messages をそのまま使わない。
 Pulse Capsule =
   binary embedded contract
   + due になった Temporal Intention
-  + PULSE.md body
   + Home Surface の軽量 recent context
 ```
 
@@ -456,11 +498,7 @@ now: 2026-05-10T09:00:00+09:00
 
 ## Temporal Intention
 
-{front matter の attention}
-
-## Pulse Notes
-
-{PULSE.md body}
+{intention の attention}
 
 ## Recent Visible Context
 
@@ -471,7 +509,6 @@ now: 2026-05-10T09:00:00+09:00
 |---|---|
 | binary embedded Pulse Contract | 入れる |
 | due intention | 入れる |
-| `PULSE.md` body | あれば入れる |
 | Home Surface の直近メッセージ | 最大10件入れる |
 | 通常 session 全文 | 入れない |
 | tool call 履歴全体 | 入れない |
@@ -543,7 +580,7 @@ LLM の出力揺れを許容しつつ、実質的な誤検知は避ける。
    Attention:
    {attention}
    - Schedule は `daily 08:00`, `weekly sun 21:00`, `every 3 days 09:00` の形式
-   - Attention は PULSE.md の intention 定義そのまま
+   - Attention は PULSE.yaml の intention 定義そのまま
    - sender は `pulse`、message_kind は `SystemEvent`
 
 2. tool phase（あった場合）
@@ -665,10 +702,11 @@ src/
 │   ├── scheduler.rs         # Sleep scheduler
 │   ├── orchestrator.rs      # Sleep Batch 実行
 │   └── ...                  # episodic_renderer / event_rollup / memory_update
+├── tools/pulse.rs           # `pulse` ツール（agent による PULSE.yaml 操作・§3.3）
 └── pulse/                   # Pulse scheduler と処理本体
-    ├── scheduler.rs         # Pulse scheduler（tick / due / gate / home surface）
+    ├── scheduler.rs         # Pulse scheduler（tick / due / gate / home surface / once archive）
     ├── capsule.rs           # Gate 判定・Capsule 構築・Home Surface 解決
-    ├── definition.rs        # PULSE.md パース・due 判定・due_key 生成
+    ├── definition.rs        # PULSE.yaml パース・検証・保存・due 判定・due_key 生成
     ├── runner.rs            # LLM activation（tool loop）
     ├── output.rs            # 出力処理（silent / notify・session 保存）
     ├── pulse_core_contract.md
@@ -702,7 +740,7 @@ src/
 
 ```text
 Phase 1: Temporal Pulse
-  PULSE.md front matter の Temporal Intention を due 判定して起動する。
+  PULSE.yaml の Temporal Intention を due 判定して起動する。
   結果は Home Surface に出し、通知経路の会話を通常 session に保存する。
 
 Phase 2: Pulse Inbox / Notification Router
