@@ -134,6 +134,8 @@ mod tests {
             last_message_time: "2026-01-01T00:00:00Z".to_string(),
             last_message_preview: None,
             agent_id: "default".to_string(),
+            archived: false,
+            pinned: false,
         }
     }
 

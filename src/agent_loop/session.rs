@@ -1100,7 +1100,6 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), {
             let channel = context.channel.clone();
             let session_key = context.session_key();
-            let surface_thread = context.surface_thread.clone();
             let chat_type = context.chat_type.clone();
             let agent_id = context.agent_id.clone();
             move |db| db.resolve_or_create_chat_id(&channel, &session_key, &chat_type, &agent_id)

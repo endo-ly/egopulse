@@ -501,7 +501,8 @@ mod tests {
             }),
         )
         .await
-        .expect("rename ok");
+        .expect("rename ok")
+        .0;
 
         // Assert
         let sessions = list_sessions(AxumState(web_state.clone()))
@@ -520,7 +521,8 @@ mod tests {
             }),
         )
         .await
-        .expect("clear ok");
+        .expect("clear ok")
+        .0;
 
         // Assert
         let sessions = list_sessions(AxumState(web_state)).await.expect("ok");
@@ -546,7 +548,8 @@ mod tests {
             }),
         )
         .await
-        .expect("archive and pin ok");
+        .expect("archive and pin ok")
+        .0;
 
         // Assert: pin state survives archiving
         let sessions = list_sessions(AxumState(web_state.clone()))
@@ -566,7 +569,8 @@ mod tests {
             }),
         )
         .await
-        .expect("unarchive ok");
+        .expect("unarchive ok")
+        .0;
 
         // Assert
         let sessions = list_sessions(AxumState(web_state)).await.expect("ok");
@@ -594,7 +598,8 @@ mod tests {
             }),
         )
         .await
-        .expect("rename ok");
+        .expect("rename ok")
+        .0;
 
         // Assert
         let event = events.recv().await.expect("conversation change");

@@ -145,6 +145,7 @@ async fn open_session(
         surface_thread: resolved.display_surface_thread,
         chat_type: resolved.context.chat_type,
         agent_id: resolved.context.agent_id,
+        chat_title: resolved.chat_title,
         effective_provider: resolved.provider,
         effective_model: resolved.model,
         transcript: messages_to_entries(&messages),
@@ -223,6 +224,7 @@ struct ResolvedSession {
     reference: SessionReference,
     context: SurfaceContext,
     display_surface_thread: String,
+    chat_title: Option<String>,
     provider: String,
     model: String,
 }
@@ -231,7 +233,7 @@ async fn resolve_session(
     state: &AppState,
     reference: SessionReference,
 ) -> Result<ResolvedSession, EgoPulseError> {
-    let (context, display_surface_thread) = match &reference {
+    let (context, display_surface_thread, chat_title) = match &reference {
         SessionReference::Existing { chat_id } => {
             let sessions = call_blocking(Arc::clone(&state.db), |db| db.list_sessions()).await?;
             let summary = sessions
@@ -265,6 +267,7 @@ async fn resolve_session(
                     agent_id,
                 ),
                 summary.surface_thread,
+                summary.chat_title,
             )
         }
         SessionReference::Named { name } => (
@@ -276,6 +279,7 @@ async fn resolve_session(
                 state.current_config().default_agent.to_string(),
             ),
             name.clone(),
+            None,
         ),
     };
     let (provider, model) = effective_model(state, &context)?;
@@ -283,6 +287,7 @@ async fn resolve_session(
         reference,
         context,
         display_surface_thread,
+        chat_title,
         provider,
         model,
     })
@@ -320,6 +325,8 @@ fn session_summary(summary: StoredSessionSummary) -> SessionSummary {
         last_message_time: summary.last_message_time,
         last_message_preview: summary.last_message_preview,
         agent_id: summary.agent_id,
+        archived: summary.archived,
+        pinned: summary.pinned,
     }
 }
 
@@ -678,6 +685,15 @@ mod tests {
             .db
             .store_message_with_session(&message, r#"[{"role":"user","content":"hello"}]"#, None)
             .expect("store message");
+        state
+            .db
+            .update_chat_display_meta(
+                chat_id,
+                Some(Some("設計相談".to_string())),
+                Some(true),
+                Some(true),
+            )
+            .expect("rename chat");
 
         // Act
         let sessions = client.list_sessions().await.expect("list sessions");
@@ -690,6 +706,12 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].channel, "discord");
         assert_eq!(sessions[0].agent_id, "special");
+        assert_eq!(sessions[0].chat_title.as_deref(), Some("設計相談"));
+        assert_eq!(sessions[0].surface_thread, "42");
+        assert!(sessions[0].archived);
+        assert!(sessions[0].pinned);
+        assert_eq!(loaded.chat_title.as_deref(), Some("設計相談"));
+        assert_eq!(loaded.surface_thread, "42");
         assert_eq!(loaded.channel, "discord");
         assert_eq!(loaded.agent_id, "special");
         assert_eq!(loaded.effective_provider, "openai");

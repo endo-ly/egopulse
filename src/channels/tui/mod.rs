@@ -149,6 +149,7 @@ impl TuiApp {
 
     fn draw(&self, terminal: &mut TuiSession) -> Result<(), EgoPulseError> {
         let surface_thread = self.session.surface_thread.clone();
+        let chat_title = self.session.chat_title.clone();
         let agent_id = self.session.agent_id.clone();
         let status = self.status.clone();
         let model = self.model.clone();
@@ -159,6 +160,7 @@ impl TuiApp {
                     frame,
                     draw::DrawState {
                         surface_thread: &surface_thread,
+                        chat_title: chat_title.as_deref(),
                         agent_id: &agent_id,
                         transcript: &self.transcript,
                         composer: &self.composer,
