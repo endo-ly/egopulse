@@ -491,7 +491,7 @@ mod tests {
         let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
 
         // Act
-        update_session(
+        let _ = update_session(
             AxumState(web_state.clone()),
             Path(chat_id),
             Json(UpdateSessionRequest {
@@ -501,8 +501,7 @@ mod tests {
             }),
         )
         .await
-        .expect("rename ok")
-        .0;
+        .expect("rename ok");
 
         // Assert
         let sessions = list_sessions(AxumState(web_state.clone()))
@@ -511,7 +510,7 @@ mod tests {
         assert_eq!(sessions.0["sessions"][0]["name"], "設計相談");
 
         // Act: clear the name
-        update_session(
+        let _ = update_session(
             AxumState(web_state.clone()),
             Path(chat_id),
             Json(UpdateSessionRequest {
@@ -521,8 +520,7 @@ mod tests {
             }),
         )
         .await
-        .expect("clear ok")
-        .0;
+        .expect("clear ok");
 
         // Assert
         let sessions = list_sessions(AxumState(web_state)).await.expect("ok");
@@ -538,7 +536,7 @@ mod tests {
         let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
 
         // Act
-        update_session(
+        let _ = update_session(
             AxumState(web_state.clone()),
             Path(chat_id),
             Json(UpdateSessionRequest {
@@ -548,8 +546,7 @@ mod tests {
             }),
         )
         .await
-        .expect("archive and pin ok")
-        .0;
+        .expect("archive and pin ok");
 
         // Assert: pin state survives archiving
         let sessions = list_sessions(AxumState(web_state.clone()))
@@ -559,7 +556,7 @@ mod tests {
         assert_eq!(sessions.0["sessions"][0]["pinned"], true);
 
         // Act: unarchive only
-        update_session(
+        let _ = update_session(
             AxumState(web_state.clone()),
             Path(chat_id),
             Json(UpdateSessionRequest {
@@ -569,8 +566,7 @@ mod tests {
             }),
         )
         .await
-        .expect("unarchive ok")
-        .0;
+        .expect("unarchive ok");
 
         // Assert
         let sessions = list_sessions(AxumState(web_state)).await.expect("ok");
@@ -588,7 +584,7 @@ mod tests {
         let mut events = web_state.app_state.conversation_events.subscribe();
 
         // Act
-        update_session(
+        let _ = update_session(
             AxumState(web_state),
             Path(chat_id),
             Json(UpdateSessionRequest {
@@ -598,8 +594,7 @@ mod tests {
             }),
         )
         .await
-        .expect("rename ok")
-        .0;
+        .expect("rename ok");
 
         // Assert
         let event = events.recv().await.expect("conversation change");
