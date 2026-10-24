@@ -191,14 +191,12 @@ pub(crate) struct PulseCapsule {
 /// # Arguments
 /// * `agent_id` - Agent identifier
 /// * `intention` - The due intention
-/// * `pulse_body` - The PULSE.md body (notes section)
 /// * `recent_messages` - Recent user-visible messages from Home Surface (max 10)
 /// * `home_surface` - The resolved home surface
 /// * `now_rfc3339` - Current timestamp in RFC3339
 pub(crate) fn build_capsule(
     agent_id: &str,
     intention: &TemporalIntention,
-    pulse_body: &str,
     recent_messages: &[String],
     home_surface: &HomeSurface,
     now_rfc3339: &str,
@@ -226,11 +224,6 @@ pub(crate) fn build_capsule(
     // Temporal Intention
     sections.push_str("## Temporal Intention\n\n");
     sections.push_str(&intention.attention);
-    sections.push_str("\n\n");
-
-    // Pulse Notes
-    sections.push_str("## Pulse Notes\n\n");
-    sections.push_str(pulse_body);
     sections.push_str("\n\n");
 
     // Recent Visible Context
@@ -636,16 +629,14 @@ mod tests {
     }
 
     #[test]
-    fn capsule_includes_contract_intention_notes_and_recent_context() {
+    fn capsule_includes_contract_intention_and_recent_context() {
         let intention = test_intention();
         let surface = test_home_surface();
-        let pulse_body = "Don't notify for trivial changes.";
         let recent = vec!["User said hello".to_string(), "Bot replied hi".to_string()];
 
         let capsule = build_capsule(
             "lyre",
             &intention,
-            pulse_body,
             &recent,
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -663,8 +654,6 @@ mod tests {
         assert!(prompt.contains("PULSE_OK"));
         assert!(prompt.contains("## Temporal Intention"));
         assert!(prompt.contains("Check today's schedule and unresolved items."));
-        assert!(prompt.contains("## Pulse Notes"));
-        assert!(prompt.contains("Don't notify for trivial changes."));
         assert!(prompt.contains("## Recent Visible Context"));
         assert!(prompt.contains("User said hello"));
         assert!(prompt.contains("Bot replied hi"));
@@ -682,7 +671,6 @@ mod tests {
         let capsule = build_capsule(
             "lyre",
             &intention,
-            "body",
             &recent,
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -705,7 +693,6 @@ mod tests {
         let capsule = build_capsule(
             "lyre",
             &intention,
-            "notes",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",
@@ -737,7 +724,6 @@ mod tests {
         let capsule = build_capsule(
             "lyre",
             &intention,
-            "body",
             &[],
             &surface,
             "2026-05-10T09:00:00+09:00",

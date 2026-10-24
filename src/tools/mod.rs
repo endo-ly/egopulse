@@ -13,6 +13,7 @@ mod dotenv_secrets;
 mod files;
 pub(crate) mod mcp;
 mod path_guard;
+mod pulse;
 mod sanitizer;
 mod search;
 mod send_attachment;
@@ -21,6 +22,7 @@ mod text;
 mod web_fetch;
 
 pub(crate) use files::*;
+pub(crate) use pulse::PulseTool;
 pub(crate) use sanitizer::*;
 pub(crate) use search::*;
 pub(crate) use send_attachment::*;

@@ -141,7 +141,6 @@ struct FileRetryConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct FilePulseConfig {
-    enabled: Option<bool>,
     tick_interval: Option<String>,
 }
 
@@ -951,10 +950,7 @@ fn normalize_pulse(file: Option<FilePulseConfig>) -> Result<PulseConfig, ConfigE
         None => 60,
     };
 
-    Ok(PulseConfig {
-        enabled: fp.enabled.unwrap_or(false),
-        tick_interval_secs,
-    })
+    Ok(PulseConfig { tick_interval_secs })
 }
 
 fn normalize_db(file: Option<FileDatabaseConfig>) -> Result<DatabaseConfig, ConfigError> {

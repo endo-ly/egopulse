@@ -151,7 +151,7 @@ Pulse の `attention`（intention 定義内のテキスト）は、LLM が何に
 
 `pulse_runs` テーブルに `attention_snapshot` カラムを追加し、run 開始時に当時の `attention` テキストを保存する。Run Detail API レスポンスでこのスナップショットを返す。
 
-これにより、run 完了後に `PULSE.md` が編集されても、当時の attention を正確に再現できる。
+これにより、run 完了後に `PULSE.yaml` が編集されても、当時の attention を正確に再現できる。
 
 ### 表示仕様
 
@@ -238,8 +238,8 @@ Pulse Tab の Run Detail から、対応する Chat session へジャンプで�
 
 ## 8. Out of Scope
 
-- Pulse Intention の CRUD 編集（`PULSE.md` の編集はファイルシステム経由）
+- Pulse Intention の CRUD 編集（`PULSE.yaml` の編集は agent の `pulse` ツール経由）
 - Pulse の手動発火ボタン（テスト用途でも WebUI からは提供しない）
 - 集計ダッシュボード（発火頻度・silent率等の統計）
-- Pulse Capsule 内部ログの表示（`PULSE.md` body / Recent Visible Context / Core Contract 等）
+- Pulse Capsule 内部ログの表示（Recent Visible Context / Core Contract 等）
 - Pulse の強制 skip / 再実行（due_key 消去等の操作は CLI から）

@@ -1,7 +1,9 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono_tz::Tz;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Explicit delivery destination for pulse notifications.
@@ -11,11 +13,14 @@ pub(crate) struct DeliverySpec {
     pub external_chat_id: String,
 }
 
+/// The full Pulse document for one agent (`agents/{agent_id}/PULSE.yaml`).
 #[derive(Clone, Debug)]
 pub(crate) struct PulseDefinition {
+    /// Agent-level switch. When `false` the scheduler skips the agent entirely
+    /// and the `pulse` tool only reports the disabled state.
+    pub enabled: bool,
     pub default_delivery: Option<DeliverySpec>,
     pub intentions: Vec<TemporalIntention>,
-    pub body: String,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +48,13 @@ pub(crate) enum TemporalSchedule {
         interval_days: u32,
         at: String,
     },
+    /// Fire once at a fixed local `date` and `at`. A successful activation
+    /// archives the intention; a failed or skipped run leaves it in place so
+    /// the agent can inspect and repair it conversationally.
+    Once {
+        date: String,
+        at: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -61,29 +73,39 @@ pub(crate) enum PulseParseError {
     },
     #[error("pulse_invalid_delivery: {agent_id}: {detail}")]
     InvalidDelivery { agent_id: String, detail: String },
-    #[error("pulse_unsupported_version: {agent_id}: {version}")]
-    UnsupportedVersion { agent_id: String, version: u32 },
+    #[error("pulse_save_error: {agent_id}: {detail}")]
+    SaveFailed { agent_id: String, detail: String },
 }
 
-/// Schema version that this runtime understands. Pulse definitions declaring a
-/// different version are rejected with [`PulseParseError::UnsupportedVersion`]
-/// rather than silently ignored.
-///
-/// This is distinct from the DB schema version (migration ledger) and from the
-/// Config revision (immutable snapshot generation); see
-/// `docs/pulse.md` and `docs/config.md`.
-const SUPPORTED_PULSE_VERSION: u32 = 1;
+// ===========================================================================
+// YAML file format
+// ===========================================================================
 
-#[derive(Deserialize)]
+/// Delivery destination as written in / read from `PULSE.yaml`.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct PulseFrontMatter {
-    version: u32,
-    #[serde(default)]
-    intentions: Vec<IntentionRaw>,
-    default_delivery: Option<DeliveryRaw>,
+struct DeliveryRaw {
+    channel: String,
+    external_chat_id: String,
 }
 
-#[derive(Deserialize)]
+/// Schedule as written in / read from `PULSE.yaml`. Flat shape: `kind`
+/// determines which of the optional fields must be present.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ScheduleRaw {
+    kind: String,
+    #[serde(default)]
+    at: String,
+    #[serde(default)]
+    day: Option<String>,
+    #[serde(default)]
+    interval_days: Option<u32>,
+    #[serde(default)]
+    date: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct IntentionRaw {
     id: String,
@@ -91,30 +113,29 @@ struct IntentionRaw {
     enabled: bool,
     schedule: ScheduleRaw,
     attention: String,
+    #[serde(default)]
     delivery: Option<DeliveryRaw>,
+}
+
+/// `PULSE.yaml` document shape. `enabled` defaults to `true` so a hand-written
+/// minimal file only needs `intentions`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PulseDocumentRaw {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_delivery: Option<DeliveryRaw>,
+    #[serde(default)]
+    intentions: Vec<IntentionRaw>,
 }
 
 fn default_true() -> bool {
     true
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScheduleRaw {
-    kind: String,
-    at: String,
-    day: Option<String>,
-    interval_days: Option<u32>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DeliveryRaw {
-    channel: String,
-    external_chat_id: String,
-}
-
-const VALID_DELIVERY_CHANNELS: &[&str] = &["discord", "telegram"];
+pub(crate) const VALID_DELIVERY_CHANNELS: &[&str] = &["discord", "telegram"];
+const VALID_WEEKDAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 fn validate_delivery_raw(
     agent_id: &str,
@@ -144,101 +165,15 @@ fn validate_delivery_raw(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn parse_pulse_definition(content: &str) -> Result<PulseDefinition, PulseParseError> {
-    parse_pulse_definition_inner(content, "")
-}
-
-fn parse_pulse_definition_inner(
-    content: &str,
+fn validate_date(
     agent_id: &str,
-) -> Result<PulseDefinition, PulseParseError> {
-    let content = content.replace("\r\n", "\n");
-    let trimmed = content.trim();
-
-    if trimmed.is_empty() {
-        return Ok(PulseDefinition {
-            default_delivery: None,
-            intentions: Vec::new(),
-            body: String::new(),
-        });
-    }
-
-    let Some(rest) = trimmed.strip_prefix("---") else {
-        return Err(PulseParseError::ParseFailed {
-            agent_id: agent_id.to_string(),
-            detail: "PULSE.md content must start with YAML front matter".to_string(),
-        });
-    };
-
-    let Some(rest) = rest.strip_prefix('\n') else {
-        return Err(PulseParseError::ParseFailed {
-            agent_id: agent_id.to_string(),
-            detail: "PULSE.md front matter opening marker must be followed by a newline"
-                .to_string(),
-        });
-    };
-
-    let Some(end) = rest.find("\n---") else {
-        return Err(PulseParseError::ParseFailed {
-            agent_id: agent_id.to_string(),
-            detail: "PULSE.md front matter closing marker is missing".to_string(),
-        });
-    };
-
-    let frontmatter_str = &rest[..end];
-    let body = rest[end + 4..].trim().to_string();
-
-    let fm: PulseFrontMatter =
-        yaml_serde::from_str(frontmatter_str).map_err(|e| PulseParseError::ParseFailed {
-            agent_id: agent_id.to_string(),
-            detail: e.to_string(),
-        })?;
-
-    if fm.version != SUPPORTED_PULSE_VERSION {
-        return Err(PulseParseError::UnsupportedVersion {
-            agent_id: agent_id.to_string(),
-            version: fm.version,
-        });
-    }
-
-    let default_delivery = fm
-        .default_delivery
-        .as_ref()
-        .map(|raw| validate_delivery_raw(agent_id, raw, "default_delivery"))
-        .transpose()?;
-
-    let mut intentions = Vec::with_capacity(fm.intentions.len());
-    let mut seen_ids = HashSet::new();
-
-    for raw in fm.intentions {
-        if seen_ids.contains(&raw.id) {
-            return Err(PulseParseError::DuplicateIntentionId {
-                agent_id: agent_id.to_string(),
-                id: raw.id,
-            });
-        }
-        seen_ids.insert(raw.id.clone());
-
-        let schedule = validate_and_build_schedule(agent_id, &raw)?;
-        let delivery = raw
-            .delivery
-            .as_ref()
-            .map(|d| validate_delivery_raw(agent_id, d, &format!("intention '{}'", raw.id)))
-            .transpose()?;
-        intentions.push(TemporalIntention {
-            id: raw.id,
-            enabled: raw.enabled,
-            schedule,
-            attention: raw.attention,
-            delivery,
-        });
-    }
-
-    Ok(PulseDefinition {
-        default_delivery,
-        intentions,
-        body,
+    intention_id: &str,
+    date: &str,
+) -> Result<NaiveDate, PulseParseError> {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| PulseParseError::InvalidSchedule {
+        agent_id: agent_id.to_string(),
+        intention_id: intention_id.to_string(),
+        detail: format!("invalid date format: {date}, expected YYYY-MM-DD"),
     })
 }
 
@@ -246,9 +181,10 @@ fn validate_and_build_schedule(
     agent_id: &str,
     raw: &IntentionRaw,
 ) -> Result<TemporalSchedule, PulseParseError> {
+    let intention_id = &raw.id;
     match raw.schedule.kind.as_str() {
         "daily" => {
-            validate_hhmm(agent_id, &raw.id, &raw.schedule.at)?;
+            validate_hhmm(agent_id, intention_id, &raw.schedule.at)?;
             Ok(TemporalSchedule::Daily {
                 at: raw.schedule.at.clone(),
             })
@@ -260,8 +196,8 @@ fn validate_and_build_schedule(
                 .as_deref()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            validate_weekday(agent_id, &raw.id, &day)?;
-            validate_hhmm(agent_id, &raw.id, &raw.schedule.at)?;
+            validate_weekday(agent_id, intention_id, &day)?;
+            validate_hhmm(agent_id, intention_id, &raw.schedule.at)?;
             Ok(TemporalSchedule::Weekly {
                 day,
                 at: raw.schedule.at.clone(),
@@ -269,21 +205,25 @@ fn validate_and_build_schedule(
         }
         "interval" => {
             let interval_days = raw.schedule.interval_days.unwrap_or(0);
-            validate_interval_days(agent_id, &raw.id, interval_days)?;
-            validate_hhmm(agent_id, &raw.id, &raw.schedule.at)?;
+            validate_interval_days(agent_id, intention_id, interval_days)?;
+            validate_hhmm(agent_id, intention_id, &raw.schedule.at)?;
             Ok(TemporalSchedule::Interval {
                 interval_days,
                 at: raw.schedule.at.clone(),
             })
         }
-        "once" => Err(PulseParseError::InvalidSchedule {
-            agent_id: agent_id.to_string(),
-            intention_id: raw.id.clone(),
-            detail: "once schedule is no longer supported; use daily or weekly instead".to_string(),
-        }),
+        "once" => {
+            let date = raw.schedule.date.as_deref().unwrap_or("").to_string();
+            validate_date(agent_id, intention_id, &date)?;
+            validate_hhmm(agent_id, intention_id, &raw.schedule.at)?;
+            Ok(TemporalSchedule::Once {
+                date,
+                at: raw.schedule.at.clone(),
+            })
+        }
         other => Err(PulseParseError::InvalidSchedule {
             agent_id: agent_id.to_string(),
-            intention_id: raw.id.clone(),
+            intention_id: intention_id.to_string(),
             detail: format!("unknown schedule kind: {other}"),
         }),
     }
@@ -325,8 +265,6 @@ fn validate_interval_days(
     Ok(())
 }
 
-const VALID_WEEKDAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-
 fn validate_weekday(agent_id: &str, intention_id: &str, day: &str) -> Result<(), PulseParseError> {
     if !VALID_WEEKDAYS.contains(&day) {
         return Err(PulseParseError::InvalidSchedule {
@@ -336,6 +274,134 @@ fn validate_weekday(agent_id: &str, intention_id: &str, day: &str) -> Result<(),
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn parse_pulse_definition(content: &str) -> Result<PulseDefinition, PulseParseError> {
+    parse_pulse_definition_inner(content, "")
+}
+
+fn parse_pulse_definition_inner(
+    content: &str,
+    agent_id: &str,
+) -> Result<PulseDefinition, PulseParseError> {
+    let content = content.replace("\r\n", "\n");
+    let trimmed = content.trim();
+
+    if trimmed.is_empty() {
+        return Ok(PulseDefinition {
+            enabled: true,
+            default_delivery: None,
+            intentions: Vec::new(),
+        });
+    }
+
+    let doc: PulseDocumentRaw =
+        yaml_serde::from_str(trimmed).map_err(|e| PulseParseError::ParseFailed {
+            agent_id: agent_id.to_string(),
+            detail: e.to_string(),
+        })?;
+
+    let default_delivery = doc
+        .default_delivery
+        .as_ref()
+        .map(|raw| validate_delivery_raw(agent_id, raw, "default_delivery"))
+        .transpose()?;
+
+    let mut intentions = Vec::with_capacity(doc.intentions.len());
+    let mut seen_ids = HashSet::new();
+
+    for raw in &doc.intentions {
+        if seen_ids.contains(&raw.id) {
+            return Err(PulseParseError::DuplicateIntentionId {
+                agent_id: agent_id.to_string(),
+                id: raw.id.clone(),
+            });
+        }
+        seen_ids.insert(raw.id.clone());
+
+        let schedule = validate_and_build_schedule(agent_id, raw)?;
+        let delivery = raw
+            .delivery
+            .as_ref()
+            .map(|d| validate_delivery_raw(agent_id, d, &format!("intention '{}'", raw.id)))
+            .transpose()?;
+        intentions.push(TemporalIntention {
+            id: raw.id.clone(),
+            enabled: raw.enabled,
+            schedule,
+            attention: raw.attention.clone(),
+            delivery,
+        });
+    }
+
+    Ok(PulseDefinition {
+        enabled: doc.enabled,
+        default_delivery,
+        intentions,
+    })
+}
+
+fn schedule_raw(schedule: &TemporalSchedule) -> ScheduleRaw {
+    match schedule {
+        TemporalSchedule::Daily { at } => ScheduleRaw {
+            kind: "daily".to_string(),
+            at: at.clone(),
+            day: None,
+            interval_days: None,
+            date: None,
+        },
+        TemporalSchedule::Weekly { day, at } => ScheduleRaw {
+            kind: "weekly".to_string(),
+            at: at.clone(),
+            day: Some(day.clone()),
+            interval_days: None,
+            date: None,
+        },
+        TemporalSchedule::Interval { interval_days, at } => ScheduleRaw {
+            kind: "interval".to_string(),
+            at: at.clone(),
+            day: None,
+            interval_days: Some(*interval_days),
+            date: None,
+        },
+        TemporalSchedule::Once { date, at } => ScheduleRaw {
+            kind: "once".to_string(),
+            at: at.clone(),
+            day: None,
+            interval_days: None,
+            date: Some(date.clone()),
+        },
+    }
+}
+
+fn intention_raw(intention: &TemporalIntention) -> IntentionRaw {
+    IntentionRaw {
+        id: intention.id.clone(),
+        enabled: intention.enabled,
+        schedule: schedule_raw(&intention.schedule),
+        attention: intention.attention.clone(),
+        delivery: intention.delivery.as_ref().map(|d| DeliveryRaw {
+            channel: d.channel.clone(),
+            external_chat_id: d.external_chat_id.clone(),
+        }),
+    }
+}
+
+fn document_raw(definition: &PulseDefinition) -> PulseDocumentRaw {
+    PulseDocumentRaw {
+        enabled: definition.enabled,
+        default_delivery: definition.default_delivery.as_ref().map(|d| DeliveryRaw {
+            channel: d.channel.clone(),
+            external_chat_id: d.external_chat_id.clone(),
+        }),
+        intentions: definition.intentions.iter().map(intention_raw).collect(),
+    }
+}
+
+/// Path of an agent's `PULSE.yaml`.
+fn pulse_file_path(state_root: &Path, agent_id: &str) -> PathBuf {
+    state_root.join("agents").join(agent_id).join("PULSE.yaml")
 }
 
 fn is_safe_agent_id(id: &str) -> bool {
@@ -353,6 +419,7 @@ fn is_safe_agent_id(id: &str) -> bool {
 /// - `Daily { at: "08:00" }` → `"daily 08:00"`
 /// - `Weekly { day: "sun", at: "21:00" }` → `"weekly sun 21:00"`
 /// - `Interval { interval_days: 3, at: "09:00" }` → `"every 3 days 09:00"`
+/// - `Once { date: "2026-05-11", at: "09:00" }` → `"once 2026-05-11 09:00"`
 pub(crate) fn format_schedule(schedule: &TemporalSchedule) -> String {
     match schedule {
         TemporalSchedule::Daily { at } => format!("daily {at}"),
@@ -360,9 +427,28 @@ pub(crate) fn format_schedule(schedule: &TemporalSchedule) -> String {
         TemporalSchedule::Interval { interval_days, at } => {
             format!("every {interval_days} days {at}")
         }
+        TemporalSchedule::Once { date, at } => format!("once {date} {at}"),
     }
 }
 
+/// Suggest a readable intention id derived from the schedule, e.g.
+/// `daily-0900`, `weekly-sun-2100`, `every-3d-0900`, `once-20260511-0900`.
+pub(crate) fn suggest_intention_id(schedule: &TemporalSchedule) -> String {
+    let hhmm = |at: &str| at.replace(':', "");
+    match schedule {
+        TemporalSchedule::Daily { at } => format!("daily-{}", hhmm(at)),
+        TemporalSchedule::Weekly { day, at } => format!("weekly-{day}-{}", hhmm(at)),
+        TemporalSchedule::Interval { interval_days, at } => {
+            format!("every-{interval_days}d-{}", hhmm(at))
+        }
+        TemporalSchedule::Once { date, at } => {
+            format!("once-{}-{}", date.replace('-', ""), hhmm(at))
+        }
+    }
+}
+
+/// Load and parse an agent's `PULSE.yaml`. A missing file yields an empty,
+/// enabled definition — Pulse is per-agent and simply unset until first use.
 pub(crate) fn load_pulse_definition(
     state_root: &Path,
     agent_id: &str,
@@ -373,30 +459,97 @@ pub(crate) fn load_pulse_definition(
         });
     }
 
-    let path = state_root.join("agents").join(agent_id).join("PULSE.md");
+    let path = pulse_file_path(state_root, agent_id);
 
     if !path.exists() {
         return Ok(PulseDefinition {
+            enabled: true,
             default_delivery: None,
             intentions: Vec::new(),
-            body: String::new(),
         });
     }
 
     let content = std::fs::read_to_string(&path).map_err(|e| PulseParseError::ParseFailed {
         agent_id: agent_id.to_string(),
-        detail: format!("failed to read PULSE.md: {e}"),
+        detail: format!("failed to read PULSE.yaml: {e}"),
     })?;
 
     parse_pulse_definition_inner(&content, agent_id)
 }
 
+/// Serialize, validate (round-trip through the parser), and atomically write
+/// an agent's `PULSE.yaml`. The round-trip guarantees a file written through
+/// this function always parses back cleanly.
+pub(crate) fn save_pulse_definition(
+    state_root: &Path,
+    agent_id: &str,
+    definition: &PulseDefinition,
+) -> Result<(), PulseParseError> {
+    if !is_safe_agent_id(agent_id) {
+        return Err(PulseParseError::UnsafeAgentId {
+            agent_id: agent_id.to_string(),
+        });
+    }
+
+    let yaml = yaml_serde::to_string(&document_raw(definition)).map_err(|e| {
+        PulseParseError::SaveFailed {
+            agent_id: agent_id.to_string(),
+            detail: format!("failed to serialize PULSE.yaml: {e}"),
+        }
+    })?;
+
+    // Validation round-trip: a file we write must parse back cleanly.
+    parse_pulse_definition_inner(&yaml, agent_id)?;
+
+    let path = pulse_file_path(state_root, agent_id);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| PulseParseError::SaveFailed {
+            agent_id: agent_id.to_string(),
+            detail: format!("failed to create agent directory: {e}"),
+        })?;
+    }
+
+    // Atomic replace: write to a sibling temp file, then rename over the target.
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, &yaml).map_err(|e| PulseParseError::SaveFailed {
+        agent_id: agent_id.to_string(),
+        detail: format!("failed to write PULSE.yaml: {e}"),
+    })?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        PulseParseError::SaveFailed {
+            agent_id: agent_id.to_string(),
+            detail: format!("failed to replace PULSE.yaml: {e}"),
+        }
+    })?;
+
+    Ok(())
+}
+
+/// Remove one intention from the agent's `PULSE.yaml` (used to archive a fired
+/// `once` intention). Reloads the current file from disk so concurrent edits
+/// outside the activation are preserved. Returns whether the intention was
+/// found and removed.
+pub(crate) fn archive_intention(
+    state_root: &Path,
+    agent_id: &str,
+    intention_id: &str,
+) -> Result<bool, PulseParseError> {
+    let mut definition = load_pulse_definition(state_root, agent_id)?;
+    let before = definition.intentions.len();
+    definition
+        .intentions
+        .retain(|intention| intention.id != intention_id);
+    if definition.intentions.len() == before {
+        return Ok(false);
+    }
+    save_pulse_definition(state_root, agent_id, &definition)?;
+    Ok(true)
+}
+
 // ===========================================================================
 // Due Resolver
 // ===========================================================================
-
-use chrono::{DateTime, Datelike, LocalResult, NaiveTime, TimeZone, Utc, Weekday};
-use chrono_tz::Tz;
 
 /// Result of a due check for a single intention.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -411,10 +564,10 @@ pub(crate) struct DueCheck {
 ///
 /// `agent_id` identifies the agent for due_key generation.
 /// `now` is the current UTC time.
-/// `timezone` is the IANA timezone for daily/weekly/interval evaluation (e.g. "Asia/Tokyo").
+/// `timezone` is the IANA timezone for daily/weekly/interval/once evaluation (e.g. "Asia/Tokyo").
 /// `last_success_at` is the most recent successful activation time for this
-/// `(agent_id, intention_id)`. Only `interval` schedules consult it; `daily`
-/// and `weekly` ignore it.
+/// `(agent_id, intention_id)`. Only `interval` schedules consult it; the other
+/// kinds ignore it.
 pub(crate) fn check_due(
     agent_id: &str,
     intention: &TemporalIntention,
@@ -429,6 +582,7 @@ pub(crate) fn check_due(
         TemporalSchedule::Interval { interval_days, at } => {
             is_interval_due(*interval_days, at, now, timezone, last_success_at)
         }
+        TemporalSchedule::Once { date, at } => is_once_due(date, at, now, timezone),
     };
     DueCheck { due, due_key }
 }
@@ -441,6 +595,8 @@ pub(crate) fn check_due(
 /// - interval: `{agent_id}:{intention_id}:{YYYY-MM-DD}` (local evaluation date;
 ///   advances each day so a failed run can be retried on the next day while
 ///   the interval window remains open)
+/// - once:     `{agent_id}:{intention_id}:{YYYY-MM-DD}` (the configured date;
+///   stable across ticks, consumed by the first run regardless of status)
 pub(crate) fn generate_due_key(
     agent_id: &str,
     intention: &TemporalIntention,
@@ -466,6 +622,32 @@ pub(crate) fn generate_due_key(
                 iso.week()
             )
         }
+        TemporalSchedule::Once { date, .. } => {
+            format!("{agent_id}:{}:{date}", intention.id)
+        }
+    }
+}
+
+/// Resolve a local calendar date + time in `timezone` to a UTC instant.
+///
+/// DST handling: a non-existent local time (gap) yields `None`; an ambiguous
+/// local time (fold) resolves to the earlier occurrence.
+fn local_datetime(tz: &Tz, date: chrono::NaiveDate, time: NaiveTime) -> Option<DateTime<Utc>> {
+    let naive_dt = date.and_time(time);
+    match tz.from_local_datetime(&naive_dt) {
+        LocalResult::None => None,
+        LocalResult::Single(dt) => Some(dt.with_timezone(&Utc)),
+        LocalResult::Ambiguous(earliest, _latest) => Some(earliest.with_timezone(&Utc)),
+    }
+}
+
+fn parse_timezone(timezone: &str) -> Option<Tz> {
+    match timezone.parse::<Tz>() {
+        Ok(tz) => Some(tz),
+        Err(e) => {
+            tracing::warn!("invalid timezone \"{timezone}\": {e}");
+            None
+        }
     }
 }
 
@@ -483,27 +665,18 @@ fn is_daily_due(at: &str, now: DateTime<Utc>, timezone: &str) -> bool {
             return false;
         }
     };
-    let tz: Tz = match timezone.parse() {
-        Ok(tz) => tz,
-        Err(e) => {
-            tracing::warn!("invalid timezone \"{timezone}\": {e}");
-            return false;
-        }
+    let Some(tz) = parse_timezone(timezone) else {
+        return false;
     };
 
     let local_now = now.with_timezone(&tz);
-    let naive_dt = local_now.date_naive().and_time(time);
-
-    let target = match tz.from_local_datetime(&naive_dt) {
-        LocalResult::None => {
+    match local_datetime(&tz, local_now.date_naive(), time) {
+        Some(target) => now >= target,
+        None => {
             tracing::debug!("skipping daily intention: local time {at} falls in DST gap");
-            return false;
+            false
         }
-        LocalResult::Single(dt) => dt,
-        LocalResult::Ambiguous(earliest, _latest) => earliest,
-    };
-
-    now >= target.with_timezone(&Utc)
+    }
 }
 
 /// Evaluate weekly schedule: first check if the current local weekday matches
@@ -516,14 +689,10 @@ fn is_weekly_due(day: &str, at: &str, now: DateTime<Utc>, timezone: &str) -> boo
             return false;
         }
     };
-    let tz: Tz = match timezone.parse() {
-        Ok(tz) => tz,
-        Err(e) => {
-            tracing::warn!("invalid timezone \"{timezone}\": {e}");
-            return false;
-        }
-    };
 
+    let Some(tz) = parse_timezone(timezone) else {
+        return false;
+    };
     let local_now = now.with_timezone(&tz);
     if local_now.weekday() != target_weekday {
         return false;
@@ -548,12 +717,8 @@ fn is_interval_due(
     timezone: &str,
     last_success_at: Option<DateTime<Utc>>,
 ) -> bool {
-    let tz: Tz = match timezone.parse() {
-        Ok(tz) => tz,
-        Err(e) => {
-            tracing::warn!("invalid timezone \"{timezone}\": {e}");
-            return false;
-        }
+    let Some(tz) = parse_timezone(timezone) else {
+        return false;
     };
 
     let local_today = now.with_timezone(&tz).date_naive();
@@ -566,6 +731,96 @@ fn is_interval_due(
     }
 
     is_daily_due(at, now, timezone)
+}
+
+/// Evaluate once schedule: due only on the configured local date, after `at`.
+///
+/// A past date is simply never due again; the gate's `due_key` (configured
+/// date) is consumed by the first run regardless of its status.
+fn is_once_due(date: &str, at: &str, now: DateTime<Utc>, timezone: &str) -> bool {
+    let Some(target_date) = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok() else {
+        tracing::warn!("invalid date format in once schedule: {date}");
+        return false;
+    };
+    let Some(time) = parse_hhmm(at) else {
+        tracing::warn!("invalid time format in once schedule: {at}");
+        return false;
+    };
+    let Some(tz) = parse_timezone(timezone) else {
+        return false;
+    };
+
+    let local_now = now.with_timezone(&tz);
+    if local_now.date_naive() != target_date {
+        return false;
+    }
+
+    matches!(local_datetime(&tz, target_date, time), Some(target) if now >= target)
+}
+
+/// Estimate the next due instant for an intention, used by the `pulse` tool's
+/// `list` output. Pure calendar estimate for daily/weekly; DB-anchored (via
+/// `last_success_at`) for interval; fixed for once. Returns `None` when no
+/// future instant exists (e.g. a stale `once`).
+pub(crate) fn estimate_next_due(
+    intention: &TemporalIntention,
+    now: DateTime<Utc>,
+    timezone: &str,
+    last_success_at: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let tz: Tz = timezone.parse().ok()?;
+    let local_now = now.with_timezone(&tz);
+    let today = local_now.date_naive();
+
+    let at_time = |at: &str| parse_hhmm(at);
+
+    match &intention.schedule {
+        TemporalSchedule::Daily { at } => {
+            let time = at_time(at)?;
+            let candidate_date = if local_now.time() < time {
+                today
+            } else {
+                today.succ_opt()?
+            };
+            local_datetime(&tz, candidate_date, time)
+        }
+        TemporalSchedule::Weekly { day, at } => {
+            let target_weekday = parse_weekday(day)?;
+            let time = at_time(at)?;
+            let days_ahead = (target_weekday.num_days_from_monday() + 7
+                - today.weekday().num_days_from_monday())
+                % 7;
+            let candidate_date = today + chrono::Duration::days(days_ahead as i64);
+            let mut candidate = local_datetime(&tz, candidate_date, time)?;
+            if candidate <= now {
+                let next_date = candidate_date + chrono::Duration::days(7);
+                candidate = local_datetime(&tz, next_date, time)?;
+            }
+            Some(candidate)
+        }
+        TemporalSchedule::Interval { interval_days, at } => {
+            let time = at_time(at)?;
+            let target_date = last_success_at.map(|s| {
+                s.with_timezone(&tz).date_naive() + chrono::Duration::days(*interval_days as i64)
+            });
+            // The intention is due at the first `at` on or after the target
+            // date (or today when the window is already open / first run).
+            let candidate_date = target_date.map(|d| d.max(today)).unwrap_or(today);
+            let candidate = local_datetime(&tz, candidate_date, time)?;
+            if candidate <= now {
+                // Window already open today: due on the next scan.
+                Some(now)
+            } else {
+                Some(candidate)
+            }
+        }
+        TemporalSchedule::Once { date, at } => {
+            let target_date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+            let time = at_time(at)?;
+            let candidate = local_datetime(&tz, target_date, time)?;
+            (candidate > now).then_some(candidate)
+        }
+    }
 }
 
 /// Parse a `HH:MM` time string into a [`NaiveTime`].
@@ -614,6 +869,13 @@ mod tests {
                 },
                 "every 3 days 09:00",
             ),
+            (
+                TemporalSchedule::Once {
+                    date: "2026-05-11".to_string(),
+                    at: "09:00".to_string(),
+                },
+                "once 2026-05-11 09:00",
+            ),
         ];
 
         for (schedule, expected) in cases {
@@ -621,10 +883,46 @@ mod tests {
         }
     }
 
-    fn valid_pulse_md() -> String {
+    #[test]
+    fn suggest_intention_id_derives_from_schedule() {
+        let cases = [
+            (
+                TemporalSchedule::Daily {
+                    at: "09:00".to_string(),
+                },
+                "daily-0900",
+            ),
+            (
+                TemporalSchedule::Weekly {
+                    day: "sun".to_string(),
+                    at: "21:00".to_string(),
+                },
+                "weekly-sun-2100",
+            ),
+            (
+                TemporalSchedule::Interval {
+                    interval_days: 3,
+                    at: "09:00".to_string(),
+                },
+                "every-3d-0900",
+            ),
+            (
+                TemporalSchedule::Once {
+                    date: "2026-05-11".to_string(),
+                    at: "09:00".to_string(),
+                },
+                "once-20260511-0900",
+            ),
+        ];
+
+        for (schedule, expected) in cases {
+            assert_eq!(suggest_intention_id(&schedule), expected);
+        }
+    }
+
+    fn valid_pulse_yaml() -> String {
         "\
----
-version: 1
+enabled: true
 intentions:
   - id: morning_review
     schedule:
@@ -639,32 +937,24 @@ intentions:
       at: \"21:00\"
     attention: |
       Reflect on the week.
----
-
-# PULSE
-
-## Notes
-
-- Don't notify for trivial changes.
 "
         .to_string()
     }
 
     #[test]
-    fn parse_pulse_definition_loads_front_matter_and_body() {
-        let content = valid_pulse_md();
+    fn parse_pulse_definition_loads_document() {
+        let content = valid_pulse_yaml();
 
         let result = parse_pulse_definition(&content).expect("should parse successfully");
 
+        assert!(result.enabled);
         assert_eq!(result.intentions.len(), 2);
         assert_eq!(result.intentions[0].id, "morning_review");
-        assert!(result.body.contains("# PULSE"));
-        assert!(result.body.contains("Don't notify for trivial changes."));
     }
 
     #[test]
     fn parse_daily_and_weekly_intentions() {
-        let content = valid_pulse_md();
+        let content = valid_pulse_yaml();
 
         let result = parse_pulse_definition(&content).expect("should parse successfully");
 
@@ -690,32 +980,59 @@ intentions:
     }
 
     #[test]
-    fn parse_rejects_once_schedule() {
+    fn parse_once_intention() {
         let content = "\
----
-version: 1
+intentions:
+  - id: dentist_reminder
+    schedule:
+      kind: once
+      date: \"2026-05-12\"
+      at: \"18:00\"
+    attention: Leave for the dentist.
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 1);
+        assert!(matches!(
+            &result.intentions[0].schedule,
+            TemporalSchedule::Once { date, at } if date == "2026-05-12" && at == "18:00"
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_once_with_missing_or_invalid_date() {
+        let missing_date = "\
 intentions:
   - id: event_check
     schedule:
       kind: once
-      at: \"2026-05-12T18:00:00+09:00\"
+      at: \"18:00\"
     attention: test
----
-
-body
 ";
-        let err = parse_pulse_definition(content).unwrap_err();
+        let err = parse_pulse_definition(missing_date).unwrap_err();
         assert!(
             matches!(err, PulseParseError::InvalidSchedule { ref intention_id, .. } if intention_id == "event_check"),
-            "expected InvalidSchedule for once, got: {err}"
+            "expected InvalidSchedule for missing once date, got: {err}"
+        );
+
+        let invalid_date = "\
+intentions:
+  - id: event_check
+    schedule:
+      kind: once
+      date: \"2026/05/12\"
+      at: \"18:00\"
+    attention: test
+";
+        let err = parse_pulse_definition(invalid_date).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidSchedule { ref intention_id, .. } if intention_id == "event_check"),
+            "expected InvalidSchedule for invalid once date, got: {err}"
         );
     }
 
     #[test]
     fn parse_interval_intention() {
         let content = "\
----
-version: 1
 intentions:
   - id: periodic_report
     schedule:
@@ -723,9 +1040,6 @@ intentions:
       interval_days: 3
       at: \"09:00\"
     attention: test
----
-
-body
 ";
         let result = parse_pulse_definition(content).expect("should parse");
         assert_eq!(result.intentions.len(), 1);
@@ -739,8 +1053,6 @@ body
     #[test]
     fn parse_rejects_zero_interval_days() {
         let content = "\
----
-version: 1
 intentions:
   - id: periodic_report
     schedule:
@@ -748,9 +1060,6 @@ intentions:
       interval_days: 0
       at: \"09:00\"
     attention: test
----
-
-body
 ";
         let err = parse_pulse_definition(content).unwrap_err();
         assert!(
@@ -762,17 +1071,12 @@ body
     #[test]
     fn parse_rejects_interval_with_missing_interval_days() {
         let content = "\
----
-version: 1
 intentions:
   - id: periodic_report
     schedule:
       kind: interval
       at: \"09:00\"
     attention: test
----
-
-body
 ";
         let err = parse_pulse_definition(content).unwrap_err();
         assert!(
@@ -784,8 +1088,6 @@ body
     #[test]
     fn parse_rejects_duplicate_intention_ids() {
         let content = "\
----
-version: 1
 intentions:
   - id: morning_review
     schedule:
@@ -797,9 +1099,6 @@ intentions:
       kind: daily
       at: \"10:00\"
     attention: second
----
-
-body
 ";
 
         let result = parse_pulse_definition(content);
@@ -815,17 +1114,12 @@ body
     #[test]
     fn parse_rejects_invalid_hhmm_and_weekday() {
         let invalid_time = "\
----
-version: 1
 intentions:
   - id: bad_time
     schedule:
       kind: daily
       at: \"25:00\"
     attention: test
----
-
-body
 ";
         let err = parse_pulse_definition(invalid_time).unwrap_err();
         assert!(
@@ -834,8 +1128,6 @@ body
         );
 
         let invalid_weekday = "\
----
-version: 1
 intentions:
   - id: bad_day
     schedule:
@@ -843,9 +1135,6 @@ intentions:
       day: xyz
       at: \"09:00\"
     attention: test
----
-
-body
 ";
         let err = parse_pulse_definition(invalid_weekday).unwrap_err();
         assert!(
@@ -855,13 +1144,163 @@ body
     }
 
     #[test]
+    fn parse_agent_enabled_defaults_true_and_overrides_false() {
+        let content = "\
+enabled: false
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert!(
+            !result.enabled,
+            "agent-level enabled: false should be parsed"
+        );
+
+        let default_doc = parse_pulse_definition("intentions: []").expect("should parse");
+        assert!(
+            default_doc.enabled,
+            "agent-level enabled should default to true"
+        );
+    }
+
+    #[test]
+    fn parse_intention_enabled_defaults_and_overrides() {
+        let content = "\
+intentions:
+  - id: default_enabled
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: active
+  - id: explicitly_disabled
+    enabled: false
+    schedule:
+      kind: weekly
+      day: sun
+      at: \"21:00\"
+    attention: paused
+  - id: explicitly_enabled
+    enabled: true
+    schedule:
+      kind: daily
+      at: \"10:00\"
+    attention: active
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        assert_eq!(result.intentions.len(), 3);
+        assert_eq!(result.intentions[0].id, "default_enabled");
+        assert_eq!(result.intentions[1].id, "explicitly_disabled");
+        assert_eq!(result.intentions[2].id, "explicitly_enabled");
+        assert!(result.intentions[0].enabled);
+        assert!(!result.intentions[1].enabled);
+        assert!(result.intentions[2].enabled);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_channel() {
+        let content = "\
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+    delivery:
+      channel: web
+      external_chat_id: \"abc\"
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidDelivery { .. }),
+            "expected InvalidDelivery, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty_external_chat_id() {
+        let content = "\
+default_delivery:
+  channel: discord
+  external_chat_id: \"\"
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+";
+        let err = parse_pulse_definition(content).unwrap_err();
+        assert!(
+            matches!(err, PulseParseError::InvalidDelivery { .. }),
+            "expected InvalidDelivery, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_delivery_sources_and_optional_values() {
+        let content = "\
+default_delivery:
+  channel: discord
+  external_chat_id: \"111\"
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+    delivery:
+      channel: telegram
+      external_chat_id: \"222\"
+  - id: evening_review
+    schedule:
+      kind: daily
+      at: \"21:00\"
+    attention: test
+";
+        let result = parse_pulse_definition(content).expect("should parse");
+        let dd = result.default_delivery.as_ref().expect("default_delivery");
+        assert_eq!(dd.channel, "discord");
+
+        let first = &result.intentions[0];
+        let d = first.delivery.as_ref().expect("intention delivery");
+        assert_eq!(d.channel, "telegram");
+        assert_eq!(d.external_chat_id, "222");
+
+        assert!(result.intentions[1].delivery.is_none());
+
+        let without_delivery = parse_pulse_definition(&valid_pulse_yaml()).expect("parse");
+        assert!(without_delivery.default_delivery.is_none());
+        assert!(without_delivery.intentions[0].delivery.is_none());
+    }
+
+    #[test]
+    fn parse_non_yaml_content_is_rejected() {
+        let result = parse_pulse_definition("# Just a heading\nSome plain text");
+        assert!(
+            result.is_err(),
+            "plain non-YAML text should be rejected as ParseFailed"
+        );
+    }
+
+    #[test]
+    fn parse_empty_content_yields_default_document() {
+        let result = parse_pulse_definition("").expect("should parse");
+        assert!(result.enabled);
+        assert!(result.intentions.is_empty());
+    }
+
+    #[test]
     fn load_missing_pulse_definition_returns_empty() {
         let dir = tempfile::tempdir().unwrap();
 
         let result = load_pulse_definition(dir.path(), "nonexistent").unwrap();
 
+        assert!(result.enabled);
         assert!(result.intentions.is_empty());
-        assert!(result.body.is_empty());
     }
 
     #[test]
@@ -899,47 +1338,115 @@ body
         );
     }
 
+    // --- save / load roundtrip tests ---
+
+    fn sample_document() -> PulseDefinition {
+        PulseDefinition {
+            enabled: false,
+            default_delivery: Some(DeliverySpec {
+                channel: "discord".to_string(),
+                external_chat_id: "111".to_string(),
+            }),
+            intentions: vec![
+                TemporalIntention {
+                    id: "morning_review".to_string(),
+                    enabled: true,
+                    schedule: TemporalSchedule::Daily {
+                        at: "09:00".to_string(),
+                    },
+                    attention: "Check the day.\nCarry over unresolved items.\n".to_string(),
+                    delivery: None,
+                },
+                TemporalIntention {
+                    id: "dentist_reminder".to_string(),
+                    enabled: true,
+                    schedule: TemporalSchedule::Once {
+                        date: "2026-05-12".to_string(),
+                        at: "18:00".to_string(),
+                    },
+                    attention: "Leave for the dentist.".to_string(),
+                    delivery: Some(DeliverySpec {
+                        channel: "telegram".to_string(),
+                        external_chat_id: "222".to_string(),
+                    }),
+                },
+            ],
+        }
+    }
+
     #[test]
-    fn scheduler_warns_and_continues_on_pulse_parse_error() {
-        let invalid_yaml = "\
----
-version: not_a_number
----
+    fn save_then_load_roundtrips_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let document = sample_document();
 
-body
-";
-        let result = parse_pulse_definition(invalid_yaml);
-        assert!(result.is_err(), "invalid YAML should return an error");
+        save_pulse_definition(dir.path(), "lyre", &document).expect("save");
 
-        let empty = "";
-        let result = parse_pulse_definition(empty).unwrap();
-        assert!(result.intentions.is_empty());
-
-        let no_frontmatter = "# Just a heading\nSome text without front matter";
-        let result = parse_pulse_definition(no_frontmatter);
+        let path = dir.path().join("agents").join("lyre").join("PULSE.yaml");
+        assert!(path.exists(), "PULSE.yaml should be written");
         assert!(
-            result.is_err(),
-            "non-empty PULSE.md without front matter should be rejected"
+            !dir.path()
+                .join("agents")
+                .join("lyre")
+                .join("PULSE.yaml.tmp")
+                .exists(),
+            "temp file should be renamed away"
+        );
+
+        let loaded = load_pulse_definition(dir.path(), "lyre").expect("load");
+        assert_eq!(loaded.enabled, document.enabled);
+        assert_eq!(
+            loaded.intentions[0].attention, document.intentions[0].attention,
+            "multi-line attention must roundtrip"
+        );
+        assert_eq!(
+            loaded.default_delivery, document.default_delivery,
+            "default_delivery should roundtrip"
+        );
+        assert_eq!(loaded.intentions.len(), document.intentions.len());
+        assert_eq!(loaded.intentions[0].id, "morning_review");
+        assert!(matches!(
+            &loaded.intentions[1].schedule,
+            TemporalSchedule::Once { date, at } if date == "2026-05-12" && at == "18:00"
+        ));
+        assert_eq!(
+            loaded.intentions[1].delivery, document.intentions[1].delivery,
+            "intention delivery should roundtrip"
         );
     }
 
     #[test]
-    fn unsupported_pulse_version_is_rejected() {
-        // Arrange: a well-formed front matter whose version is not supported.
-        let yaml = format!(
-            "---\nversion: {version}\n---\n\nbody\n",
-            version = super::SUPPORTED_PULSE_VERSION + 1
-        );
-
-        // Act
-        let result = parse_pulse_definition(&yaml);
-
-        // Assert
-        let err = result.expect_err("unsupported version must be rejected");
+    fn save_rejects_unsafe_agent_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = save_pulse_definition(dir.path(), "../escape", &sample_document()).unwrap_err();
         assert!(
-            matches!(err, PulseParseError::UnsupportedVersion { version, .. } if version == super::SUPPORTED_PULSE_VERSION + 1),
-            "expected UnsupportedVersion, got: {err}"
+            matches!(err, PulseParseError::UnsafeAgentId { .. }),
+            "expected UnsafeAgentId, got: {err}"
         );
+    }
+
+    #[test]
+    fn archive_intention_removes_only_target_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        save_pulse_definition(dir.path(), "lyre", &sample_document()).expect("save");
+
+        let archived = archive_intention(dir.path(), "lyre", "dentist_reminder").expect("archive");
+
+        assert!(archived, "once intention should be archived");
+        let loaded = load_pulse_definition(dir.path(), "lyre").expect("load");
+        assert_eq!(loaded.intentions.len(), 1);
+        assert_eq!(loaded.intentions[0].id, "morning_review");
+    }
+
+    #[test]
+    fn archive_intention_returns_false_for_unknown_id() {
+        let dir = tempfile::tempdir().unwrap();
+        save_pulse_definition(dir.path(), "lyre", &sample_document()).expect("save");
+
+        let archived = archive_intention(dir.path(), "lyre", "nonexistent").expect("archive");
+
+        assert!(!archived);
+        let loaded = load_pulse_definition(dir.path(), "lyre").expect("load");
+        assert_eq!(loaded.intentions.len(), 2, "nothing should be removed");
     }
 
     // --- Due Resolver tests ---
@@ -973,6 +1480,19 @@ body
             enabled: true,
             schedule: TemporalSchedule::Interval {
                 interval_days,
+                at: at.to_string(),
+            },
+            attention: String::new(),
+            delivery: None,
+        }
+    }
+
+    fn make_once(date: &str, at: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: "test_intention".to_string(),
+            enabled: true,
+            schedule: TemporalSchedule::Once {
+                date: date.to_string(),
                 at: at.to_string(),
             },
             attention: String::new(),
@@ -1040,6 +1560,60 @@ body
         let now = utc(2026, 5, 10, 12, 0, 0);
         let key = generate_due_key("kitara", &intention, now, "Asia/Tokyo");
         assert_eq!(key, "kitara:weekly_reflection:2026-W19");
+    }
+
+    // --- once schedule tests ---
+
+    #[test]
+    fn once_due_only_on_target_date_after_at() {
+        let intention = make_once("2026-05-12", "18:00");
+
+        // 2026-05-12 17:59 JST: before at → not due
+        assert!(
+            !check_due(
+                "lyre",
+                &intention,
+                utc(2026, 5, 12, 8, 59, 0),
+                "Asia/Tokyo",
+                None
+            )
+            .due
+        );
+        // 2026-05-12 18:01 JST: due
+        assert!(
+            check_due(
+                "lyre",
+                &intention,
+                utc(2026, 5, 12, 9, 1, 0),
+                "Asia/Tokyo",
+                None
+            )
+            .due
+        );
+        // 2026-05-13 18:01 JST: past the target date → never due again
+        assert!(
+            !check_due(
+                "lyre",
+                &intention,
+                utc(2026, 5, 13, 9, 1, 0),
+                "Asia/Tokyo",
+                None
+            )
+            .due
+        );
+    }
+
+    #[test]
+    fn due_key_once_uses_configured_date() {
+        let intention = make_once("2026-05-12", "18:00");
+        let key = generate_due_key("lyre", &intention, utc(2026, 5, 12, 9, 0, 0), "Asia/Tokyo");
+        assert_eq!(key, "lyre:test_intention:2026-05-12");
+
+        // due_key stays on the configured date regardless of the evaluation day,
+        // so a failed run on the target day consumes the date (no silent retry).
+        let next_day =
+            generate_due_key("lyre", &intention, utc(2026, 5, 13, 9, 0, 0), "Asia/Tokyo");
+        assert_eq!(next_day, "lyre:test_intention:2026-05-12");
     }
 
     // --- interval schedule tests ---
@@ -1221,147 +1795,88 @@ body
         assert!(!result.due);
     }
 
-    // --- enabled field tests ---
+    // --- next due estimate tests ---
 
     #[test]
-    fn parse_intention_enabled_defaults_and_overrides() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: default_enabled
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: active
-  - id: explicitly_disabled
-    enabled: false
-    schedule:
-      kind: weekly
-      day: sun
-      at: \"21:00\"
-    attention: paused
-  - id: explicitly_enabled
-    enabled: true
-    schedule:
-      kind: daily
-      at: \"10:00\"
-    attention: active
----
+    fn estimate_next_due_daily_same_or_next_day() {
+        // 2026-05-10 08:59 JST → today 09:00 JST
+        let intention = make_daily("09:00");
+        let before = estimate_next_due(&intention, utc(2026, 5, 9, 23, 59, 0), "Asia/Tokyo", None);
+        assert_eq!(before, Some(utc(2026, 5, 10, 0, 0, 0)));
 
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        assert_eq!(result.intentions.len(), 3);
-        assert_eq!(result.intentions[0].id, "default_enabled");
-        assert_eq!(result.intentions[1].id, "explicitly_disabled");
-        assert_eq!(result.intentions[2].id, "explicitly_enabled");
-        assert!(result.intentions[0].enabled);
-        assert!(!result.intentions[1].enabled);
-        assert!(result.intentions[2].enabled);
+        // 2026-05-10 09:01 JST → tomorrow 09:00 JST
+        let after = estimate_next_due(&intention, utc(2026, 5, 10, 0, 1, 0), "Asia/Tokyo", None);
+        assert_eq!(after, Some(utc(2026, 5, 11, 0, 0, 0)));
     }
 
-    // --- delivery tests ---
+    #[test]
+    fn estimate_next_due_weekly_rolls_to_next_week_when_time_passed() {
+        // 2026-05-10 is a Sunday. 21:00 JST on Sunday → today 21:00 JST
+        let intention = make_weekly("sun", "21:00");
+        let before = estimate_next_due(&intention, utc(2026, 5, 10, 5, 0, 0), "Asia/Tokyo", None);
+        assert_eq!(before, Some(utc(2026, 5, 10, 12, 0, 0)));
+
+        // After Sunday 21:00 JST → next Sunday 21:00 JST (2026-05-17)
+        let after = estimate_next_due(&intention, utc(2026, 5, 10, 12, 1, 0), "Asia/Tokyo", None);
+        assert_eq!(after, Some(utc(2026, 5, 17, 12, 0, 0)));
+    }
 
     #[test]
-    fn parse_rejects_invalid_channel() {
-        let content = "\
----
-version: 1
-intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
-    delivery:
-      channel: web
-      external_chat_id: \"abc\"
----
+    fn estimate_next_due_interval_uses_last_success_anchor() {
+        // last_success 2026-07-03, interval 3 → target 2026-07-06, at 09:00 JST
+        let intention = make_interval(3, "09:00");
+        let last_success = utc(2026, 7, 3, 0, 1, 0);
 
-body
-";
-        let err = parse_pulse_definition(content).unwrap_err();
-        assert!(
-            matches!(err, PulseParseError::InvalidDelivery { .. }),
-            "expected InvalidDelivery, got: {err}"
+        // Asked on 2026-07-04 10:00 JST → 2026-07-06 09:00 JST
+        let during = estimate_next_due(
+            &intention,
+            utc(2026, 7, 4, 1, 0, 0),
+            "Asia/Tokyo",
+            Some(last_success),
         );
-    }
+        assert_eq!(during, Some(utc(2026, 7, 6, 0, 0, 0)));
 
-    #[test]
-    fn parse_rejects_empty_external_chat_id() {
-        let content = "\
----
-version: 1
-default_delivery:
-  channel: discord
-  external_chat_id: \"\"
-intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
----
-
-body
-";
-        let err = parse_pulse_definition(content).unwrap_err();
-        assert!(
-            matches!(err, PulseParseError::InvalidDelivery { .. }),
-            "expected InvalidDelivery, got: {err}"
+        // Asked after the window opened → due now
+        let overdue = estimate_next_due(
+            &intention,
+            utc(2026, 7, 6, 0, 1, 0),
+            "Asia/Tokyo",
+            Some(last_success),
         );
+        assert_eq!(overdue, Some(utc(2026, 7, 6, 0, 1, 0)));
     }
 
     #[test]
-    fn parse_delivery_sources_and_optional_values() {
-        let content = "\
----
-version: 1
-default_delivery:
-  channel: discord
-  external_chat_id: \"111\"
-intentions:
-  - id: morning_review
-    schedule:
-      kind: daily
-      at: \"09:00\"
-    attention: test
-    delivery:
-      channel: telegram
-      external_chat_id: \"222\"
-  - id: evening_review
-    schedule:
-      kind: daily
-      at: \"21:00\"
-    attention: test
----
+    fn estimate_next_due_once_future_only() {
+        let intention = make_once("2026-05-12", "18:00");
 
-body
-";
-        let result = parse_pulse_definition(content).expect("should parse");
-        let dd = result.default_delivery.as_ref().expect("default_delivery");
-        assert_eq!(dd.channel, "discord");
+        let future = estimate_next_due(&intention, utc(2026, 5, 10, 0, 0, 0), "Asia/Tokyo", None);
+        assert_eq!(future, Some(utc(2026, 5, 12, 9, 0, 0)));
 
-        let first = &result.intentions[0];
-        let d = first.delivery.as_ref().expect("intention delivery");
-        assert_eq!(d.channel, "telegram");
-        assert_eq!(d.external_chat_id, "222");
-
-        assert!(result.intentions[1].delivery.is_none());
-
-        let without_delivery = parse_pulse_definition(&valid_pulse_md()).expect("parse");
-        assert!(without_delivery.default_delivery.is_none());
-        assert!(without_delivery.intentions[0].delivery.is_none());
+        let past = estimate_next_due(&intention, utc(2026, 5, 13, 0, 0, 0), "Asia/Tokyo", None);
+        assert_eq!(past, None, "stale once intention has no next due");
     }
 
     #[test]
-    fn parse_delivery_without_front_matter_is_rejected() {
-        let content = "# Just a heading\nSome text without front matter";
-        let err = parse_pulse_definition(content).unwrap_err();
-        assert!(
-            matches!(err, PulseParseError::ParseFailed { .. }),
-            "expected ParseFailed, got: {err}"
-        );
+    fn estimate_next_due_ignores_disabled_intention_flag() {
+        // The estimate is schedule-only; enablement is handled by callers.
+        let mut intention = make_daily("09:00");
+        intention.enabled = false;
+        let estimate =
+            estimate_next_due(&intention, utc(2026, 5, 9, 23, 59, 0), "Asia/Tokyo", None);
+        assert_eq!(estimate, Some(utc(2026, 5, 10, 0, 0, 0)));
+    }
+
+    #[test]
+    fn local_datetime_handles_midnight_boundary() {
+        use chrono::Timelike;
+        // Sanity: hour/min/sec of resolved time must match the requested HH:MM.
+        let tz: Tz = "Asia/Tokyo".parse().expect("tz");
+        let date = NaiveDate::from_ymd_opt(2026, 5, 10).expect("date");
+        let time = parse_hhmm("23:59").expect("time");
+        let resolved = local_datetime(&tz, date, time).expect("resolved");
+        let local = resolved.with_timezone(&tz);
+        assert_eq!(local.hour(), 23);
+        assert_eq!(local.minute(), 59);
     }
 }
