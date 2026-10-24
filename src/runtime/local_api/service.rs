@@ -251,7 +251,11 @@ async fn resolve_session(
             } else {
                 chat.agent_id.clone()
             };
-            let context_thread = context_thread_from_chat(&chat, &agent_id);
+            let context_thread = SurfaceContext::surface_thread_from_session_key(
+                &chat.channel,
+                &chat.external_chat_id,
+                &agent_id,
+            );
             (
                 SurfaceContext::new(
                     chat.channel,
@@ -282,17 +286,6 @@ async fn resolve_session(
         provider,
         model,
     })
-}
-
-fn context_thread_from_chat(chat: &crate::storage::ChatInfo, agent_id: &str) -> String {
-    let without_channel = chat
-        .external_chat_id
-        .strip_prefix(&format!("{}:", chat.channel))
-        .unwrap_or(&chat.external_chat_id);
-    without_channel
-        .strip_suffix(&format!(":agent:{agent_id}"))
-        .unwrap_or(without_channel)
-        .to_string()
 }
 
 fn effective_model(
