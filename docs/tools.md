@@ -461,7 +461,7 @@ Environment variables:
   - Secret 会話からは呼び出せない（エラーを返す）。Pulse の実行・配送は通常スコープで行われるため
   - 操作対象は常に実行中の自エージェント（他エージェントの PULSE.yaml は操作しない）
   - 書き込みは serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は発生しない。load → 変更 → save は排他ゲート内で実行され、並行操作でも更新消失はしない。バリデーションエラー（時刻形式・id 重複・`once` 過去日・DST で存在しない時刻等）はツールエラーとして返り、エージェントが会話内で自己修正できる
-  - `list` は各 intention の schedule・enabled・次回発火見積もり（`interval` は DB の最新成功 run を参照）を返す。PULSE.yaml が手編集で破損している場合はパースエラーを報告する
+  - `list` は各 intention の schedule・enabled・次回発火判定を返す。判定は scheduler と同一（カレンダー候補 + `pulse_runs` 実行履歴）で、時刻到達かつ未実行は `due now (pending next scan)`、実行済み期間は `already attempted for current period`、`once` 実行済みは `already attempted (no automatic retry)`。disabled な intention には発火見込みを表示しない。PULSE.yaml が手編集で破損している場合はパースエラーを報告する
   - `once` は `date + at` が過去の add / update を拒否する。発火が成功すると、実行時点の内容が現在の定義と一致する場合にのみ自動アーカイブ（ファイルから除去）される。失敗・skipped、activation 中の変更があった場合はファイルに残る（自動リトライなし）
 - 成功時: 操作結果のテキスト（`add` は id と次回発火見積もりを含む）
 - 主な失敗:

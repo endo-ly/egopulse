@@ -14,8 +14,9 @@ use serde_json::json;
 use crate::config::ConfigManager;
 use crate::conversation::ConversationScope;
 use crate::pulse::definition::{
-    self, DeliverySpec, PulseDefinition, TemporalIntention, TemporalSchedule, estimate_next_due,
-    format_schedule, load_pulse_definition, save_pulse_definition, suggest_intention_id,
+    self, DeliverySpec, PulseDefinition, TemporalIntention, TemporalSchedule, check_due,
+    estimate_next_due, format_schedule, generate_due_key, load_pulse_definition,
+    save_pulse_definition, suggest_intention_id,
 };
 use crate::storage::Database;
 use crate::tools::{Tool, ToolErrorKind, ToolExecutionContext, ToolResult};
@@ -48,16 +49,22 @@ impl PulseTool {
         Self { config_manager, db }
     }
 
-    /// Format the next-due suffix for one intention. `interval` schedules
-    /// consult the last successful run from the DB; other kinds are pure
-    /// calendar estimates.
+    /// Explain when this intention will next fire, using the same two-stage
+    /// judgment as the scheduler: the calendar estimate
+    /// ([`estimate_next_due`]) combined with the run history the gate
+    /// ([`Database::has_pulse_due_run`]) enforces. This keeps `list` and
+    /// `add` from promising a firing the scheduler will suppress, and from
+    /// missing one it will perform.
+    ///
+    /// # Errors
+    /// Returns `StorageError` when run-history lookups fail.
     async fn next_due_text(
         &self,
         agent_id: &str,
         intention: &TemporalIntention,
         timezone: &str,
         now: chrono::DateTime<chrono::Utc>,
-    ) -> String {
+    ) -> Result<String, crate::error::StorageError> {
         let last_success_at = if matches!(intention.schedule, TemporalSchedule::Interval { .. }) {
             let agent_id = agent_id.to_string();
             let intention_id = intention.id.clone();
@@ -65,18 +72,45 @@ impl PulseTool {
             crate::storage::call_blocking(db, move |db| {
                 db.get_last_success_started_at(&agent_id, &intention_id)
             })
-            .await
-            .unwrap_or(None)
+            .await?
         } else {
             None
         };
 
+        let current_key = generate_due_key(agent_id, intention, now, timezone);
+        let consumed = {
+            let agent_id = agent_id.to_string();
+            let intention_id = intention.id.clone();
+            let key = current_key.clone();
+            let db = Arc::clone(&self.db);
+            crate::storage::call_blocking(db, move |db| {
+                db.has_pulse_due_run(&agent_id, &intention_id, &key)
+            })
+            .await?
+        };
+
+        if check_due(agent_id, intention, now, timezone, last_success_at).due && !consumed {
+            return Ok("due now (pending next scan)".to_string());
+        }
+        if consumed && matches!(intention.schedule, TemporalSchedule::Once { .. }) {
+            return Ok("already attempted (no automatic retry)".to_string());
+        }
+
         match estimate_next_due(intention, now, timezone, last_success_at) {
-            Some(due) if due <= now => {
-                format!("due now ({} {timezone})", format_local(due, timezone))
+            None => Ok("no upcoming due".to_string()),
+            Some(candidate) => {
+                let candidate_key = generate_due_key(agent_id, intention, candidate, timezone);
+                if consumed && candidate_key == current_key {
+                    Ok("already attempted for current period".to_string())
+                } else if candidate <= now {
+                    Ok("due now (pending next scan)".to_string())
+                } else {
+                    Ok(format!(
+                        "next due {} ({timezone})",
+                        format_local(candidate, timezone)
+                    ))
+                }
             }
-            Some(due) => format!("next due {} ({timezone})", format_local(due, timezone)),
-            None => "no upcoming due".to_string(),
         }
     }
 
@@ -107,12 +141,20 @@ impl PulseTool {
             } else {
                 "disabled"
             };
+            let due_text = if intention.enabled {
+                match self.next_due_text(agent_id, intention, timezone, now).await {
+                    Ok(text) => format!(" | {text}"),
+                    Err(e) => format!(" | error: run history lookup failed ({e})"),
+                }
+            } else {
+                String::new()
+            };
             lines.push(format!(
-                "- {} [{}] {} | {}",
+                "- {} [{}] {}{}",
                 intention.id,
                 state,
                 format_schedule(&intention.schedule),
-                self.next_due_text(agent_id, intention, timezone, now).await
+                due_text
             ));
             lines.push(format!("  attention: {}", intention.attention.trim()));
             if let Some(delivery) = intention
@@ -205,12 +247,16 @@ impl PulseTool {
             (id, intention)
         };
 
-        let due_text = self
+        let due_text = match self
             .next_due_text(agent_id, &intention, timezone, chrono::Utc::now())
-            .await;
+            .await
+        {
+            Ok(text) => format!("{text}."),
+            Err(e) => format!("run history lookup failed ({e}), so the next due is unknown."),
+        };
 
         ToolResult::success(format!(
-            "Added intention '{id}' ({}). {due_text}. It takes effect on the next scan.",
+            "Added intention '{id}' ({}). {due_text} It takes effect on the next scan.",
             format_schedule(&schedule)
         ))
     }
@@ -835,7 +881,7 @@ mod tests {
             .await;
         assert!(!result.is_error, "add failed: {}", result.content);
         assert!(result.content.contains("Added intention 'daily-0900'"));
-        assert!(result.content.contains("next due"));
+        assert!(result.content.contains("It takes effect on the next scan"));
 
         let loaded =
             load_pulse_definition(std::path::Path::new(&env.state_root), "lyre").expect("load");
@@ -1107,7 +1153,11 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.content.contains("Pulse for agent 'lyre': disabled"));
         assert!(result.content.contains("daily_check [disabled]"));
-        assert!(result.content.contains("next due"));
+        assert!(
+            !result.content.contains("due now"),
+            "nothing may be announced as firing: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -1239,6 +1289,236 @@ mod tests {
         // Assert
         assert!(result.is_error);
         assert!(result.content.contains("attention must not be empty"));
+    }
+
+    // --- next-due display: scheduler-consistent judgment (fixed clock) ---
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc
+            .with_ymd_and_hms(2026, 5, 10, 18, 0, 0)
+            .single()
+            .expect("valid utc")
+    }
+
+    fn daily_intention(id: &str, at: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: id.to_string(),
+            enabled: true,
+            schedule: TemporalSchedule::Daily { at: at.to_string() },
+            attention: "check".to_string(),
+            delivery: None,
+        }
+    }
+
+    fn interval_intention(id: &str, interval_days: u32) -> TemporalIntention {
+        TemporalIntention {
+            id: id.to_string(),
+            enabled: true,
+            schedule: TemporalSchedule::Interval {
+                interval_days,
+                at: "09:00".to_string(),
+            },
+            attention: "check".to_string(),
+            delivery: None,
+        }
+    }
+
+    fn once_intention(id: &str, date: &str) -> TemporalIntention {
+        TemporalIntention {
+            id: id.to_string(),
+            enabled: true,
+            schedule: TemporalSchedule::Once {
+                date: date.to_string(),
+                at: "09:00".to_string(),
+            },
+            attention: "check".to_string(),
+            delivery: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn due_now_when_time_passed_and_period_unconsumed() {
+        // Arrange
+        let env = build_env();
+
+        // Act + Assert: 09:00 has passed with no run today — the scheduler
+        // fires on the next scan, so the display must say so (review case 1).
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &daily_intention("daily_check", "09:00"),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "due now (pending next scan)");
+
+        // Act + Assert: before 09:00 the future same-day candidate is the next
+        // due, not "due now" (review case 3).
+        let morning = fixed_now() - chrono::Duration::hours(10);
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &daily_intention("daily_check", "09:00"),
+                "UTC",
+                morning,
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "next due 2026-05-10 09:00 (UTC)");
+    }
+
+    #[tokio::test]
+    async fn consumed_period_shows_next_occurrence_or_already_attempted() {
+        // Arrange: today's 09:00 already ran (review cases 2 and 4)
+        let env = build_env();
+        env._state
+            .db
+            .try_create_pulse_run(
+                "run-1",
+                "lyre",
+                "daily_check",
+                "lyre:daily_check:2026-05-10",
+            )
+            .expect("insert run");
+
+        // Act + Assert: the next day's key is unconsumed, so it is the next due
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &daily_intention("daily_check", "09:00"),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "next due 2026-05-11 09:00 (UTC)");
+
+        // Act + Assert: a same-day move to 21:00 lands in the consumed period
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &daily_intention("daily_check", "21:00"),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "already attempted for current period");
+    }
+
+    #[tokio::test]
+    async fn interval_display_reflects_run_history() {
+        // Arrange (review cases 6 and 7)
+        let env = build_env();
+        env._state
+            .db
+            .try_create_pulse_run(
+                "run-failed",
+                "lyre",
+                "failed_check",
+                "lyre:failed_check:2026-05-10",
+            )
+            .expect("insert run");
+        env._state
+            .db
+            .update_pulse_run_failed("run-failed", "activation failed")
+            .expect("mark failed");
+        env._state
+            .db
+            .try_create_pulse_run(
+                "run-success",
+                "lyre",
+                "window_check",
+                "lyre:window_check:2026-05-10",
+            )
+            .expect("insert run");
+        {
+            let conn = env._state.db.get_conn().expect("pool");
+            conn.execute(
+                "UPDATE pulse_runs SET started_at = ?1 WHERE id = ?2",
+                rusqlite::params!["2026-05-10T09:00:00+00:00", "run-success"],
+            )
+            .expect("backdate started_at");
+        }
+        env._state
+            .db
+            .update_pulse_run_success(
+                "run-success",
+                None,
+                None,
+                crate::storage::PulseOutputKind::Silent,
+                "PULSE_OK",
+            )
+            .expect("mark success");
+
+        // Act + Assert: a failed attempt still consumes the day — no "due now"
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &interval_intention("failed_check", 1),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "already attempted for current period");
+
+        // Act + Assert: a success anchors the next window three days out
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &interval_intention("window_check", 3),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "next due 2026-05-13 09:00 (UTC)");
+    }
+
+    #[tokio::test]
+    async fn once_display_reflects_attempt_state() {
+        // Arrange (review cases 9 and 10)
+        let env = build_env();
+        env._state
+            .db
+            .try_create_pulse_run("run-1", "lyre", "reminder", "lyre:reminder:2026-05-10")
+            .expect("insert run");
+
+        // Act + Assert: an attempted once never retries
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &once_intention("reminder", "2026-05-10"),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "already attempted (no automatic retry)");
+
+        // Act + Assert: an expired, never-run once has no upcoming due
+        let text = env
+            .tool
+            .next_due_text(
+                "lyre",
+                &once_intention("expired", "2020-01-01"),
+                "UTC",
+                fixed_now(),
+            )
+            .await
+            .expect("next due");
+        assert_eq!(text, "no upcoming due");
     }
 
     #[test]
