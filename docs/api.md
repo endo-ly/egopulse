@@ -196,12 +196,28 @@ GET /api/sessions
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `session_key` | `string` | セッション識別キー。全チャネルで `chat:{chat_id}` 形式に統一されており、`GET /api/history` や WebSocket `chat.send` でそのまま指定できる |
-| `label` | `string` | 表示ラベル（`external_chat_id`） |
+| `name` | `string \| null` | ユーザーが付けた表示名。未設定は `null` |
 | `chat_id` | `number` | 内部チャット ID |
+| `archived` | `boolean` | アーカイブ済みかどうか |
+| `pinned` | `boolean` | 一覧先頭に固定されているかどうか |
 | `channel` | `string` | チャネル種別（`web`, `discord`, `telegram` 等） |
 | `agent_id` | `string` | セッションを所有する agent ID |
-| `last_message_time` | `string` | 当該チャットの最新メッセージのタイムスタンプ (RFC 3339)。メッセージが無い場合はチャット作成時刻。レスポンスはこの値の降順（同一値は `chat_id` 降順）でソートされる |
+| `last_message_time` | `string` | 当該チャットの最新メッセージのタイムスタンプ (RFC 3339)。メッセージが無い場合はチャット作成時刻。レスポンスは `pinned` 降順 → この値の降順 → `chat_id` 降順でソートされる |
 | `last_message_preview` | `string \| null` | 最終メッセージの先頭プレビュー |
+
+### 2.5.1 セッションの更新
+
+```text
+PATCH /api/sessions/{chat_id}
+```
+
+| フィールド | 型 | 必須 | 説明 |
+|-----------|-----|:---:|------|
+| `name` | `string \| null` | 任意 | 表示名。trim 後 1〜200 文字。`null` で解除。省略時は変更しない |
+| `archived` | `boolean` | 任意 | アーカイブ状態。省略時は変更しない |
+| `pinned` | `boolean` | 任意 | ピン状態。省略時は変更しない |
+
+`name` / `archived` / `pinned` のいずれか 1 つ以上が必要。成功時は `{"ok": true}` を返し、`session_updated` を購読中のクライアントへ配信する。存在しない `chat_id` は `404`、空文字の名前や長すぎる名前、フィールドなしの要求は `400`。
 
 ---
 

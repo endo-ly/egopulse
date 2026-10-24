@@ -27,7 +27,7 @@ CLI サブコマンドとチャットスラッシュコマンドの完全仕様�
 | `egopulse events extract` | `[--agent] [--from] [--to]` | 過去セッションからエピソードイベントを再抽出（バックフィル） | 必須 |
 | `egopulse update` | なし | 最新リリースに更新 | 不要 |
 
-`-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は、TTY でない stdin から読み込む。`PROMPT` と stdin の両方がある場合は、両者を空行 2 つで連結する。headless 実行の `--session` は指定セッションを再開し、`--continue` は最終更新セッションを再開する。引数なしの `egopulse` は起動済み Runtime の Local API に接続し、`--session` が指定されていればそのセッションを開き、省略時は最終更新セッションまたは新規コンテキストを Inline TUI で開く。Runtime が起動していない場合は自動起動せず、`egopulse gateway start` または `egopulse run` を案内する。headless の成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。プロンプトがない場合は終了コード 2、それ以外のエラーは 1、Ctrl-C は 0 で終了する。
+`-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は、TTY でない stdin から読み込む。`PROMPT` と stdin の両方がある場合は、両者を空行 2 つで連結する。headless 実行の `--session` は指定セッションを再開し、`--continue` は最終更新セッションを再開する。引数なしの `egopulse` は起動済み Runtime の Local API に接続し、`--session` が指定されていればそのセッションを開き、省略時は最終更新セッションまたは新規コンテキストを Inline TUI で開く。Runtime が起動していない場合は自動起動せず、`egopulse gateway start` または `egopulse run` を案内する。`--session` は保存済みセッションの `surface_thread`（`external_chat_id` から `{channel}:` 接頭辞と `:agent:{agent_id}` 接尾辞を除いた値）と一致した場合にそのセッションを開き、一致しない場合はその名前の新規セッションとして扱う。表示名（`chat_title`）を変更しても `surface_thread` は変わらないため、`--session` の指定はリネームの影響を受けない。headless の成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。プロンプトがない場合は終了コード 2、それ以外のエラーは 1、Ctrl-C は 0 で終了する。
 
 ### 1.2 グローバルオプション
 

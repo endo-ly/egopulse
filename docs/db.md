@@ -175,7 +175,7 @@ DDL の正本は `src/storage/migration.rs`。本節は各テーブルのカラ�
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | chat_id | INTEGER | PK (auto) | 内部ID |
-| chat_title | TEXT | nullable | 表示名 |
+| chat_title | TEXT | nullable | ユーザーが付ける表示名。未設定は NULL（セッションの識別には使わない） |
 | chat_type | TEXT | NOT NULL DEFAULT 'private' | チャット種別 |
 | last_message_time | TEXT | NOT NULL | 最終メッセージ時刻（RFC3339） |
 | channel | TEXT | nullable | チャンネル識別子（`cli`, `web`, `discord`, `telegram`） |
@@ -183,14 +183,19 @@ DDL の正本は `src/storage/migration.rs`。本節は各テーブルのカラ�
 | agent_id | TEXT | NOT NULL DEFAULT 'default' | エージェント識別子。エージェント単位の記憶読み込みやチャネル紜付けに使用 |
 | revision | INTEGER | NOT NULL DEFAULT 0 | 会話変更ごとに増加する整数CAS。timestamp を競合判定から排除 |
 | next_message_seq | INTEGER | NOT NULL DEFAULT 1 | 次に発行する chat 内 message sequence |
+| archived | INTEGER | NOT NULL DEFAULT 0 | 1 のとき Web UI のセッション一覧でアーカイブ扱い（履歴・記憶・Turn は保持） |
+| pinned | INTEGER | NOT NULL DEFAULT 0 | 1 のときセッション一覧の先頭に固定 |
 
 **制約**:
 - `(channel, external_chat_id)` の UNIQUE インデックス。channel 横断で同じ外部チャットを二重登録しない
 
 **操作**:
 - `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
-- `resolve_or_create_chat_id(channel, external_chat_id, chat_title, chat_type)` — Upsert（`ON CONFLICT DO UPDATE`）
+- `resolve_or_create_chat_id(channel, external_chat_id, chat_type, agent_id)` — セッション識別子の Upsert（`ON CONFLICT DO UPDATE`）。表示名は変更しない
+- `update_chat_display_meta(chat_id, name, archived, pinned)` — 表示名・アーカイブ・ピンの更新。表示名の唯一の書き込み経路
 - `get_chat_by_id(chat_id)` — chat_id からチャンネル情報を逆引き
+
+セッション一覧（`list_sessions`）は `pinned` 降順 → `last_message_time` 降順 → `chat_id` 降順で返す。`surface_thread` は `external_chat_id` から導出し、表示名の変更では変わらない。
 
 #### Channel Log (Multi-Agent Room)
 

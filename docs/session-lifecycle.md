@@ -128,7 +128,8 @@ execute_scheduled_turn():
 ### `chats`
 
 - 役割: chat の論理 ID と surface との対応付け
-- 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`, `agent_id`
+- 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`, `agent_id`, `archived`, `pinned`
+- `chat_title` はユーザーが付ける表示名で、セッションの識別には使わない。識別は `chat_id`（canonical key `chat:{id}`）と `external_chat_id` が担い、表示名の変更で `session_key()` や `surface_thread` は変わらない。`resolve_or_create_chat_id` は表示名を書き換えず、表示名の更新は `update_chat_display_meta` に集約する
 
 ### `messages`
 
@@ -139,6 +140,14 @@ execute_scheduled_turn():
 `seq IS NOT NULL` の committed conversation history は append-only かつ immutable であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。staged row は commit 時に `seq` が付与され、terminal Turn への promotion 時には削除される場合がある。
 
 Tool 実行中の human follow-up は staged message として保存され、`turn_id` に current Turn（`tools_pending` または `tools_completed`）を持つ。Tool Result の保存と `complete_tools()` が成功した直後に、staged rows を timestamp と message ID の FIFO で committed history と session snapshot へ同一トランザクションで反映する。プロセス停止でこの反映が中断された場合も、`tools_completed` の recovery が同じ処理を冪等に再実行する。
+
+### セッションの整理状態
+
+`archived` と `pinned` は一覧の見え方を制御するメタデータで、会話の内容には影響しない。
+
+- `pinned = 1` のセッションは一覧の先頭に固定される（`pinned` 降順 → `last_message_time` 降順 → `chat_id` 降順）
+- `archived = 1` のセッションはアーカイブ扱いになる。履歴・記憶・Turn は保持され、開いて送信することもできる
+- 両方が真の場合はアーカイブを優先して表示し、ピン状態は保持する（アーカイブ解除で復元される）
 
 ### `sessions`
 
