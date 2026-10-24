@@ -26,6 +26,7 @@ import {
   useSessionRefresh,
   type SessionUpdatedPayload,
 } from "./useSessionRefresh";
+import { randomId } from "../../shared/lib/random";
 
 export interface UseChatTransportOptions {
   sessionKey: string;
@@ -220,7 +221,7 @@ export function useChatTransport({
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     for (const [runId, tracking] of runsRef.current) {
-      const rpcId = crypto.randomUUID();
+      const rpcId = randomId();
       resubscribeRpcsRef.current.set(rpcId, runId);
       ws.send(
         JSON.stringify({
@@ -569,9 +570,9 @@ export function useChatTransport({
         uncertain.sessionKey === sessionKey &&
         uncertain.text === text
           ? uncertain.messageId
-          : `web:${crypto.randomUUID()}`;
+          : `web:${randomId()}`;
       uncertainSendRef.current = null;
-      const rpcId = crypto.randomUUID();
+      const rpcId = randomId();
       const msg = {
         type: "req",
         id: rpcId,

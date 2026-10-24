@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, type KeyboardEvent } from "react";
 import { loadDraft, saveDraft } from "./draftStorage";
 import { matchSlashCommands } from "./slashCommands";
+import { randomId } from "../../shared/lib/random";
 
 export interface ComposerProps {
   /** Resolves true when the send was accepted; the text is kept otherwise. */
@@ -18,12 +19,12 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
   const submittingRef = useRef(false);
   const storageKeyRef = useRef(storageKey);
   const draftVersionRef = useRef(0);
-  const draftIdRef = useRef(crypto.randomUUID());
+  const draftIdRef = useRef(randomId());
 
   if (storageKeyRef.current !== storageKey) {
     storageKeyRef.current = storageKey;
     draftVersionRef.current += 1;
-    draftIdRef.current = crypto.randomUUID();
+    draftIdRef.current = randomId();
   }
 
   const matches = matchSlashCommands(text);
@@ -32,7 +33,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
 
   useEffect(() => {
     setText(loadDraft(storageKey));
-    draftIdRef.current = crypto.randomUUID();
+    draftIdRef.current = randomId();
     submittingRef.current = false;
     setSubmitting(false);
   }, [storageKey]);
@@ -71,7 +72,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
           return;
         }
         setText("");
-        draftIdRef.current = crypto.randomUUID();
+        draftIdRef.current = randomId();
         draftVersionRef.current += 1;
         setSuggestIndex(-1);
         setSuggestHidden(false);
@@ -84,7 +85,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
 
   const acceptSuggestion = (index: number) => {
     draftVersionRef.current += 1;
-    draftIdRef.current = crypto.randomUUID();
+    draftIdRef.current = randomId();
     setText(matches[index].name + " ");
     setSuggestIndex(-1);
     setSuggestHidden(false);
@@ -149,7 +150,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
         disabled={disabled || submitting}
         onChange={(e) => {
           draftVersionRef.current += 1;
-          draftIdRef.current = crypto.randomUUID();
+          draftIdRef.current = randomId();
           setText(e.target.value);
           setSuggestIndex(-1);
           setSuggestHidden(false);
