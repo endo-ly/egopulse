@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 18;
+pub(super) const SCHEMA_VERSION: i64 = 19;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1027,6 +1027,19 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 18;
     }
 
+    if version < 19 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Session organization state for the Web UI. Neither flag carries a
+        // timestamp: the list only needs "pinned first" and "archived away".
+        add_column_if_missing(&tx, "chats", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&tx, "chats", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+
+        set_schema_version_in_tx(&tx, 19, "add chats.archived and chats.pinned")?;
+        tx.commit()?;
+        version = 19;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -1034,7 +1047,7 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 7;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 8;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1363,6 +1376,18 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         set_schema_version_in_tx(&tx, 7, "add llm_usage_logs.cached_input_tokens (secret db)")?;
         tx.commit()?;
         version = 7;
+    }
+
+    if version < 8 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Mirrored from the primary DB so `Database` methods stay scope agnostic.
+        add_column_if_missing(&tx, "chats", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&tx, "chats", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+
+        set_schema_version_in_tx(&tx, 8, "add chats.archived and chats.pinned (secret db)")?;
+        tx.commit()?;
+        version = 8;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);

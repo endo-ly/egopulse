@@ -161,9 +161,11 @@ impl Database {
                     ORDER BY m.seq DESC
                     LIMIT 1
                 ) AS last_message_preview,
-                c.agent_id
+                c.agent_id,
+                c.archived,
+                c.pinned
              FROM chats c
-             ORDER BY last_message_time DESC, c.chat_id DESC",
+             ORDER BY c.pinned DESC, last_message_time DESC, c.chat_id DESC",
         )?;
         stmt.query_map([], |row| {
             let channel: String = row.get(1)?;
@@ -182,6 +184,8 @@ impl Database {
                 last_message_time: row.get(4)?,
                 last_message_preview: row.get(5)?,
                 agent_id: row.get(6)?,
+                archived: row.get::<_, i64>(7)? != 0,
+                pinned: row.get::<_, i64>(8)? != 0,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -1835,6 +1839,61 @@ mod tests {
             "chat with the latest message must sort first"
         );
         assert_eq!(sessions[1].chat_id, chat_b);
+    }
+
+    #[test]
+    fn list_sessions_exposes_archive_and_pin_state() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:pinned", None, "cli", "default")
+            .expect("create chat");
+        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
+
+        // Act
+        db.get_conn()
+            .expect("connection")
+            .execute(
+                "UPDATE chats SET archived = 1, pinned = 1 WHERE chat_id = ?1",
+                rusqlite::params![chat_id],
+            )
+            .expect("set flags");
+        let sessions = db.list_sessions().expect("list sessions");
+
+        // Assert
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].archived);
+        assert!(sessions[0].pinned);
+    }
+
+    #[test]
+    fn list_sessions_places_pinned_sessions_first() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let older = db
+            .resolve_or_create_chat_id("cli", "cli:older", None, "cli", "default")
+            .expect("create older chat");
+        let newer = db
+            .resolve_or_create_chat_id("cli", "cli:newer", None, "cli", "default")
+            .expect("create newer chat");
+        store_msg(&db, "msg-older", older, "older", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-newer", newer, "newer", "2024-02-01T00:00:00Z");
+
+        // Act
+        db.get_conn()
+            .expect("connection")
+            .execute(
+                "UPDATE chats SET pinned = 1 WHERE chat_id = ?1",
+                rusqlite::params![older],
+            )
+            .expect("pin older chat");
+        let sessions = db.list_sessions().expect("list sessions");
+
+        // Assert
+        assert_eq!(sessions[0].chat_id, older);
+        assert!(sessions[0].pinned);
+        assert!(!sessions[1].pinned);
+        assert_eq!(sessions[1].chat_id, newer);
     }
 
     #[test]

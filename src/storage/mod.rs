@@ -304,6 +304,10 @@ pub(crate) struct SessionSummary {
     pub last_message_time: String,
     pub last_message_preview: Option<String>,
     pub agent_id: String,
+    /// Whether the session is archived (hidden from the active list).
+    pub archived: bool,
+    /// Whether the session is pinned to the top of the list.
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
