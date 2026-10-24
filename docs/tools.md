@@ -433,10 +433,10 @@ Environment variables:
 - 挙動:
   - 全チャネルで利用可能
   - 自己送信 (`to == 自分自身`) は禁止
-  - メッセージを Channel Log に `MessageKind::AgentSend` で保存
-  - チャネルに `[From → To] message` 形式で表示
-  - 宛先エージェントの Turn を `PendingAgentTurn` として `TurnScheduler` 経由でバックグラウンド実行
-  - チェーン深度 (chain depth) が `MAX_AGENT_CHAIN_DEPTH` (4) を超えるターンは Channel Log に SystemEvent を記録して破棄
+  - `MessageKind::AgentSend` でメッセージを保存する。マルチエージェントルームでは Channel Log へ、それ以外のチャネルでは送信元セッションの chat へ保存する
+  - チャネルへの `[From → To] message` 形式での表示は Discord / Telegram で行う。Web はセッション transcript での表示に委ね、TUI / CLI はチャネル表示を行わない
+  - 宛先エージェントの Turn を `ScheduledTurn` として `TurnIntake` 経由で永続受理し、バックグラウンド実行する
+  - チェーン深度 (chain depth) が `MAX_AGENT_CHAIN_DEPTH` (4) を超える呼び出しはツール実行時に拒否される（`delivered: false`）。受付済みターンが実行時に上限を超えた場合は Channel Log に SystemEvent を記録して破棄する
   - 同一 origin のターン数が `MAX_AGENT_TURNS_PER_INPUT` (12) に達すると SystemEvent を記録して停止
 - 成功時:
   - `{"delivered": true, "to": "<agent_id>"}`

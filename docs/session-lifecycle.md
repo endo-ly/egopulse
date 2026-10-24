@@ -65,14 +65,18 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 
 1. **送信元エージェント**が `agent_send` ツールを呼び出し (`to`, `message`)
 2. **宛先ターンを受付**: `TurnIntake::submit()` がターンを永続的に受け付け、スケジューラへ渡す。受付に失敗したターンは後続処理を行わない
-3. **Channel Log に保存・表示**: `MessageKind::AgentSend` と送信元・宛先を記録し、`[From → To] message` 形式でチャネルに表示する
+3. **送信メッセージを保存**: `MessageKind::AgentSend` と送信元・宛先を記録する。マルチエージェントルームでは Channel Log へ、それ以外のチャネルでは送信元セッションの chat へ保存する。`[From → To] message` 形式でのチャネル表示は Discord / Telegram で行う
 4. **宛先ターンを非同期実行**: `process_turn` が送信元情報を含む Direct Input を宛先 Agent Session に保存する
-5. **宛先エージェント応答**: `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信する
+5. **宛先エージェント応答**: `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信する。Web / TUI / CLI では応答は宛先 Agent Session への永続化のみで、チャネル送信は行われない
 
 **制約**:
 - チェーン深度 (`chain_depth`) が `MAX_AGENT_CHAIN_DEPTH` (4) を超えるターンは破棄
 - 自己送信 (`from == to`) は禁止
-- Discord チャネルが設定されている場合のみ利用可能
+
+**処理順序とログの整合**:
+- 宛先ターンは永続受理の時点で実行を開始し得るため、Channel Log への保存が宛先ターンの実行に先行しないことがある
+- 受理と Channel Log 保存の間でプロセスが停止した場合、受理済みターンの handoff 記録がログに残らない
+- この順序により、受付拒否時に未送信のメッセージがログへ混入することを防ぐ
 
 ### 1.5 TurnScheduler による同時実行制御
 
@@ -109,7 +113,7 @@ execute_scheduled_turn():
 
 - Webhook: queue full 時は `429 Too Many Requests`（`session_queue_full` / `global_queue_full`）を返し、`202` にはならない。`202` は `turn_runs` への accepted commit **完了後**に返る。再起動後に `TurnDispatcher` が再実行するのは `accepted`（受付から再開）、`input_committed`（model loop resume）、`tools_completed`（未commitの staged follow-upを反映してから、Tool を再実行せず次の model iteration だけ resume）である。受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`）。Webの同一 `request_key` への異なる本文は `409 Conflict` として拒否する。
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
-- Agent Send (`agent_send`): 非同期のため、拒否時に Channel Log へ SystemEvent を記録する。
+- Agent Send (`agent_send`): 非同期のため、受付拒否時はツール結果 `delivered: false` として呼び出し元へ返る。
 
 **TurnTracker の有界化**: origin ごとの turn count / terminal reason を 1 つの state に統合し、24 時間の TTL で完了済み origin を破棄する。origin 追跡上限は 4096。TTL prunes 後も上限なら新規 origin を明示的に拒否する（既存 origin の更新は上限中も可能）。
 
