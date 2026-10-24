@@ -854,6 +854,54 @@ impl Database {
         Ok(())
     }
 
+    /// Updates the user-facing session metadata of one chat.
+    ///
+    /// * `name`: `None` leaves the title untouched, `Some(None)` clears it and
+    ///   `Some(Some(title))` sets it. The title is a display label only; the
+    ///   session identity (`chat_id` / `external_chat_id`) never changes.
+    /// * `archived` / `pinned`: `None` leaves the flag untouched.
+    ///
+    /// Returns `Ok(false)` when the chat does not exist. `chats.revision` is
+    /// untouched: this is presentation metadata, not conversation state.
+    pub(crate) fn update_chat_display_meta(
+        &self,
+        chat_id: i64,
+        name: Option<Option<String>>,
+        archived: Option<bool>,
+        pinned: Option<bool>,
+    ) -> Result<bool, StorageError> {
+        let conn = self.get_conn()?;
+        let (set_name, title) = match name {
+            Some(value) => (true, value),
+            None => (false, None),
+        };
+        let (set_archived, archived_value) = match archived {
+            Some(value) => (true, i64::from(value)),
+            None => (false, 0),
+        };
+        let (set_pinned, pinned_value) = match pinned {
+            Some(value) => (true, i64::from(value)),
+            None => (false, 0),
+        };
+        let updated = conn.execute(
+            "UPDATE chats SET
+                 chat_title = CASE WHEN ?2 THEN ?3 ELSE chat_title END,
+                 archived = CASE WHEN ?4 THEN ?5 ELSE archived END,
+                 pinned = CASE WHEN ?6 THEN ?7 ELSE pinned END
+             WHERE chat_id = ?1",
+            params![
+                chat_id,
+                set_name,
+                title,
+                set_archived,
+                archived_value,
+                set_pinned,
+                pinned_value,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Clears session message history by setting `messages_json` to an empty
     /// JSON array.  The session row itself and `messages` / `tool_calls`
     /// records are preserved.
