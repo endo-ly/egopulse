@@ -691,13 +691,7 @@ mod tests {
 
         // Create the channel_log chat so messages could be stored
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
-            db.resolve_or_create_chat_id(
-                "discord",
-                "discord:123:multi-room-log",
-                None,
-                "channel_log",
-                "",
-            )
+            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", "channel_log", "")
         })
         .await
         .expect("create log chat");
@@ -757,13 +751,7 @@ mod tests {
         let channels = Arc::new(ChannelRegistry::new());
 
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
-            db.resolve_or_create_chat_id(
-                "discord",
-                "discord:123:multi-room-log",
-                None,
-                "channel_log",
-                "",
-            )
+            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", "channel_log", "")
         })
         .await
         .expect("create log chat");
@@ -1114,13 +1102,7 @@ mod integration_tests {
         let (tool, state) = durable_multi_tool(&dir);
 
         let log_chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id(
-                "discord",
-                "discord:123:multi-room-log",
-                None,
-                "channel_log",
-                "",
-            )
+            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", "channel_log", "")
         })
         .await
         .expect("log chat");
@@ -1188,13 +1170,7 @@ mod integration_tests {
         let (tool, db) = multi_agent_tool(&config);
 
         let log_chat_id = call_blocking(Arc::clone(&db), |db| {
-            db.resolve_or_create_chat_id(
-                "discord",
-                "discord:123:multi-room-log",
-                None,
-                "channel_log",
-                "",
-            )
+            db.resolve_or_create_chat_id("discord", "discord:123:multi-room-log", "channel_log", "")
         })
         .await
         .expect("log chat");

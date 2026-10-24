@@ -600,7 +600,7 @@ mod tests {
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = Database::new(&db_path).expect("db");
         let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:tool-ledger", None, "private", "default")
+            .resolve_or_create_chat_id("cli", "cli:tool-ledger", "private", "default")
             .expect("create chat");
         assert_eq!(chat_id, 1, "expected the seeded chat to be chat_id 1");
         (db, dir)
@@ -673,7 +673,7 @@ mod tests {
     fn get_tool_calls_for_chat_returns_persisted_calls_in_timestamp_order() {
         let (db, _dir) = test_db();
         let chat_id = db
-            .resolve_or_create_chat_id("web", "web:message-1", Some("message-1"), "web", "default")
+            .resolve_or_create_chat_id("web", "web:message-1", "web", "default")
             .expect("create chat");
 
         // Two tool calls on different assistant messages; the same provider

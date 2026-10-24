@@ -535,13 +535,7 @@ mod tests {
                 calls: Arc::clone(&write_calls),
             }));
         let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:guard-pulse:agent:default",
-                Some("guard-pulse"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:guard-pulse:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -654,13 +648,7 @@ mod tests {
             None,
         );
         let chat_id = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:late-pulse:agent:default",
-                Some("late-pulse"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:late-pulse:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -935,7 +923,6 @@ mod tests {
                 .resolve_or_create_chat_id(
                     "discord",
                     "discord:123:agent:default",
-                    None,
                     "discord",
                     "default",
                 )

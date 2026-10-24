@@ -659,13 +659,7 @@ mod tests {
         let (state, client) = start_runtime(&dir).await;
         let chat_id = state
             .db
-            .resolve_or_create_chat_id(
-                "discord",
-                "discord:42:agent:special",
-                Some("work"),
-                "dm",
-                "special",
-            )
+            .resolve_or_create_chat_id("discord", "discord:42:agent:special", "dm", "special")
             .expect("create chat");
         let message = StoredMessage {
             id: "message-1".to_string(),
@@ -966,13 +960,7 @@ mod tests {
         server::start(&state).expect("start local API");
         let chat_id = state
             .db
-            .resolve_or_create_chat_id(
-                "discord",
-                "discord:42:agent:default",
-                Some("work"),
-                "dm",
-                "default",
-            )
+            .resolve_or_create_chat_id("discord", "discord:42:agent:default", "dm", "default")
             .expect("create Discord session");
         let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
         let client = LocalRuntimeClient::connect(path)
@@ -1050,13 +1038,7 @@ mod tests {
         server::start(&state).expect("start local API");
         let chat_id = state
             .db
-            .resolve_or_create_chat_id(
-                "discord",
-                "discord:42:agent:special",
-                Some("work"),
-                "dm",
-                "special",
-            )
+            .resolve_or_create_chat_id("discord", "discord:42:agent:special", "dm", "special")
             .expect("create Discord session");
         let path = super::super::socket_path(std::path::Path::new(&state.config.state_root));
         let client = LocalRuntimeClient::connect(path)

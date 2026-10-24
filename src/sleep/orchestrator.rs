@@ -2019,14 +2019,8 @@ mod tests {
     }
 
     fn create_chat(db: &Database, agent_id: &str, suffix: &str) -> i64 {
-        db.resolve_or_create_chat_id(
-            "test",
-            &format!("test:chat{suffix}"),
-            Some(&format!("chat{suffix}")),
-            "direct",
-            agent_id,
-        )
-        .expect("create chat")
+        db.resolve_or_create_chat_id("test", &format!("test:chat{suffix}"), "direct", agent_id)
+            .expect("create chat")
     }
 
     fn seed_messages_for_proceed(db: &Database, agent_id: &str) {

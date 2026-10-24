@@ -1162,13 +1162,7 @@ mod tests {
         // Assert
         assert!(matches!(error, EgoPulseError::Llm(_)));
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:failure:agent:default",
-                Some("failure"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:failure:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -1722,7 +1716,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "discord",
                 "discord:ctx-no-persist:agent:default",
-                Some("ctx-no-persist"),
                 "discord",
                 "default",
             )
@@ -1824,7 +1817,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "discord",
                 "discord:int-full-flow:agent:default",
-                Some("int-full-flow"),
                 "discord",
                 "default",
             )

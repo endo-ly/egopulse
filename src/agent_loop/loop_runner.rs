@@ -698,7 +698,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:late-tool-loop:agent:default",
-                Some("late-tool-loop"),
                 "cli",
                 "default",
             )
@@ -863,7 +862,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:follow-up-integration:agent:default",
-                Some("follow-up-integration"),
                 "cli",
                 "default",
             )
@@ -1020,7 +1018,6 @@ mod tests {
                 db.resolve_or_create_chat_id(
                     "cli",
                     &format!("cli:{session}:agent:default"),
-                    Some(&session),
                     "cli",
                     "default",
                 )

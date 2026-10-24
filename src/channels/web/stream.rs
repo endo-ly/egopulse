@@ -950,7 +950,7 @@ mod tests {
         let chat_id = state
             .app_state
             .db
-            .resolve_or_create_chat_id("web", "web:existing-session:agent:ace", None, "web", "ace")
+            .resolve_or_create_chat_id("web", "web:existing-session:agent:ace", "web", "ace")
             .expect("create chat");
         let request = SendRequest {
             session_key: Some(format!("chat:{chat_id}")),
@@ -1161,7 +1161,7 @@ mod tests {
         let chat_id = web_state
             .app_state
             .db
-            .resolve_or_create_chat_id("web", "web:ids", None, "web", "default")
+            .resolve_or_create_chat_id("web", "web:ids", "web", "default")
             .expect("chat");
         web_state
             .run_hub
@@ -1212,7 +1212,7 @@ mod tests {
         let chat_id = web_state
             .app_state
             .db
-            .resolve_or_create_chat_id("web", "web:staged", None, "web", "default")
+            .resolve_or_create_chat_id("web", "web:staged", "web", "default")
             .expect("chat");
         web_state
             .run_hub
@@ -1260,7 +1260,7 @@ mod tests {
         let chat_id = web_state
             .app_state
             .db
-            .resolve_or_create_chat_id("web", "web:partial", None, "web", "default")
+            .resolve_or_create_chat_id("web", "web:partial", "web", "default")
             .expect("chat");
         web_state
             .run_hub
@@ -1313,7 +1313,7 @@ mod tests {
         let chat_id = web_state
             .app_state
             .db
-            .resolve_or_create_chat_id("web", "web:followup", None, "web", "default")
+            .resolve_or_create_chat_id("web", "web:followup", "web", "default")
             .expect("chat");
         web_state
             .run_hub
@@ -1790,13 +1790,7 @@ mod tests {
         let chat_id = state
             .app_state
             .db
-            .resolve_or_create_chat_id(
-                "web",
-                "web:tool-session:agent:default",
-                None,
-                "web",
-                "default",
-            )
+            .resolve_or_create_chat_id("web", "web:tool-session:agent:default", "web", "default")
             .expect("create chat");
         let turn_id = match state
             .app_state
@@ -1874,13 +1868,7 @@ mod tests {
         let chat_id = state
             .app_state
             .db
-            .resolve_or_create_chat_id(
-                "web",
-                "web:busy-session:agent:default",
-                None,
-                "web",
-                "default",
-            )
+            .resolve_or_create_chat_id("web", "web:busy-session:agent:default", "web", "default")
             .expect("create chat");
         state
             .app_state

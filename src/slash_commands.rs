@@ -874,7 +874,7 @@ mod tests {
         let session_key = format!("cli:{key}");
         let key = key.to_string();
         call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id("cli", &session_key, Some(&key), "cli", "default")
+            db.resolve_or_create_chat_id("cli", &session_key, "cli", "default")
         })
         .await
         .expect("chat_id")

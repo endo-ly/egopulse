@@ -441,13 +441,7 @@ mod tests {
         assert_eq!(reply, "done");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:turn-id-links:agent:default",
-                Some("turn-id-links"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:turn-id-links:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");

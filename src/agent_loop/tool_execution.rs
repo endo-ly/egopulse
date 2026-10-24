@@ -784,13 +784,7 @@ mod integration_tests {
         assert_eq!(max_active.load(Ordering::SeqCst), 2);
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:parallel-read:agent:default",
-                Some("parallel-read"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:parallel-read:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -925,7 +919,6 @@ mod integration_tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:invalid-tool-arguments:agent:default",
-                Some("invalid-tool-arguments"),
                 "cli",
                 "default",
             )
@@ -1063,7 +1056,6 @@ mod integration_tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:ledger-input-redaction:agent:default",
-                Some("ledger-input-redaction"),
                 "cli",
                 "default",
             )
@@ -1235,13 +1227,7 @@ mod integration_tests {
 
         // Assert: all three simultaneous denials are ledgered exactly once.
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:guard-limit:agent:default",
-                Some("guard-limit"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:guard-limit:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -1476,13 +1462,7 @@ mod integration_tests {
         assert_eq!(reply, "Done.");
 
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:seq-write:agent:default",
-                Some("seq-write"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:seq-write:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");

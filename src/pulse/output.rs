@@ -459,7 +459,7 @@ mod tests {
     }
 
     fn insert_chat(db: &Database, agent_id: &str) -> i64 {
-        db.resolve_or_create_chat_id("discord", "discord:123", None, "dm", agent_id)
+        db.resolve_or_create_chat_id("discord", "discord:123", "dm", agent_id)
             .expect("create chat")
     }
 

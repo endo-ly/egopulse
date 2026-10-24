@@ -486,14 +486,8 @@ mod tests {
     }
 
     fn create_chat(db: &crate::storage::Database, agent_id: &str, suffix: &str) -> i64 {
-        db.resolve_or_create_chat_id(
-            "test",
-            &format!("test:chat{suffix}"),
-            Some(&format!("chat{suffix}")),
-            "direct",
-            agent_id,
-        )
-        .expect("create chat")
+        db.resolve_or_create_chat_id("test", &format!("test:chat{suffix}"), "direct", agent_id)
+            .expect("create chat")
     }
 
     fn store_msg(db: &crate::storage::Database, id: &str, chat_id: i64, content: &str, ts: &str) {

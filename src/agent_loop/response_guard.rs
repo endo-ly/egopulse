@@ -173,7 +173,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:declarative-guard:agent:default",
-                Some("declarative-guard"),
                 "cli",
                 "default",
             )

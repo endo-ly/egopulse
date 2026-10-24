@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 19;
+pub(super) const SCHEMA_VERSION: i64 = 20;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1038,6 +1038,49 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         set_schema_version_in_tx(&tx, 19, "add chats.archived and chats.pinned")?;
         tx.commit()?;
         version = 19;
+    }
+
+    if version < 20 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Chats used to be created with the raw surface thread as their title.
+        // Titles are user-managed display names only, so seeded values are
+        // cleared; display layers fall back to the derived surface thread.
+        let candidates = {
+            let mut stmt = tx.prepare(
+                "SELECT chat_id, channel, external_chat_id, agent_id, chat_title
+                 FROM chats
+                 WHERE chat_title IS NOT NULL",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        for (chat_id, channel, external_chat_id, agent_id, chat_title) in candidates {
+            let surface_thread =
+                crate::conversation::SurfaceContext::surface_thread_from_session_key(
+                    &channel,
+                    &external_chat_id,
+                    &agent_id,
+                );
+            if chat_title == surface_thread {
+                tx.execute(
+                    "UPDATE chats SET chat_title = NULL WHERE chat_id = ?1",
+                    params![chat_id],
+                )?;
+            }
+        }
+
+        set_schema_version_in_tx(&tx, 20, "clear chat titles seeded from surface threads")?;
+        tx.commit()?;
+        version = 20;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -2665,10 +2708,10 @@ mod tests {
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = super::super::Database::new(&db_path).expect("db");
         let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-state", None, "private", "default")
+            .resolve_or_create_chat_id("cli", "cli:v12-state", "private", "default")
             .expect("chat");
         let empty_chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-empty", None, "private", "default")
+            .resolve_or_create_chat_id("cli", "cli:v12-empty", "private", "default")
             .expect("empty chat");
         let llm_context = r#"[{"role":"user","content":"hi"}]"#;
         db.save_session(chat, llm_context).expect("session");
@@ -2798,7 +2841,7 @@ mod tests {
         let db_path = dir.path().join("runtime").join("egopulse.db");
         let db = super::super::Database::new(&db_path).expect("db");
         let chat = db
-            .resolve_or_create_chat_id("cli", "cli:v12-idem", None, "private", "default")
+            .resolve_or_create_chat_id("cli", "cli:v12-idem", "private", "default")
             .expect("chat");
         {
             let conn = db.get_conn().expect("conn");
@@ -2845,7 +2888,7 @@ mod tests {
         let db_path = dir.path().join("runtime").join("secret.db");
         let db = super::super::Database::new_secret(&db_path).expect("secret db");
         let chat = db
-            .resolve_or_create_chat_id("discord", "discord:9:agent:x", None, "private", "x")
+            .resolve_or_create_chat_id("discord", "discord:9:agent:x", "private", "x")
             .expect("chat");
         {
             let conn = db.get_conn().expect("conn");
@@ -2996,5 +3039,46 @@ mod tests {
 
         // Assert
         assert!(llm_usage_has_cached_input_tokens(&conn));
+    }
+
+    #[test]
+    fn migration_v20_clears_titles_seeded_from_surface_threads() {
+        // Arrange
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        super::run_migrations(&conn).expect("fresh migrations");
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('session-1', 'web', '2025-01-01T00:00:00Z', 'web', 'web:session-1:agent:default', 'default')",
+            [],
+        )
+        .expect("insert seeded chat");
+        conn.execute(
+            "INSERT INTO chats (chat_title, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES ('設計相談', 'web', '2025-01-01T00:00:00Z', 'web', 'web:session-2:agent:default', 'default')",
+            [],
+        )
+        .expect("insert named chat");
+        super::set_schema_version(&conn, 19, "test v19 baseline").expect("set v19");
+
+        // Act
+        super::run_migrations(&conn).expect("upgrade to v20");
+
+        // Assert
+        let seeded: Option<String> = conn
+            .query_row(
+                "SELECT chat_title FROM chats WHERE external_chat_id = 'web:session-1:agent:default'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("seeded title");
+        let named: Option<String> = conn
+            .query_row(
+                "SELECT chat_title FROM chats WHERE external_chat_id = 'web:session-2:agent:default'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("named title");
+        assert_eq!(seeded, None);
+        assert_eq!(named.as_deref(), Some("設計相談"));
     }
 }

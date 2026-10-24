@@ -757,7 +757,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:usage-log-single:agent:default",
-                Some("usage-log-single"),
                 "cli",
                 "default",
             )
@@ -1187,7 +1186,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:usage-log-multi:agent:default",
-                Some("usage-log-multi"),
                 "cli",
                 "default",
             )
@@ -1342,13 +1340,7 @@ mod tests {
             "must not retry after a delta was published"
         );
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:partial-delta:agent:default",
-                Some("partial-delta"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:partial-delta:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -1399,7 +1391,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:thinking-only-after-delta:agent:default",
-                Some("thinking-only-after-delta"),
                 "cli",
                 "default",
             )
@@ -1463,13 +1454,7 @@ mod tests {
         // Assert
         assert!(matches!(error, EgoPulseError::Llm(_)));
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:tc-fail:agent:default",
-                Some("tc-fail"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:tc-fail:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
