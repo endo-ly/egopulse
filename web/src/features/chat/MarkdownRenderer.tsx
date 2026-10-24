@@ -1,4 +1,4 @@
-import { useState, type ComponentProps } from "react";
+import { memo, useState, type ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -10,7 +10,9 @@ export interface MarkdownRendererProps {
   content: string;
 }
 
-export function MarkdownRenderer({ content }: MarkdownRendererProps) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({
+  content,
+}: MarkdownRendererProps) {
   return (
     <div className="markdown-content">
       <ReactMarkdown
@@ -22,7 +24,7 @@ export function MarkdownRenderer({ content }: MarkdownRendererProps) {
       </ReactMarkdown>
     </div>
   );
-}
+});
 
 type PreProps = Omit<ComponentProps<"pre">, "node">;
 
