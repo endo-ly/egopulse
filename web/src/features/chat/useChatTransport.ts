@@ -22,6 +22,10 @@ import {
 import { AuthRequiredError } from "../../shared/api/auth";
 import { wsUrl } from "../../shared/api/ws";
 import { invalidateQueries } from "../../shared/hooks/useServerState";
+import {
+  useSessionRefresh,
+  type SessionUpdatedPayload,
+} from "./useSessionRefresh";
 
 export interface UseChatTransportOptions {
   sessionKey: string;
@@ -109,6 +113,7 @@ export function useChatTransport({
   const [connectionState, setConnectionState] = useState<
     "connecting" | "open" | "closed"
   >("closed");
+  const refreshSessions = useSessionRefresh();
   const wsRef = useRef<WebSocket | null>(null);
   const connectPromiseRef = useRef<Promise<void> | null>(null);
   const connectResolveRef = useRef<(() => void) | null>(null);
@@ -340,6 +345,11 @@ export function useChatTransport({
         return;
       }
 
+      if (parsed.type === "event" && parsed.event === "session_updated") {
+        refreshSessions((parsed.payload ?? {}) as SessionUpdatedPayload);
+        return;
+      }
+
       if (parsed.type === "event" && parsed.event === "chat" && parsed.payload) {
         const event = parsed.payload as ChatEventPayload;
         if (!belongsToCurrentSession(event, sessionKeyRef.current, runsRef.current)) {
@@ -431,7 +441,16 @@ export function useChatTransport({
         );
       }
     },
-    [authToken, onAuthRequired, onDone, onError, clearReconnectTimer, settlePendingSend, resubscribeInFlightRuns],
+    [
+      authToken,
+      onAuthRequired,
+      onDone,
+      onError,
+      clearReconnectTimer,
+      settlePendingSend,
+      resubscribeInFlightRuns,
+      refreshSessions,
+    ],
   );
 
   const connect = useCallback(

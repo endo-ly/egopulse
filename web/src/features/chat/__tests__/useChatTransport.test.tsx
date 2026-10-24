@@ -188,6 +188,43 @@ describe("useChatTransport reconnect", () => {
     expect(connect.params.maxProtocol).toBe(2);
   });
 
+  it("session_updated_invalidates_sessions_and_the_open_history", async () => {
+    const { ws } = await connectOpen({ sessionKey: "chat:1" });
+    const invalidate = vi.mocked(invalidateQueries);
+    invalidate.mockClear();
+
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "session_updated",
+        payload: { sessionKey: "chat:1" },
+      });
+    });
+    act(() => vi.advanceTimersByTime(100));
+
+    expect(invalidate).toHaveBeenCalledWith("sessions");
+    expect(invalidate).toHaveBeenCalledWith("history:chat:1");
+  });
+
+  it("session_updated_for_another_session_invalidates_that_history", async () => {
+    const { ws } = await connectOpen({ sessionKey: "chat:1" });
+    const invalidate = vi.mocked(invalidateQueries);
+    invalidate.mockClear();
+
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "session_updated",
+        payload: { sessionKey: "chat:2" },
+      });
+    });
+    act(() => vi.advanceTimersByTime(100));
+
+    expect(invalidate).toHaveBeenCalledWith("sessions");
+    expect(invalidate).toHaveBeenCalledWith("history:chat:2");
+    expect(invalidate).not.toHaveBeenCalledWith("history:chat:1");
+  });
+
   async function connectOpen(
     options?: Parameters<typeof setup>[0],
   ) {

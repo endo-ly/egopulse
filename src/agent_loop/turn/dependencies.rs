@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::config::{Config, ConfigManager, ResolvedLlmConfig};
-use crate::conversation::ConversationScope;
+use crate::conversation::{ConversationEventBus, ConversationScope};
 use crate::error::EgoPulseError;
 use crate::llm::LlmProvider;
 use crate::memory::MemoryLoader;
@@ -43,6 +43,7 @@ pub(crate) struct TurnDependencies {
     pub(crate) assets: Arc<crate::assets::AssetStore>,
     pub(crate) usage_calibrator: Arc<crate::llm::calibration::UsageCalibrator>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
+    pub(crate) conversation_events: Arc<ConversationEventBus>,
 }
 
 impl TurnDependencies {

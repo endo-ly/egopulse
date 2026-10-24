@@ -73,12 +73,12 @@ export function WebUI() {
 
   const agentsState = useServerState("agents", () => fetchAgents(authToken));
   const sessionsState = useServerState("sessions", () => fetchSessions(authToken), {
-    pollIntervalMs: 10_000,
+    pollIntervalMs: 60_000,
   });
   const historyState = useServerState(
     `history:${selectedSession}`,
     () => fetchHistory(authToken, selectedSession),
-    { pollIntervalMs: 10_000 },
+    { pollIntervalMs: 60_000 },
   );
 
   const agents = agentsState.data ?? [];

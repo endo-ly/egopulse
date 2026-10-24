@@ -42,7 +42,7 @@ use crate::channels::adapter::ChannelRegistry;
 use crate::channels::voice::VoiceAdapter;
 use crate::channels::web::WebAdapter;
 use crate::config::{Config, ConfigManager};
-use crate::conversation::ConversationScope;
+use crate::conversation::{ConversationEventBus, ConversationScope};
 use crate::error::{ChannelError, EgoPulseError};
 use crate::llm::calibration::{CalibrationKey, CalibrationObservation, UsageCalibrator};
 use crate::llm::{Message, create_provider};
@@ -129,6 +129,8 @@ pub struct AppState {
     pub(crate) turn_observers: Arc<turn::TurnObserverRegistry>,
     /// In-memory runtime health summary for observability.
     pub(crate) runtime_status: Arc<RuntimeStatus>,
+    /// In-process fan-out for durable conversation changes.
+    pub(crate) conversation_events: Arc<ConversationEventBus>,
     /// Owns long-lived tasks and in-flight turns; orchestrates shutdown.
     pub(crate) supervisor: Arc<RuntimeSupervisor>,
     /// Learns prompt-token estimate correction factors from observed LLM usage.
@@ -203,6 +205,7 @@ impl AppState {
             turn_tracker: Arc::new(turn::TurnTracker::new()),
             turn_observers: Arc::new(turn::TurnObserverRegistry::new()),
             runtime_status: parts.runtime_status.clone(),
+            conversation_events: Arc::new(ConversationEventBus::default()),
             supervisor: Arc::new(RuntimeSupervisor::with_instance_guard(
                 parts.runtime_status,
                 Arc::clone(&parts.instance_guard),
@@ -234,6 +237,7 @@ impl AppState {
             assets: Arc::clone(&self.assets),
             usage_calibrator: Arc::clone(&self.usage_calibrator),
             active_turns: Arc::clone(&self.active_turns),
+            conversation_events: Arc::clone(&self.conversation_events),
         }
     }
 

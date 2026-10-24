@@ -109,7 +109,7 @@ Sidebar の第1セクション。必ず表示する。
 }
 ```
 
-**polling 戦略**：session 一覧のポーリングで `last_message_time` を更新し、未読判定に使う。選択中 session の新着は次回ポーリングで既読化される。
+**更新戦略**：session の更新は WebSocket の `session_updated` を受けて一覧を再取得することで即時反映する。60 秒間隔のポーリングは取りこぼし時のフォールバックとして残す。未読判定は `last_message_time` を使う。
 
 ### 2.5 SESSIONS Section
 

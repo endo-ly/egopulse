@@ -1,6 +1,7 @@
 //! Shared conversation identity and surface context.
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 /// The storage boundary a conversation belongs to.
 ///
@@ -21,6 +22,47 @@ impl std::fmt::Display for ConversationScope {
             Self::Normal => write!(f, "normal"),
             Self::Secret => write!(f, "secret"),
         }
+    }
+}
+
+/// Notification that a conversation changed durably.
+///
+/// Consumers use this to refresh their own view instead of polling. The event
+/// carries identities only: message content stays in storage. Subscribers that
+/// serve a specific scope must filter on `scope`; the bus does not enforce
+/// visibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ConversationChanged {
+    pub(crate) scope: ConversationScope,
+    pub(crate) chat_id: i64,
+}
+
+/// In-process fan-out for [`ConversationChanged`] notifications.
+pub(crate) struct ConversationEventBus {
+    sender: broadcast::Sender<ConversationChanged>,
+}
+
+impl ConversationEventBus {
+    /// Creates a bus with room for `capacity` unread events per subscriber.
+    pub(crate) fn new(capacity: usize) -> Self {
+        let (sender, _) = broadcast::channel(capacity);
+        Self { sender }
+    }
+
+    /// Publishes a change notification. Dropped when nobody is listening.
+    pub(crate) fn publish(&self, event: ConversationChanged) {
+        let _ = self.sender.send(event);
+    }
+
+    /// Subscribes to future change notifications.
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ConversationChanged> {
+        self.sender.subscribe()
+    }
+}
+
+impl Default for ConversationEventBus {
+    fn default() -> Self {
+        Self::new(256)
     }
 }
 

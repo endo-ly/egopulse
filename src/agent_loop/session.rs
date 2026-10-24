@@ -11,7 +11,7 @@ use crate::agent_loop::session_snapshot::{
     SnapshotMessage, messages_from_snapshot, messages_to_snapshot,
 };
 use crate::assets::AssetStore;
-use crate::conversation::{ConversationScope, SurfaceContext};
+use crate::conversation::{ConversationChanged, ConversationScope, SurfaceContext};
 use crate::error::{EgoPulseError, StorageError};
 use crate::llm::{Message, MessageContent, ToolCall};
 use crate::storage::{
@@ -610,10 +610,14 @@ async fn store_phase_snapshot(
             EgoPulseError::Storage(storage) => storage,
             other => StorageError::TaskJoin(other.to_string()),
         })?;
+    let chat_id = message.chat_id;
     let revision = call_blocking(state.db_for(scope), move |db| {
         db.store_message_with_session(&message, &session_json, session_revision)
     })
     .await?;
+    state
+        .conversation_events
+        .publish(ConversationChanged { scope, chat_id });
     Ok(PersistedTurn {
         revision,
         messages: snapshot_messages,
@@ -638,6 +642,7 @@ async fn store_phase_snapshot_with_turn_input(
     let turn_id_owned = turn_id.to_string();
     let config_revision = config_snapshot.revision as i64;
     let config_fingerprint_owned = config_snapshot.fingerprint.clone();
+    let chat_id = message.chat_id;
     let revision = call_blocking(state.db_for(scope), move |db| {
         db.commit_turn_input_with_conversation(
             &message,
@@ -649,6 +654,9 @@ async fn store_phase_snapshot_with_turn_input(
         )
     })
     .await?;
+    state
+        .conversation_events
+        .publish(ConversationChanged { scope, chat_id });
     Ok(PersistedTurn {
         revision,
         messages: snapshot_messages,
@@ -1907,5 +1915,43 @@ mod tests {
         assert_eq!(Arc::strong_count(&messages), 1);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content.as_text_lossy(), "hello");
+    }
+
+    #[tokio::test]
+    async fn persist_phase_publishes_conversation_changed() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_string_lossy().to_string(),
+            Box::new(FakeProvider {
+                response: "ok".to_string(),
+            }),
+        );
+        let mut events = state.conversation_events.subscribe();
+        let context = cli_context("conversation-events");
+        let chat_id = resolve_chat_id(&state.turn_dependencies(), &context)
+            .await
+            .expect("chat id");
+        let stored = StoredMessage::assistant(chat_id, "default".to_string(), "hello".to_string());
+
+        // Act
+        persist_phase(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            stored,
+            Message::text("assistant", "hello"),
+            &[],
+            None,
+        )
+        .await
+        .expect("persist");
+
+        // Assert
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("bus open");
+        assert_eq!(event.chat_id, chat_id);
+        assert_eq!(event.scope, ConversationScope::Normal);
     }
 }

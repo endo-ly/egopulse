@@ -13,13 +13,15 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::auth;
 use super::stream::{SendRequest, accept_web_input};
 use super::{RunEvent, RunLookupError, WEB_ACTOR, WebState};
+use crate::conversation::{ConversationChanged, ConversationScope};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -200,6 +202,17 @@ struct GatewayChatContent {
     text: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionUpdatedPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_key: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    resync: bool,
+}
+
 struct SocketRequestContext<'a> {
     tx: &'a mpsc::UnboundedSender<Message>,
     connected: &'a AtomicBool,
@@ -271,6 +284,8 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
 
     let connected = Arc::new(AtomicBool::new(false));
     let forwarded_runs = Arc::new(Mutex::new(HashSet::new()));
+    let session_events_cancel = CancellationToken::new();
+    let mut session_events_started = false;
     // 接続完了前は connect を期限付きで待ち、以降は通常の受信ループとして扱う。
     while let Some(Ok(message)) = receive_next_message(&mut receiver, &connected).await {
         let Message::Text(text) = message else {
@@ -311,11 +326,20 @@ async fn handle_socket(socket: WebSocket, state: WebState) {
                 if handle_request(&state, request_context, id, method, params).await {
                     break;
                 }
+                if !session_events_started && connected.load(Ordering::SeqCst) {
+                    session_events_started = true;
+                    spawn_session_event_forwarder(
+                        &state,
+                        out_tx.clone(),
+                        session_events_cancel.clone(),
+                    );
+                }
             }
         }
     }
 
     // writer を閉じて送信タスクも終了させ、接続ライフサイクルをここで完結させる。
+    session_events_cancel.cancel();
     drop(out_tx);
     let _ = writer.await;
 }
@@ -400,6 +424,7 @@ fn handle_connect(
                 events: vec![
                     "connect.challenge",
                     "chat",
+                    "session_updated",
                     "tool_start",
                     "tool_result",
                     "user_input",
@@ -409,6 +434,56 @@ fn handle_connect(
         },
     )
     .is_err()
+}
+
+fn spawn_session_event_forwarder(
+    state: &WebState,
+    tx: mpsc::UnboundedSender<Message>,
+    cancel: CancellationToken,
+) {
+    let events = state.app_state.conversation_events.subscribe();
+    tokio::spawn(forward_session_events(events, tx, cancel));
+}
+
+async fn forward_session_events(
+    mut events: broadcast::Receiver<ConversationChanged>,
+    tx: mpsc::UnboundedSender<Message>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            received = events.recv() => match received {
+                Ok(event) => {
+                    // Secret-scope conversations never surface on the Web UI.
+                    if event.scope != ConversationScope::Normal {
+                        continue;
+                    }
+                    let payload = SessionUpdatedPayload {
+                        chat_id: Some(event.chat_id),
+                        session_key: Some(format!("chat:{}", event.chat_id)),
+                        resync: false,
+                    };
+                    if send_event(&tx, "session_updated", payload).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Events were dropped; the client must reconcile from the
+                    // persisted session list instead of missing an update.
+                    let payload = SessionUpdatedPayload {
+                        chat_id: None,
+                        session_key: None,
+                        resync: true,
+                    };
+                    if send_event(&tx, "session_updated", payload).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
 }
 
 async fn handle_chat_send(
@@ -2165,5 +2240,79 @@ mod tests {
         assert_eq!(ack["type"], "res");
         assert_eq!(ack["ok"], true);
         assert_eq!(ack["payload"]["replayTruncated"], true);
+    }
+
+    #[tokio::test]
+    async fn ws_forwards_normal_scope_session_events() {
+        // Arrange
+        let bus = crate::conversation::ConversationEventBus::new(4);
+        let events = bus.subscribe();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let cancel = CancellationToken::new();
+        let forwarder = tokio::spawn(forward_session_events(events, tx, cancel.clone()));
+
+        // Act: a secret-scope event is invisible to the Web UI, while a
+        // normal-scope event must be forwarded.
+        bus.publish(crate::conversation::ConversationChanged {
+            scope: ConversationScope::Secret,
+            chat_id: 1,
+        });
+        bus.publish(crate::conversation::ConversationChanged {
+            scope: ConversationScope::Normal,
+            chat_id: 42,
+        });
+
+        // Assert
+        let message = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("session event");
+        let text = match message {
+            Message::Text(text) => text,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["type"], "event");
+        assert_eq!(parsed["event"], "session_updated");
+        assert_eq!(parsed["payload"]["chatId"], 42);
+        assert_eq!(parsed["payload"]["sessionKey"], "chat:42");
+        assert!(parsed["payload"].get("resync").is_none());
+
+        cancel.cancel();
+        forwarder.await.expect("forwarder");
+    }
+
+    #[tokio::test]
+    async fn ws_requests_resync_when_session_events_lag() {
+        // Arrange: leave the receiver behind so the first recv reports the gap.
+        let bus = crate::conversation::ConversationEventBus::new(1);
+        let events = bus.subscribe();
+        for chat_id in 0..3 {
+            bus.publish(crate::conversation::ConversationChanged {
+                scope: ConversationScope::Normal,
+                chat_id,
+            });
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let cancel = CancellationToken::new();
+        let forwarder = tokio::spawn(forward_session_events(events, tx, cancel.clone()));
+
+        // Act
+        let message = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("event timeout")
+            .expect("session event");
+
+        // Assert
+        let text = match message {
+            Message::Text(text) => text,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["event"], "session_updated");
+        assert_eq!(parsed["payload"]["resync"], true);
+
+        cancel.cancel();
+        forwarder.await.expect("forwarder");
     }
 }

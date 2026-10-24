@@ -579,7 +579,7 @@ JSON-RPC 風の双方向メッセージング。
     "server": { "version": "0.1.0", "connId": "uuid" },
     "features": {
       "methods": ["connect", "chat.send", "run.subscribe"],
-      "events": ["connect.challenge", "chat", "tool_start", "tool_result", "user_input", "assistant_discarded"]
+      "events": ["connect.challenge", "chat", "session_updated", "tool_start", "tool_result", "user_input", "assistant_discarded"]
     }
   }
 }
@@ -698,6 +698,23 @@ Message identity は end-to-end で安定している。ユーザーメッセー
 - `replayTruncated`: リプレイバッファが `lastSeq` 以降の全イベントを保持できていない（512件のTTL退避で欠落がある）場合に `true`。リプレイだけでは途切れのないトランスクリプトを復元できないため、クライアントはそのrun由来のlive entries（run ownershipで特定）を破棄し、永続化済み履歴から再構築する（live購読は継続する）
 - `done`: 購読時点でrunが完了済みかどうか
 - runが保持期間切れ・プロセス再起動などでRunHubから見つからない場合は `run_not_found` エラーを返す。クライアントは永続化済み履歴 (`GET /api/history`) から再構築する
+
+#### セッション更新通知
+
+会話の永続化が完了すると、接続中のクライアントへ `session_updated` が送信される。通知は識別子のみで、メッセージ本文は含まない。クライアントは `GET /api/sessions` と、必要に応じて `GET /api/history` を再取得する。
+
+```json
+{
+  "type": "event",
+  "event": "session_updated",
+  "payload": {
+    "chatId": 42,
+    "sessionKey": "chat:42"
+  }
+}
+```
+
+購読側のバッファ超過などでイベントを取りこぼした場合、サーバーは `chatId` / `sessionKey` を含めず `resync: true` のみを送る。クライアントはセッション一覧とすべての履歴キャッシュを無効化する。
 
 #### ツールイベント受信
 

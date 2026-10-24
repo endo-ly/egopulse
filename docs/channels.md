@@ -70,6 +70,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 
 - **メッセージ受信**: HTTP POST `/api/send_stream` または WebSocket `chat.send`。通常メッセージは共通のWeb入力境界からdurable Turnとして `TurnScheduler` へ投入する
 - **ストリーミング**: RunHub を介した publish/subscribe モデル
+- **セッション更新通知**: durable な会話保存の完了後、接続中の WebSocket クライアントへ `session_updated` を配信する。クライアントはセッション一覧と対象履歴を再取得する。イベントの取りこぼしを検出した場合は `resync` で再同期を要求する。定期ポーリングはフォールバックとして残る
 - **再接続**: SSEは `last_event_id`、WebSocketは `run.subscribe` によるイベントリプレイ対応（最大 512 イベント、5 分 TTL）。run が保持期間切れの場合は `run_not_found` を返し、クライアントは永続化済み履歴から再構築する
 - **応答**: WebAdapter は local-only で送信不可（Web クライアントへの送信は SSE/WS が直接行う）
 - **既存チャットのagent**: `chat:{id}` を指定した再開時は、`chats.agent_id` を使用する。新規Webセッションだけが `default_agent` を使用する。
