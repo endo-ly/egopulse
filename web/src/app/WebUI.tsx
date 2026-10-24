@@ -10,7 +10,8 @@ import { isWaitingForAssistant, mergeChatMessages } from "../features/chat/chatR
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
-import { createSessionKey, fetchSessions } from "../shared/api/sessions";
+import { createSessionKey, fetchSessions, updateSession } from "../shared/api/sessions";
+import type { SessionPatch } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
 import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
 import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
@@ -18,6 +19,13 @@ import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./rou
 import type { TabId } from "./navigation";
 
 const DEFAULT_SESSION_KEY = "main";
+
+/** Extracts the chat id from a canonical `chat:{id}` session key. */
+function parseChatId(key: string): number | null {
+  if (!key.startsWith("chat:")) return null;
+  const id = Number(key.slice("chat:".length));
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
 
 function currentPathname(): string | null {
   try {
@@ -70,6 +78,7 @@ export function WebUI() {
   const [authDraft, setAuthDraft] = useState(authToken);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
+  const [pendingSessionName, setPendingSessionName] = useState<string | null>(null);
 
   const agentsState = useServerState("agents", () => fetchAgents(authToken));
   const sessionsState = useServerState("sessions", () => fetchSessions(authToken), {
@@ -120,8 +129,10 @@ export function WebUI() {
       )
     )
       return;
+    // Archived sessions are hidden from the initial pick; an empty result leaves
+    // the new-conversation state instead of opening a shelved session.
     const firstAgentSession = sessions.find(
-      (session) => session.agent_id === selectedAgent,
+      (session) => session.agent_id === selectedAgent && !session.archived,
     );
     if (firstAgentSession) {
       setSelectedSession(firstAgentSession.session_key);
@@ -262,13 +273,36 @@ export function WebUI() {
     if (path !== null) navigatePath(path, false);
   }, [selectedAgent]);
 
-  const handleSessionResolved = useCallback((key: string) => {
-    setSelectedSession(key);
-    setSessionExplicit(true);
-  }, []);
+  const handleSessionResolved = useCallback(
+    (key: string) => {
+      setSelectedSession(key);
+      setSessionExplicit(true);
+      // A name typed before the first message is applied once the session is
+      // persisted as `chat:{id}`; unnamed sessions stay untouched.
+      const name = pendingSessionName;
+      const chatId = parseChatId(key);
+      if (name && chatId !== null) {
+        setPendingSessionName(null);
+        updateSession(authToken, chatId, { name })
+          .then(() => invalidateQueries("sessions"))
+          .catch((error: unknown) => setTransportError(String(error)));
+      }
+    },
+    [authToken, pendingSessionName],
+  );
 
-  const handleNewSession = () => {
+  const handleUpdateSession = useCallback(
+    (chatId: number, patch: SessionPatch) => {
+      updateSession(authToken, chatId, patch)
+        .then(() => invalidateQueries("sessions"))
+        .catch((error: unknown) => setTransportError(String(error)));
+    },
+    [authToken],
+  );
+
+  const handleNewSession = (name?: string) => {
     const key = createSessionKey();
+    setPendingSessionName(name?.trim() ? name.trim() : null);
     setSelectedSession(key);
     setSessionExplicit(true);
     setActiveTab("chat");
@@ -395,6 +429,7 @@ export function WebUI() {
         onSelectSession={handleSelectSession}
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
+        onUpdateSession={handleUpdateSession}
         authToken={authToken}
         agentAvatars={agentAvatars}
         onAvatarChanged={() => invalidateQueries("agents")}

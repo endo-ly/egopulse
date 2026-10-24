@@ -1,16 +1,18 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Badge } from "../../shared/ui/Badge";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { channelLabel } from "../../shared/lib/format";
 import type { SessionEntry } from "../../shared/api/types";
+import type { SessionPatch } from "../../shared/api/sessions";
 
 export interface SessionsSectionProps {
   sessions: SessionEntry[];
   selectedAgent: string;
   selectedSession: string;
   onSelectSession: (key: string) => void;
-  onNewSession?: () => void;
+  onNewSession?: (name?: string) => void;
+  onUpdateSession?: (chatId: number, patch: SessionPatch) => void;
   /** Session keys with messages newer than the last view. */
   unreadSessionKeys?: ReadonlySet<string>;
 }
@@ -37,6 +39,8 @@ const CHANNEL_LABELS: Record<ChannelFilter, string> = {
   voice: "Voice",
 };
 
+const UNTITLED = "Untitled session";
+
 function emptyIcon(path: string): ReactNode {
   return (
     <svg
@@ -57,20 +61,207 @@ function emptyIcon(path: string): ReactNode {
 
 const NO_SESSIONS_ICON = emptyIcon("M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z");
 
+/** Primary label for a session row: its name, else the last message preview. */
+export function sessionTitle(session: SessionEntry): string {
+  const name = session.name?.trim();
+  if (name) return name;
+  const preview = session.last_message_preview.trim();
+  return preview || UNTITLED;
+}
+
+/** Secondary line: the preview when the row is already identified by a name. */
+function sessionSubtitle(session: SessionEntry): string {
+  const name = session.name?.trim();
+  if (!name) return "";
+  return session.last_message_preview.trim();
+}
+
+interface SessionRowProps {
+  session: SessionEntry;
+  active: boolean;
+  unread: boolean;
+  onSelect: () => void;
+  onUpdateSession?: (chatId: number, patch: SessionPatch) => void;
+}
+
+function SessionRow({
+  session,
+  active,
+  unread,
+  onSelect,
+  onUpdateSession,
+}: SessionRowProps) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(session.name ?? "");
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    setDraft(session.name ?? "");
+  }, [session.name]);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 1500);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
+  const subtitle = sessionSubtitle(session);
+
+  const commitRename = () => {
+    const next = draft.trim();
+    setRenaming(false);
+    if (!onUpdateSession) return;
+    if (next === (session.name ?? "")) return;
+    onUpdateSession(session.chat_id, { name: next === "" ? null : next });
+  };
+
+  const copySessionId = async () => {
+    setMenuOpen(false);
+    const sessionId = `chat:${session.chat_id}`;
+    try {
+      await navigator.clipboard.writeText(sessionId);
+      setCopied(true);
+    } catch {
+      setCopied(false);
+      setRenaming(false);
+      window.prompt("Session ID", sessionId);
+    }
+  };
+
+  return (
+    <li>
+      <Card active={active} onClick={renaming ? undefined : onSelect}>
+        <div className={`session-item${unread ? " unread" : ""}`}>
+          <Badge kind="channel">{channelLabel(session.channel)}</Badge>
+          {renaming ? (
+            <input
+              className="session-rename-input"
+              value={draft}
+              autoFocus
+              aria-label="Session name"
+              onChange={(event) => setDraft(event.target.value)}
+              onClick={(event) => event.stopPropagation()}
+              onBlur={commitRename}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter") commitRename();
+                if (event.key === "Escape") {
+                  setDraft(session.name ?? "");
+                  setRenaming(false);
+                }
+              }}
+            />
+          ) : (
+            <span className="session-text">
+              <span className="session-title">{sessionTitle(session)}</span>
+              {subtitle ? <span className="session-preview">{subtitle}</span> : null}
+            </span>
+          )}
+          {copied ? <span className="session-copied">Copied</span> : null}
+          {onUpdateSession ? (
+            <div className="session-actions">
+              <button
+                type="button"
+                className="session-menu-btn"
+                aria-label="Session actions"
+                aria-expanded={menuOpen}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setMenuOpen((open) => !open);
+                }}
+              >
+                ⋯
+              </button>
+              {menuOpen ? (
+                <div className="session-menu" role="menu">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setMenuOpen(false);
+                      setRenaming(true);
+                    }}
+                  >
+                    Rename
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setMenuOpen(false);
+                      onUpdateSession(session.chat_id, { pinned: !session.pinned });
+                    }}
+                  >
+                    {session.pinned ? "Unpin" : "Pin"}
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setMenuOpen(false);
+                      onUpdateSession(session.chat_id, { archived: !session.archived });
+                    }}
+                  >
+                    {session.archived ? "Restore" : "Archive"}
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void copySessionId();
+                    }}
+                  >
+                    Copy session ID
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      </Card>
+    </li>
+  );
+}
+
 export function SessionsSection({
   sessions,
   selectedAgent,
   selectedSession,
   onSelectSession,
   onNewSession,
+  onUpdateSession,
   unreadSessionKeys,
 }: SessionsSectionProps) {
   const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
 
-  const agentSessions = sessions.filter((s) => s.agent_id === selectedAgent);
-  const visible = agentSessions
-    .filter((s) => channelFilter === "all" || s.channel === channelFilter)
-    .sort((a, b) => b.last_message_time - a.last_message_time);
+  const agentSessions = sessions
+    .filter((s) => s.agent_id === selectedAgent)
+    .filter((s) => channelFilter === "all" || s.channel === channelFilter);
+
+  // Archived sessions take precedence over the pin flag so a pinned session can
+  // be archived without losing its pin state.
+  const pinned = agentSessions.filter((s) => !s.archived && s.pinned);
+  const active = agentSessions.filter((s) => !s.archived && !s.pinned);
+  const archived = agentSessions.filter((s) => s.archived);
+
+  const renderRow = (session: SessionEntry) => (
+    <SessionRow
+      key={session.session_key}
+      session={session}
+      active={selectedSession === session.session_key}
+      unread={unreadSessionKeys?.has(session.session_key) ?? false}
+      onSelect={() => onSelectSession(session.session_key)}
+      onUpdateSession={onUpdateSession}
+    />
+  );
 
   return (
     <div className="sessions-section">
@@ -93,7 +284,7 @@ export function SessionsSection({
             <button
               type="button"
               className="sessions-new-btn"
-              onClick={onNewSession}
+              onClick={() => setCreating((open) => !open)}
               aria-label="New Session"
               title="New Session"
             >
@@ -115,38 +306,78 @@ export function SessionsSection({
         </div>
       </div>
 
-      {visible.length === 0 ? (
-        agentSessions.length === 0 ? (
-          <EmptyState
-            icon={NO_SESSIONS_ICON}
-            title="No sessions"
-            description="No sessions yet. Start a new conversation."
+      {creating && onNewSession ? (
+        <form
+          className="sessions-create-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const name = newName.trim();
+            setCreating(false);
+            setNewName("");
+            onNewSession(name === "" ? undefined : name);
+          }}
+        >
+          <input
+            className="session-rename-input"
+            value={newName}
+            autoFocus
+            placeholder="Session name (optional)"
+            aria-label="New session name"
+            onChange={(event) => setNewName(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                setCreating(false);
+                setNewName("");
+              }
+            }}
           />
-        ) : (
+          <button type="submit" className="sessions-create-submit">
+            Create
+          </button>
+        </form>
+      ) : null}
+
+      {agentSessions.length === 0 ? (
+        sessions.some((s) => s.agent_id === selectedAgent) ? (
           <EmptyState
             icon={NO_SESSIONS_ICON}
             title="No matches"
             description={`No ${CHANNEL_LABELS[channelFilter]} sessions for this agent.`}
           />
+        ) : (
+          <EmptyState
+            icon={NO_SESSIONS_ICON}
+            title="No sessions"
+            description="No sessions yet. Start a new conversation."
+          />
         )
       ) : (
-        <ul className="sessions-list">
-          {visible.map((s) => (
-            <li key={s.session_key}>
-              <Card
-                active={selectedSession === s.session_key}
-                onClick={() => onSelectSession(s.session_key)}
+        <>
+          {pinned.length > 0 ? (
+            <div className="sessions-group">
+              <h3 className="sessions-group-title">PINNED</h3>
+              <ul className="sessions-list">{pinned.map(renderRow)}</ul>
+            </div>
+          ) : null}
+          {active.length > 0 ? (
+            <ul className="sessions-list">{active.map(renderRow)}</ul>
+          ) : null}
+          {archived.length > 0 ? (
+            <div className="sessions-group">
+              <button
+                type="button"
+                className="sessions-group-toggle"
+                aria-expanded={archivedOpen}
+                onClick={() => setArchivedOpen((open) => !open)}
               >
-                <div
-                  className={`session-item${unreadSessionKeys?.has(s.session_key) ? " unread" : ""}`}
-                >
-                  <Badge kind="channel">{channelLabel(s.channel)}</Badge>
-                  <span className="session-preview">{s.last_message_preview}</span>
-                </div>
-              </Card>
-            </li>
-          ))}
-        </ul>
+                ARCHIVED ({archived.length})
+              </button>
+              {archivedOpen ? (
+                <ul className="sessions-list">{archived.map(renderRow)}</ul>
+              ) : null}
+            </div>
+          ) : null}
+        </>
       )}
     </div>
   );
