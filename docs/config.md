@@ -410,7 +410,7 @@ Pulse（注意活性化）のスケジューラ設定。Pulse の有効 / 無効
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
-| `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`） |
+| `pulse.tick_interval` | `string` | 任意 | `"1m"` | due scan の基本周期。Duration 形式（例: `30s`, `5m`, `1h`, `1h30m`）。`once` の次回発火がこの周期内にある場合はその時刻に起床する |
 
 ### 3.9 DB バックアップ設定（`db.backup`）
 

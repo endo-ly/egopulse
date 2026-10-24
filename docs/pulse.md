@@ -100,7 +100,7 @@ Pulse:
 ```text
 ┌──────────────────────────────┐
 │         Pulse Scheduler       │
-│  tick_interval ごとに起動     │
+│ tick_interval ごと / once 時刻 │
 └──────────────┬───────────────┘
                │
                ▼
@@ -217,7 +217,7 @@ pulse:
 
 | 設定 | 役割 |
 |---|---|
-| `pulse.tick_interval` | due scan の周期（Duration 形式: `30s`, `1m`, `1h`。デフォルト `1m`） |
+| `pulse.tick_interval` | due scan の基本周期（Duration 形式: `30s`, `1m`, `1h`。デフォルト `1m`）。`once` の次回発火がこの周期内にある場合、scheduler はその時刻に起床する（発火は tick に依存しない） |
 
 due 判定の timezone は `pulse` 配下には設定しない。トップレベルの `timezone`（[config.md](./config.md)）を使用する。
 
@@ -312,7 +312,7 @@ schedule:
 ```
 
 - `add` 時に `date + at` が過去のものは拒否される（ツール経由の場合）
-- 発火は対象日の `at` 以降の最初の scan で行われる
+- 発火は対象日の `at` **ちょうど**（秒精度）に行われる。`once` は予約型リマインダであり、時刻そのものが意味を持つため、scheduler は `tick_interval` を待たずに次回 due 時刻へ起床する（[§3.2](#32-config)）
 - **成功した run の後に intention は自動アーカイブされる**（PULSE.yaml から除去される）。単発リマインドが設定の残余を残さないため
 - 失敗・skipped の場合は intention はファイルに残る。`due_key` は対象日を消耗するため自動リトライはせず、エージェントが `list` で検知して会話的に再設定する
 

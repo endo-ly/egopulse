@@ -31,8 +31,8 @@ recent conversation context; if there is nothing worth reporting you stay silent
 otherwise your message is delivered and the user can reply to it.
 
 Rules: `delivery` defaults to the current conversation (Discord/Telegram only; elsewhere \
-pass it explicitly). A `once` intention must be in the future and is removed automatically \
-after a successful run. Edits take effect on the next scan (within about a minute); \
+pass it explicitly). A `once` intention must be in the future, fires at the specified \
+time, and is removed automatically after a successful run. Edits take effect on the next scan; \
 changing a schedule does not re-fire an occurrence that already ran today. Check `list` \
 before adding and when investigating why a pulse did or did not fire. Do not edit \
 PULSE.yaml directly; use this tool.";
@@ -392,7 +392,7 @@ impl Tool for PulseTool {
                             "kind": {
                                 "type": "string",
                                 "enum": ["daily", "weekly", "interval", "once"],
-                                "description": "Schedule kind. daily/weekly/interval recur; once fires a single time and is archived after success"
+                                "description": "Schedule kind"
                             },
                             "at": {
                                 "type": "string",
@@ -410,7 +410,7 @@ impl Tool for PulseTool {
                             },
                             "date": {
                                 "type": "string",
-                                "description": "Target date, YYYY-MM-DD, must be in the future (once only)"
+                                "description": "Target date in YYYY-MM-DD (once only)"
                             }
                         }
                     },

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
 use crate::config::AgentId;
@@ -440,8 +440,12 @@ async fn load_last_success_started_at(
 
 /// Run the pulse scheduler tick loop.
 ///
-/// Sleeps for the configured tick interval between scans. Runs until
-/// `shutdown` is cancelled, at which point it returns promptly.
+/// Scans every `tick_interval`. `daily` / `weekly` / `interval` intentions
+/// fire on the first scan after their time, because they are directions of
+/// attention. A `once` intention is an appointment-style reminder, so the loop
+/// wakes at its exact due instant (still bounded by `tick_interval` when the
+/// reminder is further away). Runs until `shutdown` is cancelled, at which
+/// point it returns promptly.
 pub(crate) async fn run_pulse_scheduler(
     state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -452,6 +456,11 @@ pub(crate) async fn run_pulse_scheduler(
     loop {
         let snapshot = state.config_manager.current_blocking();
         let pulse = snapshot.config.pulse();
+        let tick_interval = Duration::from_secs(pulse.tick_interval_secs);
+
+        let now = Utc::now();
+        let earliest_once = earliest_once_due(&snapshot, now);
+        let delay = next_scan_delay(now, tick_interval, earliest_once);
 
         tokio::select! {
             _ = shutdown.cancelled() => {
@@ -464,9 +473,76 @@ pub(crate) async fn run_pulse_scheduler(
                 }
                 continue;
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(pulse.tick_interval_secs)) => {}
+            _ = tokio::time::sleep(delay) => {}
         }
         run_pulse_scan(&state).await;
+    }
+}
+
+/// Compute the earliest strictly-future `once` due instant across all agents.
+///
+/// Only `once` intentions participate: they are appointment-style reminders
+/// whose stated time matters, so the scheduler wakes at that instant instead of
+/// waiting for the next tick. Recurring kinds keep the ambient scan cadence.
+/// Disabled agents, disabled intentions, and unreadable definitions are
+/// ignored here; the scan itself reports parse failures.
+fn earliest_once_due(
+    snapshot: &crate::config::manager::ConfigSnapshot,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let state_root = Path::new(&snapshot.config.state_root);
+    let timezone = snapshot.config.timezone.as_str();
+    let mut earliest: Option<DateTime<Utc>> = None;
+
+    for agent_id in snapshot.config.agents.keys() {
+        let Ok(definition) =
+            super::definition::load_pulse_definition(state_root, agent_id.as_str())
+        else {
+            continue;
+        };
+        if !definition.enabled {
+            continue;
+        }
+
+        for intention in &definition.intentions {
+            if !intention.enabled {
+                continue;
+            }
+            if !matches!(
+                intention.schedule,
+                super::definition::TemporalSchedule::Once { .. }
+            ) {
+                continue;
+            }
+            let Some(due) = super::definition::estimate_next_due(intention, now, timezone, None)
+            else {
+                continue;
+            };
+            if due <= now {
+                continue;
+            }
+            earliest = Some(earliest.map_or(due, |current| current.min(due)));
+        }
+    }
+
+    earliest
+}
+
+/// Delay until the next scan: the exact `once` due instant when it falls inside
+/// the tick window, otherwise the tick interval. Clamped to at least one second
+/// so boundary instants cannot spin the loop.
+fn next_scan_delay(
+    now: DateTime<Utc>,
+    tick_interval: Duration,
+    earliest_once: Option<DateTime<Utc>>,
+) -> Duration {
+    let fallback = tick_interval.max(Duration::from_secs(1));
+    match earliest_once {
+        Some(due) if due > now => (due - now)
+            .to_std()
+            .unwrap_or(fallback)
+            .clamp(Duration::from_secs(1), fallback),
+        _ => fallback,
     }
 }
 
@@ -529,6 +605,167 @@ mod tests {
         PulseConfig {
             tick_interval_secs: 60,
         }
+    }
+
+    fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
+            .single()
+            .expect("valid utc")
+    }
+
+    // --- next scan delay tests (once reservation) ---
+
+    #[test]
+    fn next_scan_delay_wakes_at_once_due_inside_tick_window() {
+        // Arrange: tick 30m, once due in 20m → wake at the due instant
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let due = now + chrono::Duration::minutes(20);
+
+        // Act
+        let delay = next_scan_delay(now, Duration::from_secs(30 * 60), Some(due));
+
+        // Assert
+        assert_eq!(delay, Duration::from_secs(20 * 60));
+    }
+
+    #[test]
+    fn next_scan_delay_uses_tick_interval_when_once_due_is_further_away() {
+        // Arrange: tick 30m, once due in 50m
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let due = now + chrono::Duration::minutes(50);
+
+        // Act
+        let delay = next_scan_delay(now, Duration::from_secs(30 * 60), Some(due));
+
+        // Assert: the loop must still wake every tick to re-evaluate
+        assert_eq!(delay, Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn next_scan_delay_ignores_past_or_current_once_due() {
+        // Arrange: a stale or just-due instant must not spin the loop
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let tick = Duration::from_secs(30 * 60);
+
+        // Act + Assert
+        assert_eq!(
+            next_scan_delay(now, tick, Some(now - chrono::Duration::hours(1))),
+            tick
+        );
+        assert_eq!(next_scan_delay(now, tick, Some(now)), tick);
+        assert_eq!(next_scan_delay(now, tick, None), tick);
+    }
+
+    #[test]
+    fn next_scan_delay_clamps_sub_second_once_due_to_one_second() {
+        // Arrange
+        let now = utc(2026, 5, 10, 0, 0, 0);
+        let due = now + chrono::Duration::milliseconds(300);
+
+        // Act
+        let delay = next_scan_delay(now, Duration::from_secs(30 * 60), Some(due));
+
+        // Assert
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn earliest_once_due_picks_the_soonest_once_across_agents() {
+        // Arrange: agent-a has a far-future once, agent-b a nearer one, and
+        // recurring intentions must not participate at all.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_a = "\
+intentions:
+  - id: far_reminder
+    schedule:
+      kind: once
+      date: \"2999-01-03\"
+      at: \"00:00\"
+    attention: far
+";
+        let agent_b = "\
+intentions:
+  - id: daily_check
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: recurring
+  - id: near_reminder
+    schedule:
+      kind: once
+      date: \"2999-01-02\"
+      at: \"00:00\"
+    attention: near
+";
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("agent-a", agent_a), ("agent-b", agent_b)],
+        );
+        let snapshot = state.config_manager.current_blocking();
+        let now = utc(2026, 5, 10, 0, 0, 0);
+
+        // Act
+        let earliest = earliest_once_due(&snapshot, now);
+
+        // Assert: the 2999-01-02 once wins over 2999-01-03 and the daily is ignored
+        let expected = super::super::definition::estimate_next_due(
+            &super::super::definition::load_pulse_definition(
+                std::path::Path::new(&snapshot.config.state_root),
+                "agent-b",
+            )
+            .expect("load agent-b")
+            .intentions[1],
+            now,
+            "UTC",
+            None,
+        );
+        assert_eq!(earliest, expected);
+        assert!(earliest.is_some(), "a future once must be reported");
+    }
+
+    #[test]
+    fn earliest_once_due_ignores_disabled_agents_and_intentions() {
+        // Arrange: only recurring + disabled once exist
+        let dir = tempfile::tempdir().expect("tempdir");
+        let disabled_agent = "\
+enabled: false
+intentions:
+  - id: reminder
+    schedule:
+      kind: once
+      date: \"2999-01-01\"
+      at: \"00:00\"
+    attention: disabled agent
+";
+        let disabled_intention = "\
+intentions:
+  - id: daily_check
+    schedule:
+      kind: daily
+      at: \"00:00\"
+    attention: recurring only
+  - id: paused_reminder
+    enabled: false
+    schedule:
+      kind: once
+      date: \"2999-01-01\"
+      at: \"00:00\"
+    attention: paused
+";
+        let state = build_pulse_state(
+            &dir,
+            default_pulse_config(),
+            vec![("agent-a", disabled_agent), ("agent-b", disabled_intention)],
+        );
+        let snapshot = state.config_manager.current_blocking();
+
+        // Act
+        let earliest = earliest_once_due(&snapshot, utc(2026, 5, 10, 0, 0, 0));
+
+        // Assert
+        assert_eq!(earliest, None);
     }
 
     fn valid_daily_pulse_yaml() -> String {
