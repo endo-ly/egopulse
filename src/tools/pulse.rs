@@ -135,16 +135,20 @@ impl PulseTool {
             lines.push("No intentions configured.".to_string());
         }
 
+        let mut had_lookup_error = false;
         for intention in &document.intentions {
             let state = if intention.enabled {
                 "enabled"
             } else {
                 "disabled"
             };
-            let due_text = if intention.enabled {
+            let due_text = if document.enabled && intention.enabled {
                 match self.next_due_text(agent_id, intention, timezone, now).await {
                     Ok(text) => format!(" | {text}"),
-                    Err(e) => format!(" | error: run history lookup failed ({e})"),
+                    Err(e) => {
+                        had_lookup_error = true;
+                        format!(" | error: run history lookup failed ({e})")
+                    }
                 }
             } else {
                 String::new()
@@ -169,7 +173,12 @@ impl PulseTool {
             }
         }
 
-        ToolResult::success(lines.join("\n"))
+        let body = lines.join("\n");
+        if had_lookup_error {
+            ToolResult::error(body)
+        } else {
+            ToolResult::success(body)
+        }
     }
 
     async fn op_add(
@@ -206,7 +215,7 @@ impl PulseTool {
 
         // Load → mutate → save atomically under the process-wide write gate so
         // concurrent operations cannot lose each other's intentions.
-        let (id, intention) = {
+        let (id, intention, agent_enabled) = {
             let _guard = definition::pulse_file_lock();
             let mut document = match load_document(state_root, agent_id) {
                 Ok(document) => document,
@@ -244,19 +253,26 @@ impl PulseTool {
             if let Err(result) = save_document(state_root, agent_id, &document) {
                 return result;
             }
-            (id, intention)
+            (id, intention, document.enabled)
         };
 
-        let due_text = match self
-            .next_due_text(agent_id, &intention, timezone, chrono::Utc::now())
-            .await
-        {
-            Ok(text) => format!("{text}."),
-            Err(e) => format!("run history lookup failed ({e}), so the next due is unknown."),
+        let note = if !agent_enabled {
+            "The agent is disabled, so no intention will fire until it is enabled.".to_string()
+        } else {
+            match self
+                .next_due_text(agent_id, &intention, timezone, chrono::Utc::now())
+                .await
+            {
+                Ok(text) => format!("{text}. It takes effect on the next scan."),
+                Err(e) => format!(
+                    "run history lookup failed ({e}), so the next due is unknown. \
+                     It takes effect on the next scan."
+                ),
+            }
         };
 
         ToolResult::success(format!(
-            "Added intention '{id}' ({}). {due_text} It takes effect on the next scan.",
+            "Added intention '{id}' ({}). {note}",
             format_schedule(&schedule)
         ))
     }
@@ -1156,6 +1172,24 @@ mod tests {
         assert!(
             !result.content.contains("due now"),
             "nothing may be announced as firing: {}",
+            result.content
+        );
+
+        // Act: re-enable only the intention — the agent stays disabled
+        let enable = env
+            .tool
+            .execute(json!({"op": "enable", "id": "daily_check"}), &context())
+            .await;
+        assert!(!enable.is_error, "enable failed: {}", enable.content);
+        let result = env.tool.execute(json!({"op": "list"}), &context()).await;
+
+        // Assert: the agent-level disable suppresses everything, so an enabled
+        // intention must still not be announced as firing.
+        assert!(result.content.contains("Pulse for agent 'lyre': disabled"));
+        assert!(result.content.contains("daily_check [enabled]"));
+        assert!(
+            !result.content.contains("due now"),
+            "agent disable must suppress the display: {}",
             result.content
         );
     }
