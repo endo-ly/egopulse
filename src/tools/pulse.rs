@@ -12,6 +12,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::config::ConfigManager;
+use crate::conversation::ConversationScope;
 use crate::pulse::definition::{
     self, DeliverySpec, PulseDefinition, TemporalIntention, TemporalSchedule, estimate_next_due,
     format_schedule, load_pulse_definition, save_pulse_definition, suggest_intention_id,
@@ -137,11 +138,6 @@ impl PulseTool {
         agent_id: &str,
         timezone: &str,
     ) -> ToolResult {
-        let mut document = match load_document(state_root, agent_id) {
-            Ok(document) => document,
-            Err(result) => return result,
-        };
-
         let attention = match required_text(input, "attention") {
             Ok(attention) => attention,
             Err(result) => return result,
@@ -165,42 +161,53 @@ impl PulseTool {
         }
 
         let explicit_id = optional_text(input, "id");
-        let id = match explicit_id {
-            Some(id) => {
-                if document
-                    .intentions
-                    .iter()
-                    .any(|intention| intention.id == id)
-                {
-                    return ToolResult::error_with_kind(
-                        ToolErrorKind::InvalidInput,
-                        format!(
-                            "pulse: intention id '{id}' already exists. Use op=update to change \
-                             it, or pick another id. Current ids: {}",
-                            ids_line(&document)
-                        ),
-                    );
+
+        // Load → mutate → save atomically under the process-wide write gate so
+        // concurrent operations cannot lose each other's intentions.
+        let (id, intention) = {
+            let _guard = definition::pulse_file_lock();
+            let mut document = match load_document(state_root, agent_id) {
+                Ok(document) => document,
+                Err(result) => return result,
+            };
+            let id = match explicit_id {
+                Some(id) => {
+                    if document
+                        .intentions
+                        .iter()
+                        .any(|intention| intention.id == id)
+                    {
+                        return ToolResult::error_with_kind(
+                            ToolErrorKind::InvalidInput,
+                            format!(
+                                "pulse: intention id '{id}' already exists. Use op=update to \
+                                 change it, or pick another id. Current ids: {}",
+                                ids_line(&document)
+                            ),
+                        );
+                    }
+                    id
                 }
-                id
+                None => unique_suggested_id(&document, &schedule),
+            };
+
+            let intention = TemporalIntention {
+                id: id.clone(),
+                enabled: true,
+                schedule: schedule.clone(),
+                attention,
+                delivery: Some(delivery),
+            };
+            document.intentions.push(intention.clone());
+            if let Err(result) = save_document(state_root, agent_id, &document) {
+                return result;
             }
-            None => unique_suggested_id(&document, &schedule),
+            (id, intention)
         };
 
-        let intention = TemporalIntention {
-            id: id.clone(),
-            enabled: true,
-            schedule: schedule.clone(),
-            attention,
-            delivery: Some(delivery),
-        };
         let due_text = self
             .next_due_text(agent_id, &intention, timezone, chrono::Utc::now())
             .await;
-
-        document.intentions.push(intention);
-        if let Err(result) = save_document(state_root, agent_id, &document) {
-            return result;
-        }
 
         ToolResult::success(format!(
             "Added intention '{id}' ({}). {due_text}. It takes effect on the next scan.",
@@ -215,6 +222,7 @@ impl PulseTool {
         agent_id: &str,
         timezone: &str,
     ) -> ToolResult {
+        let _guard = definition::pulse_file_lock();
         let mut document = match load_document(state_root, agent_id) {
             Ok(document) => document,
             Err(result) => return result,
@@ -250,7 +258,14 @@ impl PulseTool {
             intention.schedule = schedule;
         }
         if let Some(attention) = input.get("attention").and_then(|v| v.as_str()) {
-            intention.attention = attention.trim().to_string();
+            let trimmed = attention.trim();
+            if trimmed.is_empty() {
+                return ToolResult::error_with_kind(
+                    ToolErrorKind::InvalidInput,
+                    "pulse: attention must not be empty".to_string(),
+                );
+            }
+            intention.attention = trimmed.to_string();
             changed.push("attention".to_string());
         }
         if let Some(delivery_value) = input.get("delivery") {
@@ -291,6 +306,7 @@ impl PulseTool {
         state_root: &str,
         agent_id: &str,
     ) -> ToolResult {
+        let _guard = definition::pulse_file_lock();
         let mut document = match load_document(state_root, agent_id) {
             Ok(document) => document,
             Err(result) => return result,
@@ -326,6 +342,7 @@ impl PulseTool {
         state_root: &str,
         agent_id: &str,
     ) -> ToolResult {
+        let _guard = definition::pulse_file_lock();
         let mut document = match load_document(state_root, agent_id) {
             Ok(document) => document,
             Err(result) => return result,
@@ -444,6 +461,17 @@ impl Tool for PulseTool {
         input: serde_json::Value,
         context: &ToolExecutionContext,
     ) -> ToolResult {
+        if context.scope == ConversationScope::Secret {
+            return ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                "pulse: the pulse tool is not available in secret conversations. Pulse \
+                 definitions run and deliver in normal-scope conversations, so scheduling from \
+                 here could leak secret context. Ask the user to set up the pulse from a normal \
+                 conversation."
+                    .to_string(),
+            );
+        }
+
         let Some(op) = input.get("op").and_then(|v| v.as_str()) else {
             return ToolResult::error_with_kind(
                 ToolErrorKind::InvalidInput,
@@ -631,7 +659,15 @@ fn ensure_once_is_future(
     let target = match tz.from_local_datetime(&target_date.and_time(target_time)) {
         chrono::LocalResult::Single(dt) => dt.with_timezone(&chrono::Utc),
         chrono::LocalResult::Ambiguous(earliest, _) => earliest.with_timezone(&chrono::Utc),
-        chrono::LocalResult::None => return Ok(()),
+        chrono::LocalResult::None => {
+            return Err(ToolResult::error_with_kind(
+                ToolErrorKind::InvalidInput,
+                format!(
+                    "pulse: once schedule {date} {at} does not exist in timezone {timezone} \
+                     (DST transition). Choose a time that exists on that day."
+                ),
+            ));
+        }
     };
     if target <= now {
         return Err(ToolResult::error_with_kind(
@@ -721,7 +757,7 @@ mod tests {
     use std::collections::HashMap;
 
     struct TestEnv {
-        tool: PulseTool,
+        tool: Arc<PulseTool>,
         state_root: String,
         _dir: tempfile::TempDir,
         _state: Arc<crate::runtime::AppState>,
@@ -732,7 +768,10 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let state =
             Arc::new(build_sleep_app_state_with_path(config.clone(), None).expect("build state"));
-        let tool = PulseTool::new(Arc::clone(&state.config_manager), Arc::clone(&state.db));
+        let tool = Arc::new(PulseTool::new(
+            Arc::clone(&state.config_manager),
+            Arc::clone(&state.db),
+        ));
         TestEnv {
             tool,
             state_root: config.state_root.clone(),
@@ -1077,5 +1116,148 @@ mod tests {
         let result = env.tool.execute(json!({}), &context()).await;
         assert!(result.is_error);
         assert!(result.content.contains("'op'"));
+    }
+
+    #[tokio::test]
+    async fn secret_conversations_cannot_use_the_pulse_tool() {
+        // Arrange
+        let env = build_env();
+        let mut secret_context = context();
+        secret_context.scope = crate::conversation::ConversationScope::Secret;
+
+        // Act
+        let result = env
+            .tool
+            .execute(json!({"op": "list"}), &secret_context)
+            .await;
+
+        // Assert: rejected without touching the shared definition file
+        assert!(result.is_error);
+        assert!(result.content.contains("secret conversations"));
+        let loaded =
+            load_pulse_definition(std::path::Path::new(&env.state_root), "lyre").expect("load");
+        assert!(loaded.intentions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn successful_save_wakes_the_scheduler() {
+        // Arrange: drain any stale permit left by other tests so this one only
+        // passes when OUR save notifies.
+        let env = build_env();
+        let _ = tokio::time::timeout(
+            std::time::Duration::ZERO,
+            definition::pulse_changed().notified(),
+        )
+        .await;
+        let waiter = definition::pulse_changed().notified();
+
+        // Act
+        let result = env
+            .tool
+            .execute(
+                json!({
+                    "op": "add",
+                    "schedule": {"kind": "daily", "at": "09:00"},
+                    "attention": "check"
+                }),
+                &context(),
+            )
+            .await;
+
+        // Assert
+        assert!(!result.is_error, "add failed: {}", result.content);
+        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("a successful save must wake the scheduler");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_adds_all_persist() {
+        // Arrange: five tasks racing on the same PULSE.yaml in parallel must
+        // not lose each other's writes to the serialized read-modify-write
+        // gate.
+        let env = build_env();
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let tool = Arc::clone(&env.tool);
+            handles.push(tokio::spawn(async move {
+                let input = json!({
+                    "op": "add",
+                    "id": format!("int-{i}"),
+                    "schedule": {"kind": "daily", "at": "09:00"},
+                    "attention": "race"
+                });
+                tool.execute(input, &context()).await
+            }));
+        }
+
+        // Act
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.expect("task"));
+        }
+
+        // Assert
+        for result in &results {
+            assert!(!result.is_error, "add failed: {}", result.content);
+        }
+        let loaded =
+            load_pulse_definition(std::path::Path::new(&env.state_root), "lyre").expect("load");
+        let ids = loaded
+            .intentions
+            .iter()
+            .map(|intention| intention.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(loaded.intentions.len(), 5, "no add may be lost: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_empty_attention() {
+        // Arrange
+        let env = build_env();
+        env.tool
+            .execute(
+                json!({
+                    "op": "add",
+                    "id": "daily_check",
+                    "schedule": {"kind": "daily", "at": "09:00"},
+                    "attention": "check"
+                }),
+                &context(),
+            )
+            .await;
+
+        // Act
+        let result = env
+            .tool
+            .execute(
+                json!({"op": "update", "id": "daily_check", "attention": "   "}),
+                &context(),
+            )
+            .await;
+
+        // Assert
+        assert!(result.is_error);
+        assert!(result.content.contains("attention must not be empty"));
+    }
+
+    #[test]
+    fn once_schedule_rejects_nonexistent_dst_time() {
+        // Arrange: 02:30 does not exist on the US spring-forward day.
+        let schedule = TemporalSchedule::Once {
+            date: "2026-03-08".to_string(),
+            at: "02:30".to_string(),
+        };
+
+        // Act
+        let result = ensure_once_is_future(&schedule, chrono::Utc::now(), "America/New_York");
+
+        // Assert
+        let error = result.expect_err("a nonexistent local time must be rejected");
+        assert!(
+            error.content.contains("does not exist"),
+            "{}",
+            error.content
+        );
     }
 }

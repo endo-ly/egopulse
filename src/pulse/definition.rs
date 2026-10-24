@@ -14,7 +14,7 @@ pub(crate) struct DeliverySpec {
 }
 
 /// The full Pulse document for one agent (`agents/{agent_id}/PULSE.yaml`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PulseDefinition {
     /// Agent-level switch. When `false` the scheduler skips the agent entirely
     /// and the `pulse` tool only reports the disabled state.
@@ -23,7 +23,7 @@ pub(crate) struct PulseDefinition {
     pub intentions: Vec<TemporalIntention>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TemporalIntention {
     pub id: String,
     pub enabled: bool,
@@ -32,7 +32,7 @@ pub(crate) struct TemporalIntention {
     pub delivery: Option<DeliverySpec>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TemporalSchedule {
     Daily {
         at: String,
@@ -447,6 +447,36 @@ pub(crate) fn suggest_intention_id(schedule: &TemporalSchedule) -> String {
     }
 }
 
+// ===========================================================================
+// Coordination
+// ===========================================================================
+
+/// Process-wide gate serializing read-modify-write cycles on agent
+/// `PULSE.yaml` files. The files are process-local resources, so one gate for
+/// every writer (tool operations and the scheduler's archive step) is
+/// sufficient. Hold the guard across load → mutate → save without awaiting.
+static PULSE_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Wakes the scheduler after a successful save, so a `once` intention added
+/// while the scheduler sleeps still fires at its exact time.
+static PULSE_CHANGED: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+/// Acquire the exclusive PULSE.yaml write gate.
+pub(crate) fn pulse_file_lock() -> std::sync::MutexGuard<'static, ()> {
+    PULSE_FILE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Notification source the scheduler listens to for definition changes.
+pub(crate) fn pulse_changed() -> &'static tokio::sync::Notify {
+    PULSE_CHANGED.get_or_init(tokio::sync::Notify::new)
+}
+
+// ===========================================================================
+// Load / Save
+// ===========================================================================
+
 /// Load and parse an agent's `PULSE.yaml`. A missing file yields an empty,
 /// enabled definition — Pulse is per-agent and simply unset until first use.
 pub(crate) fn load_pulse_definition(
@@ -509,40 +539,54 @@ pub(crate) fn save_pulse_definition(
         })?;
     }
 
-    // Atomic replace: write to a sibling temp file, then rename over the target.
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, &yaml).map_err(|e| PulseParseError::SaveFailed {
-        agent_id: agent_id.to_string(),
-        detail: format!("failed to write PULSE.yaml: {e}"),
-    })?;
-    std::fs::rename(&tmp, &path).map_err(|e| {
+    // Atomic replace: write to a uniquely named sibling temp file, then rename
+    // over the target. Unique names keep concurrent saves from clobbering each
+    // other's temp file.
+    let tmp = path.with_extension(format!("yaml.tmp.{}", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::write(&tmp, &yaml) {
         let _ = std::fs::remove_file(&tmp);
-        PulseParseError::SaveFailed {
+        return Err(PulseParseError::SaveFailed {
+            agent_id: agent_id.to_string(),
+            detail: format!("failed to write PULSE.yaml: {e}"),
+        });
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(PulseParseError::SaveFailed {
             agent_id: agent_id.to_string(),
             detail: format!("failed to replace PULSE.yaml: {e}"),
-        }
-    })?;
+        });
+    }
 
+    pulse_changed().notify_one();
     Ok(())
 }
 
 /// Remove one intention from the agent's `PULSE.yaml` (used to archive a fired
-/// `once` intention). Reloads the current file from disk so concurrent edits
-/// outside the activation are preserved. Returns whether the intention was
-/// found and removed.
+/// `once` intention). Only removes when the current file still holds the exact
+/// intention that was executed, so an edit made during the activation (e.g. a
+/// reschedule to tomorrow) is preserved. Callers must hold
+/// [`pulse_file_lock`] across this call. Returns whether the intention was
+/// found unchanged and removed.
 pub(crate) fn archive_intention(
     state_root: &Path,
     agent_id: &str,
-    intention_id: &str,
+    expected: &TemporalIntention,
 ) -> Result<bool, PulseParseError> {
     let mut definition = load_pulse_definition(state_root, agent_id)?;
-    let before = definition.intentions.len();
-    definition
+    let Some(current) = definition
         .intentions
-        .retain(|intention| intention.id != intention_id);
-    if definition.intentions.len() == before {
+        .iter()
+        .find(|intention| intention.id == expected.id)
+    else {
+        return Ok(false);
+    };
+    if current != expected {
         return Ok(false);
     }
+    definition
+        .intentions
+        .retain(|intention| intention.id != expected.id);
     save_pulse_definition(state_root, agent_id, &definition)?;
     Ok(true)
 }
@@ -1428,8 +1472,9 @@ intentions:
     fn archive_intention_removes_only_target_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         save_pulse_definition(dir.path(), "lyre", &sample_document()).expect("save");
+        let expected = sample_document().intentions[1].clone();
 
-        let archived = archive_intention(dir.path(), "lyre", "dentist_reminder").expect("archive");
+        let archived = archive_intention(dir.path(), "lyre", &expected).expect("archive");
 
         assert!(archived, "once intention should be archived");
         let loaded = load_pulse_definition(dir.path(), "lyre").expect("load");
@@ -1441,12 +1486,53 @@ intentions:
     fn archive_intention_returns_false_for_unknown_id() {
         let dir = tempfile::tempdir().unwrap();
         save_pulse_definition(dir.path(), "lyre", &sample_document()).expect("save");
+        let expected = TemporalIntention {
+            id: "nonexistent".to_string(),
+            enabled: true,
+            schedule: TemporalSchedule::Once {
+                date: "2026-05-12".to_string(),
+                at: "18:00".to_string(),
+            },
+            attention: "ghost".to_string(),
+            delivery: None,
+        };
 
-        let archived = archive_intention(dir.path(), "lyre", "nonexistent").expect("archive");
+        let archived = archive_intention(dir.path(), "lyre", &expected).expect("archive");
 
         assert!(!archived);
         let loaded = load_pulse_definition(dir.path(), "lyre").expect("load");
         assert_eq!(loaded.intentions.len(), 2, "nothing should be removed");
+    }
+
+    #[test]
+    fn archive_intention_keeps_intention_edited_during_the_run() {
+        // Arrange: the executed once intention is rescheduled to the next day
+        // while the activation runs.
+        let dir = tempfile::tempdir().unwrap();
+        save_pulse_definition(dir.path(), "lyre", &sample_document()).expect("save");
+        let executed = sample_document().intentions[1].clone();
+        let mut current = sample_document();
+        current.intentions[1].schedule = TemporalSchedule::Once {
+            date: "2026-05-13".to_string(),
+            at: "10:00".to_string(),
+        };
+        save_pulse_definition(dir.path(), "lyre", &current).expect("save edit");
+
+        // Act
+        let archived = archive_intention(dir.path(), "lyre", &executed).expect("archive");
+
+        // Assert: the newer definition survives the stale activation
+        assert!(!archived, "an edited intention must not be archived");
+        let loaded = load_pulse_definition(dir.path(), "lyre").expect("load");
+        assert_eq!(loaded.intentions.len(), 2);
+        assert_eq!(
+            loaded.intentions[1].schedule,
+            TemporalSchedule::Once {
+                date: "2026-05-13".to_string(),
+                at: "10:00".to_string(),
+            },
+            "the rescheduled intention must survive"
+        );
     }
 
     // --- Due Resolver tests ---

@@ -241,12 +241,14 @@ Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エー�
 挙動の固定ルール:
 
 - **バリデーションエラーはツールエラー文字列として返る**（`HH:MM` 不正、id 重複、`interval_days < 1`、曜日不正、非対応チャネル等）。エージェントは会話の中で自己修正できる
+- **Secret 会話からは利用できない**: Pulse の実行・配送は Normal スコープで行われるため、Secret 会話からの呼び出しはエラーになる（秘匿内容の意図しない漏洩を防ぐ）。Pulse の設定は通常の会話から行う
 - **書き込みは serialize → parse round-trip → atomic rename**。ツールが書いたファイルがパースできない状態は原理的に発生しない
+- **並行書き込みは直列化される**: load → 変更 → save をプロセス共通の排他ゲート内で行うため、複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない
 - **`add` の delivery デフォルトは現在の会話**。TUI / Web など送信可能チャネル以外で頼まれた場合は intention を作らず、Discord / Telegram の配送先を問い返す
 - **同日の再発火はしない**: daily の `due_key` は日付単位のため、09:00 発火済みの日に 10:00 に変更しても当日は再発火しない。再発火させたい場合は id を変える
-- **`once` は成功時に自動アーカイブされる**: run 成功後に PULSE.yaml から除去される。失敗・skipped の場合はファイルに残り、`list` で可視化されるため、エージェントが原因を説明して `remove` → `add` で再設定する。自動リトライはしない
+- **`once` は成功時に自動アーカイブされる**: run 成功後、実行時点の内容が現在の PULSE.yaml と一致する場合にのみ PULSE.yaml から除去される。activation 中にユーザーが再スケジュールした場合はそちらを優先して残す。失敗・skipped の場合はファイルに残り、`list` で可視化されるため、エージェントが原因を説明して `remove` → `add` で再設定する。自動リトライはしない
 - **v1 は自 agent のみ操作可能**（他 agent の PULSE.yaml は操作しない）。将来的な委譲拡張の余地は `agent_id` 引数の追加として残す
-- 編集は次の tick（≤ `tick_interval`、デフォルト 1 分）で反映される。再起動は不要
+- 編集は次の tick で反映される。再起動は不要。保存が成功すると scheduler へ起床信号が送られるため、`once` を追加した場合も次の tick を待たずに指定時刻へ起床する
 - Pulse Activation 中の自己編集も許可される（activation が active turn を保持するため、通常 turn との書き込み競合は発生しない）
 
 ---
@@ -311,9 +313,9 @@ schedule:
   at: "18:00"
 ```
 
-- `add` 時に `date + at` が過去のものは拒否される（ツール経由の場合）
+- `add` 時に `date + at` が過去のものは拒否される（ツール経由の場合）。タイムゾーンの DST 移行で存在しないローカル時刻も同様に拒否される
 - 発火は対象日の `at` **ちょうど**（秒精度）に行われる。`once` は予約型リマインダであり、時刻そのものが意味を持つため、scheduler は `tick_interval` を待たずに次回 due 時刻へ起床する（[§3.2](#32-config)）
-- **成功した run の後に intention は自動アーカイブされる**（PULSE.yaml から除去される）。単発リマインドが設定の残余を残さないため
+- **成功した run の後に intention は自動アーカイブされる**（PULSE.yaml から除去される）。単発リマインドが設定の残余を残さないため。activation 中に内容が変更されていた場合はアーカイブせず変更後の定義を残す
 - 失敗・skipped の場合は intention はファイルに残る。`due_key` は対象日を消耗するため自動リトライはせず、エージェントが `list` で検知して会話的に再設定する
 
 ### 4.5 validation
@@ -434,10 +436,13 @@ resolve_home_surface(agent_id, delivery):
 1. delivery が明示指定されていれば（intention.delivery → default_delivery）、
    channel:external_chat_id を DB から検索
    （channel が送信可能な discord/telegram の場合のみ）
-2. 見つからなければ警告ログを出し、自動解決へフォールバック
-3. 自動解決: chats から agent_id に一致する最新 chat を探す
-4. channel adapter が存在し、送信可能なら採用
-5. どれも見つからなければ skipped（"no sendable home surface"）
+   - 見つからなければ自動解決へフォールバックしない。
+     その run は skipped（"explicit delivery could not be resolved"）。
+     ユーザーが指定した配送先を暗黙に変更しないため
+2. delivery が省略された場合のみ自動解決:
+   chats から agent_id に一致する最新 chat を探す
+3. channel adapter が存在し、送信可能なら採用
+4. どれも見つからなければ skipped（"no sendable home surface"）
 ```
 
 - 明示指定時の DB ルックアップは `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）

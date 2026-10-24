@@ -458,15 +458,17 @@ Environment variables:
   - `attention: string`。add で必須。その時間に注意を向ける対象（実行命令ではない）
   - `delivery: object`。省略時は現在の会話（チャネルが Discord / Telegram の場合）。送信可能チャネル以外で省略した場合はエラーになり、明示指定を促す
 - 挙動:
-  - 全チャネルで利用可能。操作対象は常に実行中の自エージェント（他エージェントの PULSE.yaml は操作しない）
-  - 書き込みは serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は発生しない。バリデーションエラー（時刻形式・id 重複・`once` 過去日等）はツールエラーとして返り、エージェントが会話内で自己修正できる
+  - Secret 会話からは呼び出せない（エラーを返す）。Pulse の実行・配送は通常スコープで行われるため
+  - 操作対象は常に実行中の自エージェント（他エージェントの PULSE.yaml は操作しない）
+  - 書き込みは serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は発生しない。load → 変更 → save は排他ゲート内で実行され、並行操作でも更新消失はしない。バリデーションエラー（時刻形式・id 重複・`once` 過去日・DST で存在しない時刻等）はツールエラーとして返り、エージェントが会話内で自己修正できる
   - `list` は各 intention の schedule・enabled・次回発火見積もり（`interval` は DB の最新成功 run を参照）を返す。PULSE.yaml が手編集で破損している場合はパースエラーを報告する
-  - `once` は `date + at` が過去の add / update を拒否する。発火が成功すると intention は自動アーカイブ（ファイルから除去）される。失敗・skipped ではファイルに残る（自動リトライなし）
+  - `once` は `date + at` が過去の add / update を拒否する。発火が成功すると、実行時点の内容が現在の定義と一致する場合にのみ自動アーカイブ（ファイルから除去）される。失敗・skipped、activation 中の変更があった場合はファイルに残る（自動リトライなし）
 - 成功時: 操作結果のテキスト（`add` は id と次回発火見積もりを含む）
 - 主な失敗:
   - `"pulse: missing required parameter ..."` — 必須引数の欠落
   - `"pulse: intention id '<id>' already exists"` / `"no intention '<id>'"` — id の重複・不存在
   - `"pulse: notifications can only be delivered to Discord or Telegram ..."` — 配送先を解決できない
+  - `"pulse: the pulse tool is not available in secret conversations ..."` — Secret 会話からの呼び出し
   - `"pulse: PULSE.yaml could not be parsed ..."` — 手編集によるファイル破損
 
 実装: [egopulse/src/tools/pulse.rs](../../egopulse/src/tools/pulse.rs)

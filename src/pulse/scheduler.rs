@@ -238,9 +238,12 @@ async fn process_intention_with_activation_timeout(
     {
         Ok(Some(surface)) => surface,
         Ok(None) => {
-            if let Err(e) =
-                update_run_skipped(&state.db, &pulse_run_id, "no sendable home surface").await
-            {
+            let reason = if explicit_delivery.is_some() {
+                "explicit delivery could not be resolved"
+            } else {
+                "no sendable home surface"
+            };
+            if let Err(e) = update_run_skipped(&state.db, &pulse_run_id, reason).await {
                 warn!(
                     pulse_run_id = %pulse_run_id,
                     error = %e,
@@ -336,15 +339,19 @@ async fn process_intention_with_activation_timeout(
 
     // 9. Archive fired `once` intentions on success. A failed or skipped run
     //    leaves the intention in place so the agent can inspect and repair it.
+    //    The archive only removes the intention when the file still holds the
+    //    exact definition that ran, so an edit made during the activation (e.g.
+    //    a reschedule to tomorrow) survives.
     if matches!(
         intention.schedule,
         super::definition::TemporalSchedule::Once { .. }
     ) {
         let state_root = snapshot.config.state_root.clone();
+        let _guard = super::definition::pulse_file_lock();
         match super::definition::archive_intention(
             std::path::Path::new(&state_root),
             agent_id_str,
-            &intention.id,
+            intention,
         ) {
             Ok(true) => {
                 tracing::info!(
@@ -353,7 +360,13 @@ async fn process_intention_with_activation_timeout(
                     "pulse scan: archived fired once intention"
                 );
             }
-            Ok(false) => {}
+            Ok(false) => {
+                tracing::info!(
+                    agent_id = agent_id_str,
+                    intention_id = %intention.id,
+                    "pulse scan: once intention changed during activation, keeping it"
+                );
+            }
             Err(e) => {
                 warn!(
                     agent_id = agent_id_str,
@@ -444,8 +457,10 @@ async fn load_last_success_started_at(
 /// fire on the first scan after their time, because they are directions of
 /// attention. A `once` intention is an appointment-style reminder, so the loop
 /// wakes at its exact due instant (still bounded by `tick_interval` when the
-/// reminder is further away). Runs until `shutdown` is cancelled, at which
-/// point it returns promptly.
+/// reminder is further away), and a definition save through the pulse tool
+/// wakes the loop immediately so newly added reminders are honored within the
+/// same tick window. Runs until `shutdown` is cancelled, at which point it
+/// returns promptly.
 pub(crate) async fn run_pulse_scheduler(
     state: Arc<AppState>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -473,6 +488,7 @@ pub(crate) async fn run_pulse_scheduler(
                 }
                 continue;
             }
+            _ = super::definition::pulse_changed().notified() => {}
             _ = tokio::time::sleep(delay) => {}
         }
         run_pulse_scan(&state).await;
