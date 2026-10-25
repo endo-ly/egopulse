@@ -12,7 +12,11 @@ import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { channelLabel } from "../../shared/lib/format";
 
-import { sessionSubtitle, sessionTitle } from "../../shared/lib/session";
+import {
+  sessionSubtitle,
+  sessionTime,
+  sessionTitle,
+} from "../../shared/lib/session";
 import type { SessionEntry } from "../../shared/api/types";
 import type { SessionPatch } from "../../shared/api/sessions";
 
@@ -175,6 +179,7 @@ function SessionRow({
   }, [menu]);
 
   const subtitle = sessionSubtitle(session);
+  const time = sessionTime(session);
   const sessionId = `chat:${session.chat_id}`;
 
   const startRename = () => {
@@ -281,7 +286,17 @@ function SessionRow({
             />
           ) : (
             <span className="session-text">
-              <span className="session-title">{sessionTitle(session)}</span>
+              <span className="session-title-row">
+                <span className="session-title">{sessionTitle(session)}</span>
+                {time ? (
+                  <span
+                    className="session-time"
+                    title={new Date(session.last_message_time).toLocaleString()}
+                  >
+                    {time}
+                  </span>
+                ) : null}
+              </span>
               {subtitle ? <span className="session-preview">{subtitle}</span> : null}
             </span>
           )}
@@ -446,35 +461,41 @@ export function SessionsSection({
       </div>
 
       {creating && onNewSession ? (
-        <form
-          className="sessions-create-form"
-          onSubmit={(event) => {
-            event.preventDefault();
-            const name = newName.trim();
-            setCreating(false);
-            setNewName("");
-            onNewSession(name === "" ? undefined : name);
-          }}
-        >
-          <input
-            className="session-rename-input"
-            value={newName}
-            autoFocus
-            maxLength={200}
-            placeholder="Session name (optional)"
-            aria-label="New session name"
-            onChange={(event) => setNewName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                setCreating(false);
-                setNewName("");
-              }
+        <>
+          <form
+            className="sessions-create-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const name = newName.trim();
+              setCreating(false);
+              setNewName("");
+              onNewSession(name === "" ? undefined : name);
             }}
-          />
-          <button type="submit" className="sessions-create-submit">
-            Create
-          </button>
-        </form>
+          >
+            <input
+              className="session-rename-input"
+              value={newName}
+              autoFocus
+              maxLength={200}
+              placeholder="Session name (optional)"
+              aria-label="New session name"
+              aria-describedby="session-name-hint"
+              onChange={(event) => setNewName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  setCreating(false);
+                  setNewName("");
+                }
+              }}
+            />
+            <button type="submit" className="sessions-create-submit">
+              Create
+            </button>
+          </form>
+          <p id="session-name-hint" className="sessions-create-hint">
+            The name is saved after the first message.
+          </p>
+        </>
       ) : null}
 
       {agentSessions.length === 0 ? (
@@ -500,7 +521,10 @@ export function SessionsSection({
             </div>
           ) : null}
           {active.length > 0 ? (
-            <ul className="sessions-list">{active.map(renderRow)}</ul>
+            <div className="sessions-group">
+              <h3 className="sessions-group-title">ACTIVE</h3>
+              <ul className="sessions-list">{active.map(renderRow)}</ul>
+            </div>
           ) : null}
           {archived.length > 0 ? (
             <div className="sessions-group">

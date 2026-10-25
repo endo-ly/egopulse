@@ -93,7 +93,7 @@ Web UI をメインの会話面として使うため、セッションに人間�
 // request（すべて任意。1 つ以上必須）
 { "name": "設計相談" | null, "archived": true, "pinned": false }
 // response 200
-{ "ok": true, "session": { "chat_id": 42, "name": "設計相談", "archived": false, "pinned": true } }
+{ "ok": true }
 ```
 
 - `name`: trim 後 1〜200 文字。空文字は 400、`null` は名前解除
@@ -116,10 +116,10 @@ Web UI をメインの会話面として使うため、セッションに人間�
 | `web/src/shared/api/types.ts` | `SessionEntry` を `chat_id` / `name` / `archived` / `pinned` を持つ形へ変更（`label` 削除） |
 | `web/src/shared/api/sessions.ts` | 新フィールドのマッピングと `updateSession(authToken, chatId, patch)` を追加 |
 | `web/src/app/shell/SessionsSection.tsx` | 表示名（`name` → 最終発言プレビュー → `Untitled`）と時刻を表示。`Pinned` / `Active` / `Archived`（折りたたみ）のセクション分割。項目の操作（名前変更・ピン切替・アーカイブ切替・`chat:{id}` コピー）。既存のチャネルフィルタは全セクションに適用。クライアント側の `last_message_time` 降順ソートは廃止し、サーバーが返す順序をそのまま使う（ピン先頭を壊さない）。未読バッジは維持 |
-| `web/src/app/WebUI.tsx` | 新規作成時に任意の名前入力を受け付け、`chat:{id}` へ解決した初回送信後に `updateSession` で名前を確定。`sessions` キャッシュを invalidate。エージェント選択時の初期セッション自動選択からはアーカイブ済みを除外し、アーカイブ済みしか存在しない場合は新規会話の状態を表示する（明示的に開いたアーカイブ済みは従来どおり閲覧・送信できる） |
+| `web/src/app/WebUI.tsx` | 新規作成時に任意の名前入力を受け付け、初回送信の成功 ACK で `chat:{id}` が確定した時点に `updateSession` で名前を確定。`sessions` キャッシュを invalidate。エージェント選択時の初期セッション自動選択からはアーカイブ済みを除外し、アーカイブ済みしか存在しない場合は一意な draft キーの新規会話状態を表示する（明示的に開いたアーカイブ済みは従来どおり閲覧・送信できる） |
 | `web/src/app/command-palette/buildPaletteItems.ts` | セッション項目のラベルを `name ?? プレビュー` に変更し、アーカイブ済みを除外 |
 
-セッション ID コピーは `navigator.clipboard` を使い、コピー成功を一時表示する。clipboard が使えない環境では `chat:{id}` を選択可能なテキストとして表示する。
+セッション ID コピーは `navigator.clipboard` を使い、コピー成功を一時表示する。非セキュアコンテキストなどで Clipboard API が使えない場合は `execCommand("copy")` にフォールバックし、結果を `Copied` / `Copy failed` として表示する。
 
 ### 4.5 Local API / TUI
 
@@ -269,6 +269,6 @@ npm run build --prefix web
 | `--session` の解決基準が変わる | リネームの影響を受けない raw thread に統一される。`:agent:` サフィックスが剥離されるため、未命名チャットで旧キーを指定すると新規コンテキストになる旨を docs に明記 |
 | TUI ステータス行の表示名が消える | `SessionView` に `chat_title` を追加し `chat_title ?? surface_thread` を表示して解消 |
 | 名前がメッセージ送信で上書きされる | seed 廃止により `None` が渡り `COALESCE` で既存値を保持。UT で担保 |
-| 新規作成で名前を入れても初回送信まで永続化されない | 名前はクライアント draft として保持し、`chat:{id}` 解決直後に PATCH。未送信のまま離脱した場合は保存されない旨を UI 上で明示 |
-| clipboard が使えない環境 | `chat:{id}` を選択可能なテキストとして表示し手動コピーできるようにする |
+| 新規作成で名前を入れても初回送信まで永続化されない | 名前はクライアント draft として保持し、初回送信の成功 ACK で `chat:{id}` が確定した時点に PATCH。未送信のまま離脱した場合は保存されない旨を UI 上で明示 |
+| clipboard が使えない環境 | `execCommand("copy")` にフォールバックし、成否を `Copied` / `Copy failed` として表示する |
 | secret DB のスキーマ不整合 | 同一カラムを追加して `Database` メソッドを scope 非依存に保つ |

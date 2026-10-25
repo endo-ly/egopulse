@@ -56,6 +56,7 @@ type ServerFrame = ResponseFrame | EventFrame;
 
 interface ChatAckPayload {
   runId?: string;
+  sessionKey?: string;
 }
 
 interface UncertainSend {
@@ -93,6 +94,9 @@ interface RunTracking {
   // Last gateway seq applied; frames at or below it are replays the client
   // already applied, so they are dropped instead of appended twice.
   lastSeq: number;
+  // Set when the send ack already handed the canonical session to the UI, so
+  // the terminal event does not resolve the same send a second time.
+  sessionResolved?: boolean;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1_000;
@@ -114,6 +118,10 @@ export function useChatTransport({
   const [connectionState, setConnectionState] = useState<
     "connecting" | "open" | "closed"
   >("closed");
+  // The canonical key that replaces the current draft. Ack-driven
+  // canonicalization changes the prop without starting a different chat, so
+  // the transcript must survive that one transition.
+  const canonicalizingSessionRef = useRef<string | null>(null);
   const refreshSessions = useSessionRefresh();
   const wsRef = useRef<WebSocket | null>(null);
   const connectPromiseRef = useRef<Promise<void> | null>(null);
@@ -198,6 +206,9 @@ export function useChatTransport({
   }, []);
 
   useEffect(() => {
+    const canonicalizing = canonicalizingSessionRef.current;
+    canonicalizingSessionRef.current = null;
+    if (canonicalizing === sessionKey) return;
     setState(initialChatState());
     if (uncertainSendRef.current?.sessionKey !== sessionKey) {
       uncertainSendRef.current = null;
@@ -313,13 +324,15 @@ export function useChatTransport({
         // so the composer can keep the text.
         const pending = pendingSendsRef.current.get(parsed.id);
         if (parsed.ok && parsed.payload) {
-          const { runId } = parsed.payload as ChatAckPayload;
+          const { runId, sessionKey: resolvedSessionKey } =
+            parsed.payload as ChatAckPayload;
           if (runId && pending) {
-            runsRef.current.set(runId, {
+            const tracking: RunTracking = {
               sessionKey: pending.sessionKey,
               agentId: pending.agentId,
               lastSeq: 0,
-            });
+            };
+            runsRef.current.set(runId, tracking);
             // Tag the optimistic message with its run for replay-truncated
             // cleanup. Identity needs no tag: the message already carries
             // its canonical id.
@@ -334,6 +347,18 @@ export function useChatTransport({
             // was in flight, and that session must not inherit the progress.
             if (sessionKeyRef.current === pending.sessionKey) {
               setState((prev) => reduceRunAccepted(prev, runId));
+              // The session now exists, so adopt its canonical key before the
+              // turn can fail. The terminal event is a fallback for a lost
+              // ack, not the primary point where a draft becomes durable.
+              if (
+                resolvedSessionKey &&
+                resolvedSessionKey !== pending.sessionKey &&
+                onSessionResolvedRef.current
+              ) {
+                tracking.sessionResolved = true;
+                canonicalizingSessionRef.current = resolvedSessionKey;
+                onSessionResolvedRef.current(resolvedSessionKey);
+              }
             }
           }
         } else if (!parsed.ok && pending) {
@@ -372,14 +397,15 @@ export function useChatTransport({
           reduceChatEvent(prev, event, tracking?.agentId ?? agentIdRef.current),
         );
         if (event.state === "done") {
-          // The server reports the run's canonical session; switch the UI
-          // over only when the run still belongs to the session the user is
-          // looking at (i.e. this transport sent it and they never left).
+          // The ack normally resolved the canonical session already. This is
+          // the fallback after a reconnect or a lost ack; switch only when the
+          // run still belongs to the session the user is looking at.
           if (
             event.sessionKey &&
             event.sessionKey !== sessionKeyRef.current &&
             tracking &&
             tracking.sessionKey === sessionKeyRef.current &&
+            !tracking.sessionResolved &&
             onSessionResolvedRef.current
           ) {
             onSessionResolvedRef.current(event.sessionKey);

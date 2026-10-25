@@ -35,8 +35,35 @@ describe("api client", () => {
   });
 
   it("create_session_key_keeps_web_session_format", () => {
+    const key = createSessionKey(
+      new Date(2026, 6, 3, 12, 34, 56),
+      "11111111-1111-4111-8111-111111111111",
+    );
+
+    expect(key).toBe(
+      "session-20260703123456-11111111-1111-4111-8111-111111111111",
+    );
+  });
+
+  it("create_session_key_separates_sessions_created_in_the_same_second", () => {
+    // Arrange
+    const now = new Date(2026, 6, 3, 12, 34, 56);
+
+    // Act
+    const first = createSessionKey(now, "first");
+    const second = createSessionKey(now, "second");
+
+    // Assert
+    expect(first).not.toBe(second);
+  });
+
+  it("create_session_key_appends_a_random_suffix", () => {
+    // Act
     const key = createSessionKey(new Date(2026, 6, 3, 12, 34, 56));
 
-    expect(key).toBe("session-20260703123456");
+    // Assert
+    expect(key).toMatch(
+      /-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
   });
 });

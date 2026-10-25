@@ -1,5 +1,6 @@
 import type { SessionEntry } from "./types";
 import { apiFetch } from "./client";
+import { randomId } from "../lib/random";
 
 interface SessionPayload {
   session_key: string;
@@ -50,14 +51,16 @@ export async function updateSession(
   });
 }
 
-export function createSessionKey(now = new Date()): string {
+/** Generates a unique draft key for a new web session. */
+export function createSessionKey(now = new Date(), id = randomId()): string {
   const pad = (value: number) => String(value).padStart(2, "0");
-  return [
-    `session-${now.getFullYear()}`,
+  const timestamp = [
+    now.getFullYear(),
     pad(now.getMonth() + 1),
     pad(now.getDate()),
     pad(now.getHours()),
     pad(now.getMinutes()),
     pad(now.getSeconds()),
   ].join("");
+  return `session-${timestamp}-${id}`;
 }

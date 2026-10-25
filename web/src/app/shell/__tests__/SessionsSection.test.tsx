@@ -48,6 +48,7 @@ afterEach(() => {
     configurable: true,
     value: undefined,
   });
+  vi.useRealTimers();
   cleanup();
 });
 
@@ -147,12 +148,42 @@ describe("SessionsSection", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "New Session" }));
+    expect(
+      screen.getByText("The name is saved after the first message."),
+    ).toBeTruthy();
     fireEvent.change(screen.getByLabelText("New session name"), {
       target: { value: "設計相談" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
     expect(onNewSession).toHaveBeenCalledWith("設計相談");
+    cleanup();
+  });
+
+  it("sessions_section_shows_the_last_message_time", () => {
+    // Arrange
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
+    const sessions = [
+      {
+        ...SESSIONS[0],
+        last_message_time: Date.parse("2026-07-04T11:55:00Z"),
+      },
+    ];
+    render(
+      <SessionsSection
+        sessions={sessions}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+      />,
+    );
+
+    // Act
+    const time = screen.getByText("5m");
+
+    // Assert
+    expect(time.className).toContain("session-time");
     cleanup();
   });
 
@@ -203,6 +234,7 @@ describe("SessionsSection", () => {
 
     // Assert: an archived session stays in ARCHIVED even when pinned.
     expect(screen.getByText("PINNED")).toBeTruthy();
+    expect(screen.getByText("ACTIVE")).toBeTruthy();
     expect(screen.getByText("Pinned one")).toBeTruthy();
     expect(screen.getByText("Active one")).toBeTruthy();
     expect(screen.getByRole("button", { name: /ARCHIVED/ })).toBeTruthy();
