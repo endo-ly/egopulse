@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import type { ServerResponse } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
 
 const AGENTS = [
@@ -46,10 +46,29 @@ function agentsPayload() {
   };
 }
 
-const SESSIONS = [
+// Mirrors GET /api/sessions: display name plus organization flags.
+interface MockSession {
+  session_key: string;
+  name: string | null;
+  chat_id: number;
+  channel: string;
+  agent_id: string;
+  last_message_time: string;
+  last_message_preview: string;
+  archived: boolean;
+  pinned: boolean;
+}
+
+const SESSION_NAMES: Record<number, string> = {
+  1: "Web Chat",
+  2: "Design Discussion",
+};
+const PINNED_CHATS = new Set([1]);
+const ARCHIVED_CHATS = new Set([4]);
+
+const SESSION_SOURCE = [
   {
     session_key: "web-chat",
-    label: "web:web-chat:agent:lyre",
     chat_id: 1,
     channel: "web",
     agent_id: "lyre",
@@ -58,7 +77,6 @@ const SESSIONS = [
   },
   {
     session_key: "dev-discussion",
-    label: "discord:dev-discussion:agent:lyre",
     chat_id: 2,
     channel: "discord",
     agent_id: "lyre",
@@ -67,7 +85,6 @@ const SESSIONS = [
   },
   {
     session_key: "morning-notes",
-    label: "cli:morning-notes:agent:lyre",
     chat_id: 3,
     channel: "cli",
     agent_id: "lyre",
@@ -76,7 +93,6 @@ const SESSIONS = [
   },
   {
     session_key: "quick-test",
-    label: "tui:quick-test:agent:lyre",
     chat_id: 4,
     channel: "tui",
     agent_id: "lyre",
@@ -85,7 +101,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-scrollbar",
-    label: "web:lyre-scrollbar:agent:lyre",
     chat_id: 50,
     channel: "web",
     agent_id: "lyre",
@@ -94,7 +109,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-hover-gap",
-    label: "web:lyre-hover-gap:agent:lyre",
     chat_id: 49,
     channel: "web",
     agent_id: "lyre",
@@ -103,7 +117,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-release-notes",
-    label: "discord:lyre-release-notes:agent:lyre",
     chat_id: 48,
     channel: "discord",
     agent_id: "lyre",
@@ -112,7 +125,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-bug-231",
-    label: "cli:lyre-bug-231:agent:lyre",
     chat_id: 47,
     channel: "cli",
     agent_id: "lyre",
@@ -121,7 +133,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-migration",
-    label: "web:lyre-migration:agent:lyre",
     chat_id: 46,
     channel: "web",
     agent_id: "lyre",
@@ -130,7 +141,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-i18n",
-    label: "tui:lyre-i18n:agent:lyre",
     chat_id: 45,
     channel: "tui",
     agent_id: "lyre",
@@ -139,7 +149,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-perf",
-    label: "web:lyre-perf:agent:lyre",
     chat_id: 44,
     channel: "web",
     agent_id: "lyre",
@@ -148,7 +157,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-docs",
-    label: "cli:lyre-docs:agent:lyre",
     chat_id: 43,
     channel: "cli",
     agent_id: "lyre",
@@ -157,7 +165,6 @@ const SESSIONS = [
   },
   {
     session_key: "lyre-standup",
-    label: "telegram:lyre-standup:agent:lyre",
     chat_id: 42,
     channel: "telegram",
     agent_id: "lyre",
@@ -166,7 +173,6 @@ const SESSIONS = [
   },
   {
     session_key: "vega-design",
-    label: "web:vega-design:agent:vega",
     chat_id: 60,
     channel: "web",
     agent_id: "vega",
@@ -175,7 +181,6 @@ const SESSIONS = [
   },
   {
     session_key: "orion-infra",
-    label: "discord:orion-infra:agent:orion",
     chat_id: 70,
     channel: "discord",
     agent_id: "orion",
@@ -184,7 +189,6 @@ const SESSIONS = [
   },
   {
     session_key: "ace-research",
-    label: "web:ace-research:agent:ace",
     chat_id: 5,
     channel: "web",
     agent_id: "ace",
@@ -192,6 +196,18 @@ const SESSIONS = [
     last_message_preview: "Tailwind v4 color-mix patterns investigated",
   },
 ];
+
+const SESSIONS: MockSession[] = SESSION_SOURCE.map((session) => ({
+  session_key: session.session_key,
+  name: SESSION_NAMES[session.chat_id] ?? null,
+  chat_id: session.chat_id,
+  channel: session.channel,
+  agent_id: session.agent_id,
+  last_message_time: session.last_message_time,
+  last_message_preview: session.last_message_preview,
+  archived: ARCHIVED_CHATS.has(session.chat_id),
+  pinned: PINNED_CHATS.has(session.chat_id),
+}));
 
 const MARKDOWN_SHOWCASE = [
   "# 見出しレベル 1",
@@ -693,6 +709,66 @@ export function mockApiPlugin(): Plugin | null {
         if (pathname === "/api/sessions") {
           return sendJson(res, { ok: true, sessions: SESSIONS });
         }
+        const sessionMatch = pathname.match(/^\/api\/sessions\/(\d+)$/);
+        if (sessionMatch) {
+          if (req.method !== "PATCH") {
+            res.statusCode = 405;
+            return sendJson(res, { ok: false, error: "method_not_allowed" });
+          }
+          const session = SESSIONS.find(
+            (candidate) => candidate.chat_id === Number(sessionMatch[1]),
+          );
+          if (!session) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "session not found" });
+          }
+          let patch: { name?: unknown; archived?: unknown; pinned?: unknown };
+          try {
+            patch = (await readJsonBody(req)) as typeof patch;
+          } catch {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid json" });
+          }
+          let changed = false;
+          if (Object.prototype.hasOwnProperty.call(patch, "name")) {
+            if (patch.name === null) {
+              session.name = null;
+              changed = true;
+            } else if (typeof patch.name === "string") {
+              const trimmed = patch.name.trim();
+              if (trimmed === "" || Array.from(trimmed).length > 200) {
+                res.statusCode = 400;
+                return sendJson(res, { ok: false, error: "invalid name" });
+              }
+              session.name = trimmed;
+              changed = true;
+            } else {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid name" });
+            }
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "archived")) {
+            if (typeof patch.archived !== "boolean") {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid archived" });
+            }
+            session.archived = patch.archived;
+            changed = true;
+          }
+          if (Object.prototype.hasOwnProperty.call(patch, "pinned")) {
+            if (typeof patch.pinned !== "boolean") {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid pinned" });
+            }
+            session.pinned = patch.pinned;
+            changed = true;
+          }
+          if (!changed) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "no fields to update" });
+          }
+          return sendJson(res, { ok: true });
+        }
         if (pathname === "/api/history") {
           const sessionKey = parsed.searchParams.get("session_key") ?? "";
           const messages =
@@ -780,6 +856,15 @@ export function mockApiPlugin(): Plugin | null {
       });
     },
   };
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(chunk as Buffer);
+  }
+  if (chunks.length === 0) return {};
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 function sendJson(res: ServerResponse, data: unknown): void {
