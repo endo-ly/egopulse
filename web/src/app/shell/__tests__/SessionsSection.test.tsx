@@ -242,6 +242,108 @@ describe("SessionsSection", () => {
     cleanup();
   });
 
+  it("sessions_section_opens_the_actions_menu_on_right_click", () => {
+    // Arrange
+    const onUpdateSession = vi.fn();
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+        onUpdateSession={onUpdateSession}
+      />,
+    );
+
+    // Act
+    fireEvent.contextMenu(screen.getByText("Web Chat"));
+    const menu = screen.getByRole("menu", { name: "Session actions" });
+    fireEvent.click(within(menu).getByRole("menuitem", { name: "Pin" }));
+
+    // Assert
+    expect(onUpdateSession).toHaveBeenCalledWith(1, { pinned: true });
+    expect(screen.queryByRole("menu")).toBeNull();
+    cleanup();
+  });
+
+  it("sessions_section_closes_the_actions_menu_on_escape_and_outside_click", () => {
+    // Arrange
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+        onUpdateSession={() => {}}
+      />,
+    );
+
+    // Act: Escape
+    fireEvent.contextMenu(screen.getByText("Web Chat"));
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    // Assert
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    // Act: outside click
+    fireEvent.contextMenu(screen.getByText("Web Chat"));
+    fireEvent.mouseDown(document.body);
+
+    // Assert
+    expect(screen.queryByRole("menu")).toBeNull();
+    cleanup();
+  });
+
+  it("sessions_section_renames_from_the_actions_menu", () => {
+    // Arrange
+    const onUpdateSession = vi.fn();
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+        onUpdateSession={onUpdateSession}
+      />,
+    );
+
+    // Act
+    fireEvent.contextMenu(screen.getByText("Web Chat"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+    const input = screen.getByLabelText("Session name");
+    fireEvent.change(input, { target: { value: "  Renamed  " } });
+    fireEvent.blur(input);
+
+    // Assert
+    expect(onUpdateSession).toHaveBeenCalledWith(1, { name: "Renamed" });
+    cleanup();
+  });
+
+  it("sessions_section_shows_the_session_id_when_clipboard_is_unavailable", async () => {
+    // Arrange
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+    render(
+      <SessionsSection
+        sessions={SESSIONS}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+        onUpdateSession={() => {}}
+      />,
+    );
+
+    // Act
+    fireEvent.contextMenu(screen.getByText("Web Chat"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy session ID" }));
+
+    // Assert
+    expect(await screen.findByText("chat:1")).toBeTruthy();
+    cleanup();
+  });
+
   it("sessions_section_falls_back_to_preview_for_unnamed_sessions", () => {
     // Arrange
     const sessions: SessionEntry[] = [{ ...SESSIONS[0], name: null }];

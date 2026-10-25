@@ -1,8 +1,17 @@
-import { useEffect, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+} from "react";
+import { createPortal } from "react-dom";
 import { Badge } from "../../shared/ui/Badge";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { channelLabel } from "../../shared/lib/format";
+import { sessionSubtitle, sessionTitle } from "../../shared/lib/session";
 import type { SessionEntry } from "../../shared/api/types";
 import type { SessionPatch } from "../../shared/api/sessions";
 
@@ -39,8 +48,6 @@ const CHANNEL_LABELS: Record<ChannelFilter, string> = {
   voice: "Voice",
 };
 
-const UNTITLED = "Untitled session";
-
 function emptyIcon(path: string): ReactNode {
   return (
     <svg
@@ -61,27 +68,29 @@ function emptyIcon(path: string): ReactNode {
 
 const NO_SESSIONS_ICON = emptyIcon("M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z");
 
-/** Primary label for a session row: its name, else the last message preview. */
-export function sessionTitle(session: SessionEntry): string {
-  const name = session.name?.trim();
-  if (name) return name;
-  const preview = session.last_message_preview.trim();
-  return preview || UNTITLED;
-}
-
-/** Secondary line: the preview when the row is already identified by a name. */
-function sessionSubtitle(session: SessionEntry): string {
-  const name = session.name?.trim();
-  if (!name) return "";
-  return session.last_message_preview.trim();
-}
-
 interface SessionRowProps {
   session: SessionEntry;
   active: boolean;
   unread: boolean;
   onSelect: () => void;
   onUpdateSession?: (chatId: number, patch: SessionPatch) => void;
+}
+
+type MenuPosition = { x: number; y: number };
+type CopyState = "idle" | "copied" | "manual";
+
+const MENU_WIDTH = 168;
+const MENU_MARGIN = 8;
+
+function clampMenuPosition({ x, y }: MenuPosition): MenuPosition {
+  const width = globalThis.innerWidth ?? 0;
+  const height = globalThis.innerHeight ?? 0;
+  const maxX = width > 0 ? width - MENU_WIDTH - MENU_MARGIN : x;
+  const maxY = height > 0 ? height - MENU_MARGIN : y;
+  return {
+    x: Math.max(MENU_MARGIN, Math.min(x, maxX)),
+    y: Math.max(MENU_MARGIN, Math.min(y, maxY)),
+  };
 }
 
 function SessionRow({
@@ -91,24 +100,91 @@ function SessionRow({
   onSelect,
   onUpdateSession,
 }: SessionRowProps) {
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [menu, setMenu] = useState<MenuPosition | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(session.name ?? "");
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<CopyState>("idle");
+  const menuRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const cancelRenameRef = useRef(false);
 
   useEffect(() => {
+    if (renaming) return;
     setDraft(session.name ?? "");
-  }, [session.name]);
+  }, [renaming, session.name]);
 
   useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 1500);
+    if (copyState !== "copied") return;
+    const timer = setTimeout(() => setCopyState("idle"), 1500);
     return () => clearTimeout(timer);
-  }, [copied]);
+  }, [copyState]);
+
+  // The menu is portalled to the body so the scrollable sidebar cannot clip it,
+  // and so sticky/transformed ancestors do not become its containing block.
+  useEffect(() => {
+    if (!menu) return;
+    menuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [menu]);
+
+  useLayoutEffect(() => {
+    if (!menu) return;
+    const rect = menuRef.current?.getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) return;
+    const width = globalThis.innerWidth ?? 0;
+    const height = globalThis.innerHeight ?? 0;
+    const maxX = Math.max(MENU_MARGIN, width - rect.width - MENU_MARGIN);
+    const maxY = Math.max(MENU_MARGIN, height - rect.height - MENU_MARGIN);
+    if (menu.x > maxX || menu.y > maxY) {
+      setMenu({ x: Math.min(menu.x, maxX), y: Math.min(menu.y, maxY) });
+    }
+  }, [menu]);
+
+  useEffect(() => {
+    if (!menu) return;
+    const close = () => setMenu(null);
+    const onMouseDown = (event: globalThis.MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) {
+        close();
+        return;
+      }
+      if (menuRef.current?.contains(target)) return;
+      if (triggerRef.current?.contains(target)) return;
+      close();
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.stopPropagation();
+      close();
+      triggerRef.current?.focus();
+    };
+    document.addEventListener("mousedown", onMouseDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    globalThis.addEventListener("scroll", close, true);
+    globalThis.addEventListener("resize", close);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      globalThis.removeEventListener("scroll", close, true);
+      globalThis.removeEventListener("resize", close);
+    };
+  }, [menu]);
 
   const subtitle = sessionSubtitle(session);
+  const sessionId = `chat:${session.chat_id}`;
+
+  const startRename = () => {
+    cancelRenameRef.current = false;
+    setRenaming(true);
+  };
 
   const commitRename = () => {
+    if (cancelRenameRef.current) {
+      cancelRenameRef.current = false;
+      setDraft(session.name ?? "");
+      setRenaming(false);
+      return;
+    }
     const next = draft.trim();
     setRenaming(false);
     if (!onUpdateSession) return;
@@ -116,21 +192,43 @@ function SessionRow({
     onUpdateSession(session.chat_id, { name: next === "" ? null : next });
   };
 
+  const openMenuAt = (x: number, y: number) => {
+    if (!onUpdateSession) return;
+    setMenu(clampMenuPosition({ x, y }));
+  };
+
+  const handleContextMenu = (event: MouseEvent<HTMLLIElement>) => {
+    if (!onUpdateSession || renaming) return;
+    event.preventDefault();
+    event.stopPropagation();
+    openMenuAt(event.clientX, event.clientY);
+  };
+
+  const toggleMenu = () => {
+    if (menu) {
+      setMenu(null);
+      return;
+    }
+    const rect = triggerRef.current?.getBoundingClientRect();
+    openMenuAt(
+      rect ? rect.right - MENU_WIDTH : 0,
+      rect ? rect.bottom + 4 : 0,
+    );
+  };
+
   const copySessionId = async () => {
-    setMenuOpen(false);
-    const sessionId = `chat:${session.chat_id}`;
+    setMenu(null);
     try {
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
       await navigator.clipboard.writeText(sessionId);
-      setCopied(true);
+      setCopyState("copied");
     } catch {
-      setCopied(false);
-      setRenaming(false);
-      window.prompt("Session ID", sessionId);
+      setCopyState("manual");
     }
   };
 
   return (
-    <li>
+    <li onContextMenu={handleContextMenu}>
       <Card active={active} onClick={renaming ? undefined : onSelect}>
         <div className={`session-item${unread ? " unread" : ""}`}>
           <Badge kind="channel">{channelLabel(session.channel)}</Badge>
@@ -139,16 +237,19 @@ function SessionRow({
               className="session-rename-input"
               value={draft}
               autoFocus
+              maxLength={200}
               aria-label="Session name"
               onChange={(event) => setDraft(event.target.value)}
               onClick={(event) => event.stopPropagation()}
               onBlur={commitRename}
               onKeyDown={(event) => {
                 event.stopPropagation();
-                if (event.key === "Enter") commitRename();
+                if (event.key === "Enter") {
+                  event.currentTarget.blur();
+                }
                 if (event.key === "Escape") {
-                  setDraft(session.name ?? "");
-                  setRenaming(false);
+                  cancelRenameRef.current = true;
+                  event.currentTarget.blur();
                 }
               }}
             />
@@ -158,72 +259,89 @@ function SessionRow({
               {subtitle ? <span className="session-preview">{subtitle}</span> : null}
             </span>
           )}
-          {copied ? <span className="session-copied">Copied</span> : null}
+          {copyState === "copied" ? (
+            <span className="session-copied" role="status">
+              Copied
+            </span>
+          ) : null}
+          {copyState === "manual" ? (
+            <span className="session-copied session-id" title={sessionId}>
+              {sessionId}
+            </span>
+          ) : null}
           {onUpdateSession ? (
             <div className="session-actions">
               <button
+                ref={triggerRef}
                 type="button"
                 className="session-menu-btn"
                 aria-label="Session actions"
-                aria-expanded={menuOpen}
+                aria-haspopup="menu"
+                aria-expanded={menu !== null}
                 onClick={(event) => {
                   event.stopPropagation();
-                  setMenuOpen((open) => !open);
+                  toggleMenu();
                 }}
               >
                 ⋯
               </button>
-              {menuOpen ? (
-                <div className="session-menu" role="menu">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setMenuOpen(false);
-                      setRenaming(true);
-                    }}
-                  >
-                    Rename
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setMenuOpen(false);
-                      onUpdateSession(session.chat_id, { pinned: !session.pinned });
-                    }}
-                  >
-                    {session.pinned ? "Unpin" : "Pin"}
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setMenuOpen(false);
-                      onUpdateSession(session.chat_id, { archived: !session.archived });
-                    }}
-                  >
-                    {session.archived ? "Restore" : "Archive"}
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void copySessionId();
-                    }}
-                  >
-                    Copy session ID
-                  </button>
-                </div>
-              ) : null}
             </div>
           ) : null}
         </div>
       </Card>
+      {menu && onUpdateSession
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className="session-menu"
+              role="menu"
+              aria-label="Session actions"
+              style={{ top: menu.y, left: menu.x }}
+              onContextMenu={(event) => event.preventDefault()}
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenu(null);
+                  startRename();
+                }}
+              >
+                Rename
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenu(null);
+                  onUpdateSession(session.chat_id, { pinned: !session.pinned });
+                }}
+              >
+                {session.pinned ? "Unpin" : "Pin"}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMenu(null);
+                  onUpdateSession(session.chat_id, { archived: !session.archived });
+                }}
+              >
+                {session.archived ? "Restore" : "Archive"}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  void copySessionId();
+                }}
+              >
+                Copy session ID
+              </button>
+            </div>,
+            document.body,
+          )
+        : null}
     </li>
   );
 }
@@ -321,6 +439,7 @@ export function SessionsSection({
             className="session-rename-input"
             value={newName}
             autoFocus
+            maxLength={200}
             placeholder="Session name (optional)"
             aria-label="New session name"
             onChange={(event) => setNewName(event.target.value)}

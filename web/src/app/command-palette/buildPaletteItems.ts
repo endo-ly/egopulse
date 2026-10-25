@@ -1,7 +1,7 @@
 import type { TabId } from "../navigation";
 import type { AgentEntry, ChatMessage, SessionEntry } from "../../shared/api/types";
 import { loadPaletteHistory, pushPaletteHistory } from "./paletteHistory";
-import { sessionTitle } from "../shell/SessionsSection";
+import { sessionTitle } from "../../shared/lib/session";
 
 export interface PaletteItem {
   id: string;

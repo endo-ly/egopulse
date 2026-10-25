@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { buildPaletteItems } from "../buildPaletteItems";
-import type { ChatMessage } from "../../../shared/api/types";
+import type { ChatMessage, SessionEntry } from "../../../shared/api/types";
 
 const noopActions = {
   close: vi.fn(),
@@ -77,6 +77,48 @@ describe("buildPaletteItems", () => {
     messageItems[0].onSelect();
     expect(actions.jumpToMessage).toHaveBeenCalledWith(0);
     expect(actions.close).toHaveBeenCalled();
+  });
+
+  it("session_items_use_the_display_name_and_skip_archived", () => {
+    // Arrange
+    const sessions: SessionEntry[] = [
+      {
+        session_key: "chat:1",
+        chat_id: 1,
+        name: "Design",
+        channel: "web",
+        agent_id: "lyre",
+        last_message_time: 200,
+        last_message_preview: "hello",
+        archived: false,
+        pinned: false,
+      },
+      {
+        session_key: "chat:2",
+        chat_id: 2,
+        name: "Old",
+        channel: "web",
+        agent_id: "lyre",
+        last_message_time: 100,
+        last_message_preview: "archived preview",
+        archived: true,
+        pinned: false,
+      },
+    ];
+
+    // Act
+    const items = buildPaletteItems({
+      agents: [],
+      sessions,
+      selectedAgent: "lyre",
+      query: "",
+      messages: [],
+      actions: noopActions,
+    });
+
+    // Assert
+    const sessionItems = items.filter((item) => item.section === "Sessions");
+    expect(sessionItems.map((item) => item.label)).toEqual(["Design"]);
   });
 
   it("message_items_skip_tool_calls", () => {

@@ -17,8 +17,7 @@ import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
 import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
 import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
 import type { TabId } from "./navigation";
-
-const DEFAULT_SESSION_KEY = "main";
+import { DEFAULT_SESSION_KEY, resolveAutoSessionKey } from "./sessionSelection";
 
 /** Extracts the chat id from a canonical `chat:{id}` session key. */
 function parseChatId(key: string): number | null {
@@ -58,11 +57,13 @@ export function WebUI() {
   const [selectedSession, setSelectedSession] = useState(
     bootRoute?.sessionKey ?? DEFAULT_SESSION_KEY,
   );
-  // Tracks whether the user explicitly chose a session (sidebar, palette, or new
-  // session). The auto-select effect must not clobber an explicit selection —
-  // otherwise a freshly created session is instantly replaced by the first
-  // session of the active agent.
-  const [sessionExplicit, setSessionExplicit] = useState(false);
+  // Tracks whether the user explicitly chose a session (sidebar, palette, new
+  // session, or a URL). The auto-select effect must not clobber an explicit
+  // selection — otherwise a freshly created session is instantly replaced by
+  // the first session of the active agent.
+  const [sessionExplicit, setSessionExplicit] = useState(
+    bootRoute?.tab === "chat" && bootRoute.sessionKey !== null,
+  );
   const [sleepView, setSleepView] = useState<SleepView>(
     bootRoute?.tab === "sleep" ? bootRoute.sleepView : "runs",
   );
@@ -121,22 +122,8 @@ export function WebUI() {
 
   useEffect(() => {
     if (sessionExplicit) return;
-    if (
-      sessions.some(
-        (session) =>
-          session.session_key === selectedSession &&
-          session.agent_id === selectedAgent,
-      )
-    )
-      return;
-    // Archived sessions are hidden from the initial pick; an empty result leaves
-    // the new-conversation state instead of opening a shelved session.
-    const firstAgentSession = sessions.find(
-      (session) => session.agent_id === selectedAgent && !session.archived,
-    );
-    if (firstAgentSession) {
-      setSelectedSession(firstAgentSession.session_key);
-    }
+    const next = resolveAutoSessionKey(sessions, selectedAgent, selectedSession);
+    if (next !== selectedSession) setSelectedSession(next);
   }, [selectedAgent, selectedSession, sessions, sessionExplicit]);
 
   // Reflects auto-derived selection changes in the URL. User actions push
@@ -173,6 +160,7 @@ export function WebUI() {
       } else {
         setSessionExplicit(false);
       }
+      setPendingSessionName(null);
     };
     globalThis.addEventListener("popstate", onPopState);
     return () => globalThis.removeEventListener("popstate", onPopState);
@@ -182,22 +170,24 @@ export function WebUI() {
     (key: string) => {
       setSelectedSession(key);
       setSessionExplicit(true);
-    const path = buildRoutePath({
-      tab: activeTab,
-      agentId: selectedAgent,
-      sessionKey: key,
-      sleepView,
-      runId: null,
-    });
-    if (path !== null) navigatePath(path, false);
-  },
-  [activeTab, selectedAgent],
+      setPendingSessionName(null);
+      const path = buildRoutePath({
+        tab: activeTab,
+        agentId: selectedAgent,
+        sessionKey: key,
+        sleepView,
+        runId: null,
+      });
+      if (path !== null) navigatePath(path, false);
+    },
+    [activeTab, selectedAgent, sleepView],
   );
 
   const handleSelectAgent = useCallback(
     (id: string) => {
       setSelectedAgent(id);
       setSessionExplicit(false);
+      setPendingSessionName(null);
       setSleepRunId(null);
       const path = buildRoutePath({
         tab: activeTab,
