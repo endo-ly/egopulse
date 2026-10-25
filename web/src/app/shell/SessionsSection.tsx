@@ -11,7 +11,7 @@ import { Badge } from "../../shared/ui/Badge";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { channelLabel } from "../../shared/lib/format";
-import { copyText } from "../../shared/lib/clipboard";
+
 import { sessionSubtitle, sessionTitle } from "../../shared/lib/session";
 import type { SessionEntry } from "../../shared/api/types";
 import type { SessionPatch } from "../../shared/api/sessions";
@@ -220,11 +220,37 @@ function SessionRow({
     );
   };
 
-  const copySessionId = async () => {
+  const copySessionId = () => {
     setMenu(null);
-    const copied = await copyText(sessionId);
-    setCopyState(copied ? "copied" : "failed");
-    triggerRef.current?.focus();
+    const finish = (copied: boolean) => {
+      setCopyState(copied ? "copied" : "failed");
+      triggerRef.current?.focus();
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(sessionId).then(
+        () => finish(true),
+        () => finish(false),
+      );
+      return;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = sessionId;
+    textarea.readOnly = true;
+    textarea.style.position = "fixed";
+    textarea.style.top = "0";
+    textarea.style.left = "0";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    } finally {
+      textarea.remove();
+    }
+    finish(copied);
   };
 
   return (
