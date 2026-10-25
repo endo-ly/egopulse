@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, cleanup, within } from "@testing-library/react";
 import { SessionsSection } from "../SessionsSection";
 import type { SessionEntry } from "../../../shared/api/types";
@@ -38,6 +38,18 @@ const SESSIONS: SessionEntry[] = [
     pinned: false,
   },
 ];
+
+afterEach(() => {
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: undefined,
+  });
+  Object.defineProperty(document, "execCommand", {
+    configurable: true,
+    value: undefined,
+  });
+  cleanup();
+});
 
 describe("SessionsSection", () => {
   it("sessions_section_renders_list_with_channel_and_agent_filter", () => {
@@ -208,7 +220,10 @@ describe("SessionsSection", () => {
     // Arrange
     const onUpdateSession = vi.fn();
     const writeText = vi.fn().mockResolvedValue(undefined);
-    Object.assign(navigator, { clipboard: { writeText } });
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
     render(
       <SessionsSection
         sessions={SESSIONS}
@@ -239,6 +254,7 @@ describe("SessionsSection", () => {
 
     // Assert
     expect(writeText).toHaveBeenCalledWith("chat:1");
+    expect(await screen.findByText("Copied")).toBeTruthy();
     cleanup();
   });
 
@@ -319,11 +335,12 @@ describe("SessionsSection", () => {
     cleanup();
   });
 
-  it("sessions_section_shows_the_session_id_when_clipboard_is_unavailable", async () => {
+  it("sessions_section_copies_the_id_without_the_clipboard_api", async () => {
     // Arrange
-    Object.defineProperty(navigator, "clipboard", {
+    const execCommand = vi.fn().mockReturnValue(true);
+    Object.defineProperty(document, "execCommand", {
       configurable: true,
-      value: undefined,
+      value: execCommand,
     });
     render(
       <SessionsSection
@@ -340,7 +357,9 @@ describe("SessionsSection", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Copy session ID" }));
 
     // Assert
-    expect(await screen.findByText("chat:1")).toBeTruthy();
+    expect(execCommand).toHaveBeenCalledWith("copy");
+    expect(await screen.findByText("Copied")).toBeTruthy();
+    expect(screen.queryByText("chat:1")).toBeNull();
     cleanup();
   });
 

@@ -766,15 +766,6 @@
     color: var(--color-muted);
   }
 
-  .session-id {
-    overflow: hidden;
-    max-width: 96px;
-    font-family: var(--font-mono, ui-monospace, monospace);
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    user-select: all;
-  }
-
   @media (hover: none) {
     .session-menu-btn {
       opacity: 1;

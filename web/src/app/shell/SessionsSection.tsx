@@ -11,6 +11,7 @@ import { Badge } from "../../shared/ui/Badge";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { channelLabel } from "../../shared/lib/format";
+import { copyText } from "../../shared/lib/clipboard";
 import { sessionSubtitle, sessionTitle } from "../../shared/lib/session";
 import type { SessionEntry } from "../../shared/api/types";
 import type { SessionPatch } from "../../shared/api/sessions";
@@ -77,7 +78,7 @@ interface SessionRowProps {
 }
 
 type MenuPosition = { x: number; y: number };
-type CopyState = "idle" | "copied" | "manual";
+type CopyState = "idle" | "copied" | "failed";
 
 const MENU_WIDTH = 168;
 const MENU_MARGIN = 8;
@@ -114,8 +115,11 @@ function SessionRow({
   }, [renaming, session.name]);
 
   useEffect(() => {
-    if (copyState !== "copied") return;
-    const timer = setTimeout(() => setCopyState("idle"), 1500);
+    if (copyState === "idle") return;
+    const timer = setTimeout(
+      () => setCopyState("idle"),
+      copyState === "copied" ? 1500 : 2500,
+    );
     return () => clearTimeout(timer);
   }, [copyState]);
 
@@ -218,13 +222,9 @@ function SessionRow({
 
   const copySessionId = async () => {
     setMenu(null);
-    try {
-      if (!navigator.clipboard) throw new Error("clipboard unavailable");
-      await navigator.clipboard.writeText(sessionId);
-      setCopyState("copied");
-    } catch {
-      setCopyState("manual");
-    }
+    const copied = await copyText(sessionId);
+    setCopyState(copied ? "copied" : "failed");
+    triggerRef.current?.focus();
   };
 
   return (
@@ -259,14 +259,9 @@ function SessionRow({
               {subtitle ? <span className="session-preview">{subtitle}</span> : null}
             </span>
           )}
-          {copyState === "copied" ? (
+          {copyState !== "idle" ? (
             <span className="session-copied" role="status">
-              Copied
-            </span>
-          ) : null}
-          {copyState === "manual" ? (
-            <span className="session-copied session-id" title={sessionId}>
-              {sessionId}
+              {copyState === "copied" ? "Copied" : "Copy failed"}
             </span>
           ) : null}
           {onUpdateSession ? (
