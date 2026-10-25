@@ -51,6 +51,7 @@ class FakeWebSocket {
 function setup(
   options: {
     sessionKey?: string;
+    onSessionAccepted?: (sessionKey: string, sourceSessionKey: string) => void;
     onSessionResolved?: (sessionKey: string) => void;
   } = {},
 ) {
@@ -60,6 +61,9 @@ function setup(
     authToken: "token",
     onAuthRequired: vi.fn(),
     onError: vi.fn(),
+    ...(options.onSessionAccepted
+      ? { onSessionAccepted: options.onSessionAccepted }
+      : {}),
     onSessionResolved: options.onSessionResolved,
   };
   return renderHook((props) => useChatTransport(props ?? initialProps), {
@@ -793,8 +797,10 @@ describe("useChatTransport reconnect", () => {
   });
 
   it("chat_transport_ack_from_a_left_session_shows_no_progress", async () => {
+    const onSessionAccepted = vi.fn();
     const onSessionResolved = vi.fn();
     const { result, ws, rerender } = await connectOpen({
+      onSessionAccepted,
       onSessionResolved,
     });
 
@@ -813,6 +819,7 @@ describe("useChatTransport reconnect", () => {
         authToken: "token",
         onAuthRequired: vi.fn(),
         onError: vi.fn(),
+        onSessionAccepted,
         onSessionResolved,
       });
     });
@@ -861,6 +868,7 @@ describe("useChatTransport reconnect", () => {
     // displayed session.
     expect(result.current.state.messages).toHaveLength(0);
     expect(isWaitingForAssistant(result.current.state)).toBe(false);
+    expect(onSessionAccepted).toHaveBeenCalledWith("chat:42", "s1");
     expect(onSessionResolved).not.toHaveBeenCalled();
   });
 

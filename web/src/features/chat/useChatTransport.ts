@@ -35,6 +35,12 @@ export interface UseChatTransportOptions {
   onDone?: () => void;
   onAuthRequired?: (message: string) => void;
   onError?: (message: string) => void;
+  /**
+   * Reports the canonical session of a send, even when the user left the
+   * draft before the ack arrived. Display switching is handled separately by
+   * `onSessionResolved`.
+   */
+  onSessionAccepted?: (sessionKey: string, sourceSessionKey: string) => void;
   onSessionResolved?: (sessionKey: string) => void;
 }
 
@@ -94,8 +100,10 @@ interface RunTracking {
   // Last gateway seq applied; frames at or below it are replays the client
   // already applied, so they are dropped instead of appended twice.
   lastSeq: number;
-  // Set when the send ack already handed the canonical session to the UI, so
-  // the terminal event does not resolve the same send a second time.
+  // Set when the canonical session was already reported to the UI, so the
+  // terminal event does not process the same send a second time.
+  sessionAccepted?: boolean;
+  // Set when the UI already switched to the canonical session for display.
   sessionResolved?: boolean;
 }
 
@@ -112,6 +120,7 @@ export function useChatTransport({
   onDone,
   onAuthRequired,
   onError,
+  onSessionAccepted,
   onSessionResolved,
 }: UseChatTransportOptions) {
   const [state, setState] = useState<ChatState>(initialChatState);
@@ -131,6 +140,8 @@ export function useChatTransport({
   sessionKeyRef.current = sessionKey;
   const agentIdRef = useRef(agentId);
   agentIdRef.current = agentId;
+  const onSessionAcceptedRef = useRef(onSessionAccepted);
+  onSessionAcceptedRef.current = onSessionAccepted;
   const onSessionResolvedRef = useRef(onSessionResolved);
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -347,12 +358,25 @@ export function useChatTransport({
             // was in flight, and that session must not inherit the progress.
             if (sessionKeyRef.current === pending.sessionKey) {
               setState((prev) => reduceRunAccepted(prev, runId));
-              // The session now exists, so adopt its canonical key before the
-              // turn can fail. The terminal event is a fallback for a lost
-              // ack, not the primary point where a draft becomes durable.
+            }
+            if (
+              resolvedSessionKey &&
+              resolvedSessionKey !== pending.sessionKey
+            ) {
+              // The session is durable now, so its pending display name is
+              // saved even if the user moved to another session meanwhile.
+              if (onSessionAcceptedRef.current) {
+                tracking.sessionAccepted = true;
+                onSessionAcceptedRef.current(
+                  resolvedSessionKey,
+                  pending.sessionKey,
+                );
+              }
+              // Only the session still on screen follows the canonical key.
+              // The reset effect preserves the live transcript for this one
+              // transition, so streaming continues without a flicker.
               if (
-                resolvedSessionKey &&
-                resolvedSessionKey !== pending.sessionKey &&
+                sessionKeyRef.current === pending.sessionKey &&
                 onSessionResolvedRef.current
               ) {
                 tracking.sessionResolved = true;
@@ -397,18 +421,33 @@ export function useChatTransport({
           reduceChatEvent(prev, event, tracking?.agentId ?? agentIdRef.current),
         );
         if (event.state === "done") {
-          // The ack normally resolved the canonical session already. This is
-          // the fallback after a reconnect or a lost ack; switch only when the
-          // run still belongs to the session the user is looking at.
+          // The ack normally reports the canonical session already. This is
+          // the fallback when the ack did not carry it; the name is still
+          // persisted regardless of which session is on screen.
           if (
             event.sessionKey &&
-            event.sessionKey !== sessionKeyRef.current &&
             tracking &&
-            tracking.sessionKey === sessionKeyRef.current &&
-            !tracking.sessionResolved &&
-            onSessionResolvedRef.current
+            event.sessionKey !== tracking.sessionKey
           ) {
-            onSessionResolvedRef.current(event.sessionKey);
+            if (!tracking.sessionAccepted && onSessionAcceptedRef.current) {
+              tracking.sessionAccepted = true;
+              onSessionAcceptedRef.current(
+                event.sessionKey,
+                tracking.sessionKey,
+              );
+            }
+            // Switch only when the run still belongs to the session the user
+            // is looking at (i.e. this transport sent it and they never left).
+            if (
+              event.sessionKey !== sessionKeyRef.current &&
+              tracking.sessionKey === sessionKeyRef.current &&
+              !tracking.sessionResolved &&
+              onSessionResolvedRef.current
+            ) {
+              tracking.sessionResolved = true;
+              canonicalizingSessionRef.current = event.sessionKey;
+              onSessionResolvedRef.current(event.sessionKey);
+            }
           }
           invalidateQueries("sessions");
           invalidateQueries("history");

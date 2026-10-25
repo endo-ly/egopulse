@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { App } from "./AppShell";
 import { AuthModal } from "./AuthModal";
 import { CommandPalette } from "./command-palette/CommandPalette";
@@ -82,7 +82,10 @@ export function WebUI() {
   const [authDraft, setAuthDraft] = useState(authToken);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
-  const [pendingSessionName, setPendingSessionName] = useState<string | null>(null);
+  // Names typed for drafts that have not been acknowledged yet. Keyed by the
+  // draft key so an ack that arrives after the user moved away still finds the
+  // right name.
+  const pendingSessionNamesRef = useRef(new Map<string, string>());
 
   const agentsState = useServerState("agents", () => fetchAgents(authToken));
   const sessionsState = useServerState("sessions", () => fetchSessions(authToken), {
@@ -183,7 +186,6 @@ export function WebUI() {
         setSessionExplicit(false);
       }
       setDraftSessionKey(createSessionKey());
-      setPendingSessionName(null);
     };
     globalThis.addEventListener("popstate", onPopState);
     return () => globalThis.removeEventListener("popstate", onPopState);
@@ -194,7 +196,6 @@ export function WebUI() {
       setSelectedSession(key);
       setSessionExplicit(true);
       setDraftSessionKey(createSessionKey());
-      setPendingSessionName(null);
       const path = buildRoutePath({
         tab: activeTab,
         agentId: selectedAgent,
@@ -212,7 +213,6 @@ export function WebUI() {
       setSelectedAgent(id);
       setSessionExplicit(false);
       setDraftSessionKey(createSessionKey());
-      setPendingSessionName(null);
       setSleepRunId(null);
       const path = buildRoutePath({
         tab: activeTab,
@@ -295,23 +295,23 @@ export function WebUI() {
     if (path !== null) navigatePath(path, false);
   }, [selectedAgent]);
 
-  const handleSessionResolved = useCallback(
-    (key: string) => {
-      setSelectedSession(key);
-      setSessionExplicit(true);
-      setDraftSessionKey(createSessionKey());
-      // A name typed before the first message is applied once the session is
-      // persisted as `chat:{id}`; unnamed sessions stay untouched.
-      const name = pendingSessionName;
+  const handleSessionResolved = useCallback((key: string) => {
+    setSelectedSession(key);
+    setSessionExplicit(true);
+    setDraftSessionKey(createSessionKey());
+  }, []);
+
+  const handleSessionAccepted = useCallback(
+    (key: string, sourceSessionKey: string) => {
+      const name = pendingSessionNamesRef.current.get(sourceSessionKey);
       const chatId = parseChatId(key);
-      if (name && chatId !== null) {
-        setPendingSessionName(null);
-        updateSession(authToken, chatId, { name })
-          .then(() => invalidateQueries("sessions"))
-          .catch((error: unknown) => setTransportError(String(error)));
-      }
+      if (!name || chatId === null) return;
+      pendingSessionNamesRef.current.delete(sourceSessionKey);
+      updateSession(authToken, chatId, { name })
+        .then(() => invalidateQueries("sessions"))
+        .catch((error: unknown) => setTransportError(String(error)));
     },
-    [authToken, pendingSessionName],
+    [authToken],
   );
 
   const handleUpdateSession = useCallback(
@@ -325,8 +325,9 @@ export function WebUI() {
 
   const handleNewSession = (name?: string) => {
     const key = createSessionKey();
+    const trimmedName = name?.trim();
     setDraftSessionKey(key);
-    setPendingSessionName(name?.trim() ? name.trim() : null);
+    if (trimmedName) pendingSessionNamesRef.current.set(key, trimmedName);
     setSelectedSession(key);
     setSessionExplicit(true);
     setActiveTab("chat");
@@ -348,6 +349,7 @@ export function WebUI() {
     authToken,
     onAuthRequired: setAuthMessage,
     onError: setTransportError,
+    onSessionAccepted: handleSessionAccepted,
     onSessionResolved: handleSessionResolved,
     onDone: () => {
       invalidateQueries("sessions");
