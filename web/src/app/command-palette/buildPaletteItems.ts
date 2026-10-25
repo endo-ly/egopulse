@@ -1,6 +1,7 @@
 import type { TabId } from "../navigation";
 import type { AgentEntry, ChatMessage, SessionEntry } from "../../shared/api/types";
 import { loadPaletteHistory, pushPaletteHistory } from "./paletteHistory";
+import { sessionTitle } from "../../shared/lib/session";
 
 export interface PaletteItem {
   id: string;
@@ -117,19 +118,23 @@ function sessionItems(
   actions: PaletteActions,
 ): PaletteItem[] {
   return sessions
-    .filter((session) => session.agent_id === selectedAgent)
+    .filter((session) => session.agent_id === selectedAgent && !session.archived)
     .slice(0, 5)
-    .map((session) => ({
-      id: `session-${session.session_key}`,
-      label: session.label,
-      section: "Sessions",
-      description: session.channel,
-      onSelect: () => selectAndRemember(
-        { id: `session-${session.session_key}`, label: session.label, section: "Sessions" },
-        () => actions.selectSession(session.session_key),
-        actions,
-      ),
-    }));
+    .map((session) => {
+      const label = sessionTitle(session);
+      return {
+        id: `session-${session.session_key}`,
+        label,
+        section: "Sessions",
+        description: session.channel,
+        onSelect: () =>
+          selectAndRemember(
+            { id: `session-${session.session_key}`, label, section: "Sessions" },
+            () => actions.selectSession(session.session_key),
+            actions,
+          ),
+      };
+    });
 }
 
 function messageItems(

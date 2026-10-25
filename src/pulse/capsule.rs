@@ -310,7 +310,7 @@ mod tests {
         last_message_time: &str,
     ) -> i64 {
         let chat_id = db
-            .resolve_or_create_chat_id(channel, external_chat_id, None, chat_type, agent_id)
+            .resolve_or_create_chat_id(channel, external_chat_id, chat_type, agent_id)
             .expect("create chat");
         let conn = db.get_conn().expect("pool");
         conn.execute(

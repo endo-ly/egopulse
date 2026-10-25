@@ -41,18 +41,9 @@ pub(crate) async fn resolve_chat_id(
     call_blocking(state.db_for(context.scope), {
         let channel = context.channel.clone();
         let session_key = context.session_key();
-        let surface_thread = context.surface_thread.clone();
         let chat_type = context.chat_type.clone();
         let agent_id = context.agent_id.clone();
-        move |db| {
-            db.resolve_or_create_chat_id(
-                &channel,
-                &session_key,
-                Some(&surface_thread),
-                &chat_type,
-                &agent_id,
-            )
-        }
+        move |db| db.resolve_or_create_chat_id(&channel, &session_key, &chat_type, &agent_id)
     })
     .await
     .map_err(EgoPulseError::from)
@@ -1109,18 +1100,9 @@ mod tests {
         let chat_id = call_blocking(Arc::clone(&state.db), {
             let channel = context.channel.clone();
             let session_key = context.session_key();
-            let surface_thread = context.surface_thread.clone();
             let chat_type = context.chat_type.clone();
             let agent_id = context.agent_id.clone();
-            move |db| {
-                db.resolve_or_create_chat_id(
-                    &channel,
-                    &session_key,
-                    Some(&surface_thread),
-                    &chat_type,
-                    &agent_id,
-                )
-            }
+            move |db| db.resolve_or_create_chat_id(&channel, &session_key, &chat_type, &agent_id)
         })
         .await
         .expect("chat id");

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { App } from "./AppShell";
 import { AuthModal } from "./AuthModal";
 import { CommandPalette } from "./command-palette/CommandPalette";
@@ -10,14 +10,21 @@ import { isWaitingForAssistant, mergeChatMessages } from "../features/chat/chatR
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
 import { fetchHistory } from "../shared/api/history";
-import { createSessionKey, fetchSessions } from "../shared/api/sessions";
+import { createSessionKey, fetchSessions, updateSession } from "../shared/api/sessions";
+import type { SessionPatch } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
 import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
 import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
 import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
 import type { TabId } from "./navigation";
+import { resolveAutoSessionKey } from "./sessionSelection";
 
-const DEFAULT_SESSION_KEY = "main";
+/** Extracts the chat id from a canonical `chat:{id}` session key. */
+function parseChatId(key: string): number | null {
+  if (!key.startsWith("chat:")) return null;
+  const id = Number(key.slice("chat:".length));
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
 
 function currentPathname(): string | null {
   try {
@@ -47,14 +54,19 @@ export function WebUI() {
   const bootRoute = useMemo(initialRoute, []);
   const [activeTab, setActiveTab] = useState<TabId>(bootRoute?.tab ?? "chat");
   const [selectedAgent, setSelectedAgent] = useState(bootRoute?.agentId ?? "");
+  // A fresh key for the new-conversation state. It is never a persisted
+  // session key, so an archived session cannot be reused through it.
+  const [draftSessionKey, setDraftSessionKey] = useState(createSessionKey);
   const [selectedSession, setSelectedSession] = useState(
-    bootRoute?.sessionKey ?? DEFAULT_SESSION_KEY,
+    bootRoute?.sessionKey ?? draftSessionKey,
   );
-  // Tracks whether the user explicitly chose a session (sidebar, palette, or new
-  // session). The auto-select effect must not clobber an explicit selection —
-  // otherwise a freshly created session is instantly replaced by the first
-  // session of the active agent.
-  const [sessionExplicit, setSessionExplicit] = useState(false);
+  // Tracks whether the user explicitly chose a session (sidebar, palette, new
+  // session, or a URL). The auto-select effect must not clobber an explicit
+  // selection — otherwise a freshly created session is instantly replaced by
+  // the first session of the active agent.
+  const [sessionExplicit, setSessionExplicit] = useState(
+    bootRoute?.tab === "chat" && bootRoute.sessionKey !== null,
+  );
   const [sleepView, setSleepView] = useState<SleepView>(
     bootRoute?.tab === "sleep" ? bootRoute.sleepView : "runs",
   );
@@ -70,6 +82,10 @@ export function WebUI() {
   const [authDraft, setAuthDraft] = useState(authToken);
   const [authMessage, setAuthMessage] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
+  // Names typed for drafts that have not been acknowledged yet. Keyed by the
+  // draft key so an ack that arrives after the user moved away still finds the
+  // right name.
+  const pendingSessionNamesRef = useRef(new Map<string, string>());
 
   const agentsState = useServerState("agents", () => fetchAgents(authToken));
   const sessionsState = useServerState("sessions", () => fetchSessions(authToken), {
@@ -112,21 +128,20 @@ export function WebUI() {
 
   useEffect(() => {
     if (sessionExplicit) return;
-    if (
-      sessions.some(
-        (session) =>
-          session.session_key === selectedSession &&
-          session.agent_id === selectedAgent,
-      )
-    )
-      return;
-    const firstAgentSession = sessions.find(
-      (session) => session.agent_id === selectedAgent,
+    const next = resolveAutoSessionKey(
+      sessions,
+      selectedAgent,
+      selectedSession,
+      draftSessionKey,
     );
-    if (firstAgentSession) {
-      setSelectedSession(firstAgentSession.session_key);
-    }
-  }, [selectedAgent, selectedSession, sessions, sessionExplicit]);
+    if (next !== selectedSession) setSelectedSession(next);
+  }, [
+    draftSessionKey,
+    selectedAgent,
+    selectedSession,
+    sessions,
+    sessionExplicit,
+  ]);
 
   // Reflects auto-derived selection changes in the URL. User actions push
   // their own history entry beforehand, so this only ever replaces.
@@ -136,14 +151,22 @@ export function WebUI() {
       agentId: selectedAgent,
       sessionKey:
         activeTab === "chat" &&
-        (sessionExplicit || selectedSession !== DEFAULT_SESSION_KEY)
+        (sessionExplicit || selectedSession !== draftSessionKey)
           ? selectedSession
           : null,
       sleepView,
       runId: sleepRunId,
     });
     if (path !== null) navigatePath(path, true);
-  }, [activeTab, selectedAgent, selectedSession, sessionExplicit, sleepView, sleepRunId]);
+  }, [
+    activeTab,
+    draftSessionKey,
+    selectedAgent,
+    selectedSession,
+    sessionExplicit,
+    sleepView,
+    sleepRunId,
+  ]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -162,6 +185,7 @@ export function WebUI() {
       } else {
         setSessionExplicit(false);
       }
+      setDraftSessionKey(createSessionKey());
     };
     globalThis.addEventListener("popstate", onPopState);
     return () => globalThis.removeEventListener("popstate", onPopState);
@@ -171,22 +195,24 @@ export function WebUI() {
     (key: string) => {
       setSelectedSession(key);
       setSessionExplicit(true);
-    const path = buildRoutePath({
-      tab: activeTab,
-      agentId: selectedAgent,
-      sessionKey: key,
-      sleepView,
-      runId: null,
-    });
-    if (path !== null) navigatePath(path, false);
-  },
-  [activeTab, selectedAgent],
+      setDraftSessionKey(createSessionKey());
+      const path = buildRoutePath({
+        tab: activeTab,
+        agentId: selectedAgent,
+        sessionKey: key,
+        sleepView,
+        runId: null,
+      });
+      if (path !== null) navigatePath(path, false);
+    },
+    [activeTab, selectedAgent, sleepView],
   );
 
   const handleSelectAgent = useCallback(
     (id: string) => {
       setSelectedAgent(id);
       setSessionExplicit(false);
+      setDraftSessionKey(createSessionKey());
       setSleepRunId(null);
       const path = buildRoutePath({
         tab: activeTab,
@@ -208,7 +234,7 @@ export function WebUI() {
         agentId: selectedAgent,
         sessionKey:
           tab === "chat" &&
-          (sessionExplicit || selectedSession !== DEFAULT_SESSION_KEY)
+          (sessionExplicit || selectedSession !== draftSessionKey)
             ? selectedSession
             : null,
         sleepView,
@@ -216,7 +242,14 @@ export function WebUI() {
       });
       if (path !== null) navigatePath(path, false);
     },
-    [selectedAgent, selectedSession, sessionExplicit, sleepView, sleepRunId],
+    [
+      draftSessionKey,
+      selectedAgent,
+      selectedSession,
+      sessionExplicit,
+      sleepView,
+      sleepRunId,
+    ],
   );
 
   const handleSleepViewChange = useCallback(
@@ -265,10 +298,36 @@ export function WebUI() {
   const handleSessionResolved = useCallback((key: string) => {
     setSelectedSession(key);
     setSessionExplicit(true);
+    setDraftSessionKey(createSessionKey());
   }, []);
 
-  const handleNewSession = () => {
+  const handleSessionAccepted = useCallback(
+    (key: string, sourceSessionKey: string) => {
+      const name = pendingSessionNamesRef.current.get(sourceSessionKey);
+      const chatId = parseChatId(key);
+      if (!name || chatId === null) return;
+      pendingSessionNamesRef.current.delete(sourceSessionKey);
+      updateSession(authToken, chatId, { name })
+        .then(() => invalidateQueries("sessions"))
+        .catch((error: unknown) => setTransportError(String(error)));
+    },
+    [authToken],
+  );
+
+  const handleUpdateSession = useCallback(
+    (chatId: number, patch: SessionPatch) => {
+      updateSession(authToken, chatId, patch)
+        .then(() => invalidateQueries("sessions"))
+        .catch((error: unknown) => setTransportError(String(error)));
+    },
+    [authToken],
+  );
+
+  const handleNewSession = (name?: string) => {
     const key = createSessionKey();
+    const trimmedName = name?.trim();
+    setDraftSessionKey(key);
+    if (trimmedName) pendingSessionNamesRef.current.set(key, trimmedName);
     setSelectedSession(key);
     setSessionExplicit(true);
     setActiveTab("chat");
@@ -290,6 +349,7 @@ export function WebUI() {
     authToken,
     onAuthRequired: setAuthMessage,
     onError: setTransportError,
+    onSessionAccepted: handleSessionAccepted,
     onSessionResolved: handleSessionResolved,
     onDone: () => {
       invalidateQueries("sessions");
@@ -395,6 +455,7 @@ export function WebUI() {
         onSelectSession={handleSelectSession}
         onOpenPalette={() => setPaletteOpen(true)}
         onNewSession={handleNewSession}
+        onUpdateSession={handleUpdateSession}
         authToken={authToken}
         agentAvatars={agentAvatars}
         onAvatarChanged={() => invalidateQueries("agents")}

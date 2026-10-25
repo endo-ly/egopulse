@@ -88,6 +88,10 @@ pub(crate) struct SessionSummary {
     pub(crate) last_message_time: String,
     pub(crate) last_message_preview: Option<String>,
     pub(crate) agent_id: String,
+    /// Whether the session is archived (hidden from the active list).
+    pub(crate) archived: bool,
+    /// Whether the session is pinned to the top of the list.
+    pub(crate) pinned: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +101,8 @@ pub(crate) struct SessionView {
     pub(crate) surface_thread: String,
     pub(crate) chat_type: String,
     pub(crate) agent_id: String,
+    /// User-managed display name; `None` when the session is unnamed.
+    pub(crate) chat_title: Option<String>,
     pub(crate) effective_provider: String,
     pub(crate) effective_model: String,
     pub(crate) transcript: Vec<TranscriptEntry>,

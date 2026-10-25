@@ -11,7 +11,7 @@ const agents: AgentEntry[] = [
 ];
 
 const sessions: SessionEntry[] = [
-  { session_key: "web:main", label: "Web Chat", channel: "web", agent_id: "lyre", last_message_time: 0, last_message_preview: "hello" },
+  { session_key: "chat:1", chat_id: 1, name: "Web Chat", channel: "web", agent_id: "lyre", last_message_time: 0, last_message_preview: "hello", archived: false, pinned: false },
 ];
 
 describe("CommandPalette", () => {

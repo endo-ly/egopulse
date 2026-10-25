@@ -13,7 +13,7 @@ use axum::extract::OriginalUri;
 use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Router, body::Body};
 use tokio::sync::{Mutex, broadcast};
 
@@ -446,6 +446,7 @@ fn build_router(web_state: WebState) -> Router {
             get(config::api_get_config).put(config::api_put_config),
         )
         .route("/api/sessions", get(sessions::list_sessions))
+        .route("/api/sessions/{chat_id}", patch(sessions::update_session))
         .route("/api/history", get(sessions::get_history))
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/stream", get(stream::api_stream))

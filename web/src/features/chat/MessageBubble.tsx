@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { ChatMessage } from "../../shared/api/types";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 
@@ -30,7 +31,10 @@ function avatarLetter(message: ChatMessage): string {
   return (message.sender_id[0] ?? "?").toUpperCase();
 }
 
-export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({
+  message,
+  agentAvatars,
+}: MessageBubbleProps) {
   const cls = `message-row bubble-${message.sender_kind}`;
   const avatarSrc =
     message.sender_kind === "assistant"
@@ -69,4 +73,4 @@ export function MessageBubble({ message, agentAvatars }: MessageBubbleProps) {
       </div>
     </div>
   );
-}
+});

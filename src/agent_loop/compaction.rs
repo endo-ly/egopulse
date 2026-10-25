@@ -1131,7 +1131,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:compaction-success:agent:default",
-                Some("compaction-success"),
                 "cli",
                 "default",
             )
@@ -1239,7 +1238,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:compaction-fallback:agent:default",
-                Some("compaction-fallback"),
                 "cli",
                 "default",
             )
@@ -1640,7 +1638,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:compaction-usage:agent:default",
-                Some("compaction-usage"),
                 "cli",
                 "default",
             )
@@ -1780,7 +1777,6 @@ mod tests {
             db.resolve_or_create_chat_id(
                 "cli",
                 "cli:compaction-calibration:agent:default",
-                Some("compaction-calibration"),
                 "cli",
                 "default",
             )

@@ -897,7 +897,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         // Act
@@ -926,11 +926,11 @@ intentions:
 
         let _chat_a = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:a", None, "dm", "agent-a")
+            .resolve_or_create_chat_id("discord", "discord:a", "dm", "agent-a")
             .expect("chat a");
         let _chat_b = state
             .db
-            .resolve_or_create_chat_id("telegram", "telegram:b", None, "dm", "agent-b")
+            .resolve_or_create_chat_id("telegram", "telegram:b", "dm", "agent-b")
             .expect("chat b");
 
         // Act
@@ -961,7 +961,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         // Act
@@ -999,7 +999,7 @@ intentions:
 
         let _chat_b = state
             .db
-            .resolve_or_create_chat_id("telegram", "telegram:b", None, "dm", "agent-b")
+            .resolve_or_create_chat_id("telegram", "telegram:b", "dm", "agent-b")
             .expect("chat b");
 
         // Act
@@ -1030,7 +1030,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         // Act
@@ -1056,7 +1056,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         let one_day_ago = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
@@ -1091,7 +1091,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         let five_days_ago = (chrono::Utc::now() - chrono::Duration::days(5)).to_rfc3339();
@@ -1164,7 +1164,7 @@ intentions:
         // agent-b has a sendable chat, agent-a does not
         let _chat_b = state
             .db
-            .resolve_or_create_chat_id("telegram", "telegram:b", None, "dm", "agent-b")
+            .resolve_or_create_chat_id("telegram", "telegram:b", "dm", "agent-b")
             .expect("chat b");
 
         // Act
@@ -1280,7 +1280,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         // Act
@@ -1320,7 +1320,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         // Act
@@ -1358,7 +1358,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         // Act
@@ -1541,7 +1541,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         let definition = super::super::definition::load_pulse_definition(
@@ -1599,7 +1599,7 @@ intentions:
 
         let _chat = state
             .db
-            .resolve_or_create_chat_id("discord", "discord:123", None, "dm", "default")
+            .resolve_or_create_chat_id("discord", "discord:123", "dm", "default")
             .expect("chat");
 
         let definition = super::super::definition::load_pulse_definition(

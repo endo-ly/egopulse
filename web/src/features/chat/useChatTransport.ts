@@ -26,6 +26,7 @@ import {
   useSessionRefresh,
   type SessionUpdatedPayload,
 } from "./useSessionRefresh";
+import { randomId } from "../../shared/lib/random";
 
 export interface UseChatTransportOptions {
   sessionKey: string;
@@ -34,6 +35,12 @@ export interface UseChatTransportOptions {
   onDone?: () => void;
   onAuthRequired?: (message: string) => void;
   onError?: (message: string) => void;
+  /**
+   * Reports the canonical session of a send, even when the user left the
+   * draft before the ack arrived. Display switching is handled separately by
+   * `onSessionResolved`.
+   */
+  onSessionAccepted?: (sessionKey: string, sourceSessionKey: string) => void;
   onSessionResolved?: (sessionKey: string) => void;
 }
 
@@ -55,6 +62,7 @@ type ServerFrame = ResponseFrame | EventFrame;
 
 interface ChatAckPayload {
   runId?: string;
+  sessionKey?: string;
 }
 
 interface UncertainSend {
@@ -92,6 +100,11 @@ interface RunTracking {
   // Last gateway seq applied; frames at or below it are replays the client
   // already applied, so they are dropped instead of appended twice.
   lastSeq: number;
+  // Set when the canonical session was already reported to the UI, so the
+  // terminal event does not process the same send a second time.
+  sessionAccepted?: boolean;
+  // Set when the UI already switched to the canonical session for display.
+  sessionResolved?: boolean;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1_000;
@@ -107,12 +120,17 @@ export function useChatTransport({
   onDone,
   onAuthRequired,
   onError,
+  onSessionAccepted,
   onSessionResolved,
 }: UseChatTransportOptions) {
   const [state, setState] = useState<ChatState>(initialChatState);
   const [connectionState, setConnectionState] = useState<
     "connecting" | "open" | "closed"
   >("closed");
+  // The canonical key that replaces the current draft. Ack-driven
+  // canonicalization changes the prop without starting a different chat, so
+  // the transcript must survive that one transition.
+  const canonicalizingSessionRef = useRef<string | null>(null);
   const refreshSessions = useSessionRefresh();
   const wsRef = useRef<WebSocket | null>(null);
   const connectPromiseRef = useRef<Promise<void> | null>(null);
@@ -122,6 +140,8 @@ export function useChatTransport({
   sessionKeyRef.current = sessionKey;
   const agentIdRef = useRef(agentId);
   agentIdRef.current = agentId;
+  const onSessionAcceptedRef = useRef(onSessionAccepted);
+  onSessionAcceptedRef.current = onSessionAccepted;
   const onSessionResolvedRef = useRef(onSessionResolved);
   onSessionResolvedRef.current = onSessionResolved;
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -197,6 +217,9 @@ export function useChatTransport({
   }, []);
 
   useEffect(() => {
+    const canonicalizing = canonicalizingSessionRef.current;
+    canonicalizingSessionRef.current = null;
+    if (canonicalizing === sessionKey) return;
     setState(initialChatState());
     if (uncertainSendRef.current?.sessionKey !== sessionKey) {
       uncertainSendRef.current = null;
@@ -220,7 +243,7 @@ export function useChatTransport({
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     for (const [runId, tracking] of runsRef.current) {
-      const rpcId = crypto.randomUUID();
+      const rpcId = randomId();
       resubscribeRpcsRef.current.set(rpcId, runId);
       ws.send(
         JSON.stringify({
@@ -312,13 +335,15 @@ export function useChatTransport({
         // so the composer can keep the text.
         const pending = pendingSendsRef.current.get(parsed.id);
         if (parsed.ok && parsed.payload) {
-          const { runId } = parsed.payload as ChatAckPayload;
+          const { runId, sessionKey: resolvedSessionKey } =
+            parsed.payload as ChatAckPayload;
           if (runId && pending) {
-            runsRef.current.set(runId, {
+            const tracking: RunTracking = {
               sessionKey: pending.sessionKey,
               agentId: pending.agentId,
               lastSeq: 0,
-            });
+            };
+            runsRef.current.set(runId, tracking);
             // Tag the optimistic message with its run for replay-truncated
             // cleanup. Identity needs no tag: the message already carries
             // its canonical id.
@@ -333,6 +358,31 @@ export function useChatTransport({
             // was in flight, and that session must not inherit the progress.
             if (sessionKeyRef.current === pending.sessionKey) {
               setState((prev) => reduceRunAccepted(prev, runId));
+            }
+            if (
+              resolvedSessionKey &&
+              resolvedSessionKey !== pending.sessionKey
+            ) {
+              // The session is durable now, so its pending display name is
+              // saved even if the user moved to another session meanwhile.
+              if (onSessionAcceptedRef.current) {
+                tracking.sessionAccepted = true;
+                onSessionAcceptedRef.current(
+                  resolvedSessionKey,
+                  pending.sessionKey,
+                );
+              }
+              // Only the session still on screen follows the canonical key.
+              // The reset effect preserves the live transcript for this one
+              // transition, so streaming continues without a flicker.
+              if (
+                sessionKeyRef.current === pending.sessionKey &&
+                onSessionResolvedRef.current
+              ) {
+                tracking.sessionResolved = true;
+                canonicalizingSessionRef.current = resolvedSessionKey;
+                onSessionResolvedRef.current(resolvedSessionKey);
+              }
             }
           }
         } else if (!parsed.ok && pending) {
@@ -371,17 +421,33 @@ export function useChatTransport({
           reduceChatEvent(prev, event, tracking?.agentId ?? agentIdRef.current),
         );
         if (event.state === "done") {
-          // The server reports the run's canonical session; switch the UI
-          // over only when the run still belongs to the session the user is
-          // looking at (i.e. this transport sent it and they never left).
+          // The ack normally reports the canonical session already. This is
+          // the fallback when the ack did not carry it; the name is still
+          // persisted regardless of which session is on screen.
           if (
             event.sessionKey &&
-            event.sessionKey !== sessionKeyRef.current &&
             tracking &&
-            tracking.sessionKey === sessionKeyRef.current &&
-            onSessionResolvedRef.current
+            event.sessionKey !== tracking.sessionKey
           ) {
-            onSessionResolvedRef.current(event.sessionKey);
+            if (!tracking.sessionAccepted && onSessionAcceptedRef.current) {
+              tracking.sessionAccepted = true;
+              onSessionAcceptedRef.current(
+                event.sessionKey,
+                tracking.sessionKey,
+              );
+            }
+            // Switch only when the run still belongs to the session the user
+            // is looking at (i.e. this transport sent it and they never left).
+            if (
+              event.sessionKey !== sessionKeyRef.current &&
+              tracking.sessionKey === sessionKeyRef.current &&
+              !tracking.sessionResolved &&
+              onSessionResolvedRef.current
+            ) {
+              tracking.sessionResolved = true;
+              canonicalizingSessionRef.current = event.sessionKey;
+              onSessionResolvedRef.current(event.sessionKey);
+            }
           }
           invalidateQueries("sessions");
           invalidateQueries("history");
@@ -569,9 +635,9 @@ export function useChatTransport({
         uncertain.sessionKey === sessionKey &&
         uncertain.text === text
           ? uncertain.messageId
-          : `web:${crypto.randomUUID()}`;
+          : `web:${randomId()}`;
       uncertainSendRef.current = null;
-      const rpcId = crypto.randomUUID();
+      const rpcId = randomId();
       const msg = {
         type: "req",
         id: rpcId,

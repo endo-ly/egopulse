@@ -71,7 +71,12 @@ export function useAgentAvatars(
     };
   }, [avatarKey, authToken]);
 
-  return Object.fromEntries(
-    Object.entries(avatars).map(([agentId, entry]) => [agentId, entry.url]),
+  // Stable identity: consumers use this as a memo boundary.
+  return useMemo(
+    () =>
+      Object.fromEntries(
+        Object.entries(avatars).map(([agentId, entry]) => [agentId, entry.url]),
+      ),
+    [avatars],
   );
 }

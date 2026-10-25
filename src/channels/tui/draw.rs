@@ -13,6 +13,8 @@ use super::transcript::{Block as TranscriptBlock, ToolBlock, ToolStatus, Transcr
 
 pub(super) struct DrawState<'a> {
     pub(super) surface_thread: &'a str,
+    /// User-managed display name; the thread stays the session identity.
+    pub(super) chat_title: Option<&'a str>,
     pub(super) agent_id: &'a str,
     pub(super) transcript: &'a Transcript,
     pub(super) composer: &'a Composer,
@@ -46,7 +48,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, state: DrawState<'_>) {
     draw_status(
         frame,
         status_area,
-        state.surface_thread,
+        state.chat_title.unwrap_or(state.surface_thread),
         state.agent_id,
         state.status,
         state.model,
@@ -414,6 +416,7 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
+                        chat_title: None,
                         surface_thread: "session",
                         agent_id: "default",
                         transcript: &transcript,
@@ -447,6 +450,7 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
+                        chat_title: None,
                         surface_thread: "session",
                         agent_id: "default",
                         transcript: &transcript,
@@ -485,6 +489,7 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
+                        chat_title: None,
                         surface_thread: "session",
                         agent_id: "default",
                         transcript: &transcript,
@@ -514,6 +519,7 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
+                        chat_title: None,
                         surface_thread: "session",
                         agent_id: "default",
                         transcript: &transcript,
@@ -546,6 +552,7 @@ mod tests {
                 draw(
                     frame,
                     DrawState {
+                        chat_title: None,
                         surface_thread: "session",
                         agent_id: "default",
                         transcript: &transcript,

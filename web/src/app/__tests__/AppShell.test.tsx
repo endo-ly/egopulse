@@ -69,16 +69,27 @@ describe("App shell", () => {
         agents={[{ id: "lyre", label: "Lyre", is_default: true }]}
         sessions={[
           {
-            session_key: "s1",
-            label: "Web Chat",
+            session_key: "chat:1",
+
+            chat_id: 1,
+
+            name: "Web Chat",
+
             channel: "web",
+
             agent_id: "lyre",
+
             last_message_preview: "hi",
+
             last_message_time: 1,
+
+            archived: false,
+
+            pinned: false,
           },
         ]}
         selectedAgent="lyre"
-        selectedSession="s1"
+        selectedSession="chat:1"
         onSelectAgent={onSelectAgent}
         onSelectSession={onSelectSession}
         onTabChange={onTabChange}
@@ -97,7 +108,7 @@ describe("App shell", () => {
     fireEvent.click(screen.getByText("hi"));
 
     // Assert
-    expect(onSelectSession).toHaveBeenCalledWith("s1");
+    expect(onSelectSession).toHaveBeenCalledWith("chat:1");
     expect(sidebar().className).toContain("closed");
 
     // Arrange: tab tap
@@ -123,8 +134,9 @@ describe("App shell", () => {
     // Arrange: new session tap
     openSidebar();
 
-    // Act
+    // Act: the new-session button opens the optional name form
     fireEvent.click(screen.getByRole("button", { name: "New Session" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
 
     // Assert
     expect(onNewSession).toHaveBeenCalledTimes(1);
@@ -156,25 +168,47 @@ describe("App shell", () => {
         agents={[{ id: "lyre", label: "Lyre", is_default: true }]}
         sessions={[
           {
-            session_key: "s1",
-            label: "Web Chat",
+            session_key: "chat:1",
+
+            chat_id: 1,
+
+            name: "Web Chat",
+
             channel: "web",
+
             agent_id: "lyre",
+
             last_message_preview: "hi",
+
             last_message_time: 1,
+
+            archived: false,
+
+            pinned: false,
           },
           {
-            session_key: "s2",
-            label: "Dev",
+            session_key: "chat:2",
+
+            chat_id: 2,
+
+            name: "Dev",
+
             channel: "web",
+
             agent_id: "lyre",
+
             last_message_preview: "yo",
+
             last_message_time: 2,
+
+            archived: false,
+
+            pinned: false,
           },
         ]}
         selectedAgent="lyre"
-        selectedSession="s1"
-        unreadSessionKeys={new Set(["s2"])}
+        selectedSession="chat:1"
+        unreadSessionKeys={new Set(["chat:2"])}
       />,
     );
 
@@ -260,16 +294,27 @@ describe("App shell", () => {
         ]}
         sessions={[
           {
-            session_key: "s1",
-            label: "Web Chat",
+            session_key: "chat:1",
+
+            chat_id: 1,
+
+            name: "Web Chat",
+
             channel: "web",
+
             agent_id: "lyre",
+
             last_message_preview: "hi",
+
             last_message_time: 1,
+
+            archived: false,
+
+            pinned: false,
           },
         ]}
         selectedAgent="lyre"
-        selectedSession="s1"
+        selectedSession="chat:1"
         onSelectAgent={onSelectAgent}
         onSelectSession={onSelectSession}
         onNewSession={onNewSession}
@@ -281,19 +326,23 @@ describe("App shell", () => {
     expect(screen.getByText("AGENTS")).toBeTruthy();
     expect(screen.getByText("SESSIONS")).toBeTruthy();
     expect(screen.getByText("Lyre")).toBeTruthy();
-    // Session label is intentionally not rendered; only the preview is.
-    expect(screen.queryByText("Web Chat")).toBeNull();
+    // Named sessions show their display name; unnamed ones fall back to the preview.
+    expect(screen.getByText("Web Chat")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Chat" }).className).toContain(
       "active",
     );
 
-    fireEvent.click(screen.getByText("hi"));
-    expect(onSelectSession).toHaveBeenCalledWith("s1");
+    fireEvent.click(screen.getByText("Web Chat"));
+    expect(onSelectSession).toHaveBeenCalledWith("chat:1");
 
     fireEvent.click(screen.getByRole("button", { name: /open command palette/i }));
     expect(onOpenPalette).toHaveBeenCalledTimes(1);
 
     fireEvent.click(screen.getByRole("button", { name: "New Session" }));
-    expect(onNewSession).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByLabelText("New session name"), {
+      target: { value: "設計相談" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+    expect(onNewSession).toHaveBeenCalledWith("設計相談");
   });
 });

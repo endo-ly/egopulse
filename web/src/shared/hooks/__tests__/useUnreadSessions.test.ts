@@ -5,8 +5,11 @@ import type { SessionEntry } from "../../api/types";
 
 function session(overrides: Partial<SessionEntry>): SessionEntry {
   return {
-    session_key: "s1",
-    label: "Web Chat",
+    session_key: "chat:1",
+    chat_id: 1,
+    name: "Web Chat",
+    archived: false,
+    pinned: false,
     channel: "web",
     agent_id: "lyre",
     last_message_preview: "hi",
@@ -85,8 +88,8 @@ describe("useUnreadSessions", () => {
     // Arrange + Act: reload with the persisted read state.
     const { result: reloaded } = renderHook(() =>
       useUnreadSessions(
-        [session({}), session({ session_key: "s2", last_message_time: 200 })],
-        "s1",
+        [session({}), session({ session_key: "chat:2", last_message_time: 200 })],
+        "chat:1",
       ),
     );
 
@@ -99,11 +102,11 @@ describe("useUnreadSessions", () => {
     const { result, rerender } = renderHook(
       ({ sessions, selected }: { sessions: SessionEntry[]; selected: string }) =>
         useUnreadSessions(sessions, selected),
-      { initialProps: { sessions: [session({})], selected: "s1" } },
+      { initialProps: { sessions: [session({})], selected: "chat:1" } },
     );
 
     // Act: the open session receives a reply (visible on next poll).
-    rerender({ sessions: [session({ last_message_time: 500 })], selected: "s1" });
+    rerender({ sessions: [session({ last_message_time: 500 })], selected: "chat:1" });
 
     // Assert: the open chat never flags itself unread.
     expect(result.current.size).toBe(0);

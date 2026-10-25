@@ -2245,7 +2245,7 @@ mod tests {
             Box::new(provider.clone()),
         ));
         let chat_id = call_blocking(Arc::clone(&state.db), |db| {
-            db.resolve_or_create_chat_id("cli", "invalid-payloads", None, "cli", "default")
+            db.resolve_or_create_chat_id("cli", "invalid-payloads", "cli", "default")
         })
         .await
         .expect("create chat");
@@ -2630,13 +2630,8 @@ mod tests {
             Box::new(final_provider()),
         ));
         let turn_id = call_blocking(Arc::clone(&state.db), |db| {
-            let chat_id = db.resolve_or_create_chat_id(
-                "cli",
-                "invalid-payload-retry",
-                None,
-                "cli",
-                "default",
-            )?;
+            let chat_id =
+                db.resolve_or_create_chat_id("cli", "invalid-payload-retry", "cli", "default")?;
             match db.accept_or_get_turn(AcceptTurnParams {
                 chat_id,
                 request_key: "invalid-retry",

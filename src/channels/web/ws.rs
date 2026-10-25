@@ -1686,7 +1686,6 @@ mod tests {
             .resolve_or_create_chat_id(
                 "web",
                 "web:active-follow-up:agent:default",
-                None,
                 "web",
                 "default",
             )

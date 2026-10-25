@@ -626,13 +626,7 @@ mod tests {
         assert_eq!(first, "hello back");
         assert_eq!(second, "hello back");
         let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
-            db.resolve_or_create_chat_id(
-                "cli",
-                "cli:dup-accept:agent:default",
-                Some("dup-accept"),
-                "cli",
-                "default",
-            )
+            db.resolve_or_create_chat_id("cli", "cli:dup-accept:agent:default", "cli", "default")
         })
         .await
         .expect("chat id");
@@ -669,7 +663,6 @@ mod tests {
                 db.resolve_or_create_chat_id(
                     "cli",
                     &format!("cli:{session}:agent:default"),
-                    Some(&session),
                     "cli",
                     "default",
                 )
@@ -759,7 +752,6 @@ mod tests {
                 db.resolve_or_create_chat_id(
                     "cli",
                     &format!("cli:{session}:agent:default"),
-                    Some(&session),
                     "cli",
                     "default",
                 )

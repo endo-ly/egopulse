@@ -338,7 +338,7 @@ mod tests {
 
         let db = Arc::new(Database::new(&dir.path().join("egopulse.db")).expect("database"));
         let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:attachment", None, "cli", "default")
+            .resolve_or_create_chat_id("cli", "cli:attachment", "cli", "default")
             .expect("chat id");
         let tool = SendAttachmentTool::new(
             dir.path().to_path_buf(),

@@ -1208,7 +1208,7 @@ mod tests {
         // turn_runs.chat_id has no FK, but mirror the production setup by
         // creating a chat so the row is realistic.
         let chat_id = db
-            .resolve_or_create_chat_id("cli", "cli:turn-run", None, "cli", "default")
+            .resolve_or_create_chat_id("cli", "cli:turn-run", "cli", "default")
             .expect("create chat");
         assert_eq!(chat_id, 1, "expected the seeded chat to be chat_id 1");
         (db, dir)

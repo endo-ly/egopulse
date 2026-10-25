@@ -7,6 +7,7 @@ import { SessionsSection } from "./shell/SessionsSection";
 import type { HealthStatus } from "./runtimeStatus";
 import type { TabId } from "./navigation";
 import type { AgentEntry, SessionEntry } from "../shared/api/types";
+import type { SessionPatch } from "../shared/api/sessions";
 
 export interface AppProps {
   agents?: AgentEntry[];
@@ -19,7 +20,8 @@ export interface AppProps {
   onSelectSession?: (key: string) => void;
   onTabChange?: (tab: TabId) => void;
   onOpenPalette?: () => void;
-  onNewSession?: () => void;
+  onNewSession?: (name?: string) => void;
+  onUpdateSession?: (chatId: number, patch: SessionPatch) => void;
   main?: ReactNode;
   authToken?: string;
   agentAvatars?: Readonly<Record<string, string>>;
@@ -45,6 +47,7 @@ export function App({
   onTabChange = noop,
   onOpenPalette = noop,
   onNewSession = noop,
+  onUpdateSession,
   main,
   authToken,
   agentAvatars,
@@ -147,8 +150,8 @@ export function App({
     onSelectSession(key);
     dismissOverlayOnMobile();
   };
-  const handleNewSession = () => {
-    onNewSession();
+  const handleNewSession = (name?: string) => {
+    onNewSession(name);
     dismissOverlayOnMobile();
   };
 
@@ -182,6 +185,7 @@ export function App({
               selectedSession={selectedSession}
               onSelectSession={handleSelectSession}
               onNewSession={handleNewSession}
+              onUpdateSession={onUpdateSession}
               unreadSessionKeys={unreadSessionKeys}
             />
           }

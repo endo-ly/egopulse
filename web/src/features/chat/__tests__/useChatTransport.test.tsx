@@ -51,6 +51,7 @@ class FakeWebSocket {
 function setup(
   options: {
     sessionKey?: string;
+    onSessionAccepted?: (sessionKey: string, sourceSessionKey: string) => void;
     onSessionResolved?: (sessionKey: string) => void;
   } = {},
 ) {
@@ -60,6 +61,9 @@ function setup(
     authToken: "token",
     onAuthRequired: vi.fn(),
     onError: vi.fn(),
+    ...(options.onSessionAccepted
+      ? { onSessionAccepted: options.onSessionAccepted }
+      : {}),
     onSessionResolved: options.onSessionResolved,
   };
   return renderHook((props) => useChatTransport(props ?? initialProps), {
@@ -793,8 +797,10 @@ describe("useChatTransport reconnect", () => {
   });
 
   it("chat_transport_ack_from_a_left_session_shows_no_progress", async () => {
+    const onSessionAccepted = vi.fn();
     const onSessionResolved = vi.fn();
     const { result, ws, rerender } = await connectOpen({
+      onSessionAccepted,
       onSessionResolved,
     });
 
@@ -813,6 +819,7 @@ describe("useChatTransport reconnect", () => {
         authToken: "token",
         onAuthRequired: vi.fn(),
         onError: vi.fn(),
+        onSessionAccepted,
         onSessionResolved,
       });
     });
@@ -824,7 +831,7 @@ describe("useChatTransport reconnect", () => {
         type: "res",
         id: rpcId,
         ok: true,
-        payload: { runId: "run-a" },
+        payload: { runId: "run-a", sessionKey: "chat:42" },
       });
       await pending;
     });
@@ -861,7 +868,149 @@ describe("useChatTransport reconnect", () => {
     // displayed session.
     expect(result.current.state.messages).toHaveLength(0);
     expect(isWaitingForAssistant(result.current.state)).toBe(false);
+    expect(onSessionAccepted).toHaveBeenCalledWith("chat:42", "s1");
     expect(onSessionResolved).not.toHaveBeenCalled();
+  });
+
+  it("chat_transport_resolves_the_canonical_session_on_ack_and_keeps_streaming", async () => {
+    const onSessionResolved = vi.fn();
+    const { result, ws, rerender } = await connectOpen({
+      sessionKey: "web:new-chat",
+      onSessionResolved,
+    });
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+    expect(result.current.state.messages).toHaveLength(1);
+
+    // Act: the ack resolves the session before any terminal event, so a
+    // later turn failure cannot lose the canonical key or the pending name.
+    act(() => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "chat:42" },
+      });
+    });
+    await act(async () => {
+      await pending;
+    });
+
+    expect(onSessionResolved).toHaveBeenCalledTimes(1);
+    expect(onSessionResolved).toHaveBeenCalledWith("chat:42");
+
+    // The parent now adopts the canonical key; the draft transcript must not
+    // be reset by that transition.
+    act(() => {
+      rerender({
+        sessionKey: "chat:42",
+        agentId: "default",
+        authToken: "token",
+        onAuthRequired: vi.fn(),
+        onError: vi.fn(),
+        onSessionResolved,
+      });
+    });
+    expect(result.current.state.messages.map((message) => message.content)).toEqual([
+      "hello",
+    ]);
+
+    // Streaming resumes under the canonical key without a second resolution.
+    act(() => {
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 1,
+          state: "delta",
+          message: assistantMessage("turn:a:assistant:1", "Hi"),
+        },
+      });
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 2,
+          state: "error",
+          terminal: true,
+          errorMessage: "model failed",
+        },
+      });
+    });
+
+    expect(onSessionResolved).toHaveBeenCalledTimes(1);
+    expect(result.current.state.messages.map((message) => message.content)).toEqual([
+      "hello",
+      "Hi",
+    ]);
+  });
+
+  it("chat_transport_does_not_resolve_the_same_send_twice", async () => {
+    const onSessionResolved = vi.fn();
+    const { result, ws, rerender } = await connectOpen({
+      sessionKey: "web:new-chat",
+      onSessionResolved,
+    });
+
+    let pending!: Promise<string | null>;
+    await act(async () => {
+      pending = result.current.sendMessage("hello", "draft-1");
+    });
+
+    // Act: the ack and the terminal event arrive before React can adopt the
+    // canonical key.
+    act(() => {
+      ws.receive({
+        type: "res",
+        id: lastSentChat(ws).id,
+        ok: true,
+        payload: { runId: "run-a", sessionKey: "chat:42" },
+      });
+      ws.receive({
+        type: "event",
+        event: "chat",
+        payload: {
+          runId: "run-a",
+          sessionKey: "chat:42",
+          seq: 2,
+          state: "done",
+          terminal: true,
+          message: assistantMessage("turn:a:assistant:1", "Hi"),
+        },
+      });
+    });
+    await act(async () => {
+      await pending;
+    });
+
+    // Assert
+    expect(onSessionResolved).toHaveBeenCalledTimes(1);
+    expect(result.current.state.messages.map((message) => message.content)).toEqual([
+      "hello",
+      "Hi",
+    ]);
+
+    act(() => {
+      rerender({
+        sessionKey: "chat:42",
+        agentId: "default",
+        authToken: "token",
+        onAuthRequired: vi.fn(),
+        onError: vi.fn(),
+        onSessionResolved,
+      });
+    });
+    expect(result.current.state.messages.map((message) => message.content)).toEqual([
+      "hello",
+      "Hi",
+    ]);
   });
 
   it("chat_transport_resolves_the_canonical_session_on_done_after_reconnect", async () => {

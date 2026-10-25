@@ -3,7 +3,7 @@
 //! 保存済みセッションを Web 向けのキー形式に正規化して返す。
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -11,11 +11,13 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
 use crate::agent_loop::message_format::{is_tool_preview_message, tool_preview_narration};
+use crate::conversation::{ConversationChanged, ConversationScope};
 use crate::storage::{SenderKind, StoredMessage, ToolCall, ToolState, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
 
 const MAX_LIMIT: usize = 500;
+const MAX_NAME_CHARS: usize = 200;
 
 pub(crate) fn parse_chat_id_from_session_key(key: &str) -> Option<i64> {
     key.strip_prefix("chat:")?.parse::<i64>().ok()
@@ -32,12 +34,35 @@ pub(super) struct HistoryQuery {
 /// Describes one persisted session as exposed to the web UI.
 pub(super) struct SessionItem {
     pub session_key: String,
-    pub label: String,
+    /// User-managed display name; `None` when the session is unnamed.
+    pub name: Option<String>,
     pub chat_id: i64,
     pub channel: String,
     pub agent_id: String,
     pub last_message_time: String,
     pub last_message_preview: Option<String>,
+    pub archived: bool,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Deserialize)]
+/// Request body for updating the user-facing session metadata.
+pub(super) struct UpdateSessionRequest {
+    /// Omitted leaves the name untouched; `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub name: Option<Option<String>>,
+    #[serde(default)]
+    pub archived: Option<bool>,
+    #[serde(default)]
+    pub pinned: Option<bool>,
+}
+
+/// Distinguishes "field omitted" from "field explicitly null" in JSON.
+fn deserialize_optional_field<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Lists persisted sessions that can be opened from the web UI.
@@ -64,18 +89,86 @@ pub(super) async fn list_sessions(
             // regardless of the agent-scoped `external_chat_id` shape.
             let session_key = format!("chat:{}", session.chat_id);
             SessionItem {
-                label: session.external_chat_id.clone(),
                 session_key,
+                name: session.chat_title,
                 chat_id: session.chat_id,
                 channel: session.channel,
                 agent_id: session.agent_id,
                 last_message_time: session.last_message_time,
                 last_message_preview: session.last_message_preview,
+                archived: session.archived,
+                pinned: session.pinned,
             }
         })
         .collect::<Vec<_>>();
 
     Ok(Json(serde_json::json!({"ok": true, "sessions": items})))
+}
+
+/// Updates the display name, archive flag, or pin flag of one session.
+pub(super) async fn update_session(
+    State(state): State<WebState>,
+    Path(chat_id): Path<i64>,
+    Json(request): Json<UpdateSessionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if request.name.is_none() && request.archived.is_none() && request.pinned.is_none() {
+        return Err(bad_request(
+            "at least one of name, archived, pinned is required",
+        ));
+    }
+    let name = match request.name {
+        Some(Some(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(bad_request("name must not be empty"));
+            }
+            if trimmed.chars().count() > MAX_NAME_CHARS {
+                return Err(bad_request("name is too long"));
+            }
+            Some(Some(trimmed.to_string()))
+        }
+        Some(None) => Some(None),
+        None => None,
+    };
+
+    let db = Arc::clone(&state.app_state.db);
+    let updated = match call_blocking(db, move |db| {
+        db.update_chat_display_meta(chat_id, name, request.archived, request.pinned)
+    })
+    .await
+    {
+        Ok(updated) => updated,
+        Err(error) => {
+            tracing::warn!(error = %error, chat_id, "failed to update session metadata");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
+            ));
+        }
+    };
+    if !updated {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ok": false, "error": "session not found"})),
+        ));
+    }
+
+    state
+        .app_state
+        .conversation_events
+        .publish(ConversationChanged {
+            scope: ConversationScope::Normal,
+            chat_id,
+        });
+
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
+fn bad_request(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"ok": false, "error": message})),
+    )
 }
 
 /// Returns recent messages for a normalized web session.
@@ -264,8 +357,13 @@ fn tool_call_entry(tool_call: &ToolCall) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{get_history, list_sessions, parse_chat_id_from_session_key};
-    use axum::extract::{Query, State as AxumState};
+    use super::{
+        UpdateSessionRequest, get_history, list_sessions, parse_chat_id_from_session_key,
+        update_session,
+    };
+    use axum::Json;
+    use axum::extract::{Path, Query, State as AxumState};
+    use axum::http::StatusCode;
 
     use crate::channels::web::{RunHub, WebState};
     use crate::error::LlmError;
@@ -360,6 +458,198 @@ mod tests {
         assert!(agent_ids.contains(&"lyre"));
         assert!(agent_ids.contains(&"ace"));
         assert!(agent_ids.contains(&"vega"));
+    }
+
+    #[tokio::test]
+    async fn api_sessions_exposes_name_and_organization_state() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
+
+        // Act
+        let result = list_sessions(AxumState(web_state.clone()))
+            .await
+            .expect("ok");
+
+        // Assert
+        let sessions = result.0["sessions"].as_array().expect("sessions").clone();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["chat_id"], chat_id);
+        assert!(sessions[0]["name"].is_null());
+        assert_eq!(sessions[0]["archived"], false);
+        assert_eq!(sessions[0]["pinned"], false);
+    }
+
+    #[tokio::test]
+    async fn update_session_sets_and_clears_name() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
+
+        // Act
+        let _ = update_session(
+            AxumState(web_state.clone()),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: Some(Some("  設計相談  ".to_string())),
+                archived: None,
+                pinned: None,
+            }),
+        )
+        .await
+        .expect("rename ok");
+
+        // Assert
+        let sessions = list_sessions(AxumState(web_state.clone()))
+            .await
+            .expect("ok");
+        assert_eq!(sessions.0["sessions"][0]["name"], "設計相談");
+
+        // Act: clear the name
+        let _ = update_session(
+            AxumState(web_state.clone()),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: Some(None),
+                archived: None,
+                pinned: None,
+            }),
+        )
+        .await
+        .expect("clear ok");
+
+        // Assert
+        let sessions = list_sessions(AxumState(web_state)).await.expect("ok");
+        assert!(sessions.0["sessions"][0]["name"].is_null());
+    }
+
+    #[tokio::test]
+    async fn update_session_toggles_archive_and_pin_independently() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
+
+        // Act
+        let _ = update_session(
+            AxumState(web_state.clone()),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: None,
+                archived: Some(true),
+                pinned: Some(true),
+            }),
+        )
+        .await
+        .expect("archive and pin ok");
+
+        // Assert: pin state survives archiving
+        let sessions = list_sessions(AxumState(web_state.clone()))
+            .await
+            .expect("ok");
+        assert_eq!(sessions.0["sessions"][0]["archived"], true);
+        assert_eq!(sessions.0["sessions"][0]["pinned"], true);
+
+        // Act: unarchive only
+        let _ = update_session(
+            AxumState(web_state.clone()),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: None,
+                archived: Some(false),
+                pinned: None,
+            }),
+        )
+        .await
+        .expect("unarchive ok");
+
+        // Assert
+        let sessions = list_sessions(AxumState(web_state)).await.expect("ok");
+        assert_eq!(sessions.0["sessions"][0]["archived"], false);
+        assert_eq!(sessions.0["sessions"][0]["pinned"], true);
+    }
+
+    #[tokio::test]
+    async fn update_session_publishes_conversation_change() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
+        let mut events = web_state.app_state.conversation_events.subscribe();
+
+        // Act
+        let _ = update_session(
+            AxumState(web_state),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: Some(Some("named".to_string())),
+                archived: None,
+                pinned: None,
+            }),
+        )
+        .await
+        .expect("rename ok");
+
+        // Assert
+        let event = events.recv().await.expect("conversation change");
+        assert_eq!(event.chat_id, chat_id);
+    }
+
+    #[tokio::test]
+    async fn update_session_rejects_invalid_requests() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-1:agent:lyre", "lyre");
+
+        // Act / Assert: empty name
+        let empty = update_session(
+            AxumState(web_state.clone()),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: Some(Some("   ".to_string())),
+                archived: None,
+                pinned: None,
+            }),
+        )
+        .await;
+        assert_eq!(empty.expect_err("empty name").0, StatusCode::BAD_REQUEST);
+
+        // Act / Assert: no fields
+        let none = update_session(
+            AxumState(web_state.clone()),
+            Path(chat_id),
+            Json(UpdateSessionRequest {
+                name: None,
+                archived: None,
+                pinned: None,
+            }),
+        )
+        .await;
+        assert_eq!(none.expect_err("no fields").0, StatusCode::BAD_REQUEST);
+
+        // Act / Assert: unknown session
+        let missing = update_session(
+            AxumState(web_state),
+            Path(chat_id + 999),
+            Json(UpdateSessionRequest {
+                name: None,
+                archived: Some(true),
+                pinned: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            missing.expect_err("missing session").0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[tokio::test]

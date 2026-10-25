@@ -8,11 +8,15 @@ export interface AgentEntry {
 
 export interface SessionEntry {
   session_key: string;
-  label: string;
+  chat_id: number;
+  /** User-managed display name; null when the session is unnamed. */
+  name: string | null;
   channel: string;
   agent_id: string;
   last_message_preview: string;
   last_message_time: number;
+  archived: boolean;
+  pinned: boolean;
 }
 
 export interface ChatMessage {
