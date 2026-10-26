@@ -209,6 +209,39 @@ const SESSIONS: MockSession[] = SESSION_SOURCE.map((session) => ({
   pinned: PINNED_CHATS.has(session.chat_id),
 }));
 
+const UNREAD_SEED_KEYS = ["dev-discussion", "morning-notes"] as const;
+const UNREAD_SEED_MARKER_KEY = "egopulse.mockUnreadSeed.v1";
+// Re-seed once per dev-server start; later reloads keep the read state.
+const UNREAD_SEED_ID = String(Date.now());
+
+function unreadSeedScript(): string {
+  const seed: Record<string, number> = {};
+  for (const key of UNREAD_SEED_KEYS) {
+    const session = SESSION_SOURCE.find(
+      (candidate) => candidate.session_key === key,
+    );
+    if (session) seed[key] = Date.parse(session.last_message_time) - 60_000;
+  }
+  return `(() => {
+  try {
+    const markerKey = ${JSON.stringify(UNREAD_SEED_MARKER_KEY)};
+    const seedId = ${JSON.stringify(UNREAD_SEED_ID)};
+    if (localStorage.getItem(markerKey) === seedId) return;
+    const key = "egopulse.lastSeen.v1";
+    const raw = localStorage.getItem(key);
+    const stored = raw ? JSON.parse(raw) : {};
+    if (typeof stored !== "object" || stored === null) return;
+    for (const [session, seen] of Object.entries(${JSON.stringify(seed)})) {
+      stored[session] = seen;
+    }
+    localStorage.setItem(key, JSON.stringify(stored));
+    localStorage.setItem(markerKey, seedId);
+  } catch {
+    return;
+  }
+})();`;
+}
+
 const MARKDOWN_SHOWCASE = [
   "# 見出しレベル 1",
   "",
@@ -692,6 +725,16 @@ export function mockApiPlugin(): Plugin | null {
 
   return {
     name: "egopulse-mock-api",
+    apply: "serve",
+    transformIndexHtml() {
+      return [
+        {
+          tag: "script",
+          injectTo: "head-prepend",
+          children: unreadSeedScript(),
+        },
+      ];
+    },
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = req.url ?? "";

@@ -637,6 +637,7 @@
   }
 
   .session-channel {
+    position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -689,6 +690,14 @@
     background: rgba(251, 191, 36, 0.12);
   }
 
+  .session-channel-dot {
+    position: absolute;
+    right: -3px;
+    bottom: -3px;
+    border: 2px solid var(--color-bg);
+    border-radius: var(--radius-full);
+  }
+
   .session-preview {
     flex: 1;
     min-width: 0;
@@ -697,10 +706,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-
-  .session-item.unread .session-preview {
-    color: var(--color-muted);
   }
 
   .session-text {
@@ -722,7 +727,6 @@
   }
 
   .session-item.unread .session-title {
-    color: var(--color-text-strong);
     font-weight: 700;
   }
 

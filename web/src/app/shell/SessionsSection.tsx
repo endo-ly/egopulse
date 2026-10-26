@@ -9,6 +9,7 @@ import {
 import { createPortal } from "react-dom";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
+import { StatusDot } from "../../shared/ui/StatusDot";
 import { channelLabel, channelShortLabel } from "../../shared/lib/format";
 
 import { sessionSubtitle, sessionTitle } from "../../shared/lib/session";
@@ -260,10 +261,17 @@ function SessionRow({
             className="session-channel"
             data-channel={session.channel}
             role="img"
-            aria-label={channelLabel(session.channel)}
+            aria-label={
+              unread
+                ? `${channelLabel(session.channel)} (unread)`
+                : channelLabel(session.channel)
+            }
             title={channelLabel(session.channel)}
           >
             {channelShortLabel(session.channel)}
+            {unread ? (
+              <StatusDot tone="unread" className="session-channel-dot" />
+            ) : null}
           </span>
           {renaming ? (
             <input

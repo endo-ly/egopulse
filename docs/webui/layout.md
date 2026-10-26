@@ -85,7 +85,7 @@ Sidebar の第1セクション。必ず表示する。
   - `unread`（accent 色、アニメーションなし）：未読の返事がある session を持つ agent
   - `idle`（muted-2 色）：未読なし
 - 未読の判定はフロントのみで行う（`useUnreadSessions`）。各 session の `last_message_time` が初見以降に進み、かつ選択中でなければ未読。開いた session は既読化する。既読時刻は `localStorage`（`egopulse.lastSeen.v1`）に保存し、リロード後も維持する。初回ロード時は全面青を避けるため現状を既読として初期化する
-- 未読 session の行はタイトルを太字・強テキスト色で強調する（Discord の未読チャンネル相当）。preview は subdued のまま
+- 未読 session の行はタイトルを太字にし、channel ミニバッジの右下に `unread` ドットを重ねる（Discord の未読チャンネル相当）。preview は subdued のまま
 - **agent アイコン**：ユーザーがデバイスから画像をアップロードできる（[api.md §2.11](../api.md#211-agent-avatar)）
   - アイコン設定済み：行左端に 24px 円形アイコンを表示し、StatusDot はその右下に小さく重ねる
   - 未設定：従来どおり StatusDot のみ
@@ -127,7 +127,7 @@ SESSIONS  [All ▼]
 #### Session Item
 
 - 枠線・背景を持たない 2 行構成（タイトル + preview）・細身（縦余白は極小）
-- 先頭に channel のミニバッジ（16px の単一文字 `W` / `D` / `T` / `C` / `U` / `V`、channel ごとの色）。正式名は tooltip と `aria-label` で示す
+- 先頭に channel のミニバッジ（16px の単一文字 `W` / `D` / `T` / `C` / `U` / `V`、channel ごとの色）。未読時はバッジ右下に accent のドットを重ねる。正式名は tooltip と `aria-label` で示す
 - 表示名（`name` → 最終メッセージの先頭1行 → `Untitled`）と、その下に最終メッセージの先頭1行を小さめの subdued テキストで表示する
 - 最終更新時刻は行内に表示しない（`last_message_time` は未読判定にのみ使う）
 - 行末の `⋯` ボタン、または右クリックで操作メニュー（Rename / Pin / Archive / Copy session ID）を開く

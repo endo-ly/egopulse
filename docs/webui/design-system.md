@@ -196,12 +196,12 @@ SESSIONS リストの channel 識別子は例外として、16px の単一文字
 
 ### 9.3 Status Dot
 
-agent の未読状態・runtime health の簡易表示に使う小円（8px 程度）。
+agent・session の未読状態や runtime health の簡易表示に使う小円（8px 程度）。
 
 | 色 | 意味 |
 |---|---|
 | live（accent + pulse アニメーション） | 稼働中（runtime health・sleep run 状態用。agent 行では使わない） |
-| unread（accent、アニメーションなし） | 未読の返事あり（agent 行用） |
+| unread（accent、アニメーションなし） | 未読の返事あり（agent 行・session の channel バッジ用） |
 | idle（muted-2） | 待機中 |
 | error（danger） | 直近でエラー |
 
