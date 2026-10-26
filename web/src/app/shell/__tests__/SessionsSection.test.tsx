@@ -160,7 +160,33 @@ describe("SessionsSection", () => {
     cleanup();
   });
 
-  it("sessions_section_shows_the_last_message_time", () => {
+  it("sessions_section_shows_compact_channel_badges", () => {
+    // Arrange
+    const sessions: SessionEntry[] = [
+      { ...SESSIONS[0], channel: "web" },
+      { ...SESSIONS[1], channel: "discord" },
+      { ...SESSIONS[2], agent_id: "lyre", channel: "cli" },
+    ];
+    render(
+      <SessionsSection
+        sessions={sessions}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+      />,
+    );
+
+    // Act
+    const list = document.querySelector(".sessions-list") as HTMLElement;
+
+    // Assert
+    expect(within(list).getByLabelText("Web").textContent).toBe("W");
+    expect(within(list).getByLabelText("Discord").textContent).toBe("D");
+    expect(within(list).getByLabelText("CLI").textContent).toBe("C");
+    cleanup();
+  });
+
+  it("sessions_section_omits_the_last_message_time", () => {
     // Arrange
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-04T12:00:00Z"));
@@ -180,10 +206,10 @@ describe("SessionsSection", () => {
     );
 
     // Act
-    const time = screen.getByText("5m");
+    const list = document.querySelector(".sessions-list") as HTMLElement;
 
     // Assert
-    expect(time.className).toContain("session-time");
+    expect(within(list).queryByText("5m")).toBeNull();
     cleanup();
   });
 

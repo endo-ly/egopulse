@@ -7,9 +7,26 @@ const CHANNEL_LABELS: Record<string, string> = {
   voice: "Voice",
 };
 
+const CHANNEL_SHORT_LABELS: Record<string, string> = {
+  web: "W",
+  discord: "D",
+  telegram: "T",
+  cli: "C",
+  tui: "U",
+  voice: "V",
+};
+
 /** Returns a human-friendly label for a session channel id. */
 export function channelLabel(channel: string): string {
   return CHANNEL_LABELS[channel] ?? channel;
+}
+
+/** Returns the compact single-letter form used by the session list. */
+export function channelShortLabel(channel: string): string {
+  return (
+    CHANNEL_SHORT_LABELS[channel] ??
+    channelLabel(channel).slice(0, 1).toUpperCase()
+  );
 }
 
 export function formatTokens(n: number): string {

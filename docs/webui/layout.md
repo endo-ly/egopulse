@@ -85,7 +85,7 @@ Sidebar の第1セクション。必ず表示する。
   - `unread`（accent 色、アニメーションなし）：未読の返事がある session を持つ agent
   - `idle`（muted-2 色）：未読なし
 - 未読の判定はフロントのみで行う（`useUnreadSessions`）。各 session の `last_message_time` が初見以降に進み、かつ選択中でなければ未読。開いた session は既読化する。既読時刻は `localStorage`（`egopulse.lastSeen.v1`）に保存し、リロード後も維持する。初回ロード時は全面青を避けるため現状を既読として初期化する
-- 未読 session の行は preview を太字・強テキスト色で強調する（Discord の未読チャンネル相当）
+- 未読 session の行はタイトルを太字・強テキスト色で強調する（Discord の未読チャンネル相当）。preview は subdued のまま
 - **agent アイコン**：ユーザーがデバイスから画像をアップロードできる（[api.md §2.11](../api.md#211-agent-avatar)）
   - アイコン設定済み：行左端に 24px 円形アイコンを表示し、StatusDot はその右下に小さく重ねる
   - 未設定：従来どおり StatusDot のみ
@@ -117,17 +117,19 @@ Sidebar の第2セクション。
 
 ```
 SESSIONS  [All ▼]
-  ▸ [web]      preview…
-  ▸ [discord]  preview…
-  ▸ [cli]      preview…
-  ▸ [tui]      preview…
+  [W] Web Chat
+      今日のタスク…
+  [D] Dev
+      design discussion…
+  [C] Morning notes
 ```
 
 #### Session Item
 
-- 枠線・背景を持たない 1 行構成・細身（縦余白は極小）
-- channel badge（コンパクト表示）+ 表示名（`name` → 最終メッセージの先頭1行 → `Untitled`）
-- 表示名の右に最終更新時刻を相対表示する（`now` / `5m` / `3h` / `2d`）。名前付きセッションでは最終メッセージの先頭1行を副次行に表示する
+- 枠線・背景を持たない 2 行構成（タイトル + preview）・細身（縦余白は極小）
+- 先頭に channel のミニバッジ（16px の単一文字 `W` / `D` / `T` / `C` / `U` / `V`、channel ごとの色）。正式名は tooltip と `aria-label` で示す
+- 表示名（`name` → 最終メッセージの先頭1行 → `Untitled`）と、その下に最終メッセージの先頭1行を小さめの subdued テキストで表示する
+- 最終更新時刻は行内に表示しない（`last_message_time` は未読判定にのみ使う）
 - 行末の `⋯` ボタン、または右クリックで操作メニュー（Rename / Pin / Archive / Copy session ID）を開く
 - hover で背景ハイライト、選択中はアクセント2色の背景チントで強調表示
 - label（session key 等の ID 的表記）は表示しない

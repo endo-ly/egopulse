@@ -190,7 +190,9 @@ body の背景は、左上を中心とした放射状のアクセント色グラ
 
 ### 9.2 Badge
 
-channel 名・status・trigger_type 等の短いラベル表示用。高さは 20px 程度、小テキスト・uppercase・letter-spacing 強調。channel 系バッジは channel 名を統一の muted 表現で示す（channel 毎に色を変えない）。
+channel 名・status・trigger_type 等の短いラベル表示用。高さは 20px 程度、小テキスト・uppercase・letter-spacing 強調。一般的な channel 系バッジ（ReadOnlyBanner 等）は channel 名を統一の muted 表現で示す（channel 毎に色を変えない）。
+
+SESSIONS リストの channel 識別子は例外として、16px の単一文字ミニバッジ（`W` / `D` / `T` / `C` / `U` / `V`）に channel ごとの色を割り当てる。正式名は tooltip と `aria-label` で補う。
 
 ### 9.3 Status Dot
 

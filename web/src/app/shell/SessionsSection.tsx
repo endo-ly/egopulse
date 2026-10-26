@@ -7,16 +7,11 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
-import { Badge } from "../../shared/ui/Badge";
 import { Card } from "../../shared/ui/Card";
 import { EmptyState } from "../../shared/ui/EmptyState";
-import { channelLabel } from "../../shared/lib/format";
+import { channelLabel, channelShortLabel } from "../../shared/lib/format";
 
-import {
-  sessionSubtitle,
-  sessionTime,
-  sessionTitle,
-} from "../../shared/lib/session";
+import { sessionSubtitle, sessionTitle } from "../../shared/lib/session";
 import type { SessionEntry } from "../../shared/api/types";
 import type { SessionPatch } from "../../shared/api/sessions";
 
@@ -179,7 +174,6 @@ function SessionRow({
   }, [menu]);
 
   const subtitle = sessionSubtitle(session);
-  const time = sessionTime(session);
   const sessionId = `chat:${session.chat_id}`;
 
   const startRename = () => {
@@ -262,7 +256,15 @@ function SessionRow({
     <li onContextMenu={handleContextMenu}>
       <Card active={active} onClick={renaming ? undefined : onSelect}>
         <div className={`session-item${unread ? " unread" : ""}`}>
-          <Badge kind="channel">{channelLabel(session.channel)}</Badge>
+          <span
+            className="session-channel"
+            data-channel={session.channel}
+            role="img"
+            aria-label={channelLabel(session.channel)}
+            title={channelLabel(session.channel)}
+          >
+            {channelShortLabel(session.channel)}
+          </span>
           {renaming ? (
             <input
               className="session-rename-input"
@@ -286,17 +288,7 @@ function SessionRow({
             />
           ) : (
             <span className="session-text">
-              <span className="session-title-row">
-                <span className="session-title">{sessionTitle(session)}</span>
-                {time ? (
-                  <span
-                    className="session-time"
-                    title={new Date(session.last_message_time).toLocaleString()}
-                  >
-                    {time}
-                  </span>
-                ) : null}
-              </span>
+              <span className="session-title">{sessionTitle(session)}</span>
               {subtitle ? <span className="session-preview">{subtitle}</span> : null}
             </span>
           )}
