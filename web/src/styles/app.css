@@ -1048,6 +1048,53 @@
     width: 100%;
   }
 
+  .timeline-history-start {
+    align-self: center;
+    padding: var(--space-xs) var(--space-sm);
+    color: var(--color-muted-2);
+    font-size: var(--text-xs);
+  }
+
+  .timeline-older-loading,
+  .timeline-older-error {
+    position: absolute;
+    top: var(--space-md);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    max-width: min(360px, calc(100% - var(--space-xl)));
+    padding: var(--space-xs) var(--space-base);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-panel-2);
+    box-shadow: var(--shadow-modal);
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+  }
+
+  .timeline-older-error {
+    border-color: var(--color-danger);
+    color: var(--color-danger);
+  }
+
+  .timeline-older-error span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .timeline-older-error button {
+    padding: 2px var(--space-sm);
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-text);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+
   .jump-to-latest {
     /* Pinned just above the composer (chat-tab is the positioned ancestor),
        independent of scroll position. */
@@ -1210,6 +1257,10 @@
     display: flex;
     flex-direction: column;
     min-width: 0;
+    /* Skip layout/paint for rows far outside the viewport once the user has
+       scrolled deep into history. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 120px;
   }
 
   /* User bubbles hug their content on the right of the column. */

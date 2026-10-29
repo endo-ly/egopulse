@@ -62,8 +62,9 @@ interface MockSession {
 const SESSION_NAMES: Record<number, string> = {
   1: "Web Chat",
   2: "Design Discussion",
+  44: "Long History (2,000 rows)",
 };
-const PINNED_CHATS = new Set([1]);
+const PINNED_CHATS = new Set([1, 44]);
 const ARCHIVED_CHATS = new Set([4]);
 
 const SESSION_SOURCE = [
@@ -148,12 +149,12 @@ const SESSION_SOURCE = [
     last_message_preview: "extract user-facing strings into locale file",
   },
   {
-    session_key: "lyre-perf",
+    session_key: "long-history",
     chat_id: 44,
     channel: "web",
     agent_id: "lyre",
-    last_message_time: "2026-07-03T16:40:00.000Z",
-    last_message_preview: "virtualize long message lists",
+    last_message_time: "2026-07-04T11:00:00.000Z",
+    last_message_preview: "2,000 messages for pagination testing",
   },
   {
     session_key: "lyre-docs",
@@ -335,7 +336,16 @@ const MARKDOWN_SHOWCASE = [
 ].join(`
 `);
 
-const MESSAGES = [
+interface MockHistoryMessage {
+  id: string;
+  sender_id: string;
+  sender_kind: "user" | "assistant" | "system";
+  content: string;
+  timestamp: string;
+  message_kind: string;
+}
+
+const MESSAGES: MockHistoryMessage[] = [
   {
     id: "m1",
     sender_id: "user",
@@ -425,11 +435,11 @@ function hashSeed(value: string): number {
 
 // Builds a deterministic, distinct conversation for a session so the mock can
 // surface different content per session (the real backend serves real history).
-function historyFor(sessionKey: string) {
+function historyFor(sessionKey: string): MockHistoryMessage[] {
   const seed = hashSeed(sessionKey);
   const count = 8 + (seed % 14);
   const start = Date.parse("2026-07-04T08:00:00.000Z");
-  const messages: Array<Record<string, unknown>> = [];
+  const messages: MockHistoryMessage[] = [];
   for (let i = 0; i < count; i++) {
     const isUser = i % 2 === 0;
     const topic = SAMPLE_TOPICS[(seed + i) % SAMPLE_TOPICS.length];
@@ -446,6 +456,119 @@ function historyFor(sessionKey: string) {
     });
   }
   return messages;
+}
+
+// A long, deterministic conversation for exercising history pagination. The
+// real backend reaches these depths after months of use; the mock needs one
+// session with a comparable number of rows to verify scroll anchoring.
+const LONG_HISTORY_SESSION = "long-history";
+const LONG_HISTORY_ALIAS = "lyre-perf";
+const LONG_HISTORY_COUNT = 2_000;
+let longHistoryCache: MockHistoryMessage[] | null = null;
+
+function longHistory(): MockHistoryMessage[] {
+  if (longHistoryCache) return longHistoryCache;
+  const start = Date.parse("2025-10-01T09:00:00.000Z");
+  const messages: MockHistoryMessage[] = [];
+  for (let i = 0; i < LONG_HISTORY_COUNT; i++) {
+    const isUser = i % 2 === 0;
+    const timestamp = new Date(start + i * 120_000).toISOString();
+    if (i > 0 && i % 37 === 0) {
+      messages.push({
+        id: `perf-tool-${i}`,
+        sender_id: "lyre",
+        sender_kind: "assistant",
+        content: JSON.stringify({
+          tool: "read",
+          status: "success",
+          result: `history segment ${i}\n${"line\n".repeat(6)}`,
+          input: { path: `docs/history-${i}.md` },
+          duration_ms: 12 + (i % 80),
+        }),
+        timestamp,
+        message_kind: "tool_call",
+      });
+      continue;
+    }
+    messages.push({
+      id: `perf-m${i}`,
+      sender_id: isUser ? "user" : "lyre",
+      sender_kind: isUser ? "user" : "assistant",
+      content: isUser
+        ? `過去履歴の ${i + 1} 件目。ページングの検証用に長い会話を作っています。`
+        : `履歴 ${i + 1} 件目への返信です。\n\n**ポイント**\n\n- スクロール位置が飛ばないこと\n- 読み込み中の表示\n- 先頭到達の表示${
+            i % 25 === 0
+              ? "\n\n```rust\nfn main() { println!(\"history\"); }\n```\n"
+              : ""
+          }`,
+      timestamp,
+      message_kind: "text",
+    });
+  }
+  longHistoryCache = messages;
+  return messages;
+}
+
+interface MockHistoryEntry extends MockHistoryMessage {
+  seq: number;
+}
+
+const HISTORY_DEFAULT_LIMIT = 300;
+const HISTORY_MAX_LIMIT = 500;
+
+const KNOWN_SESSION_KEYS = new Set(
+  SESSION_SOURCE.map((session) => session.session_key),
+);
+
+function historyMessagesFor(sessionKey: string): MockHistoryMessage[] {
+  if (sessionKey === "web-chat" || sessionKey === "") return MESSAGES;
+  if (sessionKey === LONG_HISTORY_SESSION || sessionKey === LONG_HISTORY_ALIAS) {
+    return longHistory();
+  }
+  // Match the real backend: an unresolved/unknown web session has no history.
+  // This keeps a mistyped route from looking like a short conversation.
+  return KNOWN_SESSION_KEYS.has(sessionKey) ? historyFor(sessionKey) : [];
+}
+
+function withoutSeq(entry: MockHistoryEntry): MockHistoryMessage {
+  return {
+    id: entry.id,
+    sender_id: entry.sender_id,
+    sender_kind: entry.sender_kind,
+    content: entry.content,
+    timestamp: entry.timestamp,
+    message_kind: entry.message_kind,
+  };
+}
+
+function historyPage(
+  sessionKey: string,
+  limitParam: string | null,
+  beforeParam: string | null,
+) {
+  const entries: MockHistoryEntry[] = historyMessagesFor(sessionKey).map(
+    (message, index) => ({ ...message, seq: index + 1 }),
+  );
+  const requested = Number(limitParam ?? HISTORY_DEFAULT_LIMIT);
+  const limit = Number.isFinite(requested)
+    ? Math.min(Math.max(Math.trunc(requested), 1), HISTORY_MAX_LIMIT)
+    : HISTORY_DEFAULT_LIMIT;
+  const before = beforeParam === null ? null : Number(beforeParam);
+  const older =
+    before === null || !Number.isFinite(before)
+      ? entries
+      : entries.filter((entry) => entry.seq < before);
+  const page = older.slice(-limit);
+  const oldest = page[0]?.seq ?? null;
+  const newest = page[page.length - 1]?.seq ?? null;
+  const hasOlder =
+    oldest !== null && entries.some((entry) => entry.seq < oldest);
+  return {
+    ok: true,
+    messages: page.map(withoutSeq),
+    next_before_seq: hasOlder ? oldest : null,
+    newest_seq: newest,
+  };
 }
 
 // Mirrors src/channels/web/sleep.rs: field names (`trigger`, `session_count`)
@@ -814,11 +937,14 @@ export function mockApiPlugin(): Plugin | null {
         }
         if (pathname === "/api/history") {
           const sessionKey = parsed.searchParams.get("session_key") ?? "";
-          const messages =
-            sessionKey === "web-chat" || sessionKey === ""
-              ? MESSAGES
-              : historyFor(sessionKey);
-          return sendJson(res, { ok: true, messages });
+          return sendJson(
+            res,
+            historyPage(
+              sessionKey,
+              parsed.searchParams.get("limit"),
+              parsed.searchParams.get("before_seq"),
+            ),
+          );
         }
         if (pathname === "/api/sleep/runs") {
           const agentId = parsed.searchParams.get("agent_id") ?? "";

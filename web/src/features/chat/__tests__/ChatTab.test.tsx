@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render } from "@testing-library/react";
 import { ChatTab } from "../ChatTab";
 import type { ChatMessage } from "../../../shared/api/types";
@@ -81,5 +81,46 @@ describe("ChatTab", () => {
       <ChatTab channel="web" readOnly={false} messages={messages} />,
     );
     expect(withoutWaiting.container.querySelector(".thinking-dots")).toBeNull();
+  });
+
+  it("renders_older_history_progress_and_start_marker", () => {
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        messages={messages}
+        loadingOlder
+        atHistoryStart
+      />,
+    );
+
+    expect(container.querySelector(".timeline-older-loading")).toBeTruthy();
+    expect(container.querySelector(".timeline-history-start")?.textContent).toContain(
+      "Beginning of conversation",
+    );
+  });
+
+  it("retries_a_failed_older_page", () => {
+    // Arrange
+    const retry = vi.fn();
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        messages={messages}
+        olderError="request failed"
+        onRetryOlder={retry}
+      />,
+    );
+
+    // Act
+    const retryButton = container.querySelector(
+      ".timeline-older-error button",
+    ) as HTMLButtonElement;
+    expect(retryButton).toBeTruthy();
+    retryButton.click();
+
+    // Assert
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 });

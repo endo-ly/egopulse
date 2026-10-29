@@ -3,6 +3,7 @@ import { MessageBubble } from "./MessageBubble";
 import { ToolCard } from "./ToolCard";
 import { Composer } from "./Composer";
 import { ReadOnlyBanner } from "./ReadOnlyBanner";
+import { Spinner } from "../../shared/ui/Spinner";
 import type { ChatMessage, ToolEventData } from "../../shared/api/types";
 
 export interface ChatTabProps {
@@ -17,6 +18,16 @@ export interface ChatTabProps {
   agentAvatars?: Record<string, string>;
   /** Assistant progress as UI state: rendered as a typing indicator row. */
   waitingForAssistant?: boolean;
+  /** Loads the next older history page. */
+  onLoadOlder?: () => void;
+  /** Retries a failed older-page request. */
+  onRetryOlder?: () => void;
+  loadingOlder?: boolean;
+  olderError?: string | null;
+  /** True once the loaded history reaches the first committed message. */
+  atHistoryStart?: boolean;
+  /** Bumped after older messages are prepended. */
+  olderLoadSeq?: number;
 }
 
 function parseToolEvent(message: ChatMessage): ToolEventData | null {
@@ -56,10 +67,21 @@ export function ChatTab({
   jumpRequest,
   agentAvatars,
   waitingForAssistant = false,
+  onLoadOlder,
+  onRetryOlder,
+  loadingOlder = false,
+  olderError = null,
+  atHistoryStart = false,
+  olderLoadSeq = 0,
 }: ChatTabProps) {
   return (
     <div className="chat-tab">
-      <Timeline jumpRequest={jumpRequest}>
+      <Timeline
+        jumpRequest={jumpRequest}
+        onReachTop={onLoadOlder}
+        atHistoryStart={atHistoryStart}
+        prependSeq={olderLoadSeq}
+      >
         {messages.map((m) => {
           const toolEvent = parseToolEvent(m);
           if (toolEvent) {
@@ -83,6 +105,22 @@ export function ChatTab({
           </div>
         )}
       </Timeline>
+      {loadingOlder && (
+        <div className="timeline-older-loading" role="status" aria-live="polite">
+          <Spinner size="sm" />
+          <span>Loading earlier messages…</span>
+        </div>
+      )}
+      {olderError && !loadingOlder && (
+        <div className="timeline-older-error" role="alert">
+          <span>{olderError}</span>
+          {onRetryOlder && (
+            <button type="button" onClick={onRetryOlder}>
+              Retry
+            </button>
+          )}
+        </div>
+      )}
       <div className="composer">
         {readOnly ? (
           <ReadOnlyBanner channel={channel} />

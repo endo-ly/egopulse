@@ -224,7 +224,7 @@ PATCH /api/sessions/{chat_id}
 ### 2.6 メッセージ履歴
 
 ```text
-GET /api/history?session_key=main&limit=100
+GET /api/history?session_key=main&limit=300&before_seq=6524
 ```
 
 #### クエリパラメータ
@@ -232,7 +232,10 @@ GET /api/history?session_key=main&limit=100
 | パラメータ | 必須 | デフォルト | 最大 | 説明 |
 |-----------|:---:|----------|------|------|
 | `session_key` | 任意 | `"main"` | | セッション識別キー |
-| `limit` | 任意 | `100` | `500` | 取得メッセージ数 |
+| `limit` | 任意 | `300` | `500` | 取得する committed message の行数（最小 1） |
+| `before_seq` | 任意 | なし | | この `seq` より古い行を取得する（exclusive）。省略時は最新ページ |
+
+`limit` は DB の `messages` 行数であり、レスポンスの表示エントリ数ではない。ツールプレビューは応答から除外され、ツールカードは親メッセージの後ろに追加されるため、表示件数は行数と一致しない。
 
 #### レスポンス (200)
 
@@ -249,9 +252,13 @@ GET /api/history?session_key=main&limit=100
       "timestamp": "2026-04-12T14:00:06Z",
       "message_kind": "tool_call"
     }
-  ]
+  ],
+  "next_before_seq": 6225,
+  "newest_seq": 6524
 }
 ```
+
+`next_before_seq` はページ内の最も古い `seq` で、次の古いページを取得する際の `before_seq` にそのまま渡す。先頭メッセージまで到達している場合、またはページが空の場合は `null`。`newest_seq` はページ内の最も新しい `seq` で、ページが空の場合は `null`。`seq` は chat 内の因果順序（`docs/db.md` の `messages.seq`）であり、削除などで欠番になり得るため、カーソルは「1 を引く」のではなく exclusive 比較で扱う。
 
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 

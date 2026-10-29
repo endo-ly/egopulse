@@ -30,6 +30,15 @@ export interface ChatMessage {
   runId?: string;
 }
 
+/** One page of committed chat history returned by `GET /api/history`. */
+export interface HistoryPage {
+  messages: ChatMessage[];
+  /** Exclusive seq cursor for the next older page; null at the beginning. */
+  nextBeforeSeq: number | null;
+  /** Highest committed seq in this page; null for an empty chat. */
+  newestSeq: number | null;
+}
+
 export interface ToolEventData {
   name: string;
   state: "pending" | "success" | "error";

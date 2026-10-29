@@ -6,10 +6,10 @@ import { ChatTab } from "../features/chat/ChatTab";
 import { SleepBatchPanel } from "../features/sleep/SleepBatchPanel";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
+import { useChatHistory } from "../features/chat/useChatHistory";
 import { isWaitingForAssistant, mergeChatMessages } from "../features/chat/chatReducer";
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
-import { fetchHistory } from "../shared/api/history";
 import { createSessionKey, fetchSessions, updateSession } from "../shared/api/sessions";
 import type { SessionPatch } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
@@ -91,29 +91,25 @@ export function WebUI() {
   const sessionsState = useServerState("sessions", () => fetchSessions(authToken), {
     pollIntervalMs: 60_000,
   });
-  const historyState = useServerState(
-    `history:${selectedSession}`,
-    () => fetchHistory(authToken, selectedSession),
-    { pollIntervalMs: 60_000 },
-  );
+  const history = useChatHistory(selectedSession, authToken);
 
   const agents = agentsState.data ?? [];
   const sessions = sessionsState.data ?? [];
 
   useEffect(() => {
-    const authError = [agentsState.error, sessionsState.error, historyState.error]
+    const authError = [agentsState.error, sessionsState.error, history.error]
       .find((error) => error instanceof AuthRequiredError);
     if (authError) {
       setAuthMessage(authError.message);
     }
-  }, [agentsState.error, historyState.error, sessionsState.error]);
+  }, [agentsState.error, history.error, sessionsState.error]);
 
   const genericFetchError = useMemo(() => {
-    for (const error of [agentsState.error, sessionsState.error, historyState.error]) {
+    for (const error of [agentsState.error, sessionsState.error, history.error]) {
       if (error && !(error instanceof AuthRequiredError)) return error;
     }
     return null;
-  }, [agentsState.error, sessionsState.error, historyState.error]);
+  }, [agentsState.error, sessionsState.error, history.error]);
 
   const [dismissedError, setDismissedError] = useState<string | null>(null);
   const visibleFetchError =
@@ -371,8 +367,8 @@ export function WebUI() {
   const isReadOnly = channel !== "web";
 
   const messages = useMemo(
-    () => mergeChatMessages(historyState.data ?? [], transport.state.messages),
-    [historyState.data, transport.state.messages],
+    () => mergeChatMessages(history.messages, transport.state.messages),
+    [history.messages, transport.state.messages],
   );
 
   const handleSend = useCallback(
@@ -408,7 +404,7 @@ export function WebUI() {
 
   const refreshCurrentTab = () => {
     if (activeTab === "chat") {
-      historyState.invalidate();
+      history.invalidate();
       sessionsState.invalidate();
     } else if (activeTab === "sleep") {
       invalidateQueries("sleep");
@@ -430,6 +426,7 @@ export function WebUI() {
 
   const chatMain = (
     <ChatTab
+      key={selectedSession}
       channel={channel}
       readOnly={isReadOnly}
       messages={messages}
@@ -438,6 +435,12 @@ export function WebUI() {
       jumpRequest={messageJump ?? undefined}
       agentAvatars={agentAvatars}
       waitingForAssistant={isWaitingForAssistant(transport.state)}
+      onLoadOlder={history.loadOlder}
+      onRetryOlder={history.retryOlder}
+      loadingOlder={history.loadingOlder}
+      olderError={history.olderError}
+      atHistoryStart={history.atHistoryStart}
+      olderLoadSeq={history.loadSeq}
     />
   );
 

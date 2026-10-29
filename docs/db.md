@@ -240,6 +240,8 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 - `store_message(msg)` — `INSERT OR REPLACE`
 - `store_message_only(msg)` — セッションを更新せずメッセージのみ保存。Channel Log (agent_send, system_event) 向け
 - `get_recent_messages(chat_id, limit)` — 最新N件（DESC→reverse）
+- `get_messages_before(chat_id, before_seq, limit)` — `seq` カーソルより古いN件（DESC→reverse）。`before_seq = None` は最新ページ
+- `has_messages_before(chat_id, before_seq)` — カーソルより古い committed message が存在するか
 - `get_all_messages(chat_id)` — 全件（ASC）
 
 #### `message_kind` の種類
@@ -312,6 +314,7 @@ read-only ツール（`idempotency_class = read_only`）は claim を経ず、�
 - `update_tool_call_output_for_message(chat_id, message_id, id, output)` — assistant メッセージ単位でスコープした出力更新
 - `get_tool_calls_for_message(chat_id, message_id)` — メッセージ単位の呼び出し履歴
 - `get_tool_calls_for_chat(chat_id)` — チャット単位の全呼び出し履歴
+- `get_tool_calls_for_messages(chat_id, message_ids)` — 履歴ページに含まれるメッセージの呼び出しのみを取得
 
 **設計ポイント**:
 - `id` は OpenAI/Codex などのプロバイダが返す call id であり、永続化上のグローバルIDではない

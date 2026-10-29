@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::agent_loop::message_format::{is_tool_preview_message, tool_preview_narration};
 use crate::conversation::{ConversationChanged, ConversationScope};
@@ -16,6 +16,7 @@ use crate::storage::{SenderKind, StoredMessage, ToolCall, ToolState, call_blocki
 
 use super::{WebState, web_external_chat_id, web_session_key};
 
+const DEFAULT_HISTORY_LIMIT: usize = 300;
 const MAX_LIMIT: usize = 500;
 const MAX_NAME_CHARS: usize = 200;
 
@@ -28,6 +29,8 @@ pub(crate) fn parse_chat_id_from_session_key(key: &str) -> Option<i64> {
 pub(super) struct HistoryQuery {
     pub session_key: Option<String>,
     pub limit: Option<usize>,
+    /// Exclusive upper bound for older pages. Omitted loads the newest page.
+    pub before_seq: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,7 +184,11 @@ pub(super) async fn get_history(
     let session_key = parsed_chat_id
         .map(|chat_id| format!("chat:{chat_id}"))
         .unwrap_or_else(|| web_session_key(requested_session_key));
-    let limit = std::cmp::min(query.limit.unwrap_or(100), MAX_LIMIT);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_LIMIT);
+    let before_seq = query.before_seq;
     let db = Arc::clone(&state.app_state.db);
 
     let chat_id = match parsed_chat_id {
@@ -197,9 +204,13 @@ pub(super) async fn get_history(
             {
                 Ok(Some(id)) => id,
                 Ok(None) => {
-                    return Ok(Json(
-                        serde_json::json!({"ok": true, "session_key": session_key, "messages": []}),
-                    ));
+                    return Ok(Json(serde_json::json!({
+                        "ok": true,
+                        "session_key": session_key,
+                        "messages": [],
+                        "next_before_seq": null,
+                        "newest_seq": null,
+                    })));
                 }
                 Err(error) => {
                     tracing::warn!(session_key = %session_key, error = %error, "failed to resolve web session");
@@ -214,10 +225,18 @@ pub(super) async fn get_history(
         }
     };
 
-    let (messages, tool_calls) = match call_blocking(db, move |db| {
-        let messages = db.get_recent_messages(chat_id, limit)?;
-        let tool_calls = db.get_tool_calls_for_chat(chat_id)?;
-        Ok::<_, crate::error::StorageError>((messages, tool_calls))
+    let (messages, tool_calls, next_before_seq, newest_seq) = match call_blocking(db, move |db| {
+        let messages = db.get_messages_before(chat_id, before_seq, limit)?;
+        let message_ids: Vec<String> = messages.iter().map(|message| message.id.clone()).collect();
+        let tool_calls = db.get_tool_calls_for_messages(chat_id, &message_ids)?;
+        let oldest_seq = messages.iter().filter_map(|message| message.seq).min();
+        let newest_seq = messages.iter().filter_map(|message| message.seq).max();
+        let has_older = match oldest_seq {
+            Some(seq) => db.has_messages_before(chat_id, seq)?,
+            None => false,
+        };
+        let next_before_seq = if has_older { oldest_seq } else { None };
+        Ok::<_, crate::error::StorageError>((messages, tool_calls, next_before_seq, newest_seq))
     })
     .await
     {
@@ -231,16 +250,10 @@ pub(super) async fn get_history(
         }
     };
 
-    // Keep only tool calls whose parent message is in the fetched window:
-    // get_tool_calls_for_chat returns every row for the chat, but the
-    // history view is bounded by the message limit, so attaching older
-    // cards would pile them up at the end.
-    let message_ids: HashSet<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+    // The storage query is scoped to this page's messages, so every returned
+    // tool call belongs directly after its parent message.
     let mut tools_by_message: HashMap<&str, Vec<&ToolCall>> = HashMap::new();
     for tool_call in &tool_calls {
-        if !message_ids.contains(tool_call.message_id.as_str()) {
-            continue;
-        }
         tools_by_message
             .entry(tool_call.message_id.as_str())
             .or_default()
@@ -298,6 +311,8 @@ pub(super) async fn get_history(
         "ok": true,
         "session_key": session_key,
         "messages": messages_json,
+        "next_before_seq": next_before_seq,
+        "newest_seq": newest_seq,
     })))
 }
 
@@ -671,6 +686,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some("main".to_string()),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
@@ -684,6 +700,198 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"message"));
         assert!(kinds.contains(&"system_event"));
+    }
+
+    #[tokio::test]
+    async fn api_history_paginates_with_seq_cursor() {
+        // Arrange: five committed messages and a page size of two.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-page:agent:lyre", "lyre");
+        for index in 0..5 {
+            let message = StoredMessage::user(
+                chat_id,
+                "user:web".to_string(),
+                format!("page message {index}"),
+            );
+            db.store_message_only(&message).expect("store message");
+        }
+
+        // Act: newest page.
+        let first = get_history(
+            AxumState(web_state.clone()),
+            Query(super::HistoryQuery {
+                session_key: Some(format!("chat:{chat_id}")),
+                limit: Some(2),
+                before_seq: None,
+            }),
+        )
+        .await
+        .expect("first page")
+        .0;
+
+        // Assert: newest rows in display order, with the oldest row as cursor.
+        let contents: Vec<&str> = first["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content"))
+            .collect();
+        assert_eq!(contents, ["page message 3", "page message 4"]);
+        assert_eq!(first["next_before_seq"].as_i64(), Some(4));
+        assert_eq!(first["newest_seq"].as_i64(), Some(5));
+
+        // Act: second page below the cursor.
+        let second = get_history(
+            AxumState(web_state.clone()),
+            Query(super::HistoryQuery {
+                session_key: Some(format!("chat:{chat_id}")),
+                limit: Some(2),
+                before_seq: Some(4),
+            }),
+        )
+        .await
+        .expect("second page")
+        .0;
+        let contents: Vec<&str> = second["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content"))
+            .collect();
+        assert_eq!(contents, ["page message 1", "page message 2"]);
+        assert_eq!(second["next_before_seq"].as_i64(), Some(2));
+        assert_eq!(second["newest_seq"].as_i64(), Some(3));
+
+        // Act: final page.
+        let third = get_history(
+            AxumState(web_state),
+            Query(super::HistoryQuery {
+                session_key: Some(format!("chat:{chat_id}")),
+                limit: Some(2),
+                before_seq: Some(2),
+            }),
+        )
+        .await
+        .expect("third page")
+        .0;
+        let contents: Vec<&str> = third["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content"))
+            .collect();
+        assert_eq!(contents, ["page message 0"]);
+        assert!(third["next_before_seq"].is_null());
+        assert_eq!(third["newest_seq"].as_i64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn api_history_clamps_zero_limit_to_one() {
+        // Arrange: an explicit zero would otherwise look like an empty final
+        // page and hide the rest of the history from a paginating client.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-zero:agent:lyre", "lyre");
+        for index in 0..2 {
+            db.store_message_only(&StoredMessage::user(
+                chat_id,
+                "user:web".to_string(),
+                format!("zero {index}"),
+            ))
+            .expect("store message");
+        }
+
+        // Act
+        let body = get_history(
+            AxumState(web_state),
+            Query(super::HistoryQuery {
+                session_key: Some(format!("chat:{chat_id}")),
+                limit: Some(0),
+                before_seq: None,
+            }),
+        )
+        .await
+        .expect("zero limit")
+        .0;
+
+        // Assert
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "zero 1");
+        assert_eq!(body["next_before_seq"].as_i64(), Some(2));
+        assert_eq!(body["newest_seq"].as_i64(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn api_history_preview_only_page_still_advances_cursor() {
+        // Arrange: three visible messages followed by three hidden result
+        // previews. A page whose rows are all hidden returns no entries but
+        // must still hand the client a cursor for the next page.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-previews:agent:lyre", "lyre");
+        for index in 0..3 {
+            db.store_message_only(&StoredMessage::user(
+                chat_id,
+                "user:web".to_string(),
+                format!("visible {index}"),
+            ))
+            .expect("store visible");
+        }
+        for index in 0..3 {
+            let mut summary = StoredMessage::assistant(
+                chat_id,
+                "lyre".to_string(),
+                format!("[tool_result]: hidden {index}"),
+            );
+            summary.parent_message_id = Some(format!("parent-{index}"));
+            db.store_message_only(&summary).expect("store preview");
+        }
+
+        // Act: the newest three rows are all previews.
+        let first = get_history(
+            AxumState(web_state.clone()),
+            Query(super::HistoryQuery {
+                session_key: Some(format!("chat:{chat_id}")),
+                limit: Some(3),
+                before_seq: None,
+            }),
+        )
+        .await
+        .expect("preview page")
+        .0;
+
+        // Assert: empty projection, but the cursor still points below it.
+        assert!(first["messages"].as_array().expect("messages").is_empty());
+        assert_eq!(first["next_before_seq"].as_i64(), Some(4));
+        assert_eq!(first["newest_seq"].as_i64(), Some(6));
+
+        // Act: the next page reaches the visible rows.
+        let second = get_history(
+            AxumState(web_state),
+            Query(super::HistoryQuery {
+                session_key: Some(format!("chat:{chat_id}")),
+                limit: Some(10),
+                before_seq: Some(4),
+            }),
+        )
+        .await
+        .expect("visible page")
+        .0;
+
+        // Assert
+        let contents: Vec<&str> = second["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["content"].as_str().expect("content"))
+            .collect();
+        assert_eq!(contents, ["visible 0", "visible 1", "visible 2"]);
+        assert!(second["next_before_seq"].is_null());
     }
 
     #[tokio::test]
@@ -741,6 +949,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
@@ -821,6 +1030,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let messages = result.0["messages"].as_array().expect("messages array");
@@ -880,6 +1090,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let messages = result.0["messages"].as_array().expect("messages array");
@@ -976,6 +1187,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
@@ -1035,6 +1247,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
@@ -1076,6 +1289,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
@@ -1125,6 +1339,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: None,
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let body = result.0;
@@ -1178,6 +1393,7 @@ mod tests {
         let query = Query(super::HistoryQuery {
             session_key: Some(format!("chat:{chat_id}")),
             limit: Some(1),
+            before_seq: None,
         });
         let result = get_history(AxumState(web_state), query).await.expect("ok");
         let messages = result.0["messages"].as_array().expect("messages array");

@@ -202,9 +202,15 @@ impl Database {
 // ---------------------------------------------------------------------------
 
 impl Database {
-    pub(crate) fn get_recent_messages(
+    /// Loads up to `limit` committed messages strictly older than `before_seq`
+    /// and returns them in ascending `seq` order.
+    ///
+    /// `before_seq = None` selects the newest page. Using `i64::MAX` as the
+    /// sentinel keeps both cases on the `(chat_id, seq)` index.
+    pub(crate) fn get_messages_before(
         &self,
         chat_id: i64,
+        before_seq: Option<i64>,
         limit: usize,
     ) -> Result<Vec<StoredMessage>, StorageError> {
         let conn = self.get_conn()?;
@@ -212,16 +218,45 @@ impl Database {
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
                     message_kind, recipient_agent_id, seq, turn_id, parent_message_id
              FROM messages
-             WHERE chat_id = ?1 AND seq IS NOT NULL
+             WHERE chat_id = ?1 AND seq IS NOT NULL AND seq < ?2
              ORDER BY seq DESC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
 
         let mut messages = stmt
-            .query_map(params![chat_id, limit as i64], row_to_stored_message)?
+            .query_map(
+                params![chat_id, before_seq.unwrap_or(i64::MAX), limit as i64],
+                row_to_stored_message,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         messages.reverse();
         Ok(messages)
+    }
+
+    /// Reports whether any committed message exists below `before_seq`.
+    pub(crate) fn has_messages_before(
+        &self,
+        chat_id: i64,
+        before_seq: i64,
+    ) -> Result<bool, StorageError> {
+        let conn = self.get_conn()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM messages
+                 WHERE chat_id = ?1 AND seq IS NOT NULL AND seq < ?2
+             )",
+            params![chat_id, before_seq],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub(crate) fn get_recent_messages(
+        &self,
+        chat_id: i64,
+        limit: usize,
+    ) -> Result<Vec<StoredMessage>, StorageError> {
+        self.get_messages_before(chat_id, None, limit)
     }
 
     pub(crate) fn get_all_messages(
@@ -1200,6 +1235,70 @@ mod tests {
         assert_eq!(recent[1].content, "chat1 message 4");
 
         assert!(db.get_all_messages(999).expect("empty chat").is_empty());
+    }
+
+    #[test]
+    fn messages_before_paginates_by_seq_cursor() {
+        // Arrange: five messages with seq 1..=5.
+        let (db, _dir) = test_db();
+        for index in 0..5 {
+            store_msg(
+                &db,
+                &format!("page_msg{index}"),
+                300,
+                &format!("page message {index}"),
+                &format!("2024-01-01T00:00:{index:02}Z"),
+            );
+        }
+
+        // Act / Assert: the newest page ends at the newest message.
+        let newest = db.get_messages_before(300, None, 2).expect("newest page");
+        let newest_contents: Vec<_> = newest.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(newest_contents, ["page message 3", "page message 4"]);
+        assert!(db.has_messages_before(300, 4).expect("has older"));
+
+        // The cursor is exclusive, so the next page starts below it.
+        let older = db.get_messages_before(300, Some(4), 2).expect("older page");
+        let older_contents: Vec<_> = older.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(older_contents, ["page message 1", "page message 2"]);
+
+        let first = db.get_messages_before(300, Some(2), 2).expect("first page");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].content, "page message 0");
+        assert!(!db.has_messages_before(300, 1).expect("no older"));
+        assert!(!db.has_messages_before(300, 0).expect("empty range"));
+    }
+
+    #[test]
+    fn messages_before_skips_deleted_seq_gaps() {
+        // Arrange: seq 3 was removed from the committed history.
+        let (db, _dir) = test_db();
+        for index in 0..3 {
+            store_msg(
+                &db,
+                &format!("gap_msg{index}"),
+                301,
+                &format!("gap message {index}"),
+                &format!("2024-01-01T00:00:{index:02}Z"),
+            );
+        }
+        db.get_conn()
+            .expect("pool")
+            .execute(
+                "UPDATE messages SET seq = 10 WHERE chat_id = 301 AND content = 'gap message 2'",
+                [],
+            )
+            .expect("move seq");
+
+        // Act: paging below the gap must not assume cursor - 1 exists.
+        let page = db
+            .get_messages_before(301, Some(10), 5)
+            .expect("page below gap");
+
+        // Assert
+        let contents: Vec<_> = page.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["gap message 0", "gap message 1"]);
+        assert!(!db.has_messages_before(301, 1).expect("start"));
     }
 
     #[test]

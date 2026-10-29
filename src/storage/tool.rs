@@ -41,6 +41,61 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(calls)
     }
+
+    /// Loads persisted tool calls attached to the given messages.
+    ///
+    /// History pages are bounded by message ids, so this avoids reading the
+    /// chat's whole tool ledger for every page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query failures.
+    pub(crate) fn get_tool_calls_for_messages(
+        &self,
+        chat_id: i64,
+        message_ids: &[String],
+    ) -> Result<Vec<ToolCall>, StorageError> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = std::iter::repeat_n("?", message_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT id, message_id, tool_name, tool_input, tool_output, timestamp,
+                    state, error_kind, error_message
+             FROM tool_calls
+             WHERE chat_id = ?1 AND message_id IN ({placeholders})
+             ORDER BY timestamp"
+        );
+
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut values = Vec::with_capacity(message_ids.len() + 1);
+        values.push(rusqlite::types::Value::Integer(chat_id));
+        values.extend(
+            message_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::Text(id.clone())),
+        );
+        let calls = stmt
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok(ToolCall {
+                    id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    tool_name: row.get(2)?,
+                    tool_input: row.get(3)?,
+                    tool_output: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    state: parse_row_enum!(row, 6, ToolState)?,
+                    error_kind: row.get(7)?,
+                    error_message: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(calls)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -717,6 +772,46 @@ mod tests {
         assert_eq!(calls[1].state, ToolState::Failed);
         assert_eq!(calls[1].error_kind.as_deref(), Some("tool_error"));
         assert_eq!(calls[1].error_message.as_deref(), Some("denied"));
+    }
+
+    #[test]
+    fn get_tool_calls_for_messages_scopes_to_requested_ids() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:message-page", "web", "default")
+            .expect("create chat");
+        for (id, message_id, timestamp) in [
+            ("tool-page-1", "message-1", "2024-01-01T00:00:00Z"),
+            ("tool-page-2", "message-2", "2024-01-01T00:00:01Z"),
+            ("tool-orphan", "deleted-message", "2024-01-01T00:00:02Z"),
+        ] {
+            db.insert_tool_call_for_test(
+                id,
+                chat_id,
+                message_id,
+                "read",
+                r#"{"path":"a.txt"}"#,
+                Some(r#"{"result":"ok"}"#),
+                timestamp,
+            )
+            .expect("insert tool call");
+        }
+
+        // Act
+        let calls = db
+            .get_tool_calls_for_messages(chat_id, &["message-1".to_string()])
+            .expect("page tool calls");
+
+        // Assert
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "tool-page-1");
+        assert_eq!(calls[0].message_id, "message-1");
+        assert!(
+            db.get_tool_calls_for_messages(chat_id, &[])
+                .expect("empty ids")
+                .is_empty()
+        );
     }
 
     #[test]
