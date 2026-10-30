@@ -990,6 +990,46 @@ impl Database {
             .map_err(Into::into)
     }
 
+    /// Lists published changes to an agent's memory files, newest first.
+    ///
+    /// Only snapshots of runs finalized as `success` / `partial_failure` are
+    /// returned: finalization happens after publication, so candidates of
+    /// unpublished (`running`) or abandoned (`failed`) runs are excluded.
+    /// Snapshots whose content did not change are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database access failure.
+    pub(crate) fn list_memory_changes(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<MemorySnapshot>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT ms.id, ms.run_id, ms.agent_id, ms.file, ms.content_before,
+                    ms.content_after, ms.created_at
+             FROM memory_snapshots ms
+             JOIN sleep_runs sr ON sr.id = ms.run_id
+             WHERE ms.agent_id = ?1
+               AND ms.content_before != ms.content_after
+               AND sr.status IN (?2, ?3)
+             ORDER BY ms.created_at DESC, ms.id DESC
+             LIMIT ?4",
+        )?;
+        stmt.query_map(
+            params![
+                agent_id,
+                SleepRunStatus::Success.to_string(),
+                SleepRunStatus::PartialFailure.to_string(),
+                limit as i64,
+            ],
+            row_to_memory_snapshot,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Into::into)
+    }
+
     /// Inserts a `before == after == base` snapshot for every memory file that
     /// does not yet have one for this run, so the publication bundle has a
     /// complete snapshot set regardless of which steps ran or were skipped.
@@ -1524,5 +1564,104 @@ mod tests {
             },
         )
         .expect("finish");
+    }
+
+    // ---------------------------------------------------------------------------
+    // Memory change history
+    // ---------------------------------------------------------------------------
+
+    /// Inserts a run with one snapshot; `change` is `(file, before, after)`.
+    fn insert_run_with_snapshot(
+        db: &Database,
+        run_id: &str,
+        agent_id: &str,
+        status: &str,
+        change: (&str, &str, &str),
+        created_at: &str,
+    ) {
+        let (file, before, after) = change;
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+             VALUES (?1, ?2, ?3, 'scheduled', ?4)",
+            params![run_id, agent_id, status, created_at],
+        )
+        .expect("insert run");
+        conn.execute(
+            "INSERT INTO memory_snapshots
+                (id, run_id, agent_id, file, content_before, content_after, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                format!("{run_id}-{file}"),
+                run_id,
+                agent_id,
+                file,
+                before,
+                after,
+                created_at
+            ],
+        )
+        .expect("insert snapshot");
+    }
+
+    #[test]
+    fn list_memory_changes_returns_only_published_changes_across_files_newest_first() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let fixtures = [
+            ("ok-old", "lyre", "success", ("semantic", "a", "b")),
+            ("partial", "lyre", "partial_failure", ("semantic", "b", "c")),
+            ("unchanged", "lyre", "success", ("semantic", "c", "c")),
+            ("pending", "lyre", "running", ("semantic", "c", "d")),
+            ("reaped", "lyre", "failed", ("semantic", "c", "e")),
+            ("other-file", "lyre", "success", ("episodic", "x", "y")),
+            ("other-agent", "musa", "success", ("semantic", "p", "q")),
+        ];
+        for (day, (run_id, agent_id, status, change)) in (1..).zip(fixtures) {
+            let created_at = format!("2026-10-{day:02}T03:00:00+00:00");
+            insert_run_with_snapshot(&db, run_id, agent_id, status, change, &created_at);
+        }
+
+        // Act
+        let changes = db.list_memory_changes("lyre", 10).expect("list");
+
+        // Assert
+        let summary: Vec<_> = changes
+            .iter()
+            .map(|c| (c.run_id.as_str(), c.file, c.content_after.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("other-file", MemoryFile::Episodic, "y"),
+                ("partial", MemoryFile::Semantic, "c"),
+                ("ok-old", MemoryFile::Semantic, "b"),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_memory_changes_respects_limit() {
+        // Arrange
+        let (db, _dir) = test_db();
+        for day in 1..=3 {
+            let run_id = format!("run-{day}");
+            let created_at = format!("2026-10-{day:02}T03:00:00+00:00");
+            insert_run_with_snapshot(
+                &db,
+                &run_id,
+                "lyre",
+                "success",
+                ("episodic", "a", &run_id),
+                &created_at,
+            );
+        }
+
+        // Act
+        let changes = db.list_memory_changes("lyre", 2).expect("list");
+
+        // Assert
+        let run_ids: Vec<_> = changes.iter().map(|c| c.run_id.as_str()).collect();
+        assert_eq!(run_ids, vec!["run-3", "run-2"]);
     }
 }
