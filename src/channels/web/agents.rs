@@ -194,7 +194,7 @@ pub(super) async fn delete_agent_avatar(
 
 /// Normalizes `agent_id` and resolves it against the configured agents.
 /// Unknown (or unsafe, e.g. path traversal) ids yield `None`.
-fn resolved_agent_id(state: &WebState, agent_id: &str) -> Option<AgentId> {
+pub(super) fn resolved_agent_id(state: &WebState, agent_id: &str) -> Option<AgentId> {
     let agent_id = AgentId::new(agent_id);
     let snapshot = state.app_state.config_manager.current_blocking();
     snapshot

@@ -22,6 +22,7 @@ use crate::channels::adapter::ConversationKind;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 
+mod agent_profile;
 mod agents;
 pub(crate) mod auth;
 mod config;
@@ -460,6 +461,24 @@ fn build_router(web_state: WebState) -> Router {
         .route(
             "/api/agents/{agent_id}/memory",
             get(sleep::get_agent_memory),
+        )
+        .route(
+            "/api/agents/{agent_id}/profile",
+            get(agent_profile::get_agent_profile),
+        )
+        .route(
+            "/api/agents/{agent_id}/files/{kind}",
+            get(agent_profile::get_agent_prompt_file),
+        )
+        .route(
+            "/api/agents/{agent_id}/memory/history",
+            get(agent_profile::get_agent_memory_history),
+        )
+        .route("/api/skills", get(agent_profile::list_skills))
+        .route("/api/skills/{name}", get(agent_profile::get_skill))
+        .route(
+            "/api/skills/{name}/files/{*path}",
+            get(agent_profile::get_skill_file),
         )
         .route("/api/sleep/runs", get(sleep::list_sleep_runs))
         .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
