@@ -513,7 +513,8 @@ export function SessionsSection({
           />
         )
       ) : (
-        <>
+        // The groups share one scroll region below the fixed header.
+        <div className="sessions-scroll">
           {pinned.length > 0 ? (
             <div className="sessions-group">
               <h3 className="sessions-group-title">PINNED</h3>
@@ -541,7 +542,7 @@ export function SessionsSection({
               ) : null}
             </div>
           ) : null}
-        </>
+        </div>
       )}
     </div>
   );

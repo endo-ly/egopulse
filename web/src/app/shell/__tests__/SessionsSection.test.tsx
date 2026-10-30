@@ -274,6 +274,37 @@ describe("SessionsSection", () => {
     cleanup();
   });
 
+  it("sessions_section_scrolls_all_groups_in_one_region_below_the_header", () => {
+    // Arrange
+    const sessions: SessionEntry[] = [
+      { ...SESSIONS[0], session_key: "chat:10", chat_id: 10, pinned: true },
+      { ...SESSIONS[1] },
+      { ...SESSIONS[0], session_key: "chat:11", chat_id: 11, archived: true },
+    ];
+
+    // Act
+    const { container } = render(
+      <SessionsSection
+        sessions={sessions}
+        selectedAgent="lyre"
+        selectedSession=""
+        onSelectSession={() => {}}
+      />,
+    );
+
+    // Assert: a single scroll region holds every group, so sessions past the
+    // sidebar height stay reachable; the header is outside it.
+    const scrollRegions = container.querySelectorAll(".sessions-scroll");
+    expect(scrollRegions).toHaveLength(1);
+    const groups = container.querySelectorAll(".sessions-group");
+    expect(groups).toHaveLength(3);
+    for (const group of groups) {
+      expect(group.parentElement).toBe(scrollRegions[0]);
+    }
+    expect(scrollRegions[0].querySelector(".sessions-header")).toBeNull();
+    cleanup();
+  });
+
   it("sessions_section_offers_pin_archive_and_copy_actions", async () => {
     // Arrange
     const onUpdateSession = vi.fn();
