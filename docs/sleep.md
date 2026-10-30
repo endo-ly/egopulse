@@ -641,5 +641,5 @@ redaction 後の内容だけを DB と記憶ファイルに保存する。
 | DB スキーマ（テーブル定義・SQL） | [db.md](./db.md) |
 | 設定（`sleep_batch` セクション含む） | [config.md §3.7](./config.md#37-sleep-batch-設定sleep_batch) |
 | REST API（Sleep エンドポイント含む） | [api.md §2.9](./api.md#29-sleep-batch) |
-| Web UI コンポーネント設計 | [webui/sleep-batch.md](./webui/sleep-batch.md) |
+| WebUI の Schedule 画面 | [webui/schedule.md](./webui/schedule.md) |
 

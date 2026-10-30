@@ -846,4 +846,4 @@ User
 | DB スキーマ（`pulse_runs` テーブル） | [db.md](./db.md) |
 | 設定（`pulse` セクション・`timezone`） | [config.md §3.8](./config.md#38-pulse-設定pulse) |
 | Sleep Batch（Scheduler 分離の相手） | [sleep.md](./sleep.md) |
-| WebUI の Pulse 画面 | [webui/pulse.md](./webui/pulse.md) |
+| WebUI の Schedule 画面 | [webui/schedule.md](./webui/schedule.md) |

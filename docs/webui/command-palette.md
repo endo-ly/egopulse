@@ -34,14 +34,14 @@
 │ ───────────────────────────────────────  │
 │  Quick Actions                            │
 │  ⌘N  New Session (with lyre)              │
-│  ⌘,  Open Config                          │
+│  ⚙   Open Config                          │
 │  ↻   Refresh current tab                  │
 │ ───────────────────────────────────────  │
 │  Navigation                               │
-│  →  Go to Chat tab                        │
-│  →  Go to Sleep tab                       │
-│  →  Go to Pulse tab                       │
-│  →  Go to Metrics tab                     │
+│  →  Go to Chat                            │
+│  →  Go to Agent                           │
+│  →  Go to Schedule                        │
+│  →  Go to Metrics                         │
 │ ───────────────────────────────────────  │
 │  Agents                                   │
 │  ▸ Switch to agent: ace                   │
@@ -74,12 +74,11 @@
 |---|---|---|
 | 1 | Recent | 最近使ったコマンド・最近開いたセッション（最大5件） |
 | 2 | Quick Actions | 高頻度アクション |
-| 3 | Navigation | タブ遷移 |
+| 3 | Navigation | 画面遷移 |
 | 4 | Agents | agent 切替 |
 | 5 | Sessions | セッション検索結果 |
 | 6 | Messages | アクティブセッションのメッセージ検索結果 |
-| 7 | Sleep Runs | Sleep run 検索結果 |
-| 8 | Pulse Runs | Pulse run 検索結果 |
+| 7 | Schedule Runs | Pulse run / Sleep run 検索結果 |
 
 クエリ入力時は、全セクションからマッチする項目を抽出し、マッチしないセクションは非表示にする。マッチが0件の場合は `"No results for '{query}'"` を表示。
 
@@ -96,19 +95,19 @@
 | Show shortcuts | (なし) | ショートカット一覧モーダルを表示 |
 | Toggle sidebar | (なし) | Sidebar 開閉（mobile/tablet のみ有効） |
 
-> Config タブへの遷移は Navigation セクションから行う。`Cmd+,` は macOS のブラウザ設定と衝突するためショートカットには割り当てない。
+> `Cmd+,` は macOS のブラウザ設定と衝突するため Config へのショートカットには割り当てない。
 
 ### 4.2 Navigation
 
-5タブへの遷移。URL 設計は別途確定（例：`/agents/{currentAgent}/chat`, `/metrics` 等）。
+5画面への遷移（URL は [layout.md §4](./layout.md#4-url-構造)）。
 
 | label | 動作 |
 |---|---|
-| Go to Chat tab | Chat タブへ遷移 |
-| Go to Sleep tab | Sleep タブへ遷移 |
-| Go to Pulse tab | Pulse タブへ遷移 |
-| Go to Metrics tab | Metrics タブへ遷移（agent 非依存） |
-| Go to Config tab | Config タブへ遷移（agent 非依存） |
+| Go to Chat | 選択 agent の Chat へ遷移 |
+| Go to Agent | 選択 agent の Agent へ遷移 |
+| Go to Schedule | 選択 agent の Schedule へ遷移 |
+| Go to Metrics | Metrics へ遷移（agent 非依存） |
+| Go to Config | Config へ遷移（agent 非依存） |
 
 ### 4.3 Agents
 
@@ -116,7 +115,7 @@ agent 一覧から選択して切り替え。
 
 | label | 動作 |
 |---|---|
-| Switch to agent: {agentId} | 選択 agent を切り替え、現在のタブcontext を維持 |
+| Switch to agent: {agentId} | 選択 agent を切り替え、現在の agent 画面を維持 |
 
 選択中 agent は表示しない（既に選択済みのため）。
 
@@ -142,21 +141,14 @@ agent 一覧から選択して切り替え。
 - description には sender kind（`user` / `assistant` / `system`）を表示する
 - ジャンプ実行は Recent 履歴に記録しない
 
-### 4.6 Sleep Runs
+### 4.6 Schedule Runs
 
-Sleep run 検索。クエリが `"sleep"` を含むか、時刻フォーマット（`2026-06-29` 等）にマッチする場合に優先表示。
-
-| label | 動作 |
-|---|---|
-| Sleep run {date} {time} · {status} | 当該 run の Detail を開く |
-
-### 4.7 Pulse Runs
-
-Pulse run 検索。同上。
+選択 agent の Pulse run / Sleep run の検索。クエリが `"sleep"` / `"pulse"` / intention id を含むか、時刻フォーマット（`2026-06-29` 等）にマッチする場合に優先表示。
 
 | label | 動作 |
 |---|---|
-| Pulse run {date} {time} · {intention_id} | 当該 run の Detail を開く |
+| Sleep run {date} {time} · {status} | Schedule 画面で当該 run の詳細を開く |
+| Pulse run {date} {time} · {intention_id} | Schedule 画面で当該 run の詳細を開く |
 
 ---
 
@@ -167,7 +159,7 @@ Pulse run 検索。同上。
 ### 5.1 記憶対象
 
 - 実行した Quick Action / Navigation
-- 開いた Session / Sleep run / Pulse run
+- 開いた Session / Schedule run
 
 ### 5.2 保存先
 
@@ -218,7 +210,7 @@ Pulse run 検索。同上。
 
 ## 8. パフォーマンス
 
-- セッション・Sleep run・Pulse run の検索対象はサーバー状態キャッシュから取得（再 fetch しない）
+- セッション・Schedule run の検索対象はサーバー状態キャッシュから取得（再 fetch しない）
 - 入力の debounce：50ms（体感ほぼリアルタイム）
 - 検索は単純な部分一致ベース
 - 結果表示上限：セクション毎 5件、全体で 30件まで

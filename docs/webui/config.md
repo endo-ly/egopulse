@@ -1,234 +1,101 @@
 # EgoPulse WebUI — Config Tab
 
-ランタイム設定を WebUI から表示・編集するためのタブ。
-
-設定は `~/.egopulse/egopulse.config.yaml` に永続化され、API 経由で取得・更新する。Config Tab は設定項目をタブ内に常時表示し、Save / Discard のフローを明示する。
-
-> **注記**: 設定ファイル `~/.egopulse/egopulse.config.yaml` および `.env` 系ファイルは WebUI を含むアプリ外からは読み取り不可。Config Tab が扱うのは `/api/config` 経由で公開された情報のみ。
+ランタイム設定（`~/.egopulse/egopulse.config.yaml`）を WebUI から確認・編集するグローバルタブ。全フィールドを構造化して表示し、各値の出どころ・反映タイミング・秘密情報の設定状態を明示する。
 
 ## 1. 構成
 
 ```
-┌─ Config Tab ─────────────────────────────────────────┐
-│ ┌─ Config Header ──────────────────────────────┐    │
-│ │  Runtime Configuration                          │    │
-│ │  /home/u/.egopulse/egopulse.config.yaml         │    │
-│ │  Last saved 14:32   [Discard] [Save changes]    │    │
-│ └────────────────────────────────────────────────┘    │
-│                                                       │
-│ Default LLM                                           │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ Provider   [OpenRouter ▼]                       │  │
-│ │ Model      [anthropic/claude-sonnet-4    ▼]     │  │
-│ │ API Key    [········  (configured)] [Clear]     │  │
-│ └─────────────────────────────────────────────────┘  │
-│                                                       │
-│ Web Server                                            │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ Enabled    [✓]                                  │  │
-│ │ Host       [127.0.0.1]                          │  │
-│ │ Port       [10961]                              │  │
-│ └─────────────────────────────────────────────────┘  │
-│                                                       │
-│ Providers                                             │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ OpenRouter    base_url: https://openrouter.ai   │  │
-│ │               default: claude-sonnet-4          │  │
-│ │               api_key: ✓ configured             │  │
-│ │ ─────                                           │  │
-│ │ OpenAI        base_url: https://api.openai.com  │  │
-│ │               default: gpt-4o                   │  │
-│ │               api_key: ✗ not set                │  │
-│ └─────────────────────────────────────────────────┘  │
-│                                                       │
-│ Channel Overrides                                     │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ discord   Provider [OpenRouter ▼]  Model [---]  │  │
-│ │ telegram  Provider [--- ▼]         Model [---]  │  │
-│ │ voice     Provider [--- ▼]         Model [---]  │  │
-│ └─────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────┘
+┌ Config ────────────────── ~/.egopulse/egopulse.config.yaml · rev 42 ┐
+│ [Structured | YAML]                                                │
+│ ┌───────────┐  Agents › lyre                                       │
+│ │ General   │  label            Lyre                               │
+│ │ Agents    │  provider         sakura              ⚡ 即時反映     │
+│ │ Providers │  model            preview/Kimi-K2.6   ⚡ 即時反映     │
+│ │ Channels  │  reasoning_effort medium                             │
+│ │ Sleep     │  discord_bot      lyre                               │
+│ │ Pulse     │  profiles.voice   openrouter / gpt-4.1-mini          │
+│ │ Webhooks  │                                                      │
+│ │ Backup    │  Providers › openrouter                              │
+│ │ Web Fetch │  api_key   env:OPENROUTER_API_KEY   ✓ configured     │
+│ │ MCP       │  base_url  https://openrouter.ai/…  ENV override     │
+│ └───────────┘                                                      │
+└────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## 2. Config Header
-
-- タイトル（"Runtime Configuration"）
-- 現在の config ファイルパス（読み取り専用・等幅表示）
-- 最終保存時刻
-- 操作：Discard（変更破棄）・Save changes
-
-### 2.1 Dirty Tracking
-
-- 編集操作（input 変更・select 変更等）のたびに dirty flag を立てる
-- dirty state に応じて Discard / Save の enabled を切替
-- 保存成功時は dirty を false に戻す
-- 編集中のページ离开防止は `beforeunload` イベントのみ対応
-
-### 2.2 Load Failure Handling
-
-`/api/config` の取得に失敗した場合、EmptyState（"Failed to load configuration" + error message + Retry button）を表示。
-
-`/api/config` が 401 を返す場合（認証切れ）は AuthModal を表示。
+- Header に config ファイルパスと revision を表示する
+- 左にセクションナビ、右に選択セクションの内容。セクションは URL で表現する（`/config/:section`）
+- Sidebar の文脈領域にもセクション一覧を表示する
 
 ---
 
-## 3. セクション構成
+## 2. 表示
 
-Config Tab の本体は以下の順序でセクションを並べる：
+### 2.1 セクション
 
-1. **Default LLM** — グローバルプロバイダー・モデル・API Key
-2. **Web Server** — Web チャネル自体のホスト・ポート・有効状態
-3. **Providers** — 登録済みプロバイダーの一覧（読み取り専用メタデータ）
-4. **Channel Overrides** — Discord / Telegram のプロバイダー・モデル上書き
+[config.md §3](../config.md#3-完全フィールドリファレンス) の構成に従う。
 
-各セクションは fieldset + legend でセマンティクスを保つ。
+| セクション | 対象 |
+|---|---|
+| General | `default_agent` / `default_provider` / `default_model` / `timezone` / compaction 系 など |
+| Agents | `agents.<id>`（provider / model / reasoning_effort / bot 紐づけ / profiles） |
+| Providers | `providers.<id>`（base_url / models / api_key） |
+| Channels | Web / Discord / Telegram / Voice |
+| Sleep | `sleep_batch` |
+| Pulse | `pulse` |
+| Webhooks | `webhooks` |
+| Backup | `db.backup` |
+| Web Fetch | `web_fetch` |
+| MCP | `mcp.json` / `mcp.d/` のサーバー定義（読み取り専用。接続状態は Metrics タブ） |
 
----
+### 2.2 フィールド表示
 
-## 4. Default LLM
+各フィールドに以下を添える。
 
-### 4.1 Provider
+| 属性 | 表示 |
+|---|---|
+| 値の出どころ | YAML / 環境変数オーバーライド / デフォルト値 |
+| 反映タイミング | 即時反映 / 要再起動（[config.md §11](../config.md#11-再起動要否と秘匿フィールド) の分類） |
+| 秘密情報 | SecretRef（`env:XXX` 等）と設定有無（`configured` / `not set`）のみ。実値は表示しない |
 
-- select ドロップダウン
-- `config.providers` から選択肢を生成
+### 2.3 YAML ビュー
 
-### 4.2 Model
+- 設定ファイルの原文を表示する。秘密情報の値はサーバー側でマスクして返す
+- `.env` の内容は扱わない
 
-- `<datalist>` を使った combobox（自由入力 + サジェスト）
-- 入力値は `default_model`（空文字可、その場合 provider の `default_model` が有効になる）
-- サジェストは選択 provider の `models` 配列
+### 2.4 外部変更の検知
 
-### 4.3 API Key
-
-- type=password の入力欄
-- 既に設定済み（`has_api_key === true`）の場合、placeholder を `"Configured. Enter to replace."` に
-- 設定済みの場合のみ "Clear" button を表示。クリックで API key の削除をマークし、Save 時に削除がサーバーへ伝わる
-
-> API key の具体的な削除シグナル（sentinel 値等）は実装詳細であり、本仕様書では「Clear 操作で API key を削除できること」のみを規定する。
-
-### 4.4 Provider 変更時の副作用
-
-Provider を変更すると：
-
-- `default_model` を新しい provider の `default_model` に更新
-- API Key 入力欄をクリア
-- `has_api_key` を新しい provider の状態に更新
+設定ファイルは外部から編集され得る。取得した revision と現在の revision が異なる場合は「外部で変更されました」と表示し、再読み込みを促す。
 
 ---
 
-## 5. Web Server
+## 3. 編集
 
-### 5.1 項目
+セクション単位で編集する。
 
-| 項目 | 型 | 制約 |
-|---|---|---|
-| Enabled | toggle | なし |
-| Host | text input | 自由入力（`127.0.0.1` / `0.0.0.0` / `localhost` 等） |
-| Port | number input | 1-65535 の整数のみ受け付け。範囲外は無視 |
+1. セクションの `Edit` でフォームに切り替える
+2. 保存前に YAML の diff を確認する（[schedule.md §4.4](./schedule.md#44-diffviewer) の DiffViewer）
+3. `Save` で `expected_fingerprint` 付きで更新する。`409` の場合は最新を再取得させる
 
-### 5.2 反映タイミング
-
-- 設定保存は次回 agent turn から反映（実行中の turn には影響しない）
-- Web Server の host / port / enabled を変更した場合、ランタイムの再起動が必要
-- 再起動を促すトーストを Save 成功時に表示：`"Web server settings will apply after runtime restart."`
+- 更新は `ConfigManager` の単一の更新境界を通る（[config.md §10](../config.md#10-設定の変更インターフェース)）。YAML 全体を書き込む経路は設けない
+- 要再起動フィールドは編集不可とし、バッジで理由を示す
+- 秘密情報は新しい値の入力と削除のみ受け付ける。実値は `.env` に保存され、YAML には SecretRef として記録される
+- 未保存の変更がある間は `beforeunload` で離脱を確認する
 
 ---
 
-## 6. Providers
+## 4. バックエンド API
 
-読み取り専用セクション。プロバイダーの追加・削除は WebUI から行わない（YAML を直接編集）。
-
-各 provider を card 形式で表示し、以下のメタデータを並べる：
-
-- `label` + `id`
-- `base_url`（等幅表示）
-- `default_model`
-- `models`（カンマ区切り、空でなければ）
-- `api_key` 状態（`configured` / `not set`、実際の key 値は表示しない）
+| API | 用途 |
+|---|---|
+| `GET /api/config` | 全フィールド・値の出どころ・反映区分・秘密情報の設定有無・revision・fingerprint を返すよう拡張 |
+| `GET /api/config/yaml` | マスク済み YAML 原文 |
+| `PUT /api/config` | 更新（既存）。編集可能なフィールドをセクション単位で拡張していく |
 
 ---
 
-## 7. Channel Overrides
+## 5. Out of Scope
 
-Discord / Telegram チャネルごとに、default LLM とは別の provider / model を指定可能。空欄の場合は Default LLM 設定を使う。
-
-### 7.1 対象チャネル
-
-- `discord` / `telegram` / `voice` を対象とする
-- チャネル毎に default LLM とは別の provider / model を指定可能
-
-### 7.2 各チャネルのフィールド
-
-- Provider（select、`---` を含む。`---` は default 使用を意味する）
-- Model（text input、空欄で default 使用）
-
-### 7.3 Provider 変更時の副作用
-
-Override の Provider を変更すると：
-
-- Model フィールドを新しい provider の default_model で上書き
-- Provider を `---` にした場合は Model も空に
-
----
-
-## 8. Save 処理
-
-### 8.1 フロー
-
-1. Save button click
-2. draft から payload を構築
-3. `PUT /api/config` で送信
-4. 成功時：
-   - response で config state を更新
-   - apiKeyDraft をクリア
-   - dirty = false
-   - lastSavedAt を更新
-   - success toast: `"Configuration saved. Changes take effect on next turn."`
-5. 失敗時：
-   - error toast を表示
-   - dirty = true を維持（retry 可能）
-   - 401 → AuthModal 表示
-
-### 8.2 API Key の扱い
-
-- 入力欄が空（未入力）：payload に `api_key` を含めない（変更なし）
-- Clear 操作を実行：payload で API key 削除を示す（実装固有の表現はサーバー側契約に委ねる）
-- その他：payload に `api_key` 実値を含める
-
-API key 実体は `.env` に保存され、YAML には SecretRef として記録される（[config.md](../config.md) 参照）。
-
----
-
-## 9. バックエンド API
-
-### 9.1 `GET /api/config`
-
-[api.md §2.4](../api.md#24-設定) に従う。変更なし。
-
-### 9.2 `PUT /api/config`
-
-[api.md §2.4](../api.md#24-設定) に従う。変更なし。
-
----
-
-## 10. アクセシビリティ
-
-- 各 field は `<label>` で input と関連付け
-- Required 項目には `aria-required="true"`
-- Save / Discard button は状態に応じて `aria-label` を切替（`"Save changes"` / `"Saving..."` 等）
-- API Key input は `autocomplete="off"` `spellcheck="false"`
-- 変更がある限り Config Header に `role="status"` で `"You have unsaved changes"` を読み上げ
-
----
-
-## 11. Out of Scope
-
-- Provider の追加・削除（YAML 直接編集のみ）
-- Agent 毎の LLM 設定（`agents.<id>` 配下のプロバイダー指定）
-- Sleep / Pulse スケジュール設定（`sleep:` / `pulse:` ブロック）
-- MCP サーバー設定（`mcp_servers:` ブロック）
-- チャネル自体の設定（Discord bots / Telegram bots 等）
+- `.env` の閲覧
+- 設定バックアップ（`egopulse.config.backups/`）の閲覧・復元
 - 設定の import / export
-- 変更履歴（git 管理を推奨）
+- MCP サーバー定義の編集
