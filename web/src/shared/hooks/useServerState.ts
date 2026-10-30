@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 interface CacheEntry<T> {
   data: T | undefined;
@@ -34,6 +34,11 @@ export function invalidateQueries(prefix: string) {
 export interface UseServerStateOptions {
   /** When set, refetch at this interval while the tab is visible. */
   pollIntervalMs?: number;
+  /**
+   * Refetch cached data once when the component mounts (or the key changes),
+   * keeping the cached data visible until the fresh response arrives.
+   */
+  revalidateOnMount?: boolean;
 }
 
 export function useServerState<T>(
@@ -85,6 +90,16 @@ export function useServerState<T>(
       refetch();
     }
   }, [entry, refetch]);
+
+  // `refetch` changes identity with every inline fetcher, so remember which
+  // key was revalidated to do it once per mount and key.
+  const revalidatedKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!options?.revalidateOnMount || revalidatedKey.current === key) return;
+    revalidatedKey.current = key;
+    const cached = cache.get(key);
+    if (cached?.data !== undefined && !cached.loading) refetch();
+  }, [key, options?.revalidateOnMount, refetch]);
 
   // Poll while the tab is visible, refetch immediately on visibility regain,
   // and pause while hidden to avoid wasted requests.

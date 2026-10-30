@@ -66,4 +66,38 @@ describe("useServerState", () => {
       { timeout: 2000 },
     );
   });
+
+  it("revalidates cached data on mount while keeping it visible", async () => {
+    // Arrange: a first mount fills the cache
+    const first = renderHook(() => useServerState("test-revalidate", () => Promise.resolve("old")));
+    await waitFor(() => expect(first.result.current.data).toBe("old"));
+    first.unmount();
+    const fetcher = vi.fn().mockResolvedValue("new");
+
+    // Act
+    const { result } = renderHook(() =>
+      useServerState("test-revalidate", fetcher, { revalidateOnMount: true }),
+    );
+
+    // Assert: cached data is shown at once, then replaced in the background
+    expect(result.current.data).toBe("old");
+    await waitFor(() => expect(result.current.data).toBe("new"));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not revalidate cached data without revalidateOnMount", async () => {
+    // Arrange
+    const first = renderHook(() => useServerState("test-cached", () => Promise.resolve("old")));
+    await waitFor(() => expect(first.result.current.data).toBe("old"));
+    first.unmount();
+    const fetcher = vi.fn().mockResolvedValue("new");
+
+    // Act
+    const { result } = renderHook(() => useServerState("test-cached", fetcher));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Assert
+    expect(result.current.data).toBe("old");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
 });
