@@ -2,12 +2,12 @@ import { useMemo, useState } from "react";
 
 import { fetchSleepRunDetail } from "../../shared/api/sleep";
 import { useServerState } from "../../shared/hooks/useServerState";
-import { computeLineDiff } from "../../shared/lib/diff";
+import { countLineChanges } from "../../shared/lib/diff";
 import { formatDuration, formatTokens } from "../../shared/lib/format";
 import { Spinner } from "../../shared/ui/Spinner";
 import { StatusDot } from "../../shared/ui/StatusDot";
 import type { AgentEntry, MemorySnapshot, SleepRunStep } from "../../shared/api/types";
-import { DiffViewer } from "./DiffViewer";
+import { DiffViewer } from "../../shared/ui/DiffViewer";
 import { statusLabel, statusTone, stepLabel, triggerLabel } from "./sleepStatus";
 
 type RunDetailProps = {
@@ -163,13 +163,7 @@ function changeCounts(snapshots: MemorySnapshot[]): Map<string, { add: number; r
   const counts = new Map<string, { add: number; remove: number }>();
   for (const snapshot of snapshots) {
     if (snapshot.content_before === snapshot.content_after) continue;
-    let add = 0;
-    let remove = 0;
-    for (const line of computeLineDiff(snapshot.content_before, snapshot.content_after)) {
-      if (line.type === "add") add += 1;
-      if (line.type === "remove") remove += 1;
-    }
-    counts.set(snapshot.file, { add, remove });
+    counts.set(snapshot.file, countLineChanges(snapshot.content_before, snapshot.content_after));
   }
   return counts;
 }

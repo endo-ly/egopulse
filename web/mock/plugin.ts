@@ -961,6 +961,209 @@ const AGENT_MEMORY: Record<string, Record<string, string>> = {
   },
 };
 
+// Mirrors GET /api/agents/:id/profile (src/channels/web/agent_profile.rs).
+function agentProfile(agentId: string) {
+  const agent = AGENTS.find((candidate) => candidate.id === agentId);
+  if (!agent) return null;
+  const memory = AGENT_MEMORY[agentId] ?? { episodic: "", semantic: "", prospective: "" };
+  const files = PROMPT_FILES(agentId);
+  const applied = (kind: keyof typeof files) =>
+    files[kind]
+      .filter((layer) => layer.applied)
+      .map((layer) => ({ scope: layer.scope, path: layer.path, chars: layer.content?.length ?? 0 }));
+  const isLyre = agentId === "lyre";
+  return {
+    id: agent.id,
+    label: agent.label,
+    is_default: agent.is_default,
+    reasoning_effort: isLyre ? "medium" : null,
+    llm: [
+      {
+        channel: null,
+        provider: isLyre ? "sakura" : "openai",
+        model: isLyre ? "preview/Kimi-K2.6" : "gpt-5",
+        provider_source: isLyre ? "agent" : "global_default",
+        model_source: isLyre ? "agent" : "global_default",
+      },
+      ...(isLyre
+        ? [
+            {
+              channel: "voice",
+              provider: "openrouter",
+              model: "gpt-4.1-mini",
+              provider_source: "profile",
+              model_source: "profile",
+            },
+          ]
+        : []),
+    ],
+    bindings: { discord_bot: isLyre ? "lyre" : null, telegram_bot: null },
+    prompt_sources: {
+      soul: applied("soul")[0] ?? null,
+      rules: applied("rules"),
+      secret: { path: `agents/${agentId}/SECRET.md`, exists: applied("secret").length > 0 },
+      memory: {
+        episodic: memory.episodic.length,
+        semantic: memory.semantic.length,
+        prospective: memory.prospective.length,
+      },
+      skills: SKILLS.length,
+    },
+  };
+}
+
+const GLOBAL_SOUL = [
+  "# Soul",
+  "",
+  "あなたは落ち着いた相棒。短く、率直に話す。",
+].join("\n");
+
+const GLOBAL_RULES = [
+  "# Rules",
+  "",
+  "- 推測で断定しない。",
+  "- 破壊的な操作の前には必ず確認する。",
+].join("\n");
+
+// Mirrors GET /api/agents/:id/files/:kind: soul falls back to the global
+// file, rules accumulate, secret is agent-only.
+function PROMPT_FILES(agentId: string) {
+  const agentSoul =
+    agentId === "lyre"
+      ? ["# Lyre", "", "観測者として振る舞い、記憶を丁寧に扱う。", "", "## 口調", "- です・ます調"].join("\n")
+      : null;
+  const agentRules = agentId === "lyre" ? "# Lyre rules\n\n- 設計判断は理由とセットで残す。" : null;
+  const secret = agentId === "lyre" ? "秘密モードでは、より親密なトーンで話す。" : null;
+  return {
+    soul: [
+      { scope: "agent", path: `agents/${agentId}/SOUL.md`, content: agentSoul, applied: agentSoul !== null },
+      { scope: "global", path: "SOUL.md", content: GLOBAL_SOUL, applied: agentSoul === null },
+    ],
+    rules: [
+      { scope: "global", path: "AGENTS.md", content: GLOBAL_RULES, applied: true },
+      { scope: "agent", path: `agents/${agentId}/AGENTS.md`, content: agentRules, applied: agentRules !== null },
+    ],
+    secret: [
+      { scope: "agent", path: `agents/${agentId}/SECRET.md`, content: secret, applied: secret !== null },
+    ],
+  };
+}
+
+// Mirrors GET /api/agents/:id/memory/history: published changes only
+// (run finalized as success / partial_failure, content actually changed).
+function memoryHistory(agentId: string) {
+  const published = new Set(
+    SLEEP_RUNS.filter(
+      (run) => run.agent_id === agentId && (run.status === "success" || run.status === "partial_failure"),
+    ).map((run) => run.id),
+  );
+  return Object.values(SLEEP_SNAPSHOTS)
+    .flat()
+    .map((snapshot) => ({
+      run_id: String(snapshot.run_id),
+      file: String(snapshot.file),
+      created_at: String(snapshot.created_at),
+      content_before: String(snapshot.content_before),
+      content_after: String(snapshot.content_after),
+    }))
+    .filter(
+      (snapshot) =>
+        published.has(snapshot.run_id) && snapshot.content_before !== snapshot.content_after,
+    )
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+// Mirrors GET /api/skills, GET /api/skills/:name, and
+// GET /api/skills/:name/files/*: frontmatter, SKILL.md body, and bundled files.
+interface MockSkill {
+  name: string;
+  description: string;
+  source: "builtin" | "workspace";
+  path: string;
+  platforms: string[];
+  deps: string[];
+  required_env: string[];
+  instructions: string;
+  files: Record<string, string>;
+}
+
+const SKILLS: MockSkill[] = [
+  {
+    name: "egopulse",
+    description: "EgoPulse の仕様・設定・運用リファレンス。設定変更や挙動の確認時に使う",
+    source: "builtin",
+    path: "skills/egopulse",
+    platforms: [],
+    deps: [],
+    required_env: [],
+    instructions: [
+      "# EgoPulse",
+      "",
+      "EgoPulse 自身について答えるときは、推測せず `references/` を読む。",
+      "",
+      "## 参照先",
+      "",
+      "| トピック | ファイル |",
+      "|---|---|",
+      "| 設定 | `references/config.md` |",
+      "| Pulse | `references/pulse.md` |",
+    ].join("\n"),
+    files: {
+      "references/config.md": "# 設定仕様\n\n`~/.egopulse/egopulse.config.yaml` に置く。\n\n```yaml\ndefault_agent: lyre\ntimezone: Asia/Tokyo\n```",
+      "references/pulse.md": "# Pulse\n\nPULSE.yaml の intention が due になったときに起動する。",
+      "references/webui/overview.md": "# WebUI\n\nWebUI は EgoPulse ランタイムの運転席である。",
+    },
+  },
+  {
+    name: "github-triage",
+    description: "GitHub の Issue / PR を読み、優先度とラベルを提案する",
+    source: "workspace",
+    path: "workspace/skills/github-triage",
+    platforms: ["linux", "macos"],
+    deps: ["gh", "jq"],
+    required_env: ["GITHUB_TOKEN"],
+    instructions: [
+      "# GitHub triage",
+      "",
+      "1. `scripts/list-open.sh` で未対応の Issue を取得する",
+      "2. `templates/labels.yaml` のラベル定義に沿って分類する",
+      "3. 優先度の根拠を1行で添える",
+    ].join("\n"),
+    files: {
+      "scripts/list-open.sh": "#!/usr/bin/env bash\nset -euo pipefail\ngh issue list --state open --json number,title,labels | jq '.[]'\n",
+      "templates/labels.yaml": "labels:\n  - name: bug\n    priority: high\n  - name: docs\n    priority: low\n",
+      "assets/diagram.png": "",
+    },
+  },
+  {
+    name: "daily-notes",
+    description: "日次ノートを workspace/notes に追記する",
+    source: "workspace",
+    path: "workspace/skills/daily-notes",
+    platforms: [],
+    deps: [],
+    required_env: [],
+    instructions: "",
+    files: {},
+  },
+];
+
+/** Bundled files that are not UTF-8 text, served as 415 like the real API. */
+const BINARY_SKILL_FILES = new Set(["assets/diagram.png"]);
+
+function skillDetail(skill: MockSkill) {
+  const { files, ...rest } = skill;
+  return {
+    ...rest,
+    files: Object.entries(files)
+      .map(([path, content]) => ({
+        path,
+        bytes: BINARY_SKILL_FILES.has(path) ? 48213 : Buffer.byteLength(content),
+      }))
+      .sort((a, b) => a.path.localeCompare(b.path)),
+  };
+}
+
 export function mockApiPlugin(): Plugin | null {
   if (process.env.VITE_MOCK !== "1") return null;
 
@@ -1139,6 +1342,59 @@ export function mockApiPlugin(): Plugin | null {
           });
         }
 
+        const profileMatch = pathname.match(/^\/api\/agents\/([^/]+)\/profile$/);
+        if (profileMatch) {
+          const profile = agentProfile(decodeURIComponent(profileMatch[1]));
+          if (!profile) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "agent_not_found" });
+          }
+          return sendJson(res, { ok: true, profile });
+        }
+        const fileMatch = pathname.match(/^\/api\/agents\/([^/]+)\/files\/([^/]+)$/);
+        if (fileMatch) {
+          const files = PROMPT_FILES(decodeURIComponent(fileMatch[1]));
+          const kind = fileMatch[2] as keyof typeof files;
+          if (!(kind in files)) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid_prompt_file_kind" });
+          }
+          return sendJson(res, { ok: true, layers: files[kind] });
+        }
+        const historyMatch = pathname.match(/^\/api\/agents\/([^/]+)\/memory\/history$/);
+        if (historyMatch) {
+          return sendJson(res, { ok: true, changes: memoryHistory(decodeURIComponent(historyMatch[1])) });
+        }
+        if (pathname === "/api/skills") {
+          return sendJson(res, {
+            ok: true,
+            skills: SKILLS.map(({ name, description, source }) => ({ name, description, source })),
+          });
+        }
+        const skillFileMatch = pathname.match(/^\/api\/skills\/([^/]+)\/files\/(.+)$/);
+        if (skillFileMatch) {
+          const skill = SKILLS.find((candidate) => candidate.name === decodeURIComponent(skillFileMatch[1]));
+          const filePath = skillFileMatch[2].split("/").map(decodeURIComponent).join("/");
+          const content = skill?.files[filePath];
+          if (content === undefined) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "skill_file_not_found" });
+          }
+          if (BINARY_SKILL_FILES.has(filePath)) {
+            res.statusCode = 415;
+            return sendJson(res, { ok: false, error: "skill_file_not_text" });
+          }
+          return sendJson(res, { ok: true, content });
+        }
+        const skillMatch = pathname.match(/^\/api\/skills\/([^/]+)$/);
+        if (skillMatch) {
+          const skill = SKILLS.find((candidate) => candidate.name === decodeURIComponent(skillMatch[1]));
+          if (!skill) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "skill_not_found" });
+          }
+          return sendJson(res, { ok: true, skill: skillDetail(skill) });
+        }
         next();
       });
     },

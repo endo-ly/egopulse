@@ -1,12 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { RunList } from "../RunList";
-import type { AgentEntry, SleepRun } from "../../../shared/api/types";
-
-const AGENTS: AgentEntry[] = [
-  { id: "lyre", label: "Lyre", is_default: true },
-  { id: "ace", label: "Ace", is_default: false },
-];
+import type { SleepRun } from "../../../shared/api/types";
 
 function makeRun(overrides: Partial<SleepRun>): SleepRun {
   return {
@@ -38,29 +33,34 @@ function stubRuns(runs: SleepRun[]) {
 }
 
 describe("RunList", () => {
-  it("renders_one_row_per_run_with_agent_label_trigger_and_relative_time", async () => {
+  it("requests_the_agent_runs_and_renders_trigger_sessions_and_time", async () => {
+    // Arrange
     stubRuns([
-      makeRun({ id: "run-1" }),
-      makeRun({ id: "run-2", agent_id: "ace", trigger: "backfill", status: "partial_failure" }),
+      makeRun({ id: "run-1", session_count: 3 }),
+      makeRun({ id: "run-2", trigger: "backfill", status: "partial_failure", session_count: 1 }),
     ]);
 
+    // Act
     const { container } = render(
-      <RunList agents={AGENTS} agentFilter="" authToken="t1" selectedRunId={null} onSelectRun={vi.fn()} />,
+      <RunList agentId="lyre" authToken="t1" selectedRunId={null} onSelectRun={vi.fn()} />,
     );
 
+    // Assert
     await waitFor(() => {
       expect(container.querySelectorAll(".run-row")).toHaveLength(2);
     });
+    const requested = String(vi.mocked(fetch).mock.calls[0][0]);
+    expect(new URL(requested, "http://localhost").searchParams.get("agent_id")).toBe("lyre");
 
     const firstRow = container.querySelectorAll(".run-row")[0];
-    expect(firstRow.textContent).toContain("Lyre");
     expect(firstRow.textContent).toContain("Scheduled");
+    expect(firstRow.textContent).toContain("3 sessions");
     expect(firstRow.textContent).toContain("3h");
     expect(firstRow.querySelectorAll(".dot-success")).toHaveLength(1);
 
     const secondRow = container.querySelectorAll(".run-row")[1];
-    expect(secondRow.textContent).toContain("Ace");
     expect(secondRow.textContent).toContain("Backfill");
+    expect(secondRow.textContent).toContain("1 session");
     expect(secondRow.querySelectorAll(".dot-warning")).toHaveLength(1);
   });
 
@@ -69,7 +69,7 @@ describe("RunList", () => {
     const onSelectRun = vi.fn();
 
     const { container } = render(
-      <RunList agents={AGENTS} agentFilter="" authToken="t2" selectedRunId="run-2" onSelectRun={onSelectRun} />,
+      <RunList agentId="lyre" authToken="t2" selectedRunId="run-2" onSelectRun={onSelectRun} />,
     );
 
     await waitFor(() => {
@@ -88,7 +88,7 @@ describe("RunList", () => {
     stubRuns([]);
 
     const { container } = render(
-      <RunList agents={AGENTS} agentFilter="" authToken="t3" selectedRunId={null} onSelectRun={vi.fn()} />,
+      <RunList agentId="lyre" authToken="t3" selectedRunId={null} onSelectRun={vi.fn()} />,
     );
 
     await waitFor(() => {
@@ -113,7 +113,7 @@ describe("RunList", () => {
     );
 
     const { container } = render(
-      <RunList agents={AGENTS} agentFilter="" authToken="t4" selectedRunId={null} onSelectRun={vi.fn()} />,
+      <RunList agentId="lyre" authToken="t4" selectedRunId={null} onSelectRun={vi.fn()} />,
     );
 
     await waitFor(() => {

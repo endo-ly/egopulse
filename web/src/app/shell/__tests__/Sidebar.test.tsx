@@ -19,36 +19,44 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
-  it("renders_operational_tabs_as_one_nav_group", () => {
+  it("renders_agent_screens_as_one_nav_group", () => {
+    // Arrange / Act
     const { container } = renderSidebar();
 
+    // Assert
     const navList = container.querySelector(".sidebar-nav-list") as HTMLElement;
     const rows = Array.from(navList.querySelectorAll(".nav-row"));
     const labels = rows.map((row) => row.querySelector(".nav-row-label")?.textContent);
-    expect(labels).toEqual(["Chat", "Sleep", "Pulse", "Metrics"]);
-
-    // Enabled tabs navigate; placeholder tabs stay disabled in the same group.
+    expect(labels).toEqual(["Chat", "Agent", "Schedule"]);
     for (const row of rows) {
-      const label = row.querySelector(".nav-row-label")?.textContent;
-      if (label === "Chat" || label === "Sleep") {
-        expect(row.hasAttribute("disabled")).toBe(false);
-      } else {
-        expect(row.hasAttribute("disabled")).toBe(true);
-        expect(row.getAttribute("title")).toContain("coming soon");
-      }
+      expect(row.hasAttribute("disabled")).toBe(false);
     }
   });
 
   it("nav_row_click_changes_tab", () => {
+    // Arrange
     const { props } = renderSidebar();
 
-    fireEvent.click(screen.getByRole("button", { name: "Sleep" }));
-    expect(props.onTabChange).toHaveBeenCalledWith("sleep");
+    // Act
+    fireEvent.click(screen.getByRole("button", { name: "Agent" }));
 
+    // Assert
+    expect(props.onTabChange).toHaveBeenCalledWith("agent");
     const chat = screen.getByRole("button", { name: "Chat" });
     expect(chat.className).toContain("active");
     expect(chat.getAttribute("aria-current")).toBe("page");
-    expect(chat.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("renders_the_context_section_below_agents", () => {
+    // Arrange / Act
+    renderSidebar({
+      agents: <div>agents-slot</div>,
+      context: <div>context-slot</div>,
+    });
+
+    // Assert
+    const body = document.querySelector(".sidebar-body") as HTMLElement;
+    expect(body.textContent).toBe("agents-slotcontext-slot");
   });
 
   it("brand_search_opens_command_palette", () => {
@@ -58,17 +66,29 @@ describe("Sidebar", () => {
     expect(props.onOpenPalette).toHaveBeenCalledTimes(1);
   });
 
-  it("footer_shows_runtime_status_and_config_utility", () => {
+  it("footer_shows_runtime_status_and_global_screens", () => {
+    // Arrange / Act
     renderSidebar();
 
+    // Assert
     expect(screen.getByText("ok")).toBeTruthy();
-    expect(screen.queryByText(/turns live/)).toBeNull();
     expect(document.querySelector(".dot-live")).not.toBeNull();
+    const footer = document.querySelector(".sidebar-footer") as HTMLElement;
+    const globals = Array.from(footer.querySelectorAll("button.footer-tab"));
+    expect(globals.map((button) => button.textContent)).toEqual(["Metrics", "Config"]);
+    for (const button of globals) {
+      expect(button.hasAttribute("disabled")).toBe(true);
+      expect(button.getAttribute("title")).toContain("coming soon");
+    }
+  });
 
-    const config = screen.getByRole("button", { name: /Config/ });
-    expect(config.hasAttribute("disabled")).toBe(true);
-    expect(config.getAttribute("title")).toContain("coming soon");
-    expect(config.className).toContain("config-btn");
+  it("footer_marks_the_active_global_screen", () => {
+    // Arrange / Act
+    renderSidebar({ activeTab: "metrics" });
+
+    // Assert
+    const metrics = screen.getByRole("button", { name: "Metrics" });
+    expect(metrics.getAttribute("aria-current")).toBe("page");
   });
 
   it("collapsed_mode_hides_labels_and_shows_brand_mark", () => {
@@ -84,7 +104,8 @@ describe("Sidebar", () => {
     expect(
       screen.queryByRole("button", { name: /open command palette/i }),
     ).toBeNull();
-    // Config gear stays in the collapsed footer.
-    expect(screen.getByRole("button", { name: /Config/ })).toBeTruthy();
+    // Global screens stay in the collapsed footer.
+    expect(screen.getByRole("button", { name: "Metrics" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Config" })).toBeTruthy();
   });
 });

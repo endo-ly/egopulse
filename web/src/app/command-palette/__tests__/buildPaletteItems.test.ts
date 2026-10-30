@@ -32,7 +32,8 @@ const messages: ChatMessage[] = [
 ];
 
 describe("buildPaletteItems", () => {
-  it("keeps_sleep_navigation_enabled", () => {
+  it("navigation_lists_every_screen_and_disables_placeholders", () => {
+    // Arrange / Act
     const items = buildPaletteItems({
       agents: [],
       sessions: [],
@@ -42,8 +43,17 @@ describe("buildPaletteItems", () => {
       actions: noopActions,
     });
 
-    const sleepItem = items.find((item) => item.id === "nav-sleep");
-    expect(sleepItem?.disabled).not.toBe(true);
+    // Assert
+    const navigation = items
+      .filter((item) => item.section === "Navigation")
+      .map((item) => [item.label, item.disabled === true]);
+    expect(navigation).toEqual([
+      ["Go to Chat", false],
+      ["Go to Agent", false],
+      ["Go to Schedule", false],
+      ["Go to Metrics", true],
+      ["Go to Config", true],
+    ]);
   });
 
   it("no_message_items_without_query", () => {

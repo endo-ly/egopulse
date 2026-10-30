@@ -1,15 +1,15 @@
 import type { ReactNode } from "react";
 import { StatusDot } from "../../shared/ui/StatusDot";
 import { healthTone, type HealthStatus } from "../runtimeStatus";
-import { NAV_TABS, type NavTab } from "../navigation";
-import type { TabId } from "../navigation";
+import { AGENT_TABS, GLOBAL_TABS, type NavTab, type TabId } from "../navigation";
 
 export interface SidebarProps {
   activeTab: TabId;
   onTabChange: (tab: TabId) => void;
   onOpenPalette: () => void;
   agents?: ReactNode;
-  sessions?: ReactNode;
+  /** Screen-specific section below the agent list (sessions, agent sections, …). */
+  context?: ReactNode;
   healthStatus?: HealthStatus;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
@@ -34,8 +34,10 @@ function navIcon(path: string): ReactNode {
 }
 
 const CHAT_ICON_PATH = "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z";
-const SLEEP_ICON_PATH = "M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z";
-const PULSE_ICON_PATH = "M22 12h-4l-3 9L9 3l-3 9H2";
+/** An ID card: the agent's identity, memory, and abilities. */
+const AGENT_ICON_PATH =
+  "M5 4h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM7 11a2 2 0 1 0 4 0a2 2 0 1 0-4 0M6 16.5c.6-1.2 1.7-2 3-2s2.4.8 3 2M14 10h4M14 14h3";
+const SCHEDULE_ICON_PATH = "M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z";
 const METRICS_ICON_PATH = "M18 20V10M12 20V4M6 20v-6";
 const CONFIG_ICON_PATH =
   "M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6";
@@ -56,24 +58,20 @@ const SEARCH_ICON = (
   </svg>
 );
 
-/** Operational views only; Config is a meta-level utility and lives in the footer. */
-const navTabs = NAV_TABS.filter((tab) => tab.id !== "config");
-const configTab = NAV_TABS.find((tab) => tab.id === "config");
-
-function tabIcon(id: TabId): ReactNode {
-  if (id === "chat") return navIcon(CHAT_ICON_PATH);
-  if (id === "sleep") return navIcon(SLEEP_ICON_PATH);
-  if (id === "pulse") return navIcon(PULSE_ICON_PATH);
-  if (id === "metrics") return navIcon(METRICS_ICON_PATH);
-  return navIcon(CONFIG_ICON_PATH);
-}
+const TAB_ICON_PATHS: Record<TabId, string> = {
+  chat: CHAT_ICON_PATH,
+  agent: AGENT_ICON_PATH,
+  schedule: SCHEDULE_ICON_PATH,
+  metrics: METRICS_ICON_PATH,
+  config: CONFIG_ICON_PATH,
+};
 
 export function Sidebar({
   activeTab,
   onTabChange,
   onOpenPalette,
   agents,
-  sessions,
+  context,
   healthStatus = "ok",
   collapsed = false,
   onToggleCollapse,
@@ -127,7 +125,7 @@ export function Sidebar({
       </div>
 
       <div className="sidebar-nav-list" aria-label="Primary navigation">
-        {navTabs.map((tab) => (
+        {AGENT_TABS.map((tab) => (
           <button
             key={tab.id}
             type="button"
@@ -137,7 +135,7 @@ export function Sidebar({
             title={tabTitle(tab)}
             onClick={() => onTabChange(tab.id)}
           >
-            <span className="nav-row-icon">{tabIcon(tab.id)}</span>
+            <span className="nav-row-icon">{navIcon(TAB_ICON_PATHS[tab.id])}</span>
             <span className="nav-row-label">{tab.label}</span>
           </button>
         ))}
@@ -146,7 +144,7 @@ export function Sidebar({
       {!collapsed && (
         <div className="sidebar-body">
           {agents}
-          {sessions}
+          {context}
         </div>
       )}
 
@@ -157,18 +155,22 @@ export function Sidebar({
             <span className="sidebar-runtime-text">{healthStatus}</span>
           )}
         </div>
-        {configTab && (
-          <button
-            type="button"
-            className="config-btn"
-            disabled={configTab.disabled}
-            aria-label="Config"
-            title={configTab.disabled ? "Config — coming soon" : "Config"}
-            onClick={() => onTabChange(configTab.id)}
-          >
-            {tabIcon(configTab.id)}
-          </button>
-        )}
+        <div className="footer-tabs" aria-label="Global screens">
+          {GLOBAL_TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              className={`nav-row footer-tab ${activeTab === tab.id ? "active" : ""}`}
+              disabled={tab.disabled}
+              aria-current={activeTab === tab.id ? "page" : undefined}
+              title={tabTitle(tab)}
+              onClick={() => onTabChange(tab.id)}
+            >
+              <span className="nav-row-icon">{navIcon(TAB_ICON_PATHS[tab.id])}</span>
+              <span className="nav-row-label">{tab.label}</span>
+            </button>
+          ))}
+        </div>
       </div>
     </nav>
   );

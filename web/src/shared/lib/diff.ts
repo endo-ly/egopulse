@@ -77,3 +77,14 @@ export function computeLineDiff(before: string, after: string): DiffLine[] {
   result.reverse();
   return result;
 }
+
+/** Counts added and removed lines between two texts. */
+export function countLineChanges(before: string, after: string): { add: number; remove: number } {
+  let add = 0;
+  let remove = 0;
+  for (const line of computeLineDiff(before, after)) {
+    if (line.type === "add") add += 1;
+    if (line.type === "remove") remove += 1;
+  }
+  return { add, remove };
+}

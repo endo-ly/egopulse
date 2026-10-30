@@ -6,37 +6,31 @@ import { formatRelativeTime } from "../../shared/lib/format";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { Spinner } from "../../shared/ui/Spinner";
 import { StatusDot } from "../../shared/ui/StatusDot";
-import type { AgentEntry, SleepRun } from "../../shared/api/types";
+import type { SleepRun } from "../../shared/api/types";
+import { MOON_ICON } from "../../shared/ui/icons";
 import { statusTone, triggerLabel } from "./sleepStatus";
 
 const PAGE_SIZE = 20;
 
 type RunListProps = {
-  agents: AgentEntry[];
-  agentFilter: string;
+  agentId: string;
   authToken: string;
   selectedRunId: string | null;
   onSelectRun: (runId: string) => void;
 };
 
-const EMPTY_ICON = (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-    <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-);
-
-export function RunList({ agents, agentFilter, authToken, selectedRunId, onSelectRun }: RunListProps) {
+export function RunList({ agentId, authToken, selectedRunId, onSelectRun }: RunListProps) {
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
 
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
-  }, [agentFilter]);
+  }, [agentId]);
 
   const runsState = useServerState(
     // authToken is part of the key: data is auth-scoped, and a distinct key
     // per token keeps cached runs from leaking across auth identities.
-    `sleep-runs:${agentFilter}:${visibleCount}:${authToken}`,
-    () => fetchSleepRuns(agentFilter || undefined, visibleCount, authToken),
+    `sleep-runs:${agentId}:${visibleCount}:${authToken}`,
+    () => fetchSleepRuns(agentId, visibleCount, authToken),
     { pollIntervalMs: 10_000 },
   );
 
@@ -52,7 +46,7 @@ export function RunList({ agents, agentFilter, authToken, selectedRunId, onSelec
   if (runs.length === 0) {
     return (
       <EmptyState
-        icon={EMPTY_ICON}
+        icon={MOON_ICON}
         title="No sleep batch runs yet"
         description="Runs are created automatically by the sleep scheduler, or when memory is distilled from conversations."
       />
@@ -68,7 +62,6 @@ export function RunList({ agents, agentFilter, authToken, selectedRunId, onSelec
           <RunRow
             key={run.id}
             run={run}
-            agentLabel={agentLabel(agents, run.agent_id)}
             selected={run.id === selectedRunId}
             onSelect={onSelectRun}
           />
@@ -87,18 +80,12 @@ export function RunList({ agents, agentFilter, authToken, selectedRunId, onSelec
   );
 }
 
-function agentLabel(agents: AgentEntry[], agentId: string): string {
-  return agents.find((agent) => agent.id === agentId)?.label ?? agentId;
-}
-
 function RunRow({
   run,
-  agentLabel,
   selected,
   onSelect,
 }: {
   run: SleepRun;
-  agentLabel: string;
   selected: boolean;
   onSelect: (runId: string) => void;
 }) {
@@ -111,8 +98,10 @@ function RunRow({
       title={run.status}
     >
       <StatusDot tone={statusTone(run.status)} />
-      <span className="run-row-agent">{agentLabel}</span>
-      <span className="run-row-trigger">{triggerLabel(run.trigger)}</span>
+      <span className="run-row-title">{triggerLabel(run.trigger)}</span>
+      <span className="run-row-meta">
+        {run.session_count} {run.session_count === 1 ? "session" : "sessions"}
+      </span>
       <span className="run-row-time">{formatRelativeTime(run.started_at)}</span>
     </button>
   );

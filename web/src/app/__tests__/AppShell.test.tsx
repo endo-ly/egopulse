@@ -115,10 +115,10 @@ describe("App shell", () => {
     openSidebar();
 
     // Act
-    fireEvent.click(screen.getByRole("button", { name: "Sleep" }));
+    fireEvent.click(screen.getByRole("button", { name: "Schedule" }));
 
     // Assert
-    expect(onTabChange).toHaveBeenCalledWith("sleep");
+    expect(onTabChange).toHaveBeenCalledWith("schedule");
     expect(sidebar().className).toContain("closed");
 
     // Arrange: agent tap
@@ -344,5 +344,41 @@ describe("App shell", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Create" }));
     expect(onNewSession).toHaveBeenCalledWith("設計相談");
+  });
+
+  it("context_section_follows_the_active_screen", () => {
+    // Arrange
+    mockViewport(false);
+    const onSelectAgentSection = vi.fn();
+    const props = {
+      agents: [{ id: "lyre", label: "Lyre", is_default: true }],
+      sessions: [],
+      selectedAgent: "lyre",
+      agentSection: "overview" as const,
+      onSelectAgentSection,
+    };
+
+    // Act
+    const { rerender } = render(<App {...props} activeTab="chat" />);
+
+    // Assert: chat shows sessions
+    expect(screen.getByText("SESSIONS")).toBeTruthy();
+    expect(screen.queryByRole("navigation", { name: "Agent sections" })).toBeNull();
+
+    // Act
+    rerender(<App {...props} activeTab="agent" />);
+    fireEvent.click(screen.getByRole("button", { name: /Soul/ }));
+
+    // Assert: agent shows its section list
+    expect(screen.queryByText("SESSIONS")).toBeNull();
+    expect(screen.getByRole("navigation", { name: "Agent sections" })).toBeTruthy();
+    expect(onSelectAgentSection).toHaveBeenCalledWith("soul");
+
+    // Act
+    rerender(<App {...props} activeTab="schedule" />);
+
+    // Assert: other screens have no context section yet
+    expect(screen.queryByText("SESSIONS")).toBeNull();
+    expect(screen.queryByRole("navigation", { name: "Agent sections" })).toBeNull();
   });
 });

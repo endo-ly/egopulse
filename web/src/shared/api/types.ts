@@ -101,8 +101,91 @@ export interface MemorySnapshot {
   created_at: string;
 }
 
-export interface AgentMemory {
-  episodic: string;
-  semantic: string;
-  prospective: string;
+export const MEMORY_LAYERS = ["episodic", "semantic", "prospective"] as const;
+export type MemoryLayer = (typeof MEMORY_LAYERS)[number];
+
+/** Published content of each long-term memory layer. */
+export type AgentMemory = Record<MemoryLayer, string>;
+
+/** Resolution level that supplied an LLM setting. */
+export type LlmSettingSource = "profile" | "agent" | "global_default" | "provider_default";
+
+export interface AgentLlmRow {
+  /** Null for channels without a profile. */
+  channel: string | null;
+  provider: string;
+  model: string;
+  provider_source: LlmSettingSource;
+  model_source: LlmSettingSource;
+}
+
+export type PromptFileScope = "global" | "agent";
+
+export interface PromptSource {
+  scope: PromptFileScope;
+  /** Path relative to the state root. */
+  path: string;
+  chars: number;
+}
+
+export interface AgentProfile {
+  id: string;
+  label: string;
+  is_default: boolean;
+  reasoning_effort: string | null;
+  llm: AgentLlmRow[];
+  bindings: { discord_bot: string | null; telegram_bot: string | null };
+  prompt_sources: {
+    /** The applied SOUL file; null when no SOUL is injected. */
+    soul: PromptSource | null;
+    /** Applied AGENTS files in injection order. */
+    rules: PromptSource[];
+    /** Location and presence of SECRET.md; its content is fetched separately. */
+    secret: { path: string; exists: boolean };
+    memory: Record<MemoryLayer, number>;
+    skills: number;
+  };
+}
+
+export type PromptFileKind = "soul" | "rules" | "secret";
+
+export interface PromptFileLayer {
+  scope: PromptFileScope;
+  path: string;
+  /** Null when the file is missing or blank. */
+  content: string | null;
+  /** Whether the content is injected into the system prompt. */
+  applied: boolean;
+}
+
+export interface MemoryChange {
+  run_id: string;
+  file: MemoryLayer;
+  created_at: string;
+  content_before: string;
+  content_after: string;
+}
+
+export interface SkillSummary {
+  name: string;
+  description: string;
+  source: "builtin" | "workspace";
+}
+
+export interface SkillFileEntry {
+  /** Path relative to the skill directory. */
+  path: string;
+  bytes: number;
+}
+
+export interface SkillDetail extends SkillSummary {
+  /** Skill directory relative to the state root. */
+  path: string;
+  platforms: string[];
+  deps: string[];
+  required_env: string[];
+  /** SKILL.md body without its frontmatter. */
+  instructions: string;
+  /** Files bundled with the skill besides SKILL.md. */
+  files: SkillFileEntry[];
 }

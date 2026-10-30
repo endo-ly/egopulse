@@ -112,8 +112,8 @@ export function CommandPalette({
     return acc;
   }, new Map());
 
-  if (!sections.has("Sleep & Pulse Runs") && !query) {
-    sections.set("Sleep & Pulse Runs", []);
+  if (!sections.has("Schedule Runs") && !query) {
+    sections.set("Schedule Runs", []);
   }
 
   let runningIndex = 0;

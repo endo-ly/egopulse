@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 
-import { computeLineDiff } from "../../shared/lib/diff";
-import { useMediaQuery } from "../../shared/hooks/useMediaQuery";
+import { computeLineDiff } from "../lib/diff";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 
 type DiffViewerProps = {
   before: string;
