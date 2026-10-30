@@ -21,6 +21,7 @@ const messages: ChatMessage[] = [
     message_kind: "text",
   },
 ];
+const entries = messages.map((message) => ({ message }));
 
 describe("ChatTab", () => {
   it("chat_tab_renders_timeline_and_composer_without_header", () => {
@@ -55,7 +56,7 @@ describe("ChatTab", () => {
       <ChatTab
         channel="web"
         readOnly={false}
-        messages={messages}
+        entries={entries}
         jumpRequest={{ index: 1, seq: 1 }}
       />,
     );
@@ -68,7 +69,7 @@ describe("ChatTab", () => {
 
   it("waiting_indicator_renders_outside_the_message_list", () => {
     const withWaiting = render(
-      <ChatTab channel="web" readOnly={false} messages={messages} waitingForAssistant />,
+      <ChatTab channel="web" readOnly={false} entries={entries} waitingForAssistant />,
     );
     expect(withWaiting.container.querySelector(".thinking-dots")).toBeTruthy();
     // The indicator is progress UI, not a message: it renders one extra row
@@ -78,7 +79,7 @@ describe("ChatTab", () => {
     ).toHaveLength(3);
 
     const withoutWaiting = render(
-      <ChatTab channel="web" readOnly={false} messages={messages} />,
+      <ChatTab channel="web" readOnly={false} entries={entries} />,
     );
     expect(withoutWaiting.container.querySelector(".thinking-dots")).toBeNull();
   });
@@ -88,7 +89,7 @@ describe("ChatTab", () => {
       <ChatTab
         channel="web"
         readOnly={false}
-        messages={messages}
+        entries={entries}
         loadingOlder
         atHistoryStart
       />,
@@ -107,7 +108,7 @@ describe("ChatTab", () => {
       <ChatTab
         channel="web"
         readOnly={false}
-        messages={messages}
+        entries={entries}
         olderError="request failed"
         onRetryOlder={retry}
       />,
@@ -122,5 +123,32 @@ describe("ChatTab", () => {
 
     // Assert
     expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  it("pulse_output_row_carries_its_folded_trace_line", () => {
+    // Arrange
+    const output = {
+      ...messages[1],
+      id: "pulse:run-1:output",
+      pulse: { run_id: "run-1", role: "output" as const, intention_id: "morning_review" },
+    };
+
+    // Act
+    const { container } = render(
+      <ChatTab
+        channel="discord"
+        readOnly
+        entries={[
+          { message: messages[0] },
+          { message: output, pulseTrace: { intentionId: "morning_review", entries: [] } },
+        ]}
+      />,
+    );
+
+    // Assert
+    const rows = container.querySelectorAll(".timeline-messages > *");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].querySelector(".pulse-trace")).toBeNull();
+    expect(rows[1].querySelector(".pulse-trace-name")?.textContent).toBe("morning_review");
   });
 });

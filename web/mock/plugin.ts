@@ -62,9 +62,10 @@ interface MockSession {
 const SESSION_NAMES: Record<number, string> = {
   1: "Web Chat",
   2: "Design Discussion",
+  71: "Pulse Home",
   44: "Long History (2,000 rows)",
 };
-const PINNED_CHATS = new Set([1, 44]);
+const PINNED_CHATS = new Set([1, 44, 71]);
 const ARCHIVED_CHATS = new Set([4]);
 
 const SESSION_SOURCE = [
@@ -75,6 +76,14 @@ const SESSION_SOURCE = [
     agent_id: "lyre",
     last_message_time: "2026-07-04T10:00:00.000Z",
     last_message_preview: "マークダウン表示とツールカードのショーケース",
+  },
+  {
+    session_key: "lyre-pulse-home",
+    chat_id: 71,
+    channel: "discord",
+    agent_id: "lyre",
+    last_message_time: "2026-07-04T10:00:05.000Z",
+    last_message_preview: "レビューの前に水を一杯どうぞ。",
   },
   {
     session_key: "dev-discussion",
@@ -343,6 +352,15 @@ interface MockHistoryMessage {
   content: string;
   timestamp: string;
   message_kind: string;
+  pulse?: MockPulseRef | null;
+}
+
+type PulseRole = "input" | "step" | "output";
+
+interface MockPulseRef {
+  run_id: string;
+  role: PulseRole;
+  intention_id: string | null;
 }
 
 const MESSAGES: MockHistoryMessage[] = [
@@ -411,6 +429,104 @@ const MESSAGES: MockHistoryMessage[] = [
       "エラー状態のツールカードは自動的に展開され、赤い `error` バッジで表示されます（上の `shell` を参照）。成功時は所要時間バッジ付きで折りたたまれます。",
     timestamp: "2026-07-04T09:59:00.000Z",
     message_kind: "text",
+  },
+];
+
+// A Discord home surface with two notified Pulse activations. Each row of an
+// activation carries its run and role, matching the backend history API.
+const PULSE_HOME_SESSION = "lyre-pulse-home";
+
+function pulseRef(runId: string, role: PulseRole, intentionId: string): MockPulseRef {
+  return { run_id: runId, role, intention_id: intentionId };
+}
+
+const PULSE_HOME_MESSAGES: MockHistoryMessage[] = [
+  {
+    id: "pulse-home-m1",
+    sender_id: "user",
+    sender_kind: "user",
+    content: "明日の朝、予定を教えて。",
+    timestamp: "2026-07-03T22:00:00.000Z",
+    message_kind: "message",
+    pulse: null,
+  },
+  {
+    id: "pulse-home-m2",
+    sender_id: "lyre",
+    sender_kind: "assistant",
+    content: "了解です。朝に予定をお知らせします。",
+    timestamp: "2026-07-03T22:00:05.000Z",
+    message_kind: "message",
+    pulse: null,
+  },
+  {
+    id: "pulse:run-morning:input",
+    sender_id: "pulse",
+    sender_kind: "user",
+    content:
+      "[Pulse: morning_review]\nSchedule: daily 08:00\nAttention:\nCheck today's schedule.",
+    timestamp: "2026-07-04T08:00:00.000Z",
+    message_kind: "system_event",
+    pulse: pulseRef("run-morning", "input", "morning_review"),
+  },
+  {
+    id: "pulse:run-morning:step:1",
+    sender_id: "lyre",
+    sender_kind: "assistant",
+    content: "今日の予定を確認します。",
+    timestamp: "2026-07-04T08:00:10.000Z",
+    message_kind: "message",
+    pulse: pulseRef("run-morning", "step", "morning_review"),
+  },
+  {
+    id: "tool:pulse-call-1",
+    sender_id: "assistant",
+    sender_kind: "assistant",
+    content: JSON.stringify({
+      tool: "read",
+      status: "success",
+      result: "10:00 design review\n15:00 1on1",
+      input: { path: "calendar/today.md" },
+    }),
+    timestamp: "2026-07-04T08:00:11.000Z",
+    message_kind: "tool_call",
+    pulse: pulseRef("run-morning", "step", "morning_review"),
+  },
+  {
+    id: "pulse:run-morning:output",
+    sender_id: "lyre",
+    sender_kind: "assistant",
+    content: "おはようございます。今日は 10:00 にデザインレビュー、15:00 に 1on1 があります。",
+    timestamp: "2026-07-04T08:01:00.000Z",
+    message_kind: "message",
+    pulse: pulseRef("run-morning", "output", "morning_review"),
+  },
+  {
+    id: "pulse-home-m3",
+    sender_id: "user",
+    sender_kind: "user",
+    content: "ありがとう。レビューの資料は昨日のままで大丈夫そう。",
+    timestamp: "2026-07-04T08:05:00.000Z",
+    message_kind: "message",
+    pulse: null,
+  },
+  {
+    id: "pulse:run-hydrate:input",
+    sender_id: "pulse",
+    sender_kind: "user",
+    content: "[Pulse: hydration]\nSchedule: every 2h\nAttention:\nRemind to drink water.",
+    timestamp: "2026-07-04T10:00:00.000Z",
+    message_kind: "system_event",
+    pulse: pulseRef("run-hydrate", "input", "hydration"),
+  },
+  {
+    id: "pulse:run-hydrate:output",
+    sender_id: "lyre",
+    sender_kind: "assistant",
+    content: "レビューの前に水を一杯どうぞ。",
+    timestamp: "2026-07-04T10:00:05.000Z",
+    message_kind: "message",
+    pulse: pulseRef("run-hydrate", "output", "hydration"),
   },
 ];
 
@@ -522,6 +638,7 @@ const KNOWN_SESSION_KEYS = new Set(
 
 function historyMessagesFor(sessionKey: string): MockHistoryMessage[] {
   if (sessionKey === "web-chat" || sessionKey === "") return MESSAGES;
+  if (sessionKey === PULSE_HOME_SESSION) return PULSE_HOME_MESSAGES;
   if (sessionKey === LONG_HISTORY_SESSION || sessionKey === LONG_HISTORY_ALIAS) {
     return longHistory();
   }
@@ -538,6 +655,7 @@ function withoutSeq(entry: MockHistoryEntry): MockHistoryMessage {
     content: entry.content,
     timestamp: entry.timestamp,
     message_kind: entry.message_kind,
+    pulse: entry.pulse ?? null,
   };
 }
 

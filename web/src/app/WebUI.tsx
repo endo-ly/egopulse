@@ -8,6 +8,7 @@ import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
 import { useChatHistory } from "../features/chat/useChatHistory";
 import { isWaitingForAssistant, mergeChatMessages } from "../features/chat/chatReducer";
+import { buildTimelineEntries } from "../features/chat/timelineEntries";
 import { AuthRequiredError, loadAuthToken, persistAuthToken } from "../shared/api/auth";
 import { fetchAgents } from "../shared/api/agents";
 import { createSessionKey, fetchSessions, updateSession } from "../shared/api/sessions";
@@ -366,9 +367,18 @@ export function WebUI() {
   const channel = selectedSessionData?.channel ?? "web";
   const isReadOnly = channel !== "web";
 
-  const messages = useMemo(
-    () => mergeChatMessages(history.messages, transport.state.messages),
+  const timelineEntries = useMemo(
+    () =>
+      buildTimelineEntries(
+        mergeChatMessages(history.messages, transport.state.messages),
+      ),
     [history.messages, transport.state.messages],
+  );
+  // The palette searches the top-level rows so its jump indices match the
+  // rendered timeline.
+  const messages = useMemo(
+    () => timelineEntries.map((entry) => entry.message),
+    [timelineEntries],
   );
 
   const handleSend = useCallback(
@@ -429,7 +439,7 @@ export function WebUI() {
       key={selectedSession}
       channel={channel}
       readOnly={isReadOnly}
-      messages={messages}
+      entries={timelineEntries}
       onSend={handleSend}
       storageKey={selectedSession}
       jumpRequest={messageJump ?? undefined}

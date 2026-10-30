@@ -94,6 +94,7 @@ pub(crate) async fn run_activation_with_snapshot(
     agent_id: &str,
     capsule: &PulseCapsule,
     home_surface: &HomeSurface,
+    pulse_run_id: &str,
     config_snapshot: Arc<crate::config::manager::ConfigSnapshot>,
 ) -> Result<ActivationResult, EgoPulseError> {
     state.active_turns.begin_turn(agent_id);
@@ -234,7 +235,7 @@ pub(crate) async fn run_activation_with_snapshot(
             }
             ModelStep::ToolCalls(assistant_phase) => assistant_phase,
         };
-        let assistant_message_id = format!("pulse-assistant-{}", uuid::Uuid::new_v4());
+        let assistant_message_id = crate::pulse::message_id::step(pulse_run_id);
 
         let tool_outcomes = ToolExecutor::new(
             &turn_dependencies,
@@ -559,6 +560,7 @@ mod tests {
             "default",
             &capsule,
             &surface,
+            "run-test",
             state.config_manager.current_blocking(),
         )
         .await
@@ -672,6 +674,7 @@ mod tests {
             "default",
             &capsule,
             &surface,
+            "run-test",
             state.config_manager.current_blocking(),
         )
         .await
@@ -751,6 +754,7 @@ mod tests {
             "default",
             &capsule,
             &surface,
+            "run-test",
             state.config_manager.current_blocking(),
         )
         .await
@@ -829,6 +833,7 @@ mod tests {
             "default",
             &capsule,
             &surface,
+            "run-test",
             state.config_manager.current_blocking(),
         )
         .await
@@ -975,6 +980,7 @@ mod tests {
                 "default",
                 &capsule,
                 &surface,
+                "run-test",
                 state.config_manager.current_blocking(),
             )
             .await
@@ -1080,6 +1086,7 @@ mod tests {
             "default",
             &capsule,
             &surface,
+            "run-test",
             state.config_manager.current_blocking(),
         )
         .await;

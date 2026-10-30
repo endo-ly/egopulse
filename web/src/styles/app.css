@@ -1009,7 +1009,9 @@
     .agent-row,
     .toast-close,
     .toast-progress-bar,
-    .sidebar {
+    .sidebar,
+    button.pulse-trace-summary,
+    .pulse-trace-chevron {
       transition-duration: 0.01ms;
     }
 
@@ -1114,6 +1116,99 @@
 
   .jump-to-latest:hover {
     background: var(--color-panel-2);
+  }
+
+
+  /* A delivered Pulse output names its intention on one quiet line above the
+     body; the line expands in place to the activation trace. */
+  .pulse-trace {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    margin-bottom: var(--space-xs);
+  }
+
+  .pulse-trace-summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    /* Pull the icon onto the body's left edge while keeping a hover pad. */
+    margin-left: -6px;
+    padding: 2px var(--space-sm) 2px 6px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--color-muted);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: var(--text-xs);
+    line-height: 1.4;
+  }
+
+  button.pulse-trace-summary {
+    cursor: pointer;
+    transition:
+      color 120ms ease,
+      background 120ms ease;
+  }
+
+  button.pulse-trace-summary:hover {
+    background: color-mix(in srgb, var(--color-text-strong) 5%, transparent);
+    color: var(--color-text);
+  }
+
+  button.pulse-trace-summary:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  .pulse-trace-icon {
+    flex-shrink: 0;
+    color: var(--color-accent);
+  }
+
+  .pulse-trace-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .pulse-trace-chevron {
+    flex-shrink: 0;
+    opacity: 0.6;
+    transition: transform 150ms ease;
+  }
+
+  .pulse-trace-summary[aria-expanded="true"] .pulse-trace-chevron {
+    transform: rotate(90deg);
+  }
+
+  .pulse-trace-body {
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin: var(--space-xs) 0 var(--space-md);
+    padding: var(--space-xs) 0 var(--space-xs) var(--space-base);
+    border-left: 2px solid color-mix(in srgb, var(--color-accent) 35%, transparent);
+  }
+
+  .pulse-trace-body .tool-card {
+    max-width: min(500px, 100%);
+  }
+
+  .pulse-trace-input {
+    margin: 0;
+    color: var(--color-muted);
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: var(--text-xs);
+    line-height: 1.6;
+    white-space: pre-wrap;
+  }
+
+  .pulse-trace-narration {
+    color: var(--color-muted);
+    font-size: var(--text-sm);
   }
 
   .toast-container {
@@ -2347,17 +2442,5 @@
 
   .code-block-fold:hover {
     background: var(--color-panel-2);
-  }
-
-  .pulse-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: var(--space-xs);
-    padding: 2px var(--space-sm);
-    background: var(--color-accent-10);
-    border-radius: var(--radius-full);
-    font-size: var(--text-xs);
-    color: var(--color-accent);
-    font-weight: 500;
   }
 }

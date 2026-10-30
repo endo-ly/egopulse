@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, render } from "@testing-library/react";
 import { MessageBubble } from "../MessageBubble";
 import type { ChatMessage } from "../../../shared/api/types";
 
@@ -50,12 +50,55 @@ describe("MessageBubble", () => {
     expect(container.querySelector(".thinking-dots")).toBeNull();
   });
 
-  it("pulse_notification_renders_pulse_badge", () => {
+  it("pulse_output_shows_only_the_intention_until_expanded", () => {
+    // Arrange
+    const pulse = { run_id: "run-1", intention_id: "morning_review" };
+    const trace = {
+      intentionId: "morning_review",
+      entries: [
+        msg({
+          id: "pulse:run-1:input",
+          sender_kind: "user",
+          content: "Attention:\nCheck today's schedule.",
+          message_kind: "system_event",
+          pulse: { ...pulse, role: "input" as const },
+        }),
+        msg({
+          id: "tool:call-1",
+          content: JSON.stringify({ tool: "read", status: "success", result: "ok" }),
+          message_kind: "tool_call",
+          pulse: { ...pulse, role: "step" as const },
+        }),
+      ],
+    };
     const { container } = render(
-      <MessageBubble message={msg({ message_kind: "pulse_notification" })} />,
+      <MessageBubble message={msg({ content: "おはようございます" })} pulseTrace={trace} />,
     );
-    const badge = container.querySelector(".pulse-badge");
-    expect(badge).toBeTruthy();
+    const summary = container.querySelector(".pulse-trace-summary") as HTMLButtonElement;
+
+    // Assert: collapsed by default, naming the intention only.
+    expect(summary.textContent).toBe("morning_review");
+    expect(summary.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector(".pulse-trace-body")).toBeNull();
+
+    // Act
+    act(() => summary.click());
+
+    // Assert: the trace opens in place.
+    expect(summary.getAttribute("aria-expanded")).toBe("true");
+    const body = container.querySelector(".pulse-trace-body");
+    expect(body?.querySelector(".pulse-trace-input")?.textContent).toContain(
+      "Check today's schedule.",
+    );
+    expect(body?.querySelector(".tool-card")).toBeTruthy();
+  });
+
+  it("ordinary_message_has_no_pulse_line", () => {
+    // Act
+    const { container } = render(<MessageBubble message={msg({})} />);
+
+    // Assert
+    expect(container.querySelector(".pulse-trace")).toBeNull();
   });
 
   it("assistant_avatar_uses_image_and_letter_fallback", () => {

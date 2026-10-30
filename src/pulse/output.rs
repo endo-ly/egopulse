@@ -20,6 +20,7 @@ use crate::error::EgoPulseError;
 use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;
 use crate::pulse::definition::{TemporalIntention, format_schedule};
+use crate::pulse::message_id;
 use crate::pulse::runner::ActivationResult;
 use crate::runtime::AppState;
 use crate::storage::{MessageKind, PulseOutputKind, StoredMessage};
@@ -152,6 +153,7 @@ async fn handle_notify(
         intention,
         chat_id,
         activation_result,
+        pulse_run_id,
     )
     .await
     {
@@ -238,11 +240,12 @@ async fn persist_notification_with_session(
     intention: &TemporalIntention,
     chat_id: i64,
     activation_result: &ActivationResult,
+    pulse_run_id: &str,
 ) -> Result<String, EgoPulseError> {
     let output_text = &activation_result.output_text;
 
     let synthetic_input = StoredMessage {
-        id: format!("pulse-in-{}", uuid::Uuid::new_v4()),
+        id: message_id::input(pulse_run_id),
         sender_id: "pulse".to_string(),
         message_kind: MessageKind::SystemEvent,
         ..StoredMessage::user(
@@ -307,7 +310,7 @@ async fn persist_notification_with_session(
                 &state.turn_dependencies(),
                 ConversationScope::Normal,
                 StoredMessage {
-                    id: format!("pulse-tools-{}", uuid::Uuid::new_v4()),
+                    id: message_id::tool_result(pulse_run_id),
                     ..StoredMessage::tool_result_preview(
                         chat_id,
                         agent_id.to_string(),
@@ -325,7 +328,7 @@ async fn persist_notification_with_session(
         }
     }
 
-    let assistant_id = format!("pulse-out-{}", uuid::Uuid::new_v4());
+    let assistant_id = message_id::output(pulse_run_id);
     let assistant_msg = StoredMessage {
         id: assistant_id.clone(),
         ..StoredMessage::assistant(chat_id, agent_id.to_string(), output_text.to_string())

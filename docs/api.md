@@ -250,7 +250,8 @@ GET /api/history?session_key=main&limit=300&before_seq=6524
       "sender_kind": "assistant",
       "content": "{\"tool\":\"read\",\"status\":\"success\",\"result\":\"...\",\"input\":{\"path\":\"a.txt\"}}",
       "timestamp": "2026-04-12T14:00:06Z",
-      "message_kind": "tool_call"
+      "message_kind": "tool_call",
+      "pulse": null
     }
   ],
   "next_before_seq": 6225,
@@ -263,6 +264,8 @@ GET /api/history?session_key=main&limit=300&before_seq=6524
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 
 メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。
+
+`pulse` は、そのエントリが属する Pulse 通知の Activation を示す。Activation 外のエントリでは `null`、属する場合は `{run_id, role, intention_id}` を持つ。`run_id` は `pulse_runs.id`、`intention_id` は同 run の intention（run の記録がない場合は `null`）。`role` は `input`（intention を注入する合成入力）、`step`（途中発話・ツール結果要約・それらに紐づくツール呼び出し）、`output`（配送先チャネルへ届けた最終応答）のいずれか。Pulse の行は `pulse:{run_id}:{role}` 形式のメッセージ ID で保存され（`src/pulse/message_id.rs`）、ツール呼び出しは親メッセージ ID から判定する。WebUI はこれを使い、`input` / `step` を同じ `run_id` の `output` の下に折りたたむ。
 
 エントリの並び順は次の 2 層で決まる:
 

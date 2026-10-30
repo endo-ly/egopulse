@@ -4,12 +4,14 @@ import { ToolCard } from "./ToolCard";
 import { Composer } from "./Composer";
 import { ReadOnlyBanner } from "./ReadOnlyBanner";
 import { Spinner } from "../../shared/ui/Spinner";
-import type { ChatMessage, ToolEventData } from "../../shared/api/types";
+import { parseToolEvent } from "./toolEvent";
+import type { TimelineEntry } from "./timelineEntries";
 
 export interface ChatTabProps {
   channel: string;
   readOnly: boolean;
-  messages?: ChatMessage[];
+  /** Top-level timeline rows, with Pulse traces folded under their outputs. */
+  entries?: TimelineEntry[];
   onSend?: (text: string, draftId: string) => Promise<boolean>;
   storageKey?: string;
   /** Jump request from the command palette: scroll to and flash the message. */
@@ -30,38 +32,10 @@ export interface ChatTabProps {
   olderLoadSeq?: number;
 }
 
-function parseToolEvent(message: ChatMessage): ToolEventData | null {
-  if (message.message_kind !== "tool_call") {
-    return null;
-  }
-  try {
-    const raw = JSON.parse(message.content) as {
-      tool?: string;
-      status?: string;
-      result?: string;
-      input?: unknown;
-      duration_ms?: number;
-    };
-    if (typeof raw.tool !== "string") return null;
-    const isError = raw.status === "error";
-    const isPending = raw.status === "pending";
-    return {
-      name: raw.tool,
-      state: isError ? "error" : isPending ? "pending" : "success",
-      output: raw.result,
-      is_error: isError,
-      input: raw.input,
-      duration_ms: raw.duration_ms,
-    };
-  } catch {
-    return null;
-  }
-}
-
 export function ChatTab({
   channel,
   readOnly,
-  messages = [],
+  entries = [],
   onSend,
   storageKey,
   jumpRequest,
@@ -82,7 +56,7 @@ export function ChatTab({
         atHistoryStart={atHistoryStart}
         prependSeq={olderLoadSeq}
       >
-        {messages.map((m) => {
+        {entries.map(({ message: m, pulseTrace }) => {
           const toolEvent = parseToolEvent(m);
           if (toolEvent) {
             return (
@@ -91,7 +65,14 @@ export function ChatTab({
               </div>
             );
           }
-          return <MessageBubble key={m.id} message={m} agentAvatars={agentAvatars} />;
+          return (
+            <MessageBubble
+              key={m.id}
+              message={m}
+              agentAvatars={agentAvatars}
+              pulseTrace={pulseTrace}
+            />
+          );
         })}
         {waitingForAssistant && (
           <div className="message-row bubble-assistant">

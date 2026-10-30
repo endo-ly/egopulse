@@ -5,10 +5,6 @@ use crate::error::StorageError;
 use super::{ChatInfo, Database, PulseOutputKind, PulseRunStatus};
 
 /// Parses a `pulse_runs` row into [`super::PulseRun`].
-///
-/// Only used by [`Database::get_pulse_run`] which is itself gated with
-/// `#[cfg(test)]` — see that method for the rationale.
-#[cfg(test)]
 fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::PulseRun> {
     use super::PulseRun;
     use std::str::FromStr;
@@ -276,12 +272,9 @@ impl Database {
 
     /// Returns a single pulse run by its primary key.
     ///
-    /// Only called from integration tests (pulse/output.rs) which verify
-    /// that pulse output handling correctly persisted the run status.
-    /// No runtime callers yet — gated with #[cfg(test)] to avoid dead_code
-    /// warnings in production builds.  Remove the gate when a runtime caller
-    /// is introduced.
-    #[cfg(test)]
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query failures.
     pub(crate) fn get_pulse_run(&self, id: &str) -> Result<Option<super::PulseRun>, StorageError> {
         use rusqlite::OptionalExtension;
 

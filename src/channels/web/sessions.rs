@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use crate::agent_loop::message_format::{is_tool_preview_message, tool_preview_narration};
 use crate::conversation::{ConversationChanged, ConversationScope};
+use crate::pulse;
 use crate::storage::{SenderKind, StoredMessage, ToolCall, ToolState, call_blocking};
 
 use super::{WebState, web_external_chat_id, web_session_key};
@@ -225,10 +226,23 @@ pub(super) async fn get_history(
         }
     };
 
-    let (messages, tool_calls, next_before_seq, newest_seq) = match call_blocking(db, move |db| {
+    let page = match call_blocking(db, move |db| {
         let messages = db.get_messages_before(chat_id, before_seq, limit)?;
         let message_ids: Vec<String> = messages.iter().map(|message| message.id.clone()).collect();
         let tool_calls = db.get_tool_calls_for_messages(chat_id, &message_ids)?;
+        let mut pulse_intentions = HashMap::new();
+        for message in &messages {
+            let Some(pulse_message) = pulse::message_id::parse(&message.id) else {
+                continue;
+            };
+            if pulse_intentions.contains_key(pulse_message.run_id) {
+                continue;
+            }
+            let intention_id = db
+                .get_pulse_run(pulse_message.run_id)?
+                .map(|run| run.intention_id);
+            pulse_intentions.insert(pulse_message.run_id.to_string(), intention_id);
+        }
         let oldest_seq = messages.iter().filter_map(|message| message.seq).min();
         let newest_seq = messages.iter().filter_map(|message| message.seq).max();
         let has_older = match oldest_seq {
@@ -236,11 +250,17 @@ pub(super) async fn get_history(
             None => false,
         };
         let next_before_seq = if has_older { oldest_seq } else { None };
-        Ok::<_, crate::error::StorageError>((messages, tool_calls, next_before_seq, newest_seq))
+        Ok::<_, crate::error::StorageError>(HistoryPage {
+            messages,
+            tool_calls,
+            pulse_intentions,
+            next_before_seq,
+            newest_seq,
+        })
     })
     .await
     {
-        Ok(value) => value,
+        Ok(page) => page,
         Err(error) => {
             tracing::warn!(chat_id, error = %error, "failed to load message history");
             return Err((
@@ -249,6 +269,13 @@ pub(super) async fn get_history(
             ));
         }
     };
+    let HistoryPage {
+        messages,
+        tool_calls,
+        pulse_intentions,
+        next_before_seq,
+        newest_seq,
+    } = page;
 
     // The storage query is scoped to this page's messages, so every returned
     // tool call belongs directly after its parent message.
@@ -296,11 +323,12 @@ pub(super) async fn get_history(
                 "content": content,
                 "timestamp": message.timestamp,
                 "message_kind": message.message_kind.to_string(),
+                "pulse": pulse_entry(&message.id, &pulse_intentions),
             }));
         }
         if let Some(tools) = tools_by_message.remove(message.id.as_str()) {
             for tool_call in tools {
-                entries.push(tool_call_entry(tool_call));
+                entries.push(tool_call_entry(tool_call, &pulse_intentions));
             }
         }
     }
@@ -322,7 +350,7 @@ pub(super) async fn get_history(
 /// The card status follows the ledger `state`, not the presence of an output:
 /// failed and uncertain calls carry no output by design, so deriving `pending`
 /// from a missing output would freeze them as running forever.
-fn tool_call_entry(tool_call: &ToolCall) -> serde_json::Value {
+fn tool_call_entry(tool_call: &ToolCall, pulse_intentions: &PulseIntentions) -> serde_json::Value {
     let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
         .unwrap_or(serde_json::Value::Null);
     let (status, result) = match (&tool_call.state, tool_call.tool_output.as_ref()) {
@@ -367,6 +395,38 @@ fn tool_call_entry(tool_call: &ToolCall) -> serde_json::Value {
         .unwrap_or_default(),
         "timestamp": tool_call.timestamp,
         "message_kind": "tool_call",
+        "pulse": pulse_entry(&tool_call.message_id, pulse_intentions),
+    })
+}
+
+/// Pulse run ID → intention ID, for the runs that appear in one history page.
+/// A run whose record is gone maps to `None`.
+type PulseIntentions = HashMap<String, Option<String>>;
+
+/// One history page as loaded from storage, before shaping for the WebUI.
+struct HistoryPage {
+    messages: Vec<StoredMessage>,
+    tool_calls: Vec<ToolCall>,
+    pulse_intentions: PulseIntentions,
+    next_before_seq: Option<i64>,
+    newest_seq: Option<i64>,
+}
+
+/// Builds the `pulse` field of a history entry: which Pulse activation the
+/// row belongs to and its role there, or `null` for rows outside any
+/// activation. Tool calls pass their parent message ID.
+fn pulse_entry(message_id: &str, pulse_intentions: &PulseIntentions) -> serde_json::Value {
+    let Some(pulse_message) = pulse::message_id::parse(message_id) else {
+        return serde_json::Value::Null;
+    };
+    let intention_id = pulse_intentions
+        .get(pulse_message.run_id)
+        .cloned()
+        .flatten();
+    serde_json::json!({
+        "run_id": pulse_message.run_id,
+        "role": pulse_message.role.as_str(),
+        "intention_id": intention_id,
     })
 }
 
@@ -1350,6 +1410,109 @@ mod tests {
         assert_eq!(messages[1]["content"], "やります");
         assert_eq!(messages[2]["message_kind"], "tool_call");
         assert_eq!(messages[2]["id"], "tool:call-1");
+    }
+
+    #[tokio::test]
+    async fn api_history_tags_pulse_rows_with_run_role_and_intention() {
+        // Arrange: an ordinary tool turn followed by a notified Pulse
+        // activation (synthetic input, narrated tool phase, final output).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-pulse:agent:lyre", "lyre");
+
+        let user_msg = StoredMessage::user(chat_id, "user:web".to_string(), "読んで".to_string());
+        db.store_message_only(&user_msg).expect("store user");
+        let assistant_msg = StoredMessage::assistant(
+            chat_id,
+            "lyre".to_string(),
+            "読みます [tool_call] read".to_string(),
+        );
+        db.store_message_only(&assistant_msg)
+            .expect("store assistant");
+        db.insert_tool_call_for_test(
+            "call-user",
+            chat_id,
+            &assistant_msg.id,
+            "read",
+            r#"{"path":"a.txt"}"#,
+            Some(r#"{"result":"ok","status":"success"}"#),
+            "2024-01-01T00:00:01Z",
+        )
+        .expect("store user tool call");
+
+        let run_id = "run-1";
+        db.try_create_pulse_run(run_id, "lyre", "morning_review", "2026-10-30")
+            .expect("create pulse run");
+        let pulse_input = StoredMessage {
+            id: crate::pulse::message_id::input(run_id),
+            sender_id: "pulse".to_string(),
+            message_kind: MessageKind::SystemEvent,
+            ..StoredMessage::user(chat_id, "pulse".to_string(), "[Pulse: test]".to_string())
+        };
+        db.store_message_only(&pulse_input)
+            .expect("store pulse input");
+        let pulse_step = StoredMessage {
+            id: crate::pulse::message_id::step(run_id),
+            ..StoredMessage::assistant(
+                chat_id,
+                "lyre".to_string(),
+                "確認します [tool_call] read".to_string(),
+            )
+        };
+        db.store_message_only(&pulse_step)
+            .expect("store pulse step");
+        db.insert_tool_call_for_test(
+            "call-pulse",
+            chat_id,
+            &pulse_step.id,
+            "read",
+            r#"{"path":"b.txt"}"#,
+            Some(r#"{"result":"ok","status":"success"}"#),
+            "2024-01-01T00:00:02Z",
+        )
+        .expect("store pulse tool call");
+        let pulse_output = StoredMessage {
+            id: crate::pulse::message_id::output(run_id),
+            ..StoredMessage::assistant(chat_id, "lyre".to_string(), "お知らせです".to_string())
+        };
+        db.store_message_only(&pulse_output)
+            .expect("store pulse output");
+
+        // Act
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+            before_seq: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+
+        // Assert
+        let messages = result.0["messages"]
+            .as_array()
+            .expect("messages array")
+            .clone();
+        let pulse_of = |id: &str| {
+            messages
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("entry {id} present"))["pulse"]
+                .clone()
+        };
+        let tagged = |role: &str| {
+            serde_json::json!({
+                "run_id": run_id,
+                "role": role,
+                "intention_id": "morning_review",
+            })
+        };
+        assert_eq!(pulse_of(&user_msg.id), serde_json::Value::Null);
+        assert_eq!(pulse_of(&assistant_msg.id), serde_json::Value::Null);
+        assert_eq!(pulse_of("tool:call-user"), serde_json::Value::Null);
+        assert_eq!(pulse_of(&pulse_input.id), tagged("input"));
+        assert_eq!(pulse_of(&pulse_step.id), tagged("step"));
+        assert_eq!(pulse_of("tool:call-pulse"), tagged("step"));
+        assert_eq!(pulse_of(&pulse_output.id), tagged("output"));
     }
 
     #[tokio::test]

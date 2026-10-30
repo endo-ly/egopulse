@@ -26,8 +26,19 @@ export interface ChatMessage {
   content: string;
   timestamp: string;
   message_kind: string;
+  /** Pulse activation this row belongs to; absent or null outside any activation. */
+  pulse?: PulseRef | null;
   /** Owning run for live entries (replay-truncated cleanup); absent on persisted rows. */
   runId?: string;
+}
+
+/** A history row's place in one Pulse activation. */
+export interface PulseRef {
+  run_id: string;
+  /** `output` is the delivered message; `input` and `step` are its trace. */
+  role: "input" | "step" | "output";
+  /** Null when the run record is gone. */
+  intention_id: string | null;
 }
 
 /** One page of committed chat history returned by `GET /api/history`. */

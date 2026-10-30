@@ -292,6 +292,7 @@ async fn process_intention_with_activation_timeout(
             agent_id_str,
             &capsule,
             &home_surface,
+            &pulse_run_id,
             Arc::clone(&snapshot),
         ),
         activation_timeout,
