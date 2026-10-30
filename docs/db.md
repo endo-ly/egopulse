@@ -490,7 +490,7 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 **操作**:
 - `create_memory_snapshot(run_id, agent_id, file, content_before, content_after)` — INSERT
 - `get_snapshots_for_run(run_id)` — run_id 絞り込み + created_at 昇順
-- `get_snapshots_for_agent(agent_id, limit)` — agent_id 絞り込み + created_at 降順
+- `list_memory_changes(agent_id, limit)` — 公開済みの変更履歴（全ファイル）。所属 run が `success` / `partial_failure` かつ `content_before != content_after` の行を created_at 降順で返す
 - `get_latest_snapshot_for_file(agent_id, file)` — agent+file の最新1件
 - `ensure_memory_snapshots_complete(run_id, agent_id, base)` — 欠落 file に `content_before == content_after == base` の snapshot を補完する
 - `list_running_sleep_runs()` — `status = 'running'` の Run を開始順に取得（スタートアップリカバリ用）

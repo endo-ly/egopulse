@@ -17,6 +17,7 @@ WebUI と外部 voice client が使用する REST API、および WebSocket の�
     - [Sleep Batch](#29-sleep-batch)
     - [Webhook](#210-webhook)
     - [Agent Avatar](#211-agent-avatar)
+    - [Agent 画面](#212-agent-画面)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -540,6 +541,104 @@ DELETE /api/agents/{agent_id}/avatar
 
 - `{ "ok": true }` を返す。未設定でも成功する（冪等）
 - 削除後は `avatar_url: null` となり、UI は頭文字アバターへ戻る
+
+### 2.12 Agent 画面
+
+**認証必須**
+
+WebUI の Agent 画面が使う閲覧用 API。agent 配下のパスは、未知 agent に `404`（`agent_not_found`）を返す。パスはすべて state root（`~/.egopulse/`）からの相対で返す。
+
+#### プロフィール
+
+```text
+GET /api/agents/{agent_id}/profile
+```
+
+agent の実効 LLM 設定・bot 紐づけ・system prompt に注入されるソースを返す。
+
+| フィールド | 説明 |
+|---|---|
+| `profile.id` / `label` / `is_default` | agent の識別情報 |
+| `profile.reasoning_effort` | `agents.<id>.reasoning_effort`（未設定は `null`） |
+| `profile.llm[]` | 実効 provider / model。先頭は profile のないチャネル（`channel: null`）、続いて profile を持つチャネルごとに1件 |
+| `profile.llm[].provider_source` / `model_source` | 解決元。`profile` / `agent` / `global_default` / `provider_default` |
+| `profile.bindings` | `discord_bot` / `telegram_bot`（未設定は `null`） |
+| `profile.prompt_sources.soul` | 注入される SOUL（`scope` / `path` / `chars`）。なければ `null` |
+| `profile.prompt_sources.rules[]` | 注入される AGENTS.md（注入順） |
+| `profile.prompt_sources.secret` | SECRET.md のパス（`path`）と有無（`exists`）。本文と文字数は含めない |
+| `profile.prompt_sources.memory` | 長期記憶3ファイルの文字数 |
+| `profile.prompt_sources.skills` | 利用可能なスキル数 |
+
+#### prompt ファイル
+
+```text
+GET /api/agents/{agent_id}/files/{kind}
+```
+
+`kind` は `soul` / `rules` / `secret`。それ以外は `400`（`invalid_prompt_file_kind`）。
+
+```json
+{
+  "ok": true,
+  "layers": [
+    { "scope": "agent", "path": "agents/lyre/SOUL.md", "content": null, "applied": false },
+    { "scope": "global", "path": "SOUL.md", "content": "…", "applied": true }
+  ]
+}
+```
+
+| kind | layers | `applied` |
+|---|---|---|
+| `soul` | agent → global | 内容のある最初の層のみ（フォールバック） |
+| `rules` | global → agent（注入順） | 内容のある層すべて（累積） |
+| `secret` | agent のみ | 内容があれば `true`（Secret スコープの turn でのみ注入） |
+
+`content` は trim 済みの本文で、ファイルがない・空の場合は `null`。
+
+#### 記憶の変更履歴
+
+```text
+GET /api/agents/{agent_id}/memory/history?limit=20
+```
+
+`limit` は既定 20、最大 100。
+
+3 層（episodic / semantic / prospective）をまたいだ公開済みの変更（所属 Sleep run が `success` / `partial_failure` で、内容が変わった snapshot）を新しい順に返す。
+
+```json
+{
+  "ok": true,
+  "changes": [
+    {
+      "run_id": "…",
+      "file": "semantic",
+      "created_at": "2026-10-30T03:05:00+00:00",
+      "content_before": "…",
+      "content_after": "…"
+    }
+  ]
+}
+```
+
+#### スキル
+
+```text
+GET /api/skills
+GET /api/skills/{name}
+GET /api/skills/{name}/files/{path}
+```
+
+- 一覧: `{ "ok": true, "skills": [{ "name", "description", "source" }] }`。`source` は `builtin`（`skills/`）/ `workspace`（`workspace/` 配下）
+- 単体: 一覧の項目に以下を加えて `skill` で返す。利用できないスキルは `404`（`skill_not_found`）
+
+  | フィールド | 説明 |
+  |---|---|
+  | `path` | スキルディレクトリ（state root からの相対） |
+  | `platforms` / `deps` / `required_env` | SKILL.md frontmatter の値 |
+  | `instructions` | SKILL.md の本文（frontmatter を除く） |
+  | `files[]` | SKILL.md 以外の同梱ファイル（`path`: スキルディレクトリからの相対、`bytes`）。隠しファイル・ビルド成果物ディレクトリ・シンボリックリンクは除外し、最大 200 件 |
+
+- 同梱ファイル: `{ "ok": true, "content": "…" }`。スキルディレクトリ外を指すパス・存在しないファイルは `404`（`skill_file_not_found`）、256 KiB 超は `413`（`skill_file_too_large`）、UTF-8 テキストでないものは `415`（`skill_file_not_text`）
 
 ---
 

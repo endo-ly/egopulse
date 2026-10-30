@@ -41,7 +41,7 @@ Desktop は Sidebar と Main の2領域、Mobile は Top Bar と Main に Sideba
 ### 2.4 Footer
 
 - 左：WebSocket 接続状態（`ok` / `degraded`）
-- 右：グローバル画面（Metrics / Config）へのアイコン。表示中の画面は強調する
+- 右：グローバル画面（Metrics / Config）。Nav と同じアイコン + ラベルで並べ、表示中の画面は強調する
 
 ### 2.5 Context Section
 
@@ -50,7 +50,7 @@ Agents と Footer の間の領域。表示中の画面に応じて内容を切�
 | 画面 | 内容 |
 |---|---|
 | Chat | SESSIONS（§2.6） |
-| Agent | セクション一覧（Overview / Soul / Rules / Secret / Memory ×3 / Skills）と各ファイルの更新時刻 |
+| Agent | SECTIONS（Overview / Soul / Rules / Secret / Memory / Skills）。SESSIONS と同じ「アイコン + 名前 + 1 行の要約」の行で並べる |
 | Schedule | UPCOMING の先頭5件（Pulse の次回発火と Sleep の次回判定） |
 | Metrics / Config | セクション一覧 |
 
@@ -89,7 +89,7 @@ Mobile（< 640px）のみ表示する高さ 44px のバー。
 | 画面 | URL | スコープ |
 |---|---|---|
 | Chat | `/agents/:agentId/chat`（セッション選択時 `/s/:sessionKey`） | agent |
-| Agent | `/agents/:agentId`、`/agents/:agentId/:section`、`/agents/:agentId/memory/:layer` | agent |
+| Agent | `/agents/:agentId`、`/agents/:agentId/:section` | agent |
 | Schedule | `/agents/:agentId/schedule`、`/schedule/{pulse\|sleep}/:runId`、`/schedule/intentions` | agent |
 | Metrics | `/metrics?range=` | global |
 | Config | `/config/:section` | global |

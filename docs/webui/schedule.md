@@ -9,7 +9,7 @@
 ## 1. 構成
 
 ```
-┌ Schedule · lyre ─────────── [All | Pulse | Sleep] [Intentions] [↻] ┐
+┌ Schedule · lyre ─────────────── [All | Pulse | Sleep] [Intentions] ┐
 │ UPCOMING                                                          │
 │  今日 21:00  ◴ evening_check     → telegram:9876…                 │
 │  明日 09:00  ◴ morning_review    → discord:#general               │
@@ -41,7 +41,7 @@
 
 - 種別フィルタ（下線タブ）: `All` / `Pulse` / `Sleep`。History と Upcoming の両方に効く
 - `Intentions` ビューへの切替
-- Refresh button（icon-only、右端）: Schedule 関連の全クエリを無効化して再取得
+- 手動の再読み込みボタンは置かない。一覧と詳細は可視時ポーリングと WS イベントで更新する（§7.3）
 
 ---
 
