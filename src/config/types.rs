@@ -265,6 +265,26 @@ pub(crate) struct ResolvedLlmConfig {
     pub headers: BTreeMap<String, String>,
 }
 
+/// Where a resolved provider or model value came from in the resolution chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LlmSettingSource {
+    /// `agents.<id>.profiles.<channel>`
+    Profile,
+    /// `agents.<id>`
+    Agent,
+    /// `default_provider` / `default_model`
+    GlobalDefault,
+    /// `providers.<id>.default_model`
+    ProviderDefault,
+}
+
+/// Resolution sources of the provider and model in a [`ResolvedLlmConfig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LlmOrigin {
+    pub provider: LlmSettingSource,
+    pub model: LlmSettingSource,
+}
+
 impl std::fmt::Debug for ResolvedLlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedLlmConfig")

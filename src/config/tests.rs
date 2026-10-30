@@ -4039,3 +4039,94 @@ fn webhook_receiver_requires_token_channel_and_non_web_thread() {
         assert_eq!(config.webhook_receivers().len(), 1);
     }
 }
+
+#[test]
+fn resolve_llm_origin_reports_profile_agent_and_global_sources() {
+    // Arrange
+    let mut config = profile_config(vec![(
+        super::AgentId::new("alice"),
+        super::AgentConfig {
+            label: "Alice".to_string(),
+            provider: Some("local".to_string()),
+            model: None,
+            profiles: HashMap::from([(
+                "voice".to_string(),
+                super::AgentProfileConfig {
+                    provider: Some("openai".to_string()),
+                    model: Some("gpt-4.1-mini".to_string()),
+                },
+            )]),
+            ..Default::default()
+        },
+    )]);
+    let alice = super::AgentId::new("alice");
+
+    // Act
+    let (voice, voice_origin) = config
+        .resolve_llm_origin_for_agent(&alice, Some("voice"))
+        .expect("voice resolve");
+    let (web, web_origin) = config
+        .resolve_llm_origin_for_agent(&alice, None)
+        .expect("web resolve");
+    config.default_model = None;
+    let (fallback, fallback_origin) = config
+        .resolve_llm_origin_for_agent(&alice, Some("web"))
+        .expect("fallback resolve");
+
+    // Assert
+    assert_eq!(
+        (voice.provider.as_str(), voice.model.as_str()),
+        ("openai", "gpt-4.1-mini")
+    );
+    assert_eq!(
+        voice_origin,
+        super::LlmOrigin {
+            provider: super::LlmSettingSource::Profile,
+            model: super::LlmSettingSource::Profile,
+        }
+    );
+    assert_eq!(
+        (web.provider.as_str(), web.model.as_str()),
+        ("local", "gpt-5")
+    );
+    assert_eq!(
+        web_origin,
+        super::LlmOrigin {
+            provider: super::LlmSettingSource::Agent,
+            model: super::LlmSettingSource::GlobalDefault,
+        }
+    );
+    assert_eq!(fallback.model, "qwen2.5");
+    assert_eq!(
+        fallback_origin.model,
+        super::LlmSettingSource::ProviderDefault
+    );
+}
+
+#[test]
+fn resolve_llm_origin_matches_resolve_llm_for_agent_channel() {
+    // Arrange
+    let config = profile_config(vec![(
+        super::AgentId::new("bob"),
+        super::AgentConfig {
+            label: "Bob".to_string(),
+            model: Some("gpt-5-mini".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        },
+    )]);
+    let bob = super::AgentId::new("bob");
+
+    // Act
+    let resolved = config
+        .resolve_llm_for_agent_channel(&bob, "discord")
+        .expect("resolve");
+    let (with_origin, origin) = config
+        .resolve_llm_origin_for_agent(&bob, Some("discord"))
+        .expect("resolve origin");
+
+    // Assert
+    assert_eq!(resolved, with_origin);
+    assert_eq!(origin.provider, super::LlmSettingSource::GlobalDefault);
+    assert_eq!(origin.model, super::LlmSettingSource::Agent);
+}
