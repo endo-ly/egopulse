@@ -10,6 +10,34 @@ struct CachedContent {
     mtime: SystemTime,
 }
 
+/// User-editable prompt files that shape an agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptFileKind {
+    /// `SOUL.md`: the agent file wins, otherwise the global file is used.
+    Soul,
+    /// `AGENTS.md`: the global and agent files are both injected.
+    Rules,
+    /// `SECRET.md`: agent-only, injected in secret-scope turns.
+    Secret,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromptFileScope {
+    Global,
+    Agent,
+}
+
+/// One file that may contribute to a [`PromptFileKind`] for an agent.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PromptFileLayer {
+    pub scope: PromptFileScope,
+    pub path: PathBuf,
+    /// Trimmed content; `None` when the file is missing or blank.
+    pub content: Option<String>,
+    /// Whether the content is injected into the system prompt.
+    pub applied: bool,
+}
+
 pub(crate) struct SoulAgentsLoader {
     soul_path: PathBuf,
     agents_path: PathBuf,
@@ -97,6 +125,47 @@ impl SoulAgentsLoader {
             section.push_str(&format!("\n<agents>\nThe following is the context organized by each agent.\n{content}\n</agents>\n"));
         }
         Some(section)
+    }
+
+    /// Lists the files contributing `kind` for `agent_id` in prompt priority
+    /// order, applying the same read rules as prompt construction.
+    ///
+    /// Returns `None` when `agent_id` is unsafe as a path component.
+    pub(crate) fn prompt_file_layers(
+        &self,
+        agent_id: &str,
+        kind: PromptFileKind,
+    ) -> Option<Vec<PromptFileLayer>> {
+        if !safe_agent_id(agent_id) {
+            return None;
+        }
+        let agent_dir = self.agents_dir.join(agent_id);
+        let layer = |scope, path: PathBuf| {
+            let content = read_trimmed(&path);
+            PromptFileLayer {
+                scope,
+                applied: content.is_some(),
+                path,
+                content,
+            }
+        };
+
+        let layers = match kind {
+            PromptFileKind::Soul => {
+                let agent = layer(PromptFileScope::Agent, agent_dir.join("SOUL.md"));
+                let mut global = layer(PromptFileScope::Global, self.soul_path.clone());
+                global.applied &= !agent.applied;
+                vec![agent, global]
+            }
+            PromptFileKind::Rules => vec![
+                layer(PromptFileScope::Global, self.agents_path.clone()),
+                layer(PromptFileScope::Agent, agent_dir.join("AGENTS.md")),
+            ],
+            PromptFileKind::Secret => {
+                vec![layer(PromptFileScope::Agent, agent_dir.join("SECRET.md"))]
+            }
+        };
+        Some(layers)
     }
 
     pub(crate) fn provision_default_soul(&self) -> io::Result<bool> {
@@ -374,5 +443,129 @@ mod tests {
         assert!(loader.load_soul(Some("")).is_none());
         assert!(loader.load_soul(Some("alice/bob")).is_none());
         assert!(loader.load_soul(Some("foo:bar")).is_none());
+    }
+
+    // --- prompt file layers ---
+
+    #[test]
+    fn soul_layers_apply_agent_soul_over_global() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("agents/alice/SOUL.md"), "Alice soul\n");
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+
+        // Act
+        let layers = loader
+            .prompt_file_layers("alice", PromptFileKind::Soul)
+            .expect("safe id");
+
+        // Assert
+        assert_eq!(
+            layers,
+            vec![
+                PromptFileLayer {
+                    scope: PromptFileScope::Agent,
+                    path: dir.path().join("agents/alice/SOUL.md"),
+                    content: Some("Alice soul".to_string()),
+                    applied: true,
+                },
+                PromptFileLayer {
+                    scope: PromptFileScope::Global,
+                    path: dir.path().join("SOUL.md"),
+                    content: Some("Global soul".to_string()),
+                    applied: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn soul_layers_fall_back_to_global_when_agent_soul_is_blank() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("agents/alice/SOUL.md"), "  \n");
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+
+        // Act
+        let layers = loader
+            .prompt_file_layers("alice", PromptFileKind::Soul)
+            .expect("safe id");
+
+        // Assert
+        let applied: Vec<_> = layers.iter().map(|l| (l.scope, l.applied)).collect();
+        assert_eq!(
+            applied,
+            vec![
+                (PromptFileScope::Agent, false),
+                (PromptFileScope::Global, true)
+            ]
+        );
+        assert_eq!(layers[0].content, None);
+    }
+
+    #[test]
+    fn rules_layers_accumulate_in_injection_order() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("AGENTS.md"), "Global rules");
+
+        // Act
+        let layers = loader
+            .prompt_file_layers("alice", PromptFileKind::Rules)
+            .expect("safe id");
+
+        // Assert
+        let summary: Vec<_> = layers
+            .iter()
+            .map(|l| (l.scope, l.content.as_deref(), l.applied))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (PromptFileScope::Global, Some("Global rules"), true),
+                (PromptFileScope::Agent, None, false),
+            ]
+        );
+        assert_eq!(layers[1].path, dir.path().join("agents/alice/AGENTS.md"));
+    }
+
+    #[test]
+    fn secret_layer_is_agent_only() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("agents/alice/SECRET.md"), "secret mode");
+
+        // Act
+        let layers = loader
+            .prompt_file_layers("alice", PromptFileKind::Secret)
+            .expect("safe id");
+
+        // Assert
+        assert_eq!(
+            layers,
+            vec![PromptFileLayer {
+                scope: PromptFileScope::Agent,
+                path: dir.path().join("agents/alice/SECRET.md"),
+                content: Some("secret mode".to_string()),
+                applied: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn prompt_file_layers_reject_unsafe_agent_id() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        // Act
+        let layers = loader.prompt_file_layers("../alice", PromptFileKind::Soul);
+
+        // Assert
+        assert_eq!(layers, None);
     }
 }
