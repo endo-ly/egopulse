@@ -1,130 +1,149 @@
 # EgoPulse WebUI — Schedule Tab
 
-選択中 agent の自律動作（Pulse / Sleep）について、「これから何が起きるか」と「何が起きたか」を一本の時間軸で確認・監査するタブ。
-
-- **Upcoming**: Pulse の次回発火と、Sleep の次回判定
-- **History**: Pulse run と Sleep run（判定結果を含む）の時系列。各 run の詳細監査
-- **Intentions**: Pulse intention の定義と実績
+選択中 agent が自分で動く仕組み、Pulse（決まった時刻に注意を向けて必要なら声をかける）と Sleep（会話を長期記憶へ蒸留する）について、実行の監視と設定の確認を行うタブ。監視（いつ何が起きるか・起きたか）と設定（何をするものか）は見る目的が違うため、別の区画に分ける。設定の区画は、将来 Pulse の attention や Sleep の各ステップのプロンプトを編集する場所になる。
 
 ## 1. 構成
 
+Sidebar の文脈領域（[layout.md §2.5](./layout.md#25-context-section)）に、Agent 画面の SECTIONS と同じ形で 3 つの区画を並べる。
+
+| 区画 | 役割 | 内容 |
+|---|---|---|
+| Activity | 監視 | 問題の要約・Upcoming（これから）・History（これまで）。run を選ぶと右に詳細を開く（§2） |
+| Pulse | 設定 | agent 単位の状態と、intention ごとの定義（§3） |
+| Sleep | 設定 | 次回チェックと実行の見込み（§4） |
+
 ```
-┌ Schedule · lyre ─────────────── [All | Pulse | Sleep] [Intentions] ┐
-│ UPCOMING                                                          │
-│  今日 21:00  ◴ evening_check     → telegram:9876…                 │
-│  明日 09:00  ◴ morning_review    → discord:#general               │
-│ ┌ 🌙 Sleep ──────────────────────────────────────────────────┐    │
-│ │ 次回判定  明日 03:00                                         │    │
-│ │ pending messages  41 / 65 で実行  ▓▓▓▓▓▓░░░░                 │    │
-│ │ 現時点ではスキップ見込み                                       │    │
-│ └────────────────────────────────────────────────────────────┘    │
-├─────────────────────────────┬─────────────────────────────────────┤
-│ HISTORY        [status ▾]   │ ◴ morning_review       ● notify     │
-│ ◴ 09:00 morning   notify    │ 2026-10-30 09:00 → 09:00:08 (8s)    │
-│   "今日のMTG確認…"            │ Delivery  discord:#general          │
-│ 🌙 03:00 Sleep    success   │ ── Attention ────────────────────    │
-│   3 sessions · 1.2k tokens  │ 今日の予定、未解決事項…                 │
-│ 🌙 昨 03:00 Sleep skipped   │ ── Output ───────────────────────    │
-│   pending 41 ≤ 64           │ 今日のMTG確認して。…                   │
-│ ◴ 昨 21:00 evening failed   │              [Chat でこの発言を開く]   │
-└─────────────────────────────┴─────────────────────────────────────┘
+┌ Sidebar ──────────────┐┌ Activity ───────────────────────────────┬ Pulse run ─────────────┐
+│ SECTIONS              ││ ● Wrap up the day failed on its last …  │ Check the calendar     │
+│ ▤ Activity            ││ UPCOMING                                │ Notified · 07:00 · 8s  │
+│   1 needs attention   ││  Today 09:00  ⌁ Check the calendar      │ ┌────────────────────┐ │
+│ ⌁ Pulse               ││  Tomorrow 03:00 ☾ Sleep  Likely to skip │ │ 通知本文            │ │
+│   2 of 3 active       ││ ● NOW ───────────────────────────────   │ └────────────────────┘ │
+│ ☾ Sleep               ││ HISTORY               ☐ Show quiet runs │ Sent to Discord · Team │
+│   Tomorrow 03:00      ││ Today                                   │ ATTENTION              │
+│                       ││  07:00 ⌁ Check the calendar  Notified … │                        │
+└───────────────────────┘└─────────────────────────────────────────┴────────────────────────┘
 ```
 
-- デスクトップ（≥ 1024px）: Upcoming の下に、左 History・右 run 詳細の2ペイン
-- 1023px 以下: History が全幅で表示され、run 選択で詳細が全画面に切り替わる（`←` で戻る）
-- 対象 agent は Sidebar の選択 agent に従う。agent 横断の状況は Metrics タブの Agents セクションで扱う
-- Sidebar の文脈領域には Upcoming の先頭5件を表示する（[layout.md §2.5](./layout.md#25-context-section)）
+| 行 | 2 行目の要約 |
+|---|---|
+| Activity | 問題があれば `{n} needs attention`、なければ直近の予定（`Next: Today 09:00`）。何もなければ `Nothing scheduled` |
+| Pulse | `{有効数} of {総数} active`。agent の Pulse が無効なら `Off`、PULSE.yaml がパースできなければ `PULSE.yaml error` |
+| Sleep | 次回チェックの時刻。スケジューラが無効なら `Manual only`、agent が対象外なら `Not scheduled` |
+
+- 区画を移るのは Sidebar で選んだときだけ。Activity の中で run を開いても区画は変わらない
+- Pulse と Sleep はそれぞれ固有の色とアイコンを持つ（Pulse: accent-2 / 波形、Sleep: accent / 月）。Sidebar・Timeline の行・run 詳細の見出しで一貫して使う
+- 対象 agent は Sidebar の選択 agent に従う。agent 横断の状況は Metrics タブで扱う
+- 手動の再読み込みボタンは置かない。表示中のデータは表示時に再取得し、以降は可視時ポーリング（10 秒）で追従する
 
 ---
 
-## 2. Header
+## 2. Activity
 
-- 種別フィルタ（下線タブ）: `All` / `Pulse` / `Sleep`。History と Upcoming の両方に効く
-- `Intentions` ビューへの切替
-- 手動の再読み込みボタンは置かない。一覧と詳細は可視時ポーリングと WS イベントで更新する（§7.3）
+Timeline と、選んだ run の詳細を左右に並べる。それぞれ独立してスクロールする。639px 以下では run 詳細を開くと Timeline を隠し、`×` で戻る。
+
+### 2.1 問題の要約
+
+Timeline の上に、直近の run に問題がある intention / Sleep を新しい順に並べる。問題がなければ何も表示しない。
+
+| 対象 | 問題とみなす条件 | 表示 |
+|---|---|---|
+| Pulse intention | 最新の run が `failed` | `{title} failed on its last firing` |
+| Pulse intention | 最新の run が `skipped`（配送先の会話が解決できず通知できなかった） | `{title} could not deliver its last notification` |
+| Sleep | 実際に処理した最新の run（`skipped` を除く）が `failed` / `partial_failure` | `Sleep failed on its last run` / `Sleep partly failed on its last run` |
+
+- 各行は status dot・タイトル・時刻と `View`（その run を右に開く）
+- その後に成功した run があれば問題は解消したとみなし、表示しない
+- PULSE.yaml がパースできない場合は、その旨（scheduler はその agent の intention を発火しない）とパースエラーを同じ枠に表示する
+
+### 2.2 Upcoming
+
+これから起きることだけを並べる。有効な intention の次回発火と Sleep の次回チェックを時刻順に並べ、発火時刻を過ぎて次のスキャン待ちの intention を先頭にする。行は選択できない（定義は Pulse / Sleep の区画で見る）。
+
+- 各行は時刻（日付ラベルと `09:00`。スキャン待ちは `Due`）・アイコン・タイトルと、2 行目
+  - Pulse: `{schedule} → {配送先}`。配送先が解決できなければ `Not deliverable` を warning 色で添える
+  - Sleep: 見込み（`Expected to run` / `Likely to skip`）と `41 of 65 new messages`（閾値 64 を超える 65 件目で実行する）
+- 次回発火はサーバーが `pulse` ツールの `list` と同じ判定（カレンダー候補 + 実行履歴）で返す。WebUI は独自に計算しない
+- agent の Pulse が無効なら `Pulse is off for this agent.` を示す。何もなければ、会話の中で agent に頼めば作られることを示す
+
+Upcoming と History の間に `Now` の区切りを置く。
+
+### 2.3 History
+
+Pulse run と Sleep run を新しい順に 1 本にまとめ、ローカル日付ごとに `Today` / `Yesterday` / `Mon, Nov 3` の見出しで区切る。
+
+| 要素 | 内容 |
+|---|---|
+| 時刻 | `07:00`（ホバーで日時） |
+| タイトル | Pulse は intention のタイトル（attention の 1 行目。PULSE.yaml から消えていれば id）、Sleep は `Sleep`（trigger が `manual` / `backfill` なら `Manual sleep` / `Backfill sleep`） |
+| 結果 | Pulse: `Notified` / `Silent` / `Failed` / `Not delivered` / `Running`。Sleep: status。status の色で示す |
+| 要約 | Pulse: 通知本文の先頭行（Markdown 記法を除く）/ `Nothing worth reporting` / エラー / skip 理由。Sleep: `Updated episodic, semantic` / `Memory unchanged` / エラー / skip 理由 |
+
+- **Quiet run**: 何も変えず注意も要らない run（報告することがなかった Pulse run と、実行しないと判定した Sleep run）。同じ日に 2 件以上続く quiet run は `{n} quiet runs`（時間帯と内訳 `Silent ×1 · Skipped ×1`）の 1 行にまとめ、選ぶとその場で展開する。`Show quiet runs` で全件を展開する。skip された Pulse run は通知が届かなかったことを意味するので quiet ではない
+- 行を選ぶと右に run 詳細を開く（§5）。開いている run の行は active 表示にする
+- 各仕組みの run を 20 件ずつ取得し、`Load earlier` で 20 件ずつ追加する。一方の仕組みが取得件数に達している場合、その最古の run より古い run はまだ取得されていない可能性があるため、その時点より前は表示しない（取得済みの範囲に抜けを作らない）
 
 ---
 
-## 3. Upcoming
+## 3. Pulse
 
-Pulse と Sleep は予測可能性が異なるため、表現を分ける。
+Skills と同じく、intention の一覧と選んだ intention の定義を左右に並べる。
 
-### 3.1 Pulse
+| 要素 | 内容 |
+|---|---|
+| agent 単位の設定 | Status（`On` / `Off`）・Timezone・Default destination（`default_delivery`。なければ直近の Discord / Telegram 会話） |
+| 一覧 | PULSE.yaml の定義順。各行はタイトル（attention の 1 行目、空なら id）と `{schedule} · next {次回発火}`。無効な intention（または agent の Pulse が無効）は薄くして `Off` を添える |
+| 定義 | タイトル・id・状態（`Active` / `Off` / `Off (Pulse is off)`）、When（schedule と timezone）、Next（無効なら `Does not fire while off`）、Sends to（§3.1）、Attention（DocumentCard で全文） |
 
-- 有効な intention の次回発火を時刻順に並べる。各行は時刻・intention id・配送先
-- 次回発火は `pulse` ツールの `list` と同じ判定（カレンダー候補 + 実行履歴）をサーバーが返す。WebUI は独自に計算しない
-- agent の Pulse が無効の場合は「Pulse disabled」と表示する
+- 選択は URL に持つ。指定がない、または PULSE.yaml から消えた intention を指す場合は先頭の intention を選ぶ
+- PULSE.yaml がパースできない場合は、agent 単位の設定と一覧の代わりにその旨とパースエラーを表示する
+- intention がない場合は、会話の中で agent に頼めば作られることを示す
+- 実行の結果はここに出さない（Activity で見る）
 
-### 3.2 Sleep
+### 3.1 配送先の表示
 
-Sleep は毎日の判定時刻（`sleep_batch.schedule`）に起動するが、実行可否はその時点の状態で決まる（pending messages が閾値以下ならスキップ、agent の turn 実行中なら見送り）。このため「予定」ではなく **次回判定とその時点の条件** を表示する。
+配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI はその会話を Sessions と同じ名前（[layout.md §2.6](./layout.md#26-sessions)）で `Discord · Team chat` のように示し、どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示し、発火が skip されることを warning 色で伝える。
+
+---
+
+## 4. Sleep
 
 | 項目 | 内容 |
 |---|---|
-| 次回判定 | 次の判定時刻。対象 agent でない（`sleep_batch.agents` 外）・Sleep 無効の場合はその旨を表示 |
-| pending messages | 現在の pending 件数と実行閾値。進捗バーで示す |
-| 見込み | 現時点の条件による実行 / スキップの見込み。判定時刻までに変わり得ることを明示する |
+| Next check | 次にスケジューラが Sleep を試みる時刻。スケジューラが無効なら `Scheduled sleep is off; it runs only when started by hand.`、agent が対象外なら `This agent is not included in scheduled sleep.` |
+| Decision | 現時点の見込み（`Expected to run` / `Likely to skip`）、閾値に対する新しいメッセージ数のメーター（閾値を超えると Sleep の色）、`41 new messages so far; it runs when there are more than 64.` |
+
+Sleep は決まった時刻に起動するが、実行するかはその時点の状態で決まる（新しいメッセージが閾値以下ならスキップ、agent が会話中なら見送り）。このため結論を先に示しつつ、「予定」と断定しない言い方にする。
 
 ---
 
-## 4. History
+## 5. Run detail
 
-### 4.1 一覧
+見出しは種別（`Pulse run` / `Sleep run`、各色）と閉じるボタン `×`。本文は「結果 → 中身 → 過程」の順に並べる。
 
-Pulse run と Sleep run を `started_at` 降順で混在表示する。区切り線ベースの2行リスト（カードは使わない）。
+### 5.1 Pulse run
 
-| 種別 | 1行目 | 2行目 |
-|---|---|---|
-| Pulse | ◴ 時刻・intention id・output kind | 通知本文の先頭 / `PULSE_OK` / エラー / skip 理由 |
-| Sleep | 🌙 時刻・trigger（Scheduled / Manual / Backfill）・status | session 数・トークン数 / skip 理由 / エラー |
-
-- status フィルタ（`All` / `Failed` / `Skipped` など）を持つ
-- 選択行は左端に accent バー + 薄いハイライト
-- 20 件ずつ取得し、`Load more` で追加取得。Pulse / Sleep それぞれの API に `before` カーソルで問い合わせ、クライアントでマージする
-- running の run がある間は可視時ポーリングで追従する
-
-### 4.2 Status
-
-| status | dot 色 |
+| 要素 | 内容 |
 |---|---|
-| `success` | success |
-| `partial_failure` | warning（Sleep のみ） |
-| `failed` | danger |
-| `skipped` | muted |
-| `running` | accent（点滅） |
+| 見出し | intention のタイトル。メタ行に結果・開始時刻・所要時間 |
+| Outcome | `notify` は通知本文をカードで Markdown 表示。`silent` は報告することがなく送信しなかった旨。`failed` はエラー、`skipped` は通知できなかった旨と理由（warning 色） |
+| 配送先 | `Sent to Discord · Team chat` と `Open in Chat`（通知を保存した会話を Chat タブで開く） |
+| Attention | run 開始時点の attention。PULSE.yaml がその後編集されても当時の内容を表示する。記録のない run は `Not recorded for this run.` |
 
-Pulse の output kind は `notify`（accent）/ `silent`（muted）のバッジで併記する。
+Activation 中のツール実行は、通知を保存した会話の Pulse trace として Chat タブで確認する（[chat.md](./chat.md)）。Pulse Capsule の内部（注入されたコンテキスト等）は表示しない。
 
-### 4.3 Run 詳細
+### 5.2 Sleep run
 
-#### Pulse run
+| 要素 | 内容 |
+|---|---|
+| 見出し | `Sleep` / `Manual sleep` / `Backfill sleep`。メタ行に status・開始時刻・所要時間・総トークン数・run ID 短縮形（`#` + 先頭6文字） |
+| Memory changes | 公開済みの run（`success` / `partial_failure`）だけに表示する。変更のあったファイルを増減行数付き（`episodic +4 −0`）のチップで並べ、選んだファイルの diff を表示する。既定は最初のファイル。変更がなければ `Memory was left unchanged.` |
+| Pipeline | 全ステップが成功していれば `✓ All 4 steps done` の 1 行。そうでなければ 4 ステップ（Event extraction → Episodic update → Semantic update → Prospective update）を並べ、成功は `✓` とトークン数、失敗は danger 色の `✕`、skipped / pending は薄く表示し、失敗したステップのエラーを全文表示する。ステップを1つも実行せず失敗した run は run のエラーを表示する |
 
-1. **ヘッダー**: status・output kind・intention id。モバイルでは `←` back
-2. **メタ**: 開始 → 終了（所要時間）、配送先（`{channel}:{external_chat_id}`）
-3. **Attention**: run 開始時点の attention テキスト（`attention_snapshot`）。PULSE.yaml がその後編集されても当時の内容を表示する
-4. **Output**: `notify` は本文を Markdown 表示し、`chat_id` / `message_id` から Chat タブの該当発言へジャンプできる。`silent` は `PULSE_OK · no notification was sent.`。`failed` はエラーブロック、`skipped` は理由
-5. **Tools**: Pulse 中のツール実行を Chat タブと同じ Tool Card で表示（[chat.md §5](./chat.md#5-tool-実行カード)）
+- 実行しないと判定した run は `Did not run: {理由}.` のみを表示する
+- `running` の run の snapshot は公開前の候補なので Memory changes に出さない
 
-Pulse Capsule の内部（注入されたコンテキスト等）は表示しない。
-
-#### Sleep run
-
-1. **ヘッダー**: status（humanize 表記）+ run ID 短縮形（`#` + 先頭6文字）
-2. **メタ**: trigger · session 数、開始 → 終了（所要時間）+ 総トークン数
-3. **Steps**: 4 ステップをパイプライン順（event_extraction → episodic_update → semantic_update → prospective_update）で表示
-
-   | step status | icon |
-   |---|---|
-   | `success` | `✓`（success） |
-   | `failed` | `✗`（danger、行背景も danger soft） |
-   | `skipped` | `–`（muted） |
-   | `running` / `pending` | spinner |
-
-   各行右にステップのトークン合計（0 は非表示）。`error_message` を持つステップはエラー詳細（等幅）を常時表示する。ステップを1つも実行せず `error_message` のみを持つ run は、同じスタイルの Error セクションを表示する
-4. **Memory Changes**: file tabs（`episodic` / `semantic` / `prospective`、スナップショットが存在するもののみ）。変更のあるタブには増減行数（`+12 −3`）を表示し、既定では最初に変更のあるファイルを選ぶ。スナップショットのない run では非表示
-5. **Skip 判定**: スキップされた判定は理由（`pending 41 ≤ 64` / `agent active`）のみを表示する
-
-### 4.4 DiffViewer
+### 5.3 DiffViewer
 
 行レベル diff（LCS ベース、自前実装）。文字単位の diff は行わない。
 
@@ -132,82 +151,57 @@ Pulse Capsule の内部（注入されたコンテキスト等）は表示しな
 - 追加行は success 系背景、削除行は danger 系背景（unified では `+` / `-` prefix）
 - 最大高さ 60vh でスクロール。500 行超は先頭 500 行のみ表示し `Show all {n} lines` で展開
 
-Agent タブの Memory History でも同じコンポーネントを使う。
+Agent タブの Memory でも同じコンポーネントを使う。
 
 ---
 
-## 5. Intentions
+## 6. Intention の編集
 
-PULSE.yaml の intention をカードで表示する。生の YAML は表示しない。
-
-```
-┌ morning_review ───────────────────────── ● enabled ┐
-│ 毎日 09:00            → discord:#general            │
-│ 今日の予定、未解決事項、昨日から持ち越している…            │
-│ 次回 明日 09:00        直近  ● ● ● ○ ● ● ✕ ● ● ●      │
-└────────────────────────────────────────────────────┘
-```
-
-| 要素 | 内容 |
-|---|---|
-| schedule | 人が読める形（毎日 09:00 / 毎週日曜 21:00 / 一度だけ 11/3 10:00） |
-| attention | 本文（長い場合は折りたたみ） |
-| delivery | 配送先。`default_delivery` を使う場合はその旨を示す |
-| enabled | intention 単位の有効状態 |
-| 次回 | §3.1 と同じ判定 |
-| 直近 | 直近 10 run の結果ドット。クリックで該当 run の詳細へ |
-
-ビュー上部に agent 単位の Pulse 有効状態と、PULSE.yaml のパースエラー（あれば）を表示する。
-
-### 5.1 編集
-
-intention の追加・変更・削除・有効化 / 無効化は、`pulse` ツールと同じ操作（`add` / `update` / `remove` / `enable` / `disable`）を API として呼び出す。PULSE.yaml を直接書き換える経路は設けない（[pulse.md §3](../pulse.md#3-ファイル責務) の「書き込みはツール経由のみ」に従う）。
+intention の追加・変更・削除・有効化 / 無効化は、`pulse` ツールと同じ操作（`add` / `update` / `remove` / `enable` / `disable`）を API として呼び出す。PULSE.yaml を直接書き換える経路は設けない（[pulse.md §3](../pulse.md#3-ファイル責務) の「書き込みはツール経由のみ」に従う）。編集は Pulse 区画の定義（§3）から行う。
 
 ---
 
-## 6. URL 構造
+## 7. URL 構造
 
 | URL | 状態 |
 |---|---|
-| `/agents/:agentId/schedule` | Upcoming + History（未選択） |
-| `/agents/:agentId/schedule?kind=pulse\|sleep` | 種別フィルタ適用 |
-| `/agents/:agentId/schedule/pulse/:runId` | Pulse run 選択 |
-| `/agents/:agentId/schedule/sleep/:runId` | Sleep run 選択 |
-| `/agents/:agentId/schedule/intentions` | Intentions |
+| `/agents/:agentId/schedule` | Activity |
+| `/agents/:agentId/schedule/runs/{pulse\|sleep}/:runId` | Activity + run 詳細 |
+| `/agents/:agentId/schedule/pulse` | Pulse（先頭の intention を選択） |
+| `/agents/:agentId/schedule/pulse/:intentionId` | Pulse + その intention |
+| `/agents/:agentId/schedule/sleep` | Sleep |
 
-agent を切り替えると run 選択は解除される（フィルタ・ビューは維持）。
+agent を切り替えると Activity に戻る（run と intention は agent ごとに異なるため）。
 
 ---
 
-## 7. バックエンド
+## 8. バックエンド
 
-### 7.1 API
+### 8.1 API
+
+API の詳細は [api.md §2.9](../api.md#29-sleep-batch) と [§2.13](../api.md#213-pulse)。
 
 | API | 用途 |
 |---|---|
-| `GET /api/sleep/runs` | Sleep run 一覧（既存）。`before` カーソルを追加 |
-| `GET /api/sleep/runs/:runId` | run + snapshots + steps（既存） |
-| `GET /api/agents/:agentId/sleep/next` | 次回判定時刻・対象可否・pending 件数・閾値 |
-| `GET /api/pulse/runs` | Pulse run 一覧（`agent_id` / `before` / `limit`） |
-| `GET /api/pulse/runs/:runId` | run 詳細（`attention_snapshot`、`tools` を含む） |
-| `GET /api/agents/:agentId/pulse` | agent の Pulse 有効状態・intention 一覧・次回発火・パースエラー |
-| `POST /api/agents/:agentId/pulse/intentions/...` | intention 操作（§5.1） |
+| `GET /api/agents/:agentId/pulse` | Pulse 有効状態・intention 一覧・次回発火・配送先の会話（`target`）・直近 run・パースエラー |
+| `GET /api/agents/:agentId/sleep/next` | 次回実行の時刻・対象可否・新しいメッセージ数・閾値 |
+| `GET /api/pulse/runs` | Pulse run 一覧（`agent_id` / `status` / `limit`） |
+| `GET /api/pulse/runs/:runId` | Pulse run 詳細（attention スナップショット・配送先の会話） |
+| `GET /api/sleep/runs` | Sleep run 一覧（`agent_id` / `status` / `limit`）。変更のあった記憶ファイル（`changed_memory`）を含む。問題の要約には `status=running,success,partial_failure,failed&limit=1` で実際に処理した最新の run を取る |
+| `GET /api/sleep/runs/:runId` | Sleep run + snapshots + steps |
+| `POST /api/agents/:agentId/pulse/intentions/...` | intention 操作（§6） |
 
-### 7.2 データの拡張
+### 8.2 記録されるデータ
 
-- **Sleep の判定結果の記録**: スケジューラ判定でスキップ（pending 件数が閾値以下）・見送り（agent の turn 実行中）となった場合も `sleep_runs` に `skipped` として理由とともに記録する。これにより History で毎日の判定を監査できる
-- **Pulse の attention スナップショット**: `pulse_runs` に run 開始時点の attention を保存する
-- **Pulse のツール実行**: Pulse run とツール実行記録を関連付けて run 詳細で返す
-
-### 7.3 リアルタイム更新
-
-WS の `pulse` / `sleep` イベント（`started` / `finished`）でキャッシュを無効化し再取得する。イベント未対応の間は可視時ポーリング（10 秒）で running run を追従する。
+- **Sleep のスキップ**: 新しいメッセージが閾値以下でスキップした回と、agent が会話中で見送った回も、理由付きの `skipped` run として `sleep_runs` に記録する（[sleep.md](../sleep.md)）。History で毎日の結果を監査できる
+- **Pulse の attention スナップショット**: `pulse_runs.attention_snapshot` に run 開始時点の attention を保存する（[pulse.md §10](../pulse.md#10-db-仕様)）
 
 ---
 
-## 8. Out of Scope
+## 9. Out of Scope
 
 - Pulse の手動発火、Sleep の手動実行
 - run の再実行・強制 skip
 - 発火頻度・成功率などの集計（Metrics タブで扱う）
 - LLM 入力プロンプト・Pulse Capsule 内部の表示
+- 月・週のカレンダー表示（intention の大半は毎日・毎週の繰り返しで、グリッドは同じ予定の反復になる。未来の発火を WebUI で展開することにもなり、§2.2 の「サーバー判定に従う」と両立しない）

@@ -51,7 +51,7 @@ Agents と Footer の間の領域。表示中の画面に応じて内容を切�
 |---|---|
 | Chat | SESSIONS（§2.6） |
 | Agent | SECTIONS（Overview / Soul / Rules / Secret / Memory / Skills）。SESSIONS と同じ「アイコン + 名前 + 1 行の要約」の行で並べる |
-| Schedule | UPCOMING の先頭5件（Pulse の次回発火と Sleep の次回判定） |
+| Schedule | SECTIONS（Activity / Pulse / Sleep）。各行は名前と 1 行の要約（[schedule.md §1](./schedule.md#1-構成)） |
 | Metrics / Config | セクション一覧 |
 
 ### 2.6 SESSIONS
@@ -90,7 +90,7 @@ Mobile（< 640px）のみ表示する高さ 44px のバー。
 |---|---|---|
 | Chat | `/agents/:agentId/chat`（セッション選択時 `/s/:sessionKey`） | agent |
 | Agent | `/agents/:agentId`、`/agents/:agentId/:section` | agent |
-| Schedule | `/agents/:agentId/schedule`、`/schedule/{pulse\|sleep}/:runId`、`/schedule/intentions` | agent |
+| Schedule | `/agents/:agentId/schedule`（Activity）、`/schedule/runs/{pulse\|sleep}/:runId`、`/schedule/pulse/:intentionId`、`/schedule/sleep`（[schedule.md §7](./schedule.md#7-url-構造)） | agent |
 | Metrics | `/metrics?range=` | global |
 | Config | `/config/:section` | global |
 

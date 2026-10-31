@@ -73,7 +73,7 @@
 セクション単位で編集する。
 
 1. セクションの `Edit` でフォームに切り替える
-2. 保存前に YAML の diff を確認する（[schedule.md §4.4](./schedule.md#44-diffviewer) の DiffViewer）
+2. 保存前に YAML の diff を確認する（[schedule.md §5.3](./schedule.md#53-diffviewer) の DiffViewer）
 3. `Save` で `expected_fingerprint` 付きで更新する。`409` の場合は最新を再取得させる
 
 - 更新は `ConfigManager` の単一の更新境界を通る（[config.md §10](../config.md#10-設定の変更インターフェース)）。YAML 全体を書き込む経路は設けない

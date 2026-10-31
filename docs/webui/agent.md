@@ -43,7 +43,7 @@ agent の現在の姿を一望するページ。各要素から詳細セクシ�
 | Stats | Sessions（アーカイブ以外の件数とチャネル内訳）、Last active、Memory（総文字数と最終更新）、Skills（数） | セッション一覧・プロフィール・記憶の変更履歴 |
 | Model | チャネル別の実効 model / provider と、それを決めた設定キー（`agents.<id>`、`agents.<id>.profiles.<channel>`、`default_model` など）。profile のないチャネルは 1 行にまとめる | モデル解決チェーン（[config.md §4](../config.md#4-モデル解決チェーン)） |
 | System prompt | agent 固有のコンテキスト（Soul / Rules / Memory）の構成比を帯で示し、各行から該当セクションへ移る。SECRET.md とスキルカタログが加わる条件を注記する | プロフィール API |
-| Recent activity | 直近の Sleep run と記憶の変更を時系列にまとめる。Sleep run は Schedule タブの run 詳細へ、記憶の変更は Memory へ移る | Sleep run 一覧・記憶の変更履歴 |
+| Recent activity | 直近の Sleep run（スキップされた判定を除く）と記憶の変更を時系列にまとめる。Sleep run は Schedule タブの run 詳細へ、記憶の変更は Memory へ移る | Sleep run 一覧・記憶の変更履歴 |
 
 モデル設定の編集は Config タブの Agents セクションで行い、Agent タブでは編集しない。
 
@@ -68,7 +68,7 @@ episodic / semantic / prospective の 3 層を 1 ページで扱う。
 | 領域 | 内容 |
 |---|---|
 | Files | 3 層を順にカードで表示する。文字数と最終更新（直近の変更時刻）を添え、長いものは先頭のみ表示して全文表示に切り替えられる |
-| Changes | 3 層をまたいだ公開済みの変更を新しい順に並べる。各行は層・時刻・増減行数を示し、開くと diff（[schedule.md §4.4](./schedule.md#44-diffviewer) の DiffViewer）を表示する。最新の 1 件は開いた状態で表示する。Sleep run 由来の行は Schedule タブの run 詳細へリンクする |
+| Changes | 3 層をまたいだ公開済みの変更を新しい順に並べる。各行は層・時刻・増減行数を示し、開くと diff（[schedule.md §5.3](./schedule.md#53-diffviewer) の DiffViewer）を表示する。最新の 1 件は開いた状態で表示する。Sleep run 由来の行は Schedule タブの run 詳細へリンクする |
 
 ### 2.6 Skills
 
@@ -115,7 +115,7 @@ API の詳細は [api.md §2.12](../api.md#212-agent-画面)。
 | `GET /api/agents/:agentId/files/:kind` | `soul` / `rules` / `secret` の各層（パス・内容・適用有無） |
 | `GET /api/agents/:agentId/memory` | 現在の長期記憶 3 ファイル |
 | `GET /api/agents/:agentId/memory/history` | 3 層をまたいだ公開済みの変更履歴 |
-| `GET /api/sleep/runs?agent_id=` | Recent activity の Sleep run |
+| `GET /api/sleep/runs?agent_id=&status=` | Recent activity の Sleep run |
 | `GET /api/skills` / `GET /api/skills/:name` / `GET /api/skills/:name/files/*` | スキル一覧・詳細・同梱ファイル。スキルは agent 非依存のためグローバルなパスに置く |
 | `PUT /api/agents/:agentId/files/:kind` / `PUT /api/agents/:agentId/memory/:layer` | 編集（`expected_hash` 必須） |
 

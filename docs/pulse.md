@@ -654,7 +654,8 @@ CREATE TABLE pulse_runs (
     finished_at   TEXT,
     output_kind   TEXT,
     output_text   TEXT,
-    error_message TEXT
+    error_message TEXT,
+    attention_snapshot TEXT
 );
 
 CREATE UNIQUE INDEX idx_pulse_runs_due
@@ -680,7 +681,8 @@ CREATE INDEX idx_pulse_runs_chat_id
 | `status` | running / success / failed / skipped |
 | `output_kind` | silent / notify |
 | `output_text` | LLM 出力。通知した本文または PULSE_OK |
-| `error_message` | 失敗時の詳細 |
+| `error_message` | 失敗時の詳細、または skip 理由 |
+| `attention_snapshot` | run 開始時点の attention。PULSE.yaml がその後変わっても、その run が何に注意を向けたかを示す |
 
 `status = skipped` になるのは、送信可能な Home Surface が解決できなかった場合（LLM は呼ばれない）。
 

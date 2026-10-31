@@ -18,6 +18,7 @@ WebUI と外部 voice client が使用する REST API、および WebSocket の�
     - [Webhook](#210-webhook)
     - [Agent Avatar](#211-agent-avatar)
     - [Agent 画面](#212-agent-画面)
+    - [Pulse](#213-pulse)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -393,24 +394,46 @@ GET /api/agents
 #### Sleep Run 一覧
 
 ```text
-GET /api/sleep/runs?agent_id={agent_id}&limit={limit}&offset={offset}
+GET /api/sleep/runs?agent_id={agent_id}&status={status}&limit={limit}
 ```
 
 ##### クエリパラメータ
 
 | パラメータ | 必須 | デフォルト | 説明 |
 |-----------|:---:|----------|------|
-| `agent_id` | 任意 | — | エージェント ID。省略時は全 agent |
-| `limit` | 任意 | `20` | 最大取得件数 |
-| `offset` | 任意 | `0` | スキップ件数（ページング用） |
+| `agent_id` | 必須 | — | エージェント ID |
+| `status` | 任意 | — | カンマ区切りの status。省略時はすべて。未知の値は `400`（`invalid_status`） |
+| `limit` | 任意 | `20` | 最大取得件数（上限 `200`） |
 
-レスポンスの `runs` 配列は `started_at` 降順。各要素のフィールド: `id`, `agent_id`, `status`, `trigger`, `started_at`, `finished_at`, `source_chats_json`, `source_digest_md`, `input_tokens`, `output_tokens`, `total_tokens`, `error_message`, `session_count`。
+レスポンスの `runs` 配列は `started_at` 降順。各要素のフィールド: `id`, `agent_id`, `status`, `trigger`, `started_at`, `finished_at`, `source_chats_json`, `source_digest_md`, `input_tokens`, `output_tokens`, `total_tokens`, `error_message`, `session_count`, `changed_memory`。
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `status` | `string` | `running`, `success`, `partial_failure`, `failed`, `skipped` |
 | `trigger` | `string` | `manual`, `scheduled`, `backfill` |
+| `error_message` | `string \| null` | `failed` ではエラー、`skipped` ではスキップ理由 |
 | `session_count` | `number` | `source_chats_json` から算出した対象セッション数 |
+| `changed_memory` | `string[]` | 内容が変わった記憶ファイル（`episodic` → `semantic` → `prospective` の順）。公開済みの run（`success` / `partial_failure`）だけが持ち、それ以外は空 |
+
+`skipped` は実行しないと判定した Sleep の記録で、ステップとスナップショットを持たない（[sleep.md](./sleep.md)）。
+
+---
+
+#### 次回の Sleep 判定
+
+```text
+GET /api/agents/{agent_id}/sleep/next
+```
+
+スケジューラによる次回の判定時刻と、その判定が見る条件を返す。未知 agent は `404`。
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `outlook.scheduler_enabled` | `boolean` | Sleep スケジューラが有効で判定時刻が決まるか |
+| `outlook.targeted` | `boolean` | agent がスケジューラの対象（`sleep_batch.agents`）に含まれるか |
+| `outlook.next_check_at` | `string \| null` | 次回の判定時刻（RFC 3339）。スケジューラ無効・対象外は `null` |
+| `outlook.pending_messages` | `number` | 未処理メッセージ数 |
+| `outlook.threshold` | `number` | 実行閾値。`pending_messages` がこれを超えると実行し、以下ならスキップする |
 
 ---
 
@@ -639,6 +662,82 @@ GET /api/skills/{name}/files/{path}
   | `files[]` | SKILL.md 以外の同梱ファイル（`path`: スキルディレクトリからの相対、`bytes`）。隠しファイル・ビルド成果物ディレクトリ・シンボリックリンクは除外し、最大 200 件 |
 
 - 同梱ファイル: `{ "ok": true, "content": "…" }`。スキルディレクトリ外を指すパス・存在しないファイルは `404`（`skill_file_not_found`）、256 KiB 超は `413`（`skill_file_too_large`）、UTF-8 テキストでないものは `415`（`skill_file_not_text`）
+
+---
+
+### 2.13 Pulse
+
+**認証必須**
+
+Pulse の intention と実行履歴を確認するためのエンドポイント。
+
+#### Agent の Pulse 定義
+
+```text
+GET /api/agents/{agent_id}/pulse
+```
+
+`agents/{agent_id}/PULSE.yaml` の内容と、各 intention の次回発火・配送先の会話・直近の run を返す。未知 agent は `404`。
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `pulse.enabled` | `boolean \| null` | agent 単位の有効状態。PULSE.yaml がパースできない場合は `null` |
+| `pulse.error` | `string \| null` | パースエラー。このとき `intentions` は空 |
+| `pulse.timezone` | `string` | schedule の時刻を解釈する timezone（トップレベルの `timezone`） |
+| `pulse.default_delivery` | `object \| null` | `{channel, external_chat_id}` |
+| `pulse.intentions[]` | `array` | 定義順の intention |
+
+`intentions` の各要素:
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `id` / `enabled` / `attention` | — | PULSE.yaml の値 |
+| `schedule` | `object` | `{kind: "daily", at}` / `{kind: "weekly", day, at}` / `{kind: "interval", interval_days, at}` / `{kind: "once", date, at}` |
+| `delivery` | `object \| null` | intention 固有の配送先。`null` は `default_delivery`（それもなければ直近の会話先）を使う |
+| `target` | `object \| null` | いま発火した場合に通知が届く会話 `{channel, session_key}`。scheduler と同じ解決（`delivery` → `default_delivery` → 直近の Discord / Telegram 会話）で決まる。解決できなければ `null` で、その発火は `skipped` になる |
+| `next` | `object \| null` | 次回発火 `{state, at}`。agent または intention が無効なら `null` |
+| `recent_runs` | `array` | 直近 10 件の run `{id, status, output_kind, started_at}`（新しい順） |
+
+`next.state` は `pulse` ツールの `list` と同じ判定（[pulse.md §3.3](./pulse.md#33-agent-による-pulse-操作pulse-ツール)）で決まる。
+
+| `state` | 意味 |
+|---|---|
+| `scheduled` | `at` に発火する |
+| `due_now` | 時刻を過ぎ、次のスキャンで発火する |
+| `attempted_this_period` | 今の期間は実行済み |
+| `attempted_once` | `once` が実行済み（自動リトライなし） |
+| `no_upcoming` | 今後の発火がない |
+
+---
+
+#### Pulse Run 一覧
+
+```text
+GET /api/pulse/runs?agent_id={agent_id}&status={status}&limit={limit}
+```
+
+| パラメータ | 必須 | デフォルト | 説明 |
+|-----------|:---:|----------|------|
+| `agent_id` | 必須 | — | エージェント ID |
+| `status` | 任意 | — | カンマ区切りの status（`running`, `success`, `failed`, `skipped`）。未知の値は `400` |
+| `limit` | 任意 | `20` | 最大取得件数（上限 `200`） |
+
+`runs` は `started_at` 降順。各要素: `id`, `agent_id`, `intention_id`, `status`, `started_at`, `finished_at`, `output_kind`（`notify` / `silent`、成功時のみ）, `output_text`（`notify` は配送した本文、`silent` は `PULSE_OK`）, `error_message`（`failed` はエラー、`skipped` は理由）。
+
+---
+
+#### Pulse Run 詳細
+
+```text
+GET /api/pulse/runs/{run_id}
+```
+
+`run` に一覧と同じ項目と以下を加えて返す。存在しない run は `404`。
+
+| フィールド | 型 | 説明 |
+|-----------|-----|------|
+| `attention_snapshot` | `string \| null` | run 開始時点の attention。記録以前の run は `null` |
+| `delivery` | `object \| null` | 通知を保存した会話 `{channel, external_chat_id, session_key}`。`session_key` は `GET /api/history` に渡せる |
 
 ---
 
