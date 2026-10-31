@@ -1,211 +1,105 @@
 # EgoPulse WebUI — Metrics Tab
 
-ランタイムの健全性・ターン履歴・エラー詳細を可視化するタブ。公開 `/health`、認証済み `/api/status`、認証済み `/telemetry` のデータを消費し、運用時の異常検知と原因切り分けを支援する。
-
-情報密度は **数値カード + エラーリスト** に統一する。
+ランタイム全体を監視するグローバルタブ。「いま健全か」と「agent ごとにどう使われているか（期間推移）」を一画面で把握し、異常の切り分けから各 agent の Agent / Schedule タブへ降りていく起点になる。
 
 ## 1. 構成
 
 ```
-┌─ Metrics Tab ────────────────────────────────────────┐
-│ ┌─ Metrics Header ──────────────────────────────┐    │
-│ │  Runtime Health                                 │    │
-│ │  Updated 12s ago · auto-refresh 10s             │    │
-│ │                                  [↻ Refresh]     │    │
-│ └────────────────────────────────────────────────┘    │
-│                                                       │
-│ ┌─ Stat Cards ─────────────────────────────────┐     │
-│ │ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐  │     │
-│ │ │ Active │ │ Total  │ │ Errors │ │ Uptime │  │     │
-│ │ │   2    │ │  142   │ │   3    │ │  24h   │  │     │
-│ │ │ turns  │ │ turns  │ │ recent │ │        │  │     │
-│ │ └────────┘ └────────┘ └────────┘ └────────┘  │     │
-│ │ ┌────────┐ ┌────────┐ ┌────────┐             │     │
-│ │ │  DB    │ │ MCP    │ │Channels│             │     │
-│ │ │  ok    │ │ 2 / 2  │ │ 3 / 3  │             │     │
-│ │ └────────┘ └────────┘ └────────┘             │     │
-│ └────────────────────────────────────────────────┘   │
-│                                                       │
-│ Channels                                              │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ ● web       running · 14s ago                    │  │
-│ │ ● discord   running · 2m ago                     │  │
-│ │ ○ telegram  failed  · bot token rejected         │  │
-│ └─────────────────────────────────────────────────┘  │
-│                                                       │
-│ Recent Errors                                         │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ 2026-06-29 14:32  llm / lyre / discord           │  │
-│ │ rate limited (retry 3/3)                          │  │
-│ │ ─────                                            │  │
-│ │ 2026-06-29 14:30  channel_send / ace / discord   │  │
-│ │ Missing access                                    │  │
-│ └─────────────────────────────────────────────────┘  │
-│                                                       │
-│ Recent Turns                                          │
-│ ┌─────────────────────────────────────────────────┐  │
-│ │ 14:32:05  lyre / discord / 5.2s / ok            │  │
-│ │ 14:31:48  ace  / web     / 1.8s / ok            │  │
-│ │ 14:31:20  lyre / discord / 0.3s / error         │  │
-│ └─────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────┘
+┌ Metrics ──────────────────────────────── [24h | 7d | 30d]  ↻ 10s ┐
+│ HEALTH                                                          │
+│ [Active 2] [Uptime 3d] [DB ok] [MCP 2/2] [Channels 3/3]         │
+│ ● web running · ● discord running · ○ telegram failed: token…   │
+│                                                                 │
+│ AGENTS                                                          │
+│ agent  turns  tokens  errors  last active   sleep   pulse       │
+│ lyre    142   1.2M     3      2m            ●       ●           │
+│ musa     38   210k     0      1h            ●       ✕           │
+│                                                                 │
+│ USAGE    tokens / day（agent 別積み上げ）  ▁▃▅▂▇▆▃                 │
+│          by model   requests · input · output · cache%           │
+│          by kind    agent_loop / sleep / pulse / compaction      │
+│                                                                 │
+│ TURNS    channel 別件数 · 所要時間 p50 / p95 · 失敗率                 │
+│ ERRORS   error_kind 別集計 + 直近のエラー                            │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-Metrics Tab は4領域で構成される：
-
-1. Metrics Header
-2. Stat Cards（数値カード群）
-3. Channels（チャネル別状態）
-4. Recent Errors / Recent Turns（運用ログ）
+- Header に期間（`24h` / `7d` / `30d`）、最終取得時刻、手動 Refresh を置く。期間は Health 以外の全セクションに効く
+- Sidebar の agent 選択の影響を受けない。agent での絞り込みは Metrics 内のフィルタ（query）で行う
+- Sidebar の文脈領域にはセクション一覧を表示する
 
 ---
 
-## 2. Metrics Header
+## 2. セクション
 
-- タイトル（"Runtime Health"）
-- 前回取得時刻と polling 間隔の表示
-- 手動 Refresh button
+### 2.1 Health
 
-### Polling 間隔
+現在のランタイム状態。期間指定の影響を受けない。
 
-- `/health`、`/api/status`、`/telemetry` を **10秒** 毎にポーリング
-- タブがバックグラウンドのときは 30秒に緩める（`document.visibilityState` で切替）
-- ユーザーが手動 Refresh を押した場合は即時再取得
-
----
-
-## 3. Stat Cards
-
-2行のグリッド（desktop: 4列 / tablet: 3列 / mobile: 2列）に並べた数値カード。
-
-### 3.1 StatCard の構造
-
-各カードは3要素で構成：
-
-- 値（特大・強調本文、tone 色があれば着色）
-- ラベル（小テキスト・muted・uppercase）
-- hint（極小テキスト・muted-2）
-
-### 3.2 カード定義
-
-| Label | Source | 表示形式 | tone 条件 |
-|---|---|---|---|
-| Active turns | `status.active_turns` | 数値 | `> 0` で live（pulse アニメ） |
-| Total turns | `telemetry.metrics["egopulse_turns_total"]` の総和 | 数値 | 常に default |
-| Recent errors | `status.recent_errors_count` | 数値 | `> 0` で danger、`0` で success |
-| Uptime | `status.uptime_secs` | `Xd Yh Zm` 形式 | 常に default |
-| DB | `status.db.ok` | `true` → `"ok"` / `false` → `"down"` | `true` で success、`false` で danger |
-| MCP | `status.mcp.healthy / failed` | `"{healthy} / {total}"` | `failed > 0` で warning、他 success |
-| Channels | `status.channels` | running / 全チャネル 数 | `failed > 0` で warning、他 success |
-
----
-
-## 4. Channels セクション
-
-`/api/status` の `channels` オブジェクトを元に、各チャネルの状態をリスト表示。
-
-### 4.1 Item 構成
-
-1行に以下を並べる：
-
-- StatusDot（state に応じた色）
-- channel name
-- state badge
-- detail（`last_error` があれば優先、なければ `last_activity` の相対時刻）
-
-### 4.2 Channel State Mapping
-
-| state | tone | badge | 意味 |
-|---|---|---|---|
-| `starting` | live | info | 起動中 |
-| `running` | live | success | 正常稼働 |
-| `failed` | error | danger | 異常停止 |
-| `stopped` | idle | muted | 停止中 |
-
-### 4.3 失敗 channel の表示
-
-失敗 channel は `last_error` の先頭部分を1行で表示する（ellipsis 付き）。全文展開は行わない。
-
----
-
-## 5. Recent Errors セクション
-
-認証済み `/telemetry` の `recent_errors` 配列を表示。
-
-### 5.1 Item 構成
-
-1行目：時刻 / error_kind badge / agent_id（あれば）/ channel badge（あれば）/ trace_id（短縮）
-2行目：summary（1行、ellipsis 付き）
-
-- 失敗が新しいほど上（`at` 降順）
-- 最大100件表示、それ以上は "Showing latest 100" 通知
-
-### 5.2 Empty State
-
-recent_errors が0件の場合、success トーンの EmptyState（"No recent errors" "All good in the last 100 events."）を表示。
-
----
-
-## 6. Recent Turns セクション
-
-認証済み `/telemetry` の `recent_turns` 配列を table 形式で表示。
-
-### 6.1 Column 構成
-
-| Column | 内容 |
+| 要素 | 内容 |
 |---|---|
-| Started | `started_at` を時刻表示 |
-| Agent | `agent_id` |
-| Channel | channel badge |
-| Duration | `duration_secs` を秒表示 |
-| Status | `ok` なら success badge、さもなくば danger badge |
-| Trace | `trace_id` の短縮形（先頭8字） |
+| Stat Cards | Active turns / Uptime / DB / MCP（接続数 / 全体）/ Channels（running / 全体）/ Bash sandbox |
+| Channels | 各チャネルの state（`starting` / `running` / `failed` / `stopped`）と、`last_error`（あれば）または `last_activity` |
+| MCP | 接続済みサーバー（transport・tool 数）と失敗サーバー（エラー概要） |
 
-### 6.2 振る舞い
+### 2.2 Agents
 
-- 1行 = 1 turn
-- 新しい順（`started_at` 降順）
-- 最大100件表示（`/telemetry` の返却上限に同じ）
-- error 行は行全体に薄い danger 系背景
-- Metrics タブ内で **agent / channel の独立フィルタ** を提供（Sidebar の agent 選択とは連動させない。Sidebar は Chat/Sleep/Pulse のコンテキストに専念）
-- trace_id はクリックでクリップボードへコピー、トーストで "Copied trace_id"
+agent ごとの期間集計の表。行クリックでその agent の Agent タブ、Sleep / Pulse 列のクリックで Schedule タブへ遷移する。
 
-### 6.3 Empty State
+| 列 | 内容 |
+|---|---|
+| turns | 期間内の turn 数 |
+| tokens | 期間内の LLM トークン合計 |
+| errors | 期間内の失敗 turn 数 |
+| last active | 最終 turn 時刻 |
+| sleep / pulse | 最新 run の status |
 
-recent_turns が0件（ランタイム起動直後等）の場合、EmptyState（"No turns yet" "Turns will appear here once the agent processes a message."）を表示。
+### 2.3 Usage
 
----
+LLM 利用量の推移と内訳。
 
-## 7. バックエンド API
+- 日（`24h` は時間）単位のトークン推移を agent 別に積み上げ表示
+- モデル別: requests / input / output / cached input の割合
+- request kind 別: 通常 turn・Sleep・Pulse・compaction などの内訳
 
-### 7.1 `GET /health`
+### 2.4 Turns
 
-認証不要の最小 liveness probe（[api.md §2.1](../api.md#21-ヘルスチェック)）。`ok` だけを返し、正常時は `200`、異常時は `503`。
+- channel 別の turn 数
+- 所要時間の分布（p50 / p95）
+- 失敗率と状態別件数（`failed` / `cancelled` / `uncertain`）
 
-### 7.2 `GET /api/status`
+### 2.5 Errors
 
-`channels.web.auth_token` の Bearer token が必要（[api.md §2.2](../api.md#22-詳細ステータス)）。チャネル状態・DB・MCP・active_turns・recent_errors_count を返す。
-
-### 7.3 `GET /telemetry`
-
-`channels.web.auth_token` の Bearer token が必要（[api.md §2.3](../api.md#23-テレメトリー)）。metrics map・recent_turns・recent_errors を返す。
-
----
-
-## 8. アクセシビリティ
-
-- StatCard の値は `aria-label="{label}: {value}"` で読み上げ
-- error log リストは `role="log"` `aria-live="polite"`（新規エラー追加時に読み上げ）
-- turns-table は標準的な `<table>` マークアップ、`scope="col"` 必須
-- polling 中は Metrics Header に `aria-busy="true"` を設定
+- `error_kind` 別の件数集計
+- 直近のエラー一覧（時刻・error_kind・agent・channel・summary）。trace_id はクリックでコピー
 
 ---
 
-## 9. Out of Scope
+## 3. データソース
 
-- 時系列グラフ（tokens / turns / errors の推移）
-- MCP サーバー個別詳細表示（`status.mcp.servers[]` の個別展開）
-- ログストリーミング（`tracing` のログを WebUI で見せる機能）
-- アラート設定（特定条件で通知）
-- メトリクスの export / CSV ダウンロード
-- Health 状態の WS プッシュ（REST polling のみ提供）
+| セクション | ソース |
+|---|---|
+| Health | `GET /api/status`（既存）を可視時 10 秒、非可視時 30 秒でポーリング |
+| Agents / Usage / Turns / Errors | DB 集計 API（新設）。`llm_usage_logs` と `turn_runs` を `chats.agent_id` で agent に結び付けて集計する |
+| 直近のエラー | `GET /telemetry`（既存）の `recent_errors` |
+
+`/telemetry` はプロセス内に直近 100 件を保持するだけで再起動で失われるため、期間推移には使わず「いまこの瞬間」の補助に限定する。
+
+### 3.1 API
+
+| API | 用途 |
+|---|---|
+| `GET /api/status` | Health（既存） |
+| `GET /telemetry` | 直近のエラー（既存） |
+| `GET /api/metrics/agents?range=` | Agents |
+| `GET /api/metrics/usage?range=&agent_id=` | Usage |
+| `GET /api/metrics/turns?range=&agent_id=` | Turns / Errors 集計 |
+
+---
+
+## 4. Out of Scope
+
+- ログストリーミング（`tracing` ログの表示）
+- アラート設定
+- メトリクスの export
+- Health 状態の WS プッシュ

@@ -1,6 +1,6 @@
 import { useId, useState } from "react";
 import type { ChatMessage } from "../../shared/api/types";
-import { MarkdownRenderer } from "./MarkdownRenderer";
+import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
 import { ToolCard } from "./ToolCard";
 import { parseToolEvent } from "./toolEvent";
 import type { PulseTraceData } from "./timelineEntries";

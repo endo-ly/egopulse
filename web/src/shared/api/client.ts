@@ -38,8 +38,13 @@ export async function apiFetch<T>(
   options?: RequestInit,
 ): Promise<T> {
   const response = await request(path, authToken, options);
-  const data = await response.json().catch(() => ({}));
-  return data as T;
+  try {
+    return (await response.json()) as T;
+  } catch {
+    // Every API answers with JSON; anything else (e.g. an HTML fallback page)
+    // must surface as an error instead of an empty payload.
+    throw new Error(`invalid JSON response from ${path}`);
+  }
 }
 
 /** Fetches an authorized binary response (e.g. agent avatars for <img> tags). */

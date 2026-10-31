@@ -4,6 +4,9 @@ import { Sidebar } from "./shell/Sidebar";
 import { MobileBar } from "./shell/MobileBar";
 import { AgentsSection } from "./shell/AgentsSection";
 import { SessionsSection } from "./shell/SessionsSection";
+import { AgentSectionNav } from "../features/agent/AgentSectionNav";
+import { ScheduleSectionNav } from "../features/schedule/ScheduleSectionNav";
+import { SCHEDULE_ACTIVITY, type AgentSection, type ScheduleView } from "./router";
 import type { HealthStatus } from "./runtimeStatus";
 import type { TabId } from "./navigation";
 import type { AgentEntry, SessionEntry } from "../shared/api/types";
@@ -15,6 +18,10 @@ export interface AppProps {
   selectedAgent?: string;
   selectedSession?: string;
   activeTab?: TabId;
+  /** Current Agent screen section; drives the Agent sidebar context. */
+  agentSection?: AgentSection;
+  /** Current Schedule screen state; drives the Schedule sidebar context. */
+  scheduleView?: ScheduleView;
   healthStatus?: HealthStatus;
   onSelectAgent?: (id: string) => void;
   onSelectSession?: (key: string) => void;
@@ -22,6 +29,8 @@ export interface AppProps {
   onOpenPalette?: () => void;
   onNewSession?: (name?: string) => void;
   onUpdateSession?: (chatId: number, patch: SessionPatch) => void;
+  onSelectAgentSection?: (section: AgentSection) => void;
+  onChangeScheduleView?: (view: ScheduleView) => void;
   main?: ReactNode;
   authToken?: string;
   agentAvatars?: Readonly<Record<string, string>>;
@@ -41,6 +50,8 @@ export function App({
   selectedAgent = "",
   selectedSession = "",
   activeTab = "chat",
+  agentSection = "overview",
+  scheduleView = SCHEDULE_ACTIVITY,
   healthStatus = "ok",
   onSelectAgent = noop,
   onSelectSession = noop,
@@ -48,6 +59,8 @@ export function App({
   onOpenPalette = noop,
   onNewSession = noop,
   onUpdateSession,
+  onSelectAgentSection = noop,
+  onChangeScheduleView = noop,
   main,
   authToken,
   agentAvatars,
@@ -154,6 +167,47 @@ export function App({
     onNewSession(name);
     dismissOverlayOnMobile();
   };
+  const handleSelectAgentSection = (section: AgentSection) => {
+    onSelectAgentSection(section);
+    dismissOverlayOnMobile();
+  };
+  const handleChangeScheduleView = (view: ScheduleView) => {
+    onChangeScheduleView(view);
+    dismissOverlayOnMobile();
+  };
+
+  let context: ReactNode = null;
+  if (activeTab === "chat") {
+    context = (
+      <SessionsSection
+        sessions={sessions}
+        selectedAgent={selectedAgent}
+        selectedSession={selectedSession}
+        onSelectSession={handleSelectSession}
+        onNewSession={handleNewSession}
+        onUpdateSession={onUpdateSession}
+        unreadSessionKeys={unreadSessionKeys}
+      />
+    );
+  } else if (activeTab === "agent" && selectedAgent) {
+    context = (
+      <AgentSectionNav
+        agentId={selectedAgent}
+        authToken={authToken ?? ""}
+        section={agentSection}
+        onSelectSection={handleSelectAgentSection}
+      />
+    );
+  } else if (activeTab === "schedule" && selectedAgent) {
+    context = (
+      <ScheduleSectionNav
+        agentId={selectedAgent}
+        authToken={authToken ?? ""}
+        section={scheduleView.section}
+        onChangeView={handleChangeScheduleView}
+      />
+    );
+  }
 
   const showCollapsed = !isMobile && sidebarCollapsed;
 
@@ -178,17 +232,7 @@ export function App({
               unreadAgentIds={unreadAgentIds}
             />
           }
-          sessions={
-            <SessionsSection
-              sessions={sessions}
-              selectedAgent={selectedAgent}
-              selectedSession={selectedSession}
-              onSelectSession={handleSelectSession}
-              onNewSession={handleNewSession}
-              onUpdateSession={onUpdateSession}
-              unreadSessionKeys={unreadSessionKeys}
-            />
-          }
+          context={context}
         />
       </aside>
       {isMobile && sidebarOpen && (

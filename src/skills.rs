@@ -224,6 +224,11 @@ impl SkillManager {
         out
     }
 
+    /// Whether `skill` is installed in the built-in skills directory.
+    pub(crate) fn is_builtin(&self, skill: &SkillMetadata) -> bool {
+        skill.dir_path.starts_with(&self.builtin_skills_dir)
+    }
+
     fn skill_is_available(&self, skill: &SkillMetadata) -> bool {
         platform_allowed(&skill.platforms) && missing_deps(&skill.deps).is_empty()
     }
@@ -307,14 +312,132 @@ fn should_skip_directory(path: &Path, prioritized_skills_dir: &Path) -> bool {
         return true;
     }
 
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(is_excluded_dir_name)
+}
 
+/// Directories never scanned for skills or listed as skill files.
+fn is_excluded_dir_name(name: &str) -> bool {
     matches!(
         name,
         ".git" | ".gradle" | "node_modules" | "target" | "build" | "dist"
     )
+}
+
+/// Upper bound on files listed for one skill directory.
+const MAX_SKILL_FILES: usize = 200;
+/// Upper bound on the size of a skill file served for reading.
+const MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
+
+/// A file bundled with a skill, relative to the skill directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillFile {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// Failure to read a bundled skill file.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SkillFileError {
+    /// Missing, not a regular file, or outside the skill directory.
+    #[error("skill file not found")]
+    NotFound,
+    #[error("skill file exceeds {MAX_SKILL_FILE_BYTES} bytes")]
+    TooLarge,
+    #[error("skill file is not utf-8 text")]
+    NotText,
+    #[error("failed to read skill file: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Lists the files bundled with the skill in `dir` (everything except its
+/// `SKILL.md`), sorted by path. Hidden entries, excluded build directories,
+/// and symlinks are skipped; at most [`MAX_SKILL_FILES`] entries are returned.
+///
+/// # Errors
+///
+/// Returns an I/O error when `dir` cannot be read.
+pub(crate) fn list_skill_files(dir: &Path) -> std::io::Result<Vec<SkillFile>> {
+    let mut files = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with('.') {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                if !is_excluded_dir_name(name) {
+                    pending.push(path);
+                }
+            } else if file_type.is_file() && path != dir.join("SKILL.md") {
+                let relative = path.strip_prefix(dir).unwrap_or(&path);
+                files.push(SkillFile {
+                    path: relative.to_string_lossy().replace('\\', "/"),
+                    bytes: entry.metadata()?.len(),
+                });
+            }
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.truncate(MAX_SKILL_FILES);
+    Ok(files)
+}
+
+/// Whether a skill serves the file at `relative`: no hidden segment, and no
+/// excluded build directory on the way down. [`list_skill_files`] applies this
+/// same rule, so a file it does not list cannot be read either.
+fn is_served_relative_path(relative: &Path) -> bool {
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if name.starts_with('.') {
+            return false;
+        }
+        // The last segment names the file itself, not a directory to walk.
+        if components.peek().is_some() && is_excluded_dir_name(name) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Reads a UTF-8 text file bundled with the skill in `dir`.
+///
+/// `relative` is resolved inside `dir`; paths that escape it (via `..`,
+/// absolute paths, or symlinks) and paths the skill does not serve (hidden
+/// files, excluded directories) are reported as [`SkillFileError::NotFound`].
+///
+/// # Errors
+///
+/// See [`SkillFileError`].
+pub(crate) fn read_skill_file(dir: &Path, relative: &str) -> Result<String, SkillFileError> {
+    let root = dir.canonicalize()?;
+    let path = root
+        .join(relative)
+        .canonicalize()
+        .map_err(|_| SkillFileError::NotFound)?;
+    // Check the canonical path, so a symlink is judged by what it resolves to.
+    let Ok(served) = path.strip_prefix(&root) else {
+        return Err(SkillFileError::NotFound);
+    };
+    if !is_served_relative_path(served) || !path.is_file() {
+        return Err(SkillFileError::NotFound);
+    }
+    if path.metadata()?.len() > MAX_SKILL_FILE_BYTES {
+        return Err(SkillFileError::TooLarge);
+    }
+    String::from_utf8(std::fs::read(&path)?).map_err(|_| SkillFileError::NotText)
 }
 
 fn parse_skill_md(content: &str, dir_path: &Path) -> Option<(SkillMetadata, String)> {
@@ -666,6 +789,30 @@ mod tests {
     }
 
     #[test]
+    fn is_builtin_distinguishes_builtin_and_user_skills() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let user_skills_dir = dir.path().join("workspace").join("skills");
+        let builtin_skills_dir = dir.path().join("skills");
+        create_skill(&user_skills_dir, "mine", "User skill.");
+        create_skill(&builtin_skills_dir, "shipped", "Built-in skill.");
+        let manager = SkillManager::from_dirs(&user_skills_dir, &builtin_skills_dir);
+
+        // Act
+        let builtin: Vec<_> = manager
+            .discover_skills()
+            .iter()
+            .map(|skill| (skill.name.clone(), manager.is_builtin(skill)))
+            .collect();
+
+        // Assert
+        assert_eq!(
+            builtin,
+            vec![("mine".to_string(), false), ("shipped".to_string(), true)]
+        );
+    }
+
+    #[test]
     fn parses_required_env_from_frontmatter() {
         let dir = tempfile::tempdir().expect("tempdir");
         let skills_dir = dir.path().join("workspace").join("skills");
@@ -746,5 +893,122 @@ mod tests {
         let result =
             super::resolve_required_env(&["EGOPULSE_MISSING_KEY_XYZ".to_string()], &dotenv);
         assert!(result.is_empty());
+    }
+
+    // --- bundled skill files ---
+
+    fn write(path: &std::path::Path, content: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(path, content).expect("write");
+    }
+
+    #[test]
+    fn list_skill_files_returns_bundled_files_except_skill_md() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join("notes");
+        create_skill_at(&skill, "notes", "Body.");
+        write(&skill.join("references/guide.md"), b"# Guide");
+        write(&skill.join("scripts/run.sh"), b"echo hi");
+        write(&skill.join(".git/HEAD"), b"ref");
+        write(&skill.join("node_modules/pkg/index.js"), b"x");
+
+        // Act
+        let files = super::list_skill_files(&skill).expect("list");
+
+        // Assert
+        assert_eq!(
+            files,
+            vec![
+                super::SkillFile {
+                    path: "references/guide.md".to_string(),
+                    bytes: 7
+                },
+                super::SkillFile {
+                    path: "scripts/run.sh".to_string(),
+                    bytes: 7
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn read_skill_file_returns_text_inside_the_skill_dir() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join("notes");
+        create_skill_at(&skill, "notes", "Body.");
+        write(&skill.join("references/guide.md"), b"# Guide");
+
+        // Act
+        let content = super::read_skill_file(&skill, "references/guide.md").expect("read");
+
+        // Assert
+        assert_eq!(content, "# Guide");
+    }
+
+    #[test]
+    fn read_skill_file_rejects_paths_the_listing_does_not_serve() {
+        // Arrange: files the skill keeps out of its listing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join("notes");
+        create_skill_at(&skill, "notes", "Body.");
+        write(&skill.join(".env"), b"TOKEN=secret");
+        write(&skill.join(".git/config"), b"[remote]");
+        write(&skill.join("node_modules/pkg/index.js"), b"x");
+        write(&skill.join("references/guide.md"), b"# Guide");
+
+        // Act
+        let env = super::read_skill_file(&skill, ".env");
+        let git = super::read_skill_file(&skill, ".git/config");
+        let vendored = super::read_skill_file(&skill, "node_modules/pkg/index.js");
+        let dotted = super::read_skill_file(&skill, "./references/guide.md");
+
+        // Assert: the same rule the listing applies, so nothing hidden leaks.
+        assert!(matches!(env, Err(super::SkillFileError::NotFound)));
+        assert!(matches!(git, Err(super::SkillFileError::NotFound)));
+        assert!(matches!(vendored, Err(super::SkillFileError::NotFound)));
+        assert_eq!(dotted.expect("read"), "# Guide");
+    }
+
+    #[test]
+    fn read_skill_file_rejects_paths_outside_the_skill_dir() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join("notes");
+        create_skill_at(&skill, "notes", "Body.");
+        write(&dir.path().join("secret.txt"), b"top secret");
+
+        // Act
+        let escaped = super::read_skill_file(&skill, "../secret.txt");
+        let absolute = super::read_skill_file(
+            &skill,
+            dir.path().join("secret.txt").to_str().expect("utf-8 path"),
+        );
+        let missing = super::read_skill_file(&skill, "nope.md");
+
+        // Assert
+        assert!(matches!(escaped, Err(super::SkillFileError::NotFound)));
+        assert!(matches!(absolute, Err(super::SkillFileError::NotFound)));
+        assert!(matches!(missing, Err(super::SkillFileError::NotFound)));
+    }
+
+    #[test]
+    fn read_skill_file_rejects_binary_and_oversized_files() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join("notes");
+        create_skill_at(&skill, "notes", "Body.");
+        write(&skill.join("logo.png"), &[0x89, 0x50, 0xff, 0xfe]);
+        let oversized = vec![b'a'; (super::MAX_SKILL_FILE_BYTES + 1) as usize];
+        write(&skill.join("huge.txt"), &oversized);
+
+        // Act
+        let binary = super::read_skill_file(&skill, "logo.png");
+        let huge = super::read_skill_file(&skill, "huge.txt");
+
+        // Assert
+        assert!(matches!(binary, Err(super::SkillFileError::NotText)));
+        assert!(matches!(huge, Err(super::SkillFileError::TooLarge)));
     }
 }

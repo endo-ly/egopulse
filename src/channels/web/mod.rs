@@ -4,11 +4,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Json;
 use axum::extract::OriginalUri;
 use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware;
@@ -21,11 +23,14 @@ use crate::channels::adapter::ChannelAdapter;
 use crate::channels::adapter::ConversationKind;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
+use crate::storage::RunCursor;
 
+mod agent_profile;
 mod agents;
 pub(crate) mod auth;
 mod config;
 pub(crate) mod health;
+mod pulse;
 mod sessions;
 mod sleep;
 pub(crate) mod sse;
@@ -40,6 +45,73 @@ pub(crate) const WEB_ACTOR: &str = "web-user";
 pub(crate) const RUN_HISTORY_LIMIT: usize = 512;
 /// Defines how long completed runs remain replayable.
 pub(crate) const RUN_TTL_SECONDS: u64 = 300;
+/// Run listings return this many rows when the request does not say otherwise.
+pub(super) const DEFAULT_RUN_LIMIT: usize = 20;
+/// Upper bound on rows a run listing returns, whatever the request asks for.
+pub(super) const MAX_RUN_LIMIT: usize = 200;
+
+/// JSON error body of a Web API handler.
+pub(super) type ApiError = (StatusCode, Json<serde_json::Value>);
+/// Result of a Web API handler that answers with a JSON object.
+pub(super) type ApiResult = Result<Json<serde_json::Value>, ApiError>;
+
+/// Builds the error body `{"ok": false, "error": code}`.
+pub(super) fn api_error(status: StatusCode, code: &str) -> ApiError {
+    (
+        status,
+        Json(serde_json::json!({"ok": false, "error": code})),
+    )
+}
+
+/// A `400` carrying the reason as its error code.
+pub(super) fn bad_request(code: &str) -> ApiError {
+    api_error(StatusCode::BAD_REQUEST, code)
+}
+
+/// A `404` carrying what was not found as its error code.
+pub(super) fn not_found(code: &str) -> ApiError {
+    api_error(StatusCode::NOT_FOUND, code)
+}
+
+/// A `500` that does not reveal the internal failure.
+pub(super) fn internal_error() -> ApiError {
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+}
+
+/// Parses a `before` paging cursor: the `started_at` and id of the oldest run
+/// already returned, joined by `|`. `None` starts from the newest run.
+///
+/// The timestamp is normalized to the format `started_at` is written in
+/// (RFC 3339, UTC), because the cursor is compared as text. Any other spelling
+/// of the same instant (e.g. `Z` instead of `+00:00`) would compare as a
+/// different time.
+pub(super) fn parse_before(raw: Option<&str>) -> Result<Option<RunCursor>, ApiError> {
+    raw.map(|before| {
+        let (started_at, id) = before
+            .split_once('|')
+            .ok_or_else(|| bad_request("invalid_before"))?;
+        if id.is_empty() {
+            return Err(bad_request("invalid_before"));
+        }
+        let started_at = chrono::DateTime::parse_from_rfc3339(started_at)
+            .map(|instant| instant.with_timezone(&chrono::Utc).to_rfc3339())
+            .map_err(|_| bad_request("invalid_before"))?;
+        Ok(RunCursor {
+            started_at,
+            id: id.to_string(),
+        })
+    })
+    .transpose()
+}
+
+/// Parses a comma-separated `status` query value; `None` keeps every status.
+pub(super) fn parse_statuses<T: FromStr>(raw: Option<&str>) -> Result<Vec<T>, ApiError> {
+    raw.into_iter()
+        .flat_map(|raw| raw.split(','))
+        .filter(|status| !status.is_empty())
+        .map(|status| status.parse().map_err(|_| bad_request("invalid_status")))
+        .collect()
+}
 
 /// Adapts the local web surface to the shared channel interface.
 pub(crate) struct WebAdapter;
@@ -461,8 +533,33 @@ fn build_router(web_state: WebState) -> Router {
             "/api/agents/{agent_id}/memory",
             get(sleep::get_agent_memory),
         )
+        .route(
+            "/api/agents/{agent_id}/profile",
+            get(agent_profile::get_agent_profile),
+        )
+        .route(
+            "/api/agents/{agent_id}/files/{kind}",
+            get(agent_profile::get_agent_prompt_file),
+        )
+        .route(
+            "/api/agents/{agent_id}/memory/history",
+            get(agent_profile::get_agent_memory_history),
+        )
+        .route("/api/agents/{agent_id}/pulse", get(pulse::get_agent_pulse))
+        .route(
+            "/api/agents/{agent_id}/sleep/next",
+            get(sleep::get_agent_sleep_outlook),
+        )
+        .route("/api/skills", get(agent_profile::list_skills))
+        .route("/api/skills/{name}", get(agent_profile::get_skill))
+        .route(
+            "/api/skills/{name}/files/{*path}",
+            get(agent_profile::get_skill_file),
+        )
         .route("/api/sleep/runs", get(sleep::list_sleep_runs))
         .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
+        .route("/api/pulse/runs", get(pulse::list_pulse_runs))
+        .route("/api/pulse/runs/{run_id}", get(pulse::get_pulse_run_detail))
         .route("/api/status", get(health::status))
         .route("/telemetry", get(health::telemetry_handler))
         .route_layer(middleware::from_fn_with_state(
@@ -516,6 +613,34 @@ mod tests {
     };
     use crate::llm::MessagesResponse;
     use crate::test_util::{build_state_with_config, test_config};
+
+    #[test]
+    fn parse_before_reads_the_run_the_cursor_points_at() {
+        // Arrange / Act
+        let none = parse_before(None).expect("no cursor");
+        let zulu = parse_before(Some("2026-10-02T09:00:00Z|run-1")).expect("zulu");
+        let offset = parse_before(Some("2026-10-02T18:00:00+09:00|run-1")).expect("offset");
+        let no_run = parse_before(Some("2026-10-02T09:00:00Z|"));
+        let no_instant = parse_before(Some("run-1"));
+        let broken = parse_before(Some("yesterday|run-1"));
+
+        // Assert: every spelling of the instant compares like the stored value.
+        assert_eq!(none, None);
+        assert_eq!(
+            zulu,
+            Some(RunCursor {
+                started_at: "2026-10-02T09:00:00+00:00".to_string(),
+                id: "run-1".to_string(),
+            })
+        );
+        assert_eq!(offset, zulu);
+        for invalid in [no_run, no_instant, broken] {
+            assert_eq!(
+                invalid.expect_err("invalid cursor").0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
 
     struct NoopChannelAdapter(&'static str);
 

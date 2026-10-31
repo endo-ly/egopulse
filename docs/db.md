@@ -359,7 +359,7 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 |--------|----|------|------|
 | id | TEXT | PK | UUID v4 |
 | agent_id | TEXT | NOT NULL | エージェント識別子 |
-| status | TEXT | NOT NULL | 実行状態（running/success/failed/skipped） |
+| status | TEXT | NOT NULL | 実行状態（running/success/partial_failure/failed/skipped） |
 | trigger_type | TEXT | NOT NULL | 起動トリガー（manual/scheduled/backfill） |
 | started_at | TEXT | NOT NULL | 開始時刻（RFC3339） |
 | finished_at | TEXT | nullable | 終了時刻（RFC3339） |
@@ -368,16 +368,16 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 | input_tokens | INTEGER | NOT NULL DEFAULT 0 | 入力トークン数 |
 | output_tokens | INTEGER | NOT NULL DEFAULT 0 | 出力トークン数 |
 | total_tokens | INTEGER | NOT NULL DEFAULT 0 | 合計トークン数 |
-| error_message | TEXT | nullable | エラーメッセージ |
+| error_message | TEXT | nullable | `failed` のエラー、`skipped` のスキップ理由 |
 
 **操作**:
 - `create_sleep_run(agent_id, trigger)` — INSERT（status=running, id/started_at 自動生成）
 - `try_create_sleep_run(agent_id, trigger)` — 同一 agent の running run を transaction 内で確認し、存在しなければ INSERT
 - `update_sleep_run_success(id, source_chats_json, source_digest_md, input_tokens, output_tokens)` — status=success 更新
 - `update_sleep_run_failed(id, error_message)` — status=failed 更新
-- `update_sleep_run_skipped(id)` — status=skipped 更新
+- `record_skipped_sleep_run(agent_id, trigger, reason)` — 実行しないと判定した Sleep を、理由付きの終了済み `skipped` run として INSERT（ステップは作らない）
 - `get_sleep_run(id)` — id で取得
-- `list_sleep_runs(agent_id, limit)` — agent_id 絞り込み + started_at 降順
+- `list_sleep_runs(agent_id, statuses, limit)` — agent_id と status（空ならすべて）で絞り込み + started_at 降順
 - `count_agent_pending_sleep_messages(agent_id)` — `event_extraction` / `prospective_update` いずれかの checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複除外して計数（Sleep 候補判定の cursor として `finished_at` ではなく checkpoint を使用）
 - `get_agent_sessions_with_pending_sleep_messages(agent_id, limit)` — 同じ pending 条件でセッションを「最古の pending message が古い順、同値なら `chat_id` 順」で取得（hot session による backlog 飢餖防止）
 
@@ -456,14 +456,16 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 | finished_at | TEXT | nullable | 終了時刻（RFC3339） |
 | output_kind | TEXT | nullable | 出力種別（silent/notify） |
 | output_text | TEXT | nullable | LLM 出力テキスト |
-| error_message | TEXT | nullable | エラーメッセージ |
+| error_message | TEXT | nullable | `failed` のエラー、`skipped` のスキップ理由 |
+| attention_snapshot | TEXT | nullable | run 開始時点の intention の attention。PULSE.yaml の変更後も当時の注意対象を監査できる |
 
 *UNIQUE 制約は `(agent_id, intention_id, due_key)` の複合。同一 intention の同一 due の二重実行を防ぐ。
 
 **操作**:
-- `try_create_pulse_run(agent_id, intention_id, due_key)` — INSERT（status=running, id/started_at 自動生成）
+- `try_create_pulse_run(id, agent_id, intention_id, due_key, attention)` — INSERT（status=running, started_at 自動生成、attention を `attention_snapshot` に保存）
 - `has_pulse_due_run(agent_id, intention_id, due_key)` — 重複チェック
 - `get_pulse_run(id)` — id で取得
+- `list_pulse_runs(agent_id, intention_id, statuses, limit)` — agent と、任意の intention・status（空ならすべて）で絞り込み + started_at 降順
 - `update_pulse_run_success(id, output_kind, output_text, chat_id, message_id)` — status=success 更新
 - `update_pulse_run_failed(id, error_message)` — status=failed 更新
 - `update_pulse_run_skipped(id, reason)` — status=skipped 更新
@@ -490,7 +492,8 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 **操作**:
 - `create_memory_snapshot(run_id, agent_id, file, content_before, content_after)` — INSERT
 - `get_snapshots_for_run(run_id)` — run_id 絞り込み + created_at 昇順
-- `get_snapshots_for_agent(agent_id, limit)` — agent_id 絞り込み + created_at 降順
+- `list_memory_changes(agent_id, limit)` — 公開済みの変更履歴（全ファイル）。所属 run が `success` / `partial_failure` かつ `content_before != content_after` の行を created_at 降順で返す
+- `changed_memory_files(run_ids)` — run ごとの変更のあった記憶ファイル。`list_memory_changes` と同じ公開済み条件で、`episodic` → `semantic` → `prospective` の順に返す
 - `get_latest_snapshot_for_file(agent_id, file)` — agent+file の最新1件
 - `ensure_memory_snapshots_complete(run_id, agent_id, base)` — 欠落 file に `content_before == content_after == base` の snapshot を補完する
 - `list_running_sleep_runs()` — `status = 'running'` の Run を開始順に取得（スタートアップリカバリ用）
@@ -716,7 +719,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 | `SleepStepName` | — | 4種の enum: `EventExtraction`, `EpisodicUpdate`, `SemanticUpdate`, `ProspectiveUpdate`（SQL: `event_extraction`, `episodic_update`, `semantic_update`, `prospective_update`） |
 | `SleepStepStatus` | — | 5種の enum: `Pending`, `Running`, `Success`, `Failed`, `Skipped`（SQL: `pending`, `running`, `success`, `failed`, `skipped`） |
 | `CheckpointSourceKind` | — | 2種の enum: `Messages`, `EpisodeEvents`（SQL: `messages`, `episode_events`） |
-| `PulseRun` | pulse_runs | id, agent_id, intention_id, due_key, chat_id, message_id, status, started_at, finished_at, output_kind, output_text, error_message |
+| `PulseRun` | pulse_runs | id, agent_id, intention_id, due_key, chat_id, message_id, status, started_at, finished_at, output_kind, output_text, error_message, attention_snapshot |
 | `MemorySnapshot` | memory_snapshots | id, run_id, agent_id, file, content_before, content_after, created_at |
 | `EpisodeEvent` | episode_events | id, agent_id, experienced_at, encoded_at, kind, title, body_md, ripple_strength, certainty, sleep_run_id, source_refs_json, created_at, updated_at |
 | `EpisodeEventKind` | — | 8種の enum: `Self_`, `Relationship`, `World`, `Feat`, `Anomaly`, `Decision`, `Insight`, `Rhythm`（SQL: `self`, `relationship`, `world`, `feat`, `anomaly`, `decision`, `insight`, `rhythm`） |
@@ -738,7 +741,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `18`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `21`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
@@ -749,7 +752,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
 5. `set_schema_version(conn, 6, "description")` または transaction 用 helper を呼び出し
 
-> **Note**: 現行のコードラインでは v1 から v18 までを順に適用する。以下は主要なマイグレーションの履歴。
+> **Note**: 現行のコードラインでは v1 から v21 までを順に適用する。以下は主要なマイグレーションの履歴。
 
 #### v3: add episode_events table + 4 indexes
 
@@ -791,6 +794,10 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 #### v16: agent_avatars table
 
 `agent_avatars` 表を新設し、WebUI 表示用の agent アイコン画像（BLOB）を保存する。詳細は [§2](#2-テーブル定義) の `agent_avatars` を参照。
+
+#### v21: pulse_runs.attention_snapshot
+
+`pulse_runs` に `attention_snapshot`（nullable）を追加する。既存の run は `NULL` のまま残る。
 
 ### 外部キー制約が最小限
 

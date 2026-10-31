@@ -258,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn gate_blocks_duplicate_due_key() {
         let (db, _dir) = test_db();
-        db.try_create_pulse_run("run-1", "agent-a", "int-1", "2025-01-01")
+        db.try_create_pulse_run("run-1", "agent-a", "int-1", "2025-01-01", "attention")
             .expect("create pulse run");
 
         let decision = evaluate_gate(&db, "agent-a", "int-1", "2025-01-01", false)

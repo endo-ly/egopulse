@@ -1,4 +1,4 @@
-import type { TabId } from "../navigation";
+import { NAV_TABS, type TabId } from "../navigation";
 import type { AgentEntry, ChatMessage, SessionEntry } from "../../shared/api/types";
 import { loadPaletteHistory, pushPaletteHistory } from "./paletteHistory";
 import { sessionTitle } from "../../shared/lib/session";
@@ -31,15 +31,6 @@ export interface BuildPaletteItemsInput {
   actions: PaletteActions;
 }
 
-const TAB_LABELS: Record<TabId, string> = {
-  chat: "Chat",
-  sleep: "Sleep",
-  pulse: "Pulse",
-  metrics: "Metrics",
-  config: "Config",
-};
-
-const DISABLED_TABS: TabId[] = ["pulse", "metrics", "config"];
 const MAX_MESSAGE_RESULTS = 20;
 
 export function buildPaletteItems({
@@ -79,17 +70,14 @@ function quickActions(actions: PaletteActions): PaletteItem[] {
 }
 
 function navigationItems(actions: PaletteActions): PaletteItem[] {
-  return (Object.keys(TAB_LABELS) as TabId[]).map((tab) => ({
-    id: `nav-${tab}`,
-    label: `Go to ${TAB_LABELS[tab]}`,
-    section: "Navigation",
-    disabled: DISABLED_TABS.includes(tab),
-    onSelect: () => selectAndRemember(
-      { id: `nav-${tab}`, label: `Go to ${TAB_LABELS[tab]}`, section: "Navigation" },
-      () => actions.navigate(tab),
-      actions,
-    ),
-  }));
+  return NAV_TABS.map((tab) => {
+    const historyItem = { id: `nav-${tab.id}`, label: `Go to ${tab.label}`, section: "Navigation" };
+    return {
+      ...historyItem,
+      disabled: tab.disabled,
+      onSelect: () => selectAndRemember(historyItem, () => actions.navigate(tab.id), actions),
+    };
+  });
 }
 
 function agentItems(

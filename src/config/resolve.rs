@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use super::{
-    AgentId, BotId, ChannelName, Config, DiscordChannelConfig, ProviderConfig, ProviderId,
-    PulseConfig, ResolvedLlmConfig, WebhookReceiverConfig, WebhookReceiverId,
+    AgentId, BotId, ChannelName, Config, DiscordChannelConfig, LlmOrigin, LlmSettingSource,
+    ProviderConfig, ProviderId, PulseConfig, ResolvedLlmConfig, WebhookReceiverConfig,
+    WebhookReceiverId,
 };
 use crate::error::ConfigError;
 
@@ -47,6 +48,23 @@ impl Config {
         agent_id: &AgentId,
         channel: &str,
     ) -> Result<ResolvedLlmConfig, ConfigError> {
+        self.resolve_llm_origin_for_agent(agent_id, Some(channel))
+            .map(|(resolved, _)| resolved)
+    }
+
+    /// Resolves like [`Config::resolve_llm_for_agent_channel`] and also reports
+    /// which level of the resolution chain supplied the provider and the model.
+    ///
+    /// `channel: None` resolves for channels that have no profile.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::resolve_llm_for_agent_channel`].
+    pub(crate) fn resolve_llm_origin_for_agent(
+        &self,
+        agent_id: &AgentId,
+        channel: Option<&str>,
+    ) -> Result<(ResolvedLlmConfig, LlmOrigin), ConfigError> {
         let agent = self
             .agents
             .get(agent_id)
@@ -54,18 +72,24 @@ impl Config {
                 agent_id: agent_id.to_string(),
             })?;
 
-        let profile = agent.profiles.get(channel);
+        let profile = channel.and_then(|channel| agent.profiles.get(channel));
 
-        let provider_name = profile
+        let (provider_name, provider_source) = profile
             .and_then(|p| p.provider.as_deref())
-            .map(|p| p.trim().to_ascii_lowercase())
+            .map(|p| (p, LlmSettingSource::Profile))
             .or_else(|| {
                 agent
                     .provider
                     .as_deref()
-                    .map(|p| p.trim().to_ascii_lowercase())
+                    .map(|p| (p, LlmSettingSource::Agent))
             })
-            .unwrap_or_else(|| self.default_provider.to_string());
+            .map(|(p, source)| (p.trim().to_ascii_lowercase(), source))
+            .unwrap_or_else(|| {
+                (
+                    self.default_provider.to_string(),
+                    LlmSettingSource::GlobalDefault,
+                )
+            });
 
         let provider_id = ProviderId::new(&provider_name);
         let provider = self.providers.get(&provider_id).ok_or_else(|| {
@@ -74,18 +98,33 @@ impl Config {
             }
         })?;
 
-        let model = profile
-            .and_then(|p| p.model.as_deref().map(String::from))
-            .or_else(|| agent.model.as_deref().map(String::from))
-            .or_else(|| self.default_model.clone())
-            .unwrap_or_else(|| provider.default_model.clone());
+        let (model, model_source) = profile
+            .and_then(|p| p.model.clone())
+            .map(|m| (m, LlmSettingSource::Profile))
+            .or_else(|| agent.model.clone().map(|m| (m, LlmSettingSource::Agent)))
+            .or_else(|| {
+                self.default_model
+                    .clone()
+                    .map(|m| (m, LlmSettingSource::GlobalDefault))
+            })
+            .unwrap_or_else(|| {
+                (
+                    provider.default_model.clone(),
+                    LlmSettingSource::ProviderDefault,
+                )
+            });
 
-        Ok(ResolvedLlmConfig::from_provider(
+        let resolved = ResolvedLlmConfig::from_provider(
             provider_name,
             provider,
             model,
             agent.reasoning_effort.clone(),
-        ))
+        );
+        let origin = LlmOrigin {
+            provider: provider_source,
+            model: model_source,
+        };
+        Ok((resolved, origin))
     }
 
     /// Resolves the provider/model pair for sleep batch LLM processing.

@@ -158,6 +158,17 @@ impl ManageConnection for SqliteConnectionManager {
 type Pool = r2d2::Pool<SqliteConnectionManager>;
 type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
+/// `?, ?, ?` with `count` placeholders, for `IN (...)` lists.
+fn placeholders(count: usize) -> String {
+    vec!["?"; count].join(", ")
+}
+
+/// SQL fragment ` AND status IN (?, …)` with `count` placeholders, for run
+/// listings filtered by status.
+fn status_filter_sql(count: usize) -> String {
+    format!(" AND status IN ({})", placeholders(count))
+}
+
 fn configure_connection(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("PRAGMA foreign_keys=ON;")?;
     conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
@@ -650,6 +661,15 @@ pub(crate) struct MemorySnapshot {
     pub created_at: String,
 }
 
+/// Where to continue a run listing from: the `started_at` and id of the oldest
+/// run already returned. The id breaks ties, so runs that share a `started_at`
+/// are never lost across a page boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunCursor {
+    pub started_at: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PulseRun {
     pub id: String,
@@ -664,6 +684,9 @@ pub(crate) struct PulseRun {
     pub output_kind: Option<PulseOutputKind>,
     pub output_text: Option<String>,
     pub error_message: Option<String>,
+    /// Attention text the run was activated with; `None` for runs recorded
+    /// before snapshots existed.
+    pub attention_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

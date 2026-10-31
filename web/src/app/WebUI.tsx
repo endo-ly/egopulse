@@ -3,7 +3,11 @@ import { App } from "./AppShell";
 import { AuthModal } from "./AuthModal";
 import { CommandPalette } from "./command-palette/CommandPalette";
 import { ChatTab } from "../features/chat/ChatTab";
-import { SleepBatchPanel } from "../features/sleep/SleepBatchPanel";
+import { AgentPanel } from "../features/agent/AgentPanel";
+import { AGENT_QUERY_PREFIX } from "../features/agent/agentQuery";
+import { SchedulePanel } from "../features/schedule/SchedulePanel";
+import { SCHEDULE_QUERY_PREFIX } from "../features/schedule/scheduleQuery";
+import { EmptyState } from "../shared/ui/EmptyState";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
 import { useChatHistory } from "../features/chat/useChatHistory";
@@ -16,8 +20,15 @@ import type { SessionPatch } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
 import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
 import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
-import { buildRoutePath, parseRoute, type AppRoute, type SleepView } from "./router";
-import type { TabId } from "./navigation";
+import {
+  buildRoutePath,
+  parseRoute,
+  SCHEDULE_ACTIVITY,
+  type AgentSection,
+  type AppRoute,
+  type ScheduleView,
+} from "./router";
+import { NAV_TABS, isAgentTab, type TabId } from "./navigation";
 import { resolveAutoSessionKey } from "./sessionSelection";
 
 /** Extracts the chat id from a canonical `chat:{id}` session key. */
@@ -51,15 +62,51 @@ function initialRoute(): AppRoute | null {
   return pathname === null ? null : parseRoute(pathname);
 }
 
+const COMING_SOON_ICON = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+
+/** Per-screen selections that a route carries besides the tab and agent. */
+interface ScreenSelection {
+  sessionKey: string | null;
+  agentSection: AgentSection;
+  scheduleView: ScheduleView;
+}
+
+function composeRoute(tab: TabId, agentId: string, selection: ScreenSelection): AppRoute {
+  switch (tab) {
+    case "chat":
+      return { tab, agentId, sessionKey: selection.sessionKey };
+    case "agent":
+      return { tab, agentId, section: selection.agentSection };
+    case "schedule":
+      return { tab, agentId, view: selection.scheduleView };
+    case "metrics":
+    case "config":
+      return { tab };
+  }
+}
+
+/** Navigates to `route`, pushing a history entry unless `replace` is set. */
+function navigateTo(route: AppRoute, replace = false): void {
+  const path = buildRoutePath(route);
+  if (path !== null) navigatePath(path, replace);
+}
+
 export function WebUI() {
   const bootRoute = useMemo(initialRoute, []);
   const [activeTab, setActiveTab] = useState<TabId>(bootRoute?.tab ?? "chat");
-  const [selectedAgent, setSelectedAgent] = useState(bootRoute?.agentId ?? "");
+  const [selectedAgent, setSelectedAgent] = useState(
+    bootRoute && "agentId" in bootRoute ? bootRoute.agentId : "",
+  );
   // A fresh key for the new-conversation state. It is never a persisted
   // session key, so an archived session cannot be reused through it.
   const [draftSessionKey, setDraftSessionKey] = useState(createSessionKey);
   const [selectedSession, setSelectedSession] = useState(
-    bootRoute?.sessionKey ?? draftSessionKey,
+    bootRoute?.tab === "chat" ? (bootRoute.sessionKey ?? draftSessionKey) : draftSessionKey,
   );
   // Tracks whether the user explicitly chose a session (sidebar, palette, new
   // session, or a URL). The auto-select effect must not clobber an explicit
@@ -68,11 +115,11 @@ export function WebUI() {
   const [sessionExplicit, setSessionExplicit] = useState(
     bootRoute?.tab === "chat" && bootRoute.sessionKey !== null,
   );
-  const [sleepView, setSleepView] = useState<SleepView>(
-    bootRoute?.tab === "sleep" ? bootRoute.sleepView : "runs",
+  const [agentSection, setAgentSection] = useState<AgentSection>(
+    bootRoute?.tab === "agent" ? bootRoute.section : "overview",
   );
-  const [sleepRunId, setSleepRunId] = useState<string | null>(
-    bootRoute?.tab === "sleep" ? bootRoute.runId : null,
+  const [scheduleView, setScheduleView] = useState<ScheduleView>(
+    bootRoute?.tab === "schedule" ? bootRoute.view : SCHEDULE_ACTIVITY,
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [messageJump, setMessageJump] = useState<{
@@ -140,30 +187,23 @@ export function WebUI() {
     sessionExplicit,
   ]);
 
+  // The session key the URL carries: only an explicit or resolved session,
+  // never the throwaway draft key of the new-conversation state.
+  const urlSessionKey =
+    sessionExplicit || selectedSession !== draftSessionKey ? selectedSession : null;
+
   // Reflects auto-derived selection changes in the URL. User actions push
   // their own history entry beforehand, so this only ever replaces.
   useEffect(() => {
-    const path = buildRoutePath({
-      tab: activeTab,
-      agentId: selectedAgent,
-      sessionKey:
-        activeTab === "chat" &&
-        (sessionExplicit || selectedSession !== draftSessionKey)
-          ? selectedSession
-          : null,
-      sleepView,
-      runId: sleepRunId,
-    });
-    if (path !== null) navigatePath(path, true);
-  }, [
-    activeTab,
-    draftSessionKey,
-    selectedAgent,
-    selectedSession,
-    sessionExplicit,
-    sleepView,
-    sleepRunId,
-  ]);
+    navigateTo(
+      composeRoute(activeTab, selectedAgent, {
+        sessionKey: urlSessionKey,
+        agentSection,
+        scheduleView,
+      }),
+      true,
+    );
+  }, [activeTab, agentSection, scheduleView, selectedAgent, urlSessionKey]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -171,11 +211,9 @@ export function WebUI() {
       const route = pathname === null ? null : parseRoute(pathname);
       if (!route) return;
       setActiveTab(route.tab);
-      if (route.agentId) setSelectedAgent(route.agentId);
-      if (route.tab === "sleep") {
-        setSleepView(route.sleepView);
-        setSleepRunId(route.runId);
-      }
+      if ("agentId" in route && route.agentId) setSelectedAgent(route.agentId);
+      if (route.tab === "agent") setAgentSection(route.section);
+      if (route.tab === "schedule") setScheduleView(route.view);
       if (route.tab === "chat" && route.sessionKey) {
         setSelectedSession(route.sessionKey);
         setSessionExplicit(true);
@@ -188,109 +226,70 @@ export function WebUI() {
     return () => globalThis.removeEventListener("popstate", onPopState);
   }, []);
 
+  // Selecting a session always shows it in Chat, from whichever screen asked.
   const handleSelectSession = useCallback(
     (key: string) => {
+      setActiveTab("chat");
       setSelectedSession(key);
       setSessionExplicit(true);
       setDraftSessionKey(createSessionKey());
-      const path = buildRoutePath({
-        tab: activeTab,
-        agentId: selectedAgent,
-        sessionKey: key,
-        sleepView,
-        runId: null,
-      });
-      if (path !== null) navigatePath(path, false);
+      navigateTo({ tab: "chat", agentId: selectedAgent, sessionKey: key });
     },
-    [activeTab, selectedAgent, sleepView],
+    [selectedAgent],
   );
 
   const handleSelectAgent = useCallback(
     (id: string) => {
+      // Global screens are agent-independent; picking an agent there opens
+      // that agent's Agent screen.
+      const tab = isAgentTab(activeTab) ? activeTab : "agent";
+      setActiveTab(tab);
       setSelectedAgent(id);
       setSessionExplicit(false);
       setDraftSessionKey(createSessionKey());
-      setSleepRunId(null);
-      const path = buildRoutePath({
-        tab: activeTab,
-        agentId: id,
-        sessionKey: null,
-        sleepView,
-        runId: null,
-      });
-      if (path !== null) navigatePath(path, false);
+      // Runs and intentions belong to the previous agent.
+      setScheduleView(SCHEDULE_ACTIVITY);
+      navigateTo(composeRoute(tab, id, { sessionKey: null, agentSection, scheduleView: SCHEDULE_ACTIVITY }));
     },
-    [activeTab, sleepView],
+    [activeTab, agentSection],
   );
 
   const handleTabChange = useCallback(
     (tab: TabId) => {
       setActiveTab(tab);
-      const path = buildRoutePath({
-        tab,
-        agentId: selectedAgent,
-        sessionKey:
-          tab === "chat" &&
-          (sessionExplicit || selectedSession !== draftSessionKey)
-            ? selectedSession
-            : null,
-        sleepView,
-        runId: sleepRunId,
-      });
-      if (path !== null) navigatePath(path, false);
+      navigateTo(
+        composeRoute(tab, selectedAgent, {
+          sessionKey: urlSessionKey,
+          agentSection,
+          scheduleView,
+        }),
+      );
     },
-    [
-      draftSessionKey,
-      selectedAgent,
-      selectedSession,
-      sessionExplicit,
-      sleepView,
-      sleepRunId,
-    ],
+    [agentSection, scheduleView, selectedAgent, urlSessionKey],
   );
 
-  const handleSleepViewChange = useCallback(
-    (view: SleepView) => {
-      setSleepView(view);
-      setSleepRunId(null);
-      const path = buildRoutePath({
-        tab: "sleep",
-        agentId: selectedAgent,
-        sessionKey: null,
-        sleepView: view,
-        runId: null,
-      });
-      if (path !== null) navigatePath(path, false);
+  const handleSelectAgentSection = useCallback(
+    (section: AgentSection) => {
+      setActiveTab("agent");
+      setAgentSection(section);
+      navigateTo({ tab: "agent", agentId: selectedAgent, section });
     },
     [selectedAgent],
   );
 
-  const handleSelectRun = useCallback(
-    (runId: string) => {
-      setSleepRunId(runId);
-      const path = buildRoutePath({
-        tab: "sleep",
-        agentId: selectedAgent,
-        sessionKey: null,
-        sleepView: "runs",
-        runId,
-      });
-      if (path !== null) navigatePath(path, false);
+  const handleChangeScheduleView = useCallback(
+    (view: ScheduleView) => {
+      setActiveTab("schedule");
+      setScheduleView(view);
+      navigateTo({ tab: "schedule", agentId: selectedAgent, view });
     },
     [selectedAgent],
   );
 
-  const handleBackFromRun = useCallback(() => {
-    setSleepRunId(null);
-    const path = buildRoutePath({
-      tab: "sleep",
-      agentId: selectedAgent,
-      sessionKey: null,
-      sleepView: "runs",
-      runId: null,
-    });
-    if (path !== null) navigatePath(path, false);
-  }, [selectedAgent]);
+  const handleOpenSleepRun = useCallback(
+    (runId: string) => handleChangeScheduleView({ section: "activity", run: { kind: "sleep", id: runId } }),
+    [handleChangeScheduleView],
+  );
 
   const handleSessionResolved = useCallback((key: string) => {
     setSelectedSession(key);
@@ -330,14 +329,7 @@ export function WebUI() {
     setActiveTab("chat");
     // Push the draft session so a reload keeps the unsent draft scoped to
     // this agent; the replace effect keeps it current once it resolves.
-    const path = buildRoutePath({
-      tab: "chat",
-      agentId: selectedAgent,
-      sessionKey: key,
-      sleepView,
-      runId: null,
-    });
-    if (path !== null) navigatePath(path, false);
+    navigateTo({ tab: "chat", agentId: selectedAgent, sessionKey: key });
   };
 
   const transport = useChatTransport({
@@ -416,8 +408,10 @@ export function WebUI() {
     if (activeTab === "chat") {
       history.invalidate();
       sessionsState.invalidate();
-    } else if (activeTab === "sleep") {
-      invalidateQueries("sleep");
+    } else if (activeTab === "schedule") {
+      invalidateQueries(SCHEDULE_QUERY_PREFIX);
+    } else if (activeTab === "agent") {
+      invalidateQueries(AGENT_QUERY_PREFIX);
     }
   };
 
@@ -462,6 +456,10 @@ export function WebUI() {
         selectedAgent={selectedAgent}
         selectedSession={selectedSession}
         activeTab={activeTab}
+        agentSection={agentSection}
+        scheduleView={scheduleView}
+        onSelectAgentSection={handleSelectAgentSection}
+        onChangeScheduleView={handleChangeScheduleView}
         healthStatus={transport.connectionState === "closed" ? "degraded" : "ok"}
         onTabChange={handleTabChange}
         onSelectAgent={handleSelectAgent}
@@ -479,17 +477,30 @@ export function WebUI() {
               {transportError && <div className="run-error">{transportError}</div>}
               {chatMain}
             </>
-          ) : activeTab === "sleep" && selectedAgent ? (
-            <SleepBatchPanel
-              agents={agents}
+          ) : activeTab === "agent" && selectedAgent ? (
+            <AgentPanel
               agentId={selectedAgent}
               authToken={authToken}
-              view={sleepView}
-              runId={sleepRunId}
-              onViewChange={handleSleepViewChange}
-              onSelectRun={handleSelectRun}
-              onBack={handleBackFromRun}
-              onRefresh={() => invalidateQueries("sleep")}
+              section={agentSection}
+              avatarUrl={agentAvatars[selectedAgent]}
+              sessions={sessions}
+              onSelectSection={handleSelectAgentSection}
+              onOpenSleepRun={handleOpenSleepRun}
+            />
+          ) : activeTab === "schedule" && selectedAgent ? (
+            <SchedulePanel
+              agentId={selectedAgent}
+              authToken={authToken}
+              view={scheduleView}
+              sessions={sessions}
+              onChangeView={handleChangeScheduleView}
+              onOpenSession={handleSelectSession}
+            />
+          ) : activeTab === "metrics" || activeTab === "config" ? (
+            <EmptyState
+              icon={COMING_SOON_ICON}
+              title={NAV_TABS.find((tab) => tab.id === activeTab)?.label ?? activeTab}
+              description="This screen is coming soon."
             />
           ) : null
         }
@@ -501,7 +512,7 @@ export function WebUI() {
         sessions={sessions}
         selectedAgent={selectedAgent}
         messages={messages}
-        onNavigate={setActiveTab}
+        onNavigate={handleTabChange}
         onSelectAgent={handleSelectAgent}
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}

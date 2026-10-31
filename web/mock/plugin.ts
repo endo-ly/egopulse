@@ -773,13 +773,13 @@ const SLEEP_RUNS = [
     status: "skipped",
     trigger: "scheduled",
     started_at: "2026-07-02T03:00:00.000Z",
-    finished_at: "2026-07-02T03:00:04.000Z",
+    finished_at: "2026-07-02T03:00:00.000Z",
     source_chats_json: "[]",
-    source_digest_md: "no new messages since last run",
+    source_digest_md: null,
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
-    error_message: null,
+    error_message: "41 new messages; runs when there are more than 64",
     session_count: 0,
   },
 ];
@@ -928,6 +928,343 @@ const SLEEP_STEPS: Record<string, Array<Record<string, unknown>>> = {
   ],
 };
 
+// Recent schedule activity, relative to server start so Upcoming and History
+// read naturally whenever the mock runs.
+const MOCK_NOW = Date.now();
+const HOUR_MS = 3600_000;
+
+function hoursAgo(hours: number): string {
+  return new Date(MOCK_NOW - hours * HOUR_MS).toISOString();
+}
+
+/** The next local occurrence of `hh:mm`, `addDays` days after today at the earliest. */
+function nextLocal(hhmm: string, addDays = 0): string {
+  const [hours, minutes] = hhmm.split(":").map(Number);
+  const date = new Date(MOCK_NOW);
+  date.setDate(date.getDate() + addDays);
+  date.setHours(hours, minutes, 0, 0);
+  if (date.getTime() <= MOCK_NOW) date.setDate(date.getDate() + 1);
+  return date.toISOString();
+}
+
+SLEEP_RUNS.push(
+  {
+    id: "run-recent-lyre-active",
+    agent_id: "lyre",
+    status: "skipped",
+    trigger: "scheduled",
+    started_at: hoursAgo(20),
+    finished_at: hoursAgo(20),
+    source_chats_json: "[]",
+    source_digest_md: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    error_message: "agent was mid-conversation",
+    session_count: 0,
+  },
+  {
+    id: "run-recent-lyre-success",
+    agent_id: "lyre",
+    status: "success",
+    trigger: "scheduled",
+    started_at: hoursAgo(44),
+    finished_at: new Date(MOCK_NOW - 44 * HOUR_MS + 252_000).toISOString(),
+    source_chats_json: '["web:web-chat", "discord:dev-discussion", "web:quick-test"]',
+    source_digest_md: "3 chats · 88 messages",
+    input_tokens: 21400,
+    output_tokens: 3900,
+    total_tokens: 25300,
+    error_message: null,
+    session_count: 3,
+  },
+);
+SLEEP_RUNS.push(
+  ...[66, 90].map((hours) => ({
+    id: `run-recent-lyre-skip-${hours}`,
+    agent_id: "lyre",
+    status: "skipped",
+    trigger: "scheduled",
+    started_at: hoursAgo(hours),
+    finished_at: hoursAgo(hours),
+    source_chats_json: "[]",
+    source_digest_md: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    error_message: "12 new messages; runs when there are more than 64",
+    session_count: 0,
+  })),
+);
+SLEEP_SNAPSHOTS["run-recent-lyre-success"] = SLEEP_SNAPSHOTS["run-20260704-lyre-manual"].map((snapshot) => ({
+  ...snapshot,
+  id: `${String(snapshot.id)}-recent`,
+  run_id: "run-recent-lyre-success",
+  created_at: hoursAgo(44),
+}));
+SLEEP_STEPS["run-recent-lyre-success"] = [
+  { step: "event_extraction", status: "success", started_at: null, finished_at: null, input_tokens: 9800, output_tokens: 1200, error_message: null },
+  { step: "episodic_update", status: "success", started_at: null, finished_at: null, input_tokens: 5200, output_tokens: 1100, error_message: null },
+  { step: "semantic_update", status: "success", started_at: null, finished_at: null, input_tokens: 4100, output_tokens: 900, error_message: null },
+  { step: "prospective_update", status: "success", started_at: null, finished_at: null, input_tokens: 2300, output_tokens: 700, error_message: null },
+];
+
+const MEMORY_LAYERS = ["episodic", "semantic", "prospective"];
+
+// Mirrors `changed_memory` of GET /api/sleep/runs: layers a published run
+// (success / partial_failure) actually changed.
+function changedMemory(run: { id: string; status: string }): string[] {
+  if (run.status !== "success" && run.status !== "partial_failure") return [];
+  const changed = new Set(
+    (SLEEP_SNAPSHOTS[run.id] ?? [])
+      .filter((snapshot) => snapshot.content_before !== snapshot.content_after)
+      .map((snapshot) => String(snapshot.file)),
+  );
+  return MEMORY_LAYERS.filter((layer) => changed.has(layer));
+}
+
+// Mirrors GET /api/agents/:id/sleep/next (src/channels/web/sleep.rs).
+function sleepOutlook(agentId: string) {
+  const targeted = agentId !== "ace";
+  return {
+    scheduler_enabled: true,
+    targeted,
+    next_check_at: targeted ? nextLocal("03:00") : null,
+    pending_messages: agentId === "lyre" ? 41 : 97,
+    threshold: 64,
+  };
+}
+
+type MockPulseRun = {
+  id: string;
+  agent_id: string;
+  intention_id: string;
+  status: "running" | "success" | "failed" | "skipped";
+  started_at: string;
+  finished_at: string | null;
+  output_kind: "notify" | "silent" | null;
+  output_text: string | null;
+  error_message: string | null;
+  attention_snapshot: string | null;
+  delivery: { channel: string; external_chat_id: string; session_key: string } | null;
+};
+
+const MORNING_ATTENTION = "今日の予定、未解決事項、昨日から持ち越している設計論点を確認する。";
+const HOME_DELIVERY = {
+  channel: "discord",
+  external_chat_id: "discord:1234567890123456789",
+  session_key: PULSE_HOME_SESSION,
+};
+
+function pulseRun(
+  id: string,
+  intention: string,
+  startedHoursAgo: number,
+  outcome: Pick<MockPulseRun, "status" | "output_kind" | "output_text" | "error_message">,
+  attention: string | null = MORNING_ATTENTION,
+): MockPulseRun {
+  return {
+    id,
+    agent_id: "lyre",
+    intention_id: intention,
+    started_at: hoursAgo(startedHoursAgo),
+    finished_at: outcome.status === "running" ? null : new Date(MOCK_NOW - startedHoursAgo * HOUR_MS + 8_000).toISOString(),
+    attention_snapshot: attention,
+    delivery: outcome.output_kind === "notify" ? HOME_DELIVERY : null,
+    ...outcome,
+  };
+}
+
+// Mirrors GET /api/pulse/runs and /api/pulse/runs/:id (src/channels/web/pulse.rs).
+const PULSE_RUNS: MockPulseRun[] = [
+  pulseRun("pulse-m0", "morning_review", 2, {
+    status: "success",
+    output_kind: "notify",
+    output_text: "おはようございます。今日は **10:00 設計レビュー** と **15:00 1on1** があります。\n\n- 昨日の宿題: Schedule 画面の Upcoming 表示\n- 持ち越し: Sleep スキップ判定の記録方法",
+    error_message: null,
+  }),
+  pulseRun("pulse-e1", "evening_check", 14, {
+    status: "success",
+    output_kind: "silent",
+    output_text: "PULSE_OK",
+    error_message: null,
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-m1", "morning_review", 26, {
+    status: "success",
+    output_kind: "notify",
+    output_text: "今日は予定がありません。持ち越しの設計論点を 1 つ片付けるのはどうでしょう。",
+    error_message: null,
+  }),
+  pulseRun("pulse-e2", "evening_check", 38, {
+    status: "failed",
+    output_kind: null,
+    output_text: null,
+    error_message: "activation timed out after 30m",
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-m2", "morning_review", 50, {
+    status: "skipped",
+    output_kind: null,
+    output_text: null,
+    error_message: "no sendable home surface",
+  }),
+  pulseRun("pulse-e3", "evening_check", 62, {
+    status: "success",
+    output_kind: "silent",
+    output_text: "PULSE_OK",
+    error_message: null,
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-e4", "evening_check", 86, {
+    status: "success",
+    output_kind: "silent",
+    output_text: "PULSE_OK",
+    error_message: null,
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-w1", "weekly_reflection", 120, {
+    status: "success",
+    output_kind: "notify",
+    output_text: "今週の振り返りです。Agent 画面を仕上げ、Schedule 画面の設計に入りました。",
+    error_message: null,
+  }, null),
+];
+
+function pulseSummary(run: MockPulseRun) {
+  const { attention_snapshot: _attention, delivery: _delivery, ...summary } = run;
+  return summary;
+}
+
+function recentRuns(intentionId: string) {
+  return PULSE_RUNS.filter((run) => run.intention_id === intentionId)
+    .slice(0, 10)
+    .map(({ id, status, output_kind, started_at }) => ({ id, status, output_kind, started_at }));
+}
+
+/** The home conversation the default delivery resolves to. */
+const HOME_TARGET = { channel: "discord", session_key: PULSE_HOME_SESSION };
+
+// Mirrors GET /api/agents/:id/pulse (src/channels/web/pulse.rs). `target` is
+// the conversation a firing would be delivered to; the Telegram destination
+// of evening_check matches no conversation, so it does not resolve.
+function agentPulse(agentId: string) {
+  if (agentId === "vega") {
+    return {
+      enabled: null,
+      error: "pulse_parse_error: vega: intentions[1].schedule.at: expected HH:MM, got \"9am\"",
+      timezone: "Asia/Tokyo",
+      default_delivery: null,
+      intentions: [],
+    };
+  }
+  if (agentId !== "lyre") {
+    return { enabled: agentId !== "ace", error: null, timezone: "Asia/Tokyo", default_delivery: null, intentions: [] };
+  }
+  return {
+    enabled: true,
+    error: null,
+    timezone: "Asia/Tokyo",
+    default_delivery: { channel: "discord", external_chat_id: "1234567890123456789" },
+    intentions: [
+      {
+        id: "morning_review",
+        enabled: true,
+        schedule: { kind: "daily", at: "09:00" },
+        attention: MORNING_ATTENTION,
+        delivery: null,
+        target: HOME_TARGET,
+        next: { state: "scheduled", at: nextLocal("09:00") },
+        recent_runs: recentRuns("morning_review"),
+      },
+      {
+        id: "evening_check",
+        enabled: true,
+        schedule: { kind: "daily", at: "21:00" },
+        attention: "今日やり残したことがあれば軽く確認する。",
+        delivery: { channel: "telegram", external_chat_id: "987654321" },
+        target: null,
+        next: { state: "scheduled", at: nextLocal("21:00") },
+        recent_runs: recentRuns("evening_check"),
+      },
+      {
+        id: "weekly_reflection",
+        enabled: true,
+        schedule: { kind: "weekly", day: "sun", at: "21:00" },
+        attention: [
+          "週の振り返り。",
+          "- 今週決めたこと",
+          "- 進まなかったこととその理由",
+          "- 来週の最初の一歩",
+          "- 体調とリズム",
+          "- 次の週に持ち越す問い",
+        ].join("\n"),
+        delivery: null,
+        target: HOME_TARGET,
+        next: { state: "scheduled", at: nextLocal("21:00", 2) },
+        recent_runs: recentRuns("weekly_reflection"),
+      },
+      {
+        id: "dentist_reminder",
+        enabled: true,
+        schedule: { kind: "once", date: "2026-11-03", at: "10:00" },
+        attention: "歯医者の予約を思い出させる。",
+        delivery: null,
+        target: HOME_TARGET,
+        next: { state: "scheduled", at: nextLocal("10:00", 3) },
+        recent_runs: [],
+      },
+      {
+        id: "stretch_break",
+        enabled: false,
+        schedule: { kind: "interval", interval_days: 2, at: "15:00" },
+        attention: "ストレッチ休憩を促す。",
+        delivery: null,
+        target: HOME_TARGET,
+        next: null,
+        recent_runs: [],
+      },
+    ],
+  };
+}
+
+/**
+ * Orders runs newest first, breaking ties on the id: the same keys the API
+ * orders by, so its `before` cursor compares like the listing does.
+ */
+function compareRuns(
+  a: { id: string; started_at: string },
+  b: { id: string; started_at: string },
+): number {
+  if (a.started_at !== b.started_at) return a.started_at < b.started_at ? -1 : 1;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
+/**
+ * Mirrors the run listings: the comma-separated `status` filter, the `before`
+ * paging cursor (`{started_at}|{id}`), and `has_more` for whether older runs
+ * are left.
+ */
+function filterRuns<T extends { id: string; status: string; started_at: string }>(
+  runs: T[],
+  params: URLSearchParams,
+): { runs: T[]; has_more: boolean } | null {
+  const statuses = (params.get("status") ?? "").split(",").filter(Boolean);
+  const before = params.get("before");
+  const cursor = before === null ? null : parseRunCursor(before);
+  if (before !== null && cursor === null) return null;
+  const limit = Number(params.get("limit") ?? "20");
+  const matching = runs
+    .filter((run) => statuses.length === 0 || statuses.includes(run.status))
+    .filter((run) => cursor === null || compareRuns(run, cursor) < 0)
+    .sort((a, b) => compareRuns(b, a));
+  return { runs: matching.slice(0, limit), has_more: matching.length > limit };
+}
+
+/** `{started_at}|{id}`, as the listings hand out; null when malformed. */
+function parseRunCursor(before: string): { id: string; started_at: string } | null {
+  const [startedAt, id] = before.split("|");
+  if (!startedAt || !id || Number.isNaN(Date.parse(startedAt))) return null;
+  return { started_at: startedAt, id };
+}
+
 // Mirrors ~/.egopulse/agents/<id>/memory/*.md served by GET /api/agents/:id/memory.
 const AGENT_MEMORY: Record<string, Record<string, string>> = {
   lyre: {
@@ -960,6 +1297,209 @@ const AGENT_MEMORY: Record<string, Record<string, string>> = {
     prospective: "",
   },
 };
+
+// Mirrors GET /api/agents/:id/profile (src/channels/web/agent_profile.rs).
+function agentProfile(agentId: string) {
+  const agent = AGENTS.find((candidate) => candidate.id === agentId);
+  if (!agent) return null;
+  const memory = AGENT_MEMORY[agentId] ?? { episodic: "", semantic: "", prospective: "" };
+  const files = PROMPT_FILES(agentId);
+  const applied = (kind: keyof typeof files) =>
+    files[kind]
+      .filter((layer) => layer.applied)
+      .map((layer) => ({ scope: layer.scope, path: layer.path, chars: layer.content?.length ?? 0 }));
+  const isLyre = agentId === "lyre";
+  return {
+    id: agent.id,
+    label: agent.label,
+    is_default: agent.is_default,
+    reasoning_effort: isLyre ? "medium" : null,
+    llm: [
+      {
+        channel: null,
+        provider: isLyre ? "sakura" : "openai",
+        model: isLyre ? "preview/Kimi-K2.6" : "gpt-5",
+        provider_source: isLyre ? "agent" : "global_default",
+        model_source: isLyre ? "agent" : "global_default",
+      },
+      ...(isLyre
+        ? [
+            {
+              channel: "voice",
+              provider: "openrouter",
+              model: "gpt-4.1-mini",
+              provider_source: "profile",
+              model_source: "profile",
+            },
+          ]
+        : []),
+    ],
+    bindings: { discord_bot: isLyre ? "lyre" : null, telegram_bot: null },
+    prompt_sources: {
+      soul: applied("soul")[0] ?? null,
+      rules: applied("rules"),
+      secret: { path: `agents/${agentId}/SECRET.md`, exists: applied("secret").length > 0 },
+      memory: {
+        episodic: memory.episodic.length,
+        semantic: memory.semantic.length,
+        prospective: memory.prospective.length,
+      },
+      skills: SKILLS.length,
+    },
+  };
+}
+
+const GLOBAL_SOUL = [
+  "# Soul",
+  "",
+  "あなたは落ち着いた相棒。短く、率直に話す。",
+].join("\n");
+
+const GLOBAL_RULES = [
+  "# Rules",
+  "",
+  "- 推測で断定しない。",
+  "- 破壊的な操作の前には必ず確認する。",
+].join("\n");
+
+// Mirrors GET /api/agents/:id/files/:kind: soul falls back to the global
+// file, rules accumulate, secret is agent-only.
+function PROMPT_FILES(agentId: string) {
+  const agentSoul =
+    agentId === "lyre"
+      ? ["# Lyre", "", "観測者として振る舞い、記憶を丁寧に扱う。", "", "## 口調", "- です・ます調"].join("\n")
+      : null;
+  const agentRules = agentId === "lyre" ? "# Lyre rules\n\n- 設計判断は理由とセットで残す。" : null;
+  const secret = agentId === "lyre" ? "秘密モードでは、より親密なトーンで話す。" : null;
+  return {
+    soul: [
+      { scope: "agent", path: `agents/${agentId}/SOUL.md`, content: agentSoul, applied: agentSoul !== null },
+      { scope: "global", path: "SOUL.md", content: GLOBAL_SOUL, applied: agentSoul === null },
+    ],
+    rules: [
+      { scope: "global", path: "AGENTS.md", content: GLOBAL_RULES, applied: true },
+      { scope: "agent", path: `agents/${agentId}/AGENTS.md`, content: agentRules, applied: agentRules !== null },
+    ],
+    secret: [
+      { scope: "agent", path: `agents/${agentId}/SECRET.md`, content: secret, applied: secret !== null },
+    ],
+  };
+}
+
+// Mirrors GET /api/agents/:id/memory/history: published changes only
+// (run finalized as success / partial_failure, content actually changed).
+function memoryHistory(agentId: string) {
+  const published = new Set(
+    SLEEP_RUNS.filter(
+      (run) => run.agent_id === agentId && (run.status === "success" || run.status === "partial_failure"),
+    ).map((run) => run.id),
+  );
+  return Object.values(SLEEP_SNAPSHOTS)
+    .flat()
+    .map((snapshot) => ({
+      run_id: String(snapshot.run_id),
+      file: String(snapshot.file),
+      created_at: String(snapshot.created_at),
+      content_before: String(snapshot.content_before),
+      content_after: String(snapshot.content_after),
+    }))
+    .filter(
+      (snapshot) =>
+        published.has(snapshot.run_id) && snapshot.content_before !== snapshot.content_after,
+    )
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+// Mirrors GET /api/skills, GET /api/skills/:name, and
+// GET /api/skills/:name/files/*: frontmatter, SKILL.md body, and bundled files.
+interface MockSkill {
+  name: string;
+  description: string;
+  source: "builtin" | "workspace";
+  path: string;
+  platforms: string[];
+  deps: string[];
+  required_env: string[];
+  instructions: string;
+  files: Record<string, string>;
+}
+
+const SKILLS: MockSkill[] = [
+  {
+    name: "egopulse",
+    description: "EgoPulse の仕様・設定・運用リファレンス。設定変更や挙動の確認時に使う",
+    source: "builtin",
+    path: "skills/egopulse",
+    platforms: [],
+    deps: [],
+    required_env: [],
+    instructions: [
+      "# EgoPulse",
+      "",
+      "EgoPulse 自身について答えるときは、推測せず `references/` を読む。",
+      "",
+      "## 参照先",
+      "",
+      "| トピック | ファイル |",
+      "|---|---|",
+      "| 設定 | `references/config.md` |",
+      "| Pulse | `references/pulse.md` |",
+    ].join("\n"),
+    files: {
+      "references/config.md": "# 設定仕様\n\n`~/.egopulse/egopulse.config.yaml` に置く。\n\n```yaml\ndefault_agent: lyre\ntimezone: Asia/Tokyo\n```",
+      "references/pulse.md": "# Pulse\n\nPULSE.yaml の intention が due になったときに起動する。",
+      "references/webui/overview.md": "# WebUI\n\nWebUI は EgoPulse ランタイムの運転席である。",
+    },
+  },
+  {
+    name: "github-triage",
+    description: "GitHub の Issue / PR を読み、優先度とラベルを提案する",
+    source: "workspace",
+    path: "workspace/skills/github-triage",
+    platforms: ["linux", "macos"],
+    deps: ["gh", "jq"],
+    required_env: ["GITHUB_TOKEN"],
+    instructions: [
+      "# GitHub triage",
+      "",
+      "1. `scripts/list-open.sh` で未対応の Issue を取得する",
+      "2. `templates/labels.yaml` のラベル定義に沿って分類する",
+      "3. 優先度の根拠を1行で添える",
+    ].join("\n"),
+    files: {
+      "scripts/list-open.sh": "#!/usr/bin/env bash\nset -euo pipefail\ngh issue list --state open --json number,title,labels | jq '.[]'\n",
+      "templates/labels.yaml": "labels:\n  - name: bug\n    priority: high\n  - name: docs\n    priority: low\n",
+      "assets/diagram.png": "",
+    },
+  },
+  {
+    name: "daily-notes",
+    description: "日次ノートを workspace/notes に追記する",
+    source: "workspace",
+    path: "workspace/skills/daily-notes",
+    platforms: [],
+    deps: [],
+    required_env: [],
+    instructions: "",
+    files: {},
+  },
+];
+
+/** Bundled files that are not UTF-8 text, served as 415 like the real API. */
+const BINARY_SKILL_FILES = new Set(["assets/diagram.png"]);
+
+function skillDetail(skill: MockSkill) {
+  const { files, ...rest } = skill;
+  return {
+    ...rest,
+    files: Object.entries(files)
+      .map(([path, content]) => ({
+        path,
+        bytes: BINARY_SKILL_FILES.has(path) ? 48213 : Buffer.byteLength(content),
+      }))
+      .sort((a, b) => a.path.localeCompare(b.path)),
+  };
+}
 
 export function mockApiPlugin(): Plugin | null {
   if (process.env.VITE_MOCK !== "1") return null;
@@ -1065,11 +1605,46 @@ export function mockApiPlugin(): Plugin | null {
           );
         }
         if (pathname === "/api/sleep/runs") {
-          const agentId = parsed.searchParams.get("agent_id") ?? "";
-          const runs = SLEEP_RUNS.filter(
-            (run) => !agentId || run.agent_id === agentId,
-          ).sort((a, b) => b.started_at.localeCompare(a.started_at));
-          return sendJson(res, { ok: true, runs });
+          const agentId = parsed.searchParams.get("agent_id");
+          const page = filterRuns(
+            SLEEP_RUNS.filter((run) => run.agent_id === agentId),
+            parsed.searchParams,
+          );
+          if (page === null) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid_before" });
+          }
+          const runs = page.runs.map((run) => ({ ...run, changed_memory: changedMemory(run) }));
+          return sendJson(res, { ok: true, runs, has_more: page.has_more });
+        }
+        if (pathname === "/api/pulse/runs") {
+          const agentId = parsed.searchParams.get("agent_id");
+          const page = filterRuns(
+            PULSE_RUNS.filter((run) => run.agent_id === agentId),
+            parsed.searchParams,
+          );
+          if (page === null) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid_before" });
+          }
+          return sendJson(res, { ok: true, runs: page.runs.map(pulseSummary), has_more: page.has_more });
+        }
+        if (pathname.startsWith("/api/pulse/runs/")) {
+          const runId = decodeURIComponent(pathname.slice("/api/pulse/runs/".length));
+          const run = PULSE_RUNS.find((candidate) => candidate.id === runId);
+          if (!run) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "not_found" });
+          }
+          return sendJson(res, { ok: true, run });
+        }
+        const pulseMatch = pathname.match(/^\/api\/agents\/([^/]+)\/pulse$/);
+        if (pulseMatch) {
+          return sendJson(res, { ok: true, pulse: agentPulse(decodeURIComponent(pulseMatch[1])) });
+        }
+        const outlookMatch = pathname.match(/^\/api\/agents\/([^/]+)\/sleep\/next$/);
+        if (outlookMatch) {
+          return sendJson(res, { ok: true, outlook: sleepOutlook(decodeURIComponent(outlookMatch[1])) });
         }
         if (pathname.startsWith("/api/sleep/runs/")) {
           const runId = decodeURIComponent(pathname.slice("/api/sleep/runs/".length));
@@ -1139,6 +1714,59 @@ export function mockApiPlugin(): Plugin | null {
           });
         }
 
+        const profileMatch = pathname.match(/^\/api\/agents\/([^/]+)\/profile$/);
+        if (profileMatch) {
+          const profile = agentProfile(decodeURIComponent(profileMatch[1]));
+          if (!profile) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "agent_not_found" });
+          }
+          return sendJson(res, { ok: true, profile });
+        }
+        const fileMatch = pathname.match(/^\/api\/agents\/([^/]+)\/files\/([^/]+)$/);
+        if (fileMatch) {
+          const files = PROMPT_FILES(decodeURIComponent(fileMatch[1]));
+          const kind = fileMatch[2] as keyof typeof files;
+          if (!(kind in files)) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid_prompt_file_kind" });
+          }
+          return sendJson(res, { ok: true, layers: files[kind] });
+        }
+        const historyMatch = pathname.match(/^\/api\/agents\/([^/]+)\/memory\/history$/);
+        if (historyMatch) {
+          return sendJson(res, { ok: true, changes: memoryHistory(decodeURIComponent(historyMatch[1])) });
+        }
+        if (pathname === "/api/skills") {
+          return sendJson(res, {
+            ok: true,
+            skills: SKILLS.map(({ name, description, source }) => ({ name, description, source })),
+          });
+        }
+        const skillFileMatch = pathname.match(/^\/api\/skills\/([^/]+)\/files\/(.+)$/);
+        if (skillFileMatch) {
+          const skill = SKILLS.find((candidate) => candidate.name === decodeURIComponent(skillFileMatch[1]));
+          const filePath = skillFileMatch[2].split("/").map(decodeURIComponent).join("/");
+          const content = skill?.files[filePath];
+          if (content === undefined) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "skill_file_not_found" });
+          }
+          if (BINARY_SKILL_FILES.has(filePath)) {
+            res.statusCode = 415;
+            return sendJson(res, { ok: false, error: "skill_file_not_text" });
+          }
+          return sendJson(res, { ok: true, content });
+        }
+        const skillMatch = pathname.match(/^\/api\/skills\/([^/]+)$/);
+        if (skillMatch) {
+          const skill = SKILLS.find((candidate) => candidate.name === decodeURIComponent(skillMatch[1]));
+          if (!skill) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "skill_not_found" });
+          }
+          return sendJson(res, { ok: true, skill: skillDetail(skill) });
+        }
         next();
       });
     },

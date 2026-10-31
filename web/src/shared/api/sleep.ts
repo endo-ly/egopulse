@@ -1,23 +1,39 @@
-import type { AgentMemory, SleepRun, SleepRunDetail } from "./types";
+import type { RunPage, SleepOutlook, SleepRun, SleepRunDetail, SleepRunStatus } from "./types";
 import { apiFetch } from "./client";
 
 /**
- * Fetches up to `limit` sleep runs, newest first.
- *
- * @param agentId restricts results to one agent; omit for all agents
+ * Statuses of sleep runs that did work. A skipped check decided not to run,
+ * so it says nothing about whether sleep works and is not activity.
  */
+export const WORKED_SLEEP_STATUSES: readonly SleepRunStatus[] = [
+  "running",
+  "success",
+  "partial_failure",
+  "failed",
+];
+
+export interface SleepRunsQuery {
+  limit: number;
+  /** Keeps only these statuses; every status when omitted. */
+  statuses?: readonly SleepRunStatus[];
+  /** Cursor below which to continue listing: `{started_at}|{id}` of the oldest run already shown. */
+  before?: string;
+}
+
+/** Fetches one page of an agent's sleep runs, newest first. */
 export async function fetchSleepRuns(
-  agentId: string | undefined,
-  limit: number,
+  agentId: string,
   authToken: string,
-): Promise<SleepRun[]> {
-  const params = new URLSearchParams({ limit: String(limit) });
-  if (agentId) params.set("agent_id", agentId);
-  const data = await apiFetch<{ ok: boolean; runs: SleepRun[] }>(
+  { limit, statuses = [], before }: SleepRunsQuery,
+): Promise<RunPage<SleepRun>> {
+  const params = new URLSearchParams({ agent_id: agentId, limit: String(limit) });
+  if (statuses.length > 0) params.set("status", statuses.join(","));
+  if (before !== undefined) params.set("before", before);
+  const data = await apiFetch<{ ok: boolean } & RunPage<SleepRun>>(
     `/api/sleep/runs?${params}`,
     authToken,
   );
-  return data.runs;
+  return { runs: data.runs, has_more: data.has_more };
 }
 
 export function fetchSleepRunDetail(runId: string, authToken: string): Promise<SleepRunDetail> {
@@ -27,13 +43,10 @@ export function fetchSleepRunDetail(runId: string, authToken: string): Promise<S
   );
 }
 
-export async function fetchAgentMemory(
-  agentId: string,
-  authToken: string,
-): Promise<AgentMemory> {
-  const data = await apiFetch<{ ok: boolean; memory: AgentMemory }>(
-    `/api/agents/${encodeURIComponent(agentId)}/memory`,
+export async function fetchSleepOutlook(agentId: string, authToken: string): Promise<SleepOutlook> {
+  const data = await apiFetch<{ ok: boolean; outlook: SleepOutlook }>(
+    `/api/agents/${encodeURIComponent(agentId)}/sleep/next`,
     authToken,
   );
-  return data.memory;
+  return data.outlook;
 }

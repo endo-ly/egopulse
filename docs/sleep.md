@@ -50,7 +50,7 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
 ```text
 1. collect_sleep_input()
        │
-       ├─ Skip: pending メッセージ ≤ 64 → 終了
+       ├─ Skip: pending メッセージ ≤ 64 → skipped run を記録して終了
        │
        └─ Proceed: 最古の pending セッションを取得（最大20件）
               │
@@ -101,7 +101,7 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
 
 `collect_sleep_input` は run の監査時刻（`finished_at`）ではなく、step checkpoint を唯一の処理済み判定として使用する。これにより「何を処理済みとするか」が Sleep 全体で一つの規則に統一される。
 
-- **pending 件数**: `event_extraction` または `prospective_update` のいずれかの checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複を除外して数える。件数が `SKIP_THRESHOLD`（64）以下なら Skip する。
+- **pending 件数**: `event_extraction` または `prospective_update` のいずれかの checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複を除外して数える。件数が `SKIP_THRESHOLD`（64）以下なら Skip し、理由（件数と閾値）を `error_message` に持つ終了済みの `skipped` run を記録する。ステップとスナップショットは作らない。
 - **候補抽出**: 同じ pending 条件でセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。最新セッション優先にしないため、継続的に更新される hot session が古い backlog を処理待ちにし続けない。
 - **1 run 上限**: `MAX_SOURCE_SESSIONS`（20）は 1 回の run の入力サイズ制限として維持する。上限から漏れたセッションは pending のまま残り、次回候補でも必ず見える。
 - **失敗時の再処理**: step が失敗した場合は該当 checkpoint が進まない。次回 collection でも同じ message が pending に残る。
@@ -495,7 +495,7 @@ renderer は容量制御・圧縮を行わず、該当データを全件描画�
 1. `start_channels` 起動時に scheduler task を spawn する（ループ内で `sleep_batch.enabled` を判定し、無効なら何もしない）
 2. scheduler は `next_scheduled_run()` で次回実行時刻を計算し、`tokio::time::sleep` で待機
 3. 時刻到達時に `run_scheduled_cycle()` を実行
-4. 各 agent について `active_turns.is_active()` を確認し、アクティブなら defer
+4. 各 agent について `active_turns.is_active()` を確認し、アクティブならその回の判定を見送り、理由を `skipped` run として記録する
 5. `run_agent_with_retry()` でリトライ設定に基づき再試行
 
 ### タイムゾーン対応
@@ -508,7 +508,7 @@ renderer は容量制御・圧縮を行わず、該当データを全件描画�
 
 ### Active Turn Tracking
 
-`ActiveTurnTracker` は agent ごとに現在の対話 turn 数を管理する。scheduler は active な agent の sleep batch を defer し、ユーザーとの対話が終了してから実行する。
+`ActiveTurnTracker` は agent ごとに現在の対話 turn 数を管理する。判定時刻に active な agent の sleep batch は見送られ、次の判定時刻に改めて判定される。
 
 ### リトライ設定
 
@@ -641,5 +641,5 @@ redaction 後の内容だけを DB と記憶ファイルに保存する。
 | DB スキーマ（テーブル定義・SQL） | [db.md](./db.md) |
 | 設定（`sleep_batch` セクション含む） | [config.md §3.7](./config.md#37-sleep-batch-設定sleep_batch) |
 | REST API（Sleep エンドポイント含む） | [api.md §2.9](./api.md#29-sleep-batch) |
-| Web UI コンポーネント設計 | [webui/sleep-batch.md](./webui/sleep-batch.md) |
+| WebUI の Schedule 画面 | [webui/schedule.md](./webui/schedule.md) |
 

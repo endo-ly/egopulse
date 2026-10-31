@@ -1,327 +1,131 @@
 # EgoPulse WebUI — Layout
 
-WebUI の全体レイアウト、Sidebar の構造、レスポンシブ挙動を定義する。
-
 ## 1. 全体構造
 
-```
-┌─ Sidebar (200px) ──┬─ Main ──────────────────────────────────┐
-│                    │                                          │
-│ ◆ EgoPulse      [🔍][<]│  選択タブ + 選択 agent のコンテンツ      │
-│ [💬][🌙][◌][◔]     │                                          │
-│ ────────────────── │   チャットは Composer 以外の              │
-│ AGENTS             │   縦領域をすべて使う                      │
-│ SESSIONS  [All ▼] +│                                          │
-│ ────────────────── │                                          │
-│ ● ok [⚙]           │                                          │
-└────────────────────┴──────────────────────────────────────────┘
-```
+Desktop は Sidebar と Main の2領域、Mobile は Top Bar と Main に Sidebar overlay を重ねる構成とする。
 
-- Desktop では 2 カラムグリッド（Sidebar + Main）。Top Bar は存在しない
-- Sidebar は全高・固定幅（desktop）
-- Main は残り全幅・全高、内部スクロール。Chat タブでは Timeline + Composer のみで構成され、ヘッダー行を持たない
+```
+┌ Sidebar ─────────────────────┐
+│ EgoPulse              🔍  ‹  │  Brand Row
+│ [💬Chat][👤Agent][📅Schedule] │  Nav（agent 画面）
+│ AGENTS                       │  Agents
+│  ● lyre   DEFAULT            │
+│  ● musa                      │
+│ ──────────────────────────── │
+│ （画面ごとの内容）               │  Context Section
+│ ──────────────────────────── │
+│ ● ok          [📈] [⚙]       │  Footer（状態 + グローバル画面）
+└──────────────────────────────┘
+```
 
 ---
 
 ## 2. Sidebar
 
-### 2.1 構成
+### 2.1 Brand Row
 
-```
-┌─ Sidebar ──────────────┐
-│ ◆ EgoPulse       [🔍][<]│  ← Brand row（検索は右端）
-│ [💬][🌙][◌][◔]         │  ← Nav（運用ビュー4タブのミニタブバー）
-│ ──────────────────     │
-│ AGENTS                 │
-│ ● lyre (default)       │
-│ ○ ace                  │
-│ ──────────────────     │
-│ SESSIONS  [All ▼]  (+) │  ← New Session はヘッダー右端
-│ ▸ [web]   preview…  ●  │
-│ ▸ [dis…]  preview…     │
-│ ──────────────────     │
-│ ● ok [⚙]                 │  ← Footer（WS接続状態 + Config）
-└────────────────────────┘
-```
+- 左に product name、右端に検索アイコン（Command Palette を開く）と collapse ボタン
 
-Sidebar は折りたたみ可能。Desktop でも [<] ボタンで icon-only の細いバー（48px）に縮小できる。
+### 2.2 Nav
 
-#### 畳み込み状態
+- agent 画面（Chat / Agent / Schedule）を1行のミニタブバーに並べる。各セルはアイコン + 小ラベル
+- 現在位置は `aria-current="page"` と背景チントで示す
 
-| 状態 | 幅 | 表示内容 |
-|---|---|---|
-| expanded（デフォルト） | 200px (desktop / tablet) | 全要素表示 |
-| collapsed | 48px | ブランドマーク「E」・nav（縦並びアイコンのみ）・Config 歯車・Runtime Status StatusDot。ラベル・セッション一覧・Search・New Session は非表示 |
+### 2.3 Agents
 
-- 畳み込み状態は URL query (`?sidebar=collapsed`) で永続化し、リロード後も維持
-- collapsed 状態でアイコン click すると expanded に戻る
-- collapsed の nav 行は `title` 属性でアクセシブルな名称を保持する
-- Search ボタンは collapsed では非表示。`Cmd+K` で常に palette を開ける
-- Mobile では折りたたみ機能を提供しない（Mobile は hamburger overlay のみ）
+- 設定済みの全 agent を並べる（`/api/agents`）。選択中 agent は背景チントで強調し、`default` タグを添える
+- agent アイコン：ユーザーが画像をアップロード・トリミングして設定できる（[api.md §2.11](../api.md#211-agent-avatar)）。Chat の assistant アバターにも使う
+- StatusDot は未読の返事を持つセッションがある agent を示す。未読判定はフロントのみで行い、既読時刻は localStorage に保存する
+- グローバル画面表示中に agent を選ぶと、その agent の Agent 画面へ遷移する
 
-### 2.2 Brand Row
+### 2.4 Footer
 
-- 高さ 40px のコンパクトな1行。左に product name、右端に検索アイコン＋ collapse ボタン
-- 検索アイコン（24px・ghost）：クリックで Command Palette を開く（[command-palette.md](./command-palette.md)）。hover で tooltip（"Search or jump… (⌘K)"）。collapsed では非表示（`Cmd+K` で常に開ける）
+- 左：WebSocket 接続状態（`ok` / `degraded`）
+- 右：グローバル画面（Metrics / Config）。Nav と同じアイコン + ラベルで並べ、表示中の画面は強調する
 
-### 2.3 Nav（タブ）
+### 2.5 Context Section
 
-**運用ビューの4タブ（Chat / Sleep / Pulse / Metrics）** を **1行のミニタブバー** に収める。サイドバー幅を4等分したセルに、アイコン + 微小ラベル（9px）を縦積みで並べる。これらは agent の運用を操作・観測する同種のビューであり、セットとして1か所に置く。
+Agents と Footer の間の領域。表示中の画面に応じて内容を切り替える。
 
-- 現在位置は `aria-current="page"` で示す。選択中セルは背景チントで強調表示
-- 有効タブ（Chat / Sleep）：セル click で URL 遷移する（§3.1 の URL 構造）
-- 無効タブ（Pulse / Metrics）：`disabled` でミュート表示。hover で "coming soon" の tooltip を表示し、有効化の際は同じセルのまま有効化する
-- collapsed 時は縦並びのアイコン列になる（ラベルは CSS で非表示、`title` 属性でアクセシブルな名称を保持）
-- Config（§2.7）はシステム設定というメタレベルの機能のためバーに含めず、Footer に置く
-
-### 2.4 AGENTS Section
-
-Sidebar の第1セクション。必ず表示する。
-
-- Section title（小テキスト・uppercase・muted）
-- agent 一覧：各 agent を1行に並べる。左端に StatusDot または agent アイコン、続けて agent name、必要に応じてタグ（`default` 等）
-- 行は枠線・背景を持たない。hover で背景ハイライト、選択中 agent はアクセント2色の背景チントで強調表示
-- StatusDot の色（未読表示。実行中の pulse 表示は廃止）：
-  - `unread`（accent 色、アニメーションなし）：未読の返事がある session を持つ agent
-  - `idle`（muted-2 色）：未読なし
-- 未読の判定はフロントのみで行う（`useUnreadSessions`）。各 session の `last_message_time` が初見以降に進み、かつ選択中でなければ未読。開いた session は既読化する。既読時刻は `localStorage`（`egopulse.lastSeen.v1`）に保存し、リロード後も維持する。初回ロード時は全面青を避けるため現状を既読として初期化する
-- 未読 session の行はタイトルを太字にし、channel ミニバッジの右下に `unread` ドットを重ねる（Discord の未読チャンネル相当）。preview は subdued のまま
-- **agent アイコン**：ユーザーがデバイスから画像をアップロードできる（[api.md §2.11](../api.md#211-agent-avatar)）
-  - アイコン設定済み：行左端に 24px 円形アイコンを表示し、StatusDot はその右下に小さく重ねる
-  - 未設定：従来どおり StatusDot のみ
-  - 行 hover で鉛筆ボタンを表示 → クリックでミニメニュー（`Upload image…` / アイコン設定済みのとき `Remove image`）。メニューは外部クリック / Escape で閉じる
-  - アップロード時はトリミングモーダル（react-easy-crop）が開き、円形プレビュー上で表示領域をドラッグ移動・ズームして選び、`Apply` で 256×256 にエンコードして PUT する
-  - チャットの assistant アバターにも同じアイコンが使われる（未設定時は頭文字）。詳細は [chat.md §4.2](./chat.md#42-avatar)
-
-#### Agent 一覧のデータソース
-
-設定済みの全 agent を返す API を `/api/agents` で提供する。既存の `/api/agents` は Sleep run のある agent のみを返す仕様だったが、これを **設定済み agent 全てを返すように拡張** する。Sleep / Pulse の各一覧 API は引き続き「実行履歴のある agent」を個別に返してよい。
-
-レスポンス例：
-
-```json
-{
-  "ok": true,
-  "agents": [
-    { "id": "lyre", "label": "Lyre", "is_default": true },
-    { "id": "ace", "label": "Ace", "is_default": false }
-  ]
-}
-```
-
-**更新戦略**：session の更新は WebSocket の `session_updated` を受けて一覧を再取得することで即時反映する。60 秒間隔のポーリングは取りこぼし時のフォールバックとして残す。未読判定は `last_message_time` を使う。
-
-### 2.5 SESSIONS Section
-
-Sidebar の第2セクション。
-
-```
-SESSIONS  [All ▼]
-  [W] Web Chat
-      今日のタスク…
-  [D] Dev
-      design discussion…
-  [C] Morning notes
-```
-
-#### Session Item
-
-- 枠線・背景を持たない 2 行構成（タイトル + preview）・細身（縦余白は極小）
-- 先頭に channel のミニバッジ（16px の単一文字 `W` / `D` / `T` / `C` / `U` / `V`、channel ごとの色）。未読時はバッジ右下に accent のドットを重ねる。正式名は tooltip と `aria-label` で示す
-- 表示名（`name` → 最終メッセージの先頭1行 → `Untitled`）と、その下に最終メッセージの先頭1行を小さめの subdued テキストで表示する
-- 最終更新時刻は行内に表示しない（`last_message_time` は未読判定にのみ使う）
-- 行末の `⋯` ボタン、または右クリックで操作メニュー（Rename / Pin / Archive / Copy session ID）を開く
-- hover で背景ハイライト、選択中はアクセント2色の背景チントで強調表示
-- label（session key 等の ID 的表記）は表示しない
-
-#### Channel Filter
-
-SESSIONS ヘッダーに単一選択のドロップダウンを置く：
-
-- `All` / `Web` / `Discord` / `Telegram` / `CLI` / `TUI` / `Voice`
-- 選択 agent と AND 条件でフィルタ
-- 選択中セッションがフィルタで除外される場合、フィルタ切替と同時に最初のマッチするセッションへ選択を移す
-
-#### List Order
-
-- サーバーが返す順序（ピン留め → 最終更新時刻の降順）をそのまま使う
-- `PINNED` / `ACTIVE` / `ARCHIVED`（折りたたみ）に分ける。アーカイブ済みはピン留めより優先する
-- 新規セッションは初回送信で `chat:{id}` が確定するまで一覧へ挿入しない（下書き状態）
-
-#### Empty States
-
-| 状態 | 表示 |
+| 画面 | 内容 |
 |---|---|
-| セッション0件 | EmptyState: "No sessions yet. Start a new conversation." |
-| フィルタ結果0件 | EmptyState: "No {channel} sessions for this agent." |
-| ロード中 | Spinner（中）を中央 |
-| ロード失敗 | EmptyState: error message + Retry button |
+| Chat | SESSIONS（§2.6） |
+| Agent | SECTIONS（Overview / Soul / Rules / Secret / Memory / Skills）。SESSIONS と同じ「アイコン + 名前 + 1 行の要約」の行で並べる |
+| Schedule | SECTIONS（Activity / Pulse / Sleep）。各行は名前と 1 行の要約（[schedule.md §1](./schedule.md#1-構成)） |
+| Metrics / Config | セクション一覧 |
 
-### 2.6 New Session
+### 2.6 SESSIONS
 
-SESSIONS ヘッダー右端の「+」アイコンボタン（22px・ghost）。新規セッションの作成口がセッション一覧の文脈上にあることで、操作対象が直感的に分かる。
+- 選択 agent のセッションを `PINNED` / `ACTIVE` / `ARCHIVED`（折りたたみ）に分けて並べる。順序はサーバーの返却順（ピン留め → 最終更新降順）
+- 各行は channel ミニバッジ + 表示名 + 最終メッセージ先頭1行。未読はタイトル太字 + バッジ右下のドット
+- 行末の `⋯` / 右クリックで Rename / Pin / Archive / Copy session ID
+- ヘッダーに channel フィルタ（`All` / `Web` / `Discord` / `Telegram` / `CLI` / `TUI` / `Voice`）と New Session（`+`）
+- New Session は名前（任意）を入力して draft セッションを作り Chat へ遷移する。chat レコードは初回送信時に作成され、名前もその ACK で保存する
+- 一覧は WS の `session_updated` で再取得し、60 秒ポーリングをフォールバックとする
 
-- 選択中 agent を親とする新規 web セッションを作成
-- クリック → 名前入力フォーム（任意）を開く → Create で一意な `session-{timestamp}-{uuid}` キーを生成し Chat タブへ遷移する
-- 名前は初回送信がサーバーに受理され、`chat:{id}` が確定した ACK の時点で保存する。ACK を待つ間に別セッションへ移動しても、元の draft の名前は保存する
-- 未送信の名前は保存しない（フォームにその旨を表示する）
-- サーバー側へは最初のメッセージ送信時に chat レコードが作成される（事前作成しない）
-- 未送信の新規セッションはブラウザリロードで消失する（ドラフト扱い、永続化は提供しない）
-- エージェントにアクティブなセッションがない場合も、既存の `main` を再利用せず新しい draft キーを使う
-- agent 未選択時は `default_agent` を使用
+### 2.7 Collapse
 
-### 2.7 Runtime Status Footer
-
-Sidebar 最下部。左に WS 接続状態、右に Config 歯車を置く。
-
-- Health status（`ok` / `degraded`）：WebSocket の接続状態のみを写す。`closed` で `degraded`、それ以外で `ok`
-- 小テキスト・muted。長い場合は ellipsis
-- StatusDot で状態を視覚的に示す
-
-#### Config Utility
-
-Footer 右端の歯車アイコン（24px・ghost）。Config はシステム設定というメタレベルの機能のため Nav バーには含めず、定番の「フッターの歯車」位置に置く。無効化中は `disabled` でミュート表示 + "coming soon" tooltip。collapsed 時は StatusDot の下に縦並びで残る。
-
-#### Health status の定義
-
-| status | 条件 |
-|---|---|
-| `ok` | すべての有効チャネルが running、DB 正常、（MCP がある場合）全 MCP 接続 |
-| `degraded` | 一部チャネルが failed / stopped、または一部 MCP 接続失敗。ただし Web チャネルは running のまま |
-| `down` | Web チャネルが running でない、または DB 異常。WebUI 自体が動かないため表示されないはずだが、判定としては定義する |
+- Desktop では collapse ボタンで icon-only（48px）に縮小できる。Nav・Footer アイコン・StatusDot のみ残し、`title` で名称を保持する
+- 状態は URL query（`?sidebar=collapsed`）で保持する
 
 ---
 
 ## 3. Mobile Top Bar
 
-Mobile（< 640px）のみ表示されるスリムなバー（高さ 44px）。
-
-```
-┌─ Top Bar ────────────────────────────────┐
-│ [☰]                        ●  [🔍]      │
-└──────────────────────────────────────────┘
-```
+Mobile（< 640px）のみ表示する高さ 44px のバー。
 
 | 要素 | 動作 |
 |---|---|
-| hamburger `[☰]` | Sidebar overlay の開閉。`aria-expanded` で状態を持つ |
-| StatusDot | Runtime health の簡易表示 |
-| palette `[🔍]` | Command Palette を開く |
+| hamburger | Sidebar overlay の開閉 |
+| StatusDot | 接続状態 |
+| 検索 | Command Palette を開く |
 
-タブ切替は Sidebar overlay の Nav に一任する（Top Bar にタブセレクタは置かない）。
+画面切替は Sidebar overlay の Nav / Footer で行う。Sidebar は左右スワイプでも開閉できる（水平移動が垂直移動を上回る場合のみ判定）。
 
-Sidebar は hamburger 以外にスワイプジェスチャーでも開閉できる。右方向へのフリックで open、左方向へのフリックで close（開始位置は画面内どこでもよい。左端は iOS/Android の戻るジェスチャーと競合するため特別扱いしない）。縦スクロールと誤動作しないよう、水平移動が垂直移動を上回る場合のみ判定する。
+---
 
-Desktop では Top Bar はレンダリングされない。
+## 4. URL 構造
 
-### 3.1 タブと URL 構造
-
-| タブ | URL | agent スコープ |
+| 画面 | URL | スコープ |
 |---|---|---|
-| Chat | `/agents/:agentId/chat` （セッション選択時は `/agents/:agentId/chat/s/:sessionKey`） | agent scoped |
-| Sleep | `/agents/:agentId/sleep` （run 選択時は `/agents/:agentId/sleep/runs/:runId`、Memory ビューは `/agents/:agentId/sleep/memory`） | agent scoped |
-| Pulse | `/agents/:agentId/pulse` （run 詳細は `/agents/:agentId/pulse/r/:runId`） | agent scoped |
-| Metrics | `/metrics` | global（agent フィルタは query で表現） |
-| Config | `/config` | global |
+| Chat | `/agents/:agentId/chat`（セッション選択時 `/s/:sessionKey`） | agent |
+| Agent | `/agents/:agentId`、`/agents/:agentId/:section` | agent |
+| Schedule | `/agents/:agentId/schedule`（Activity）、`/schedule/runs/{pulse\|sleep}/:runId`、`/schedule/pulse/:intentionId`、`/schedule/sleep`（[schedule.md §7](./schedule.md#7-url-構造)） | agent |
+| Metrics | `/metrics?range=` | global |
+| Config | `/config/:section` | global |
 
-Chat / Sleep / Pulse は Sidebar の agent 選択に従属する（agent scoped）。Metrics / Config はグローバルで、Sidebar の agent 選択の影響を受けない。
-
----
-
-## 4. レスポンシブ
-
-### 4.1 ブレークポイント
-
-| 名前 | 幅 | 想定デバイス |
-|---|---|---|
-| `sm` | < 640px | mobile 縦 |
-| `md` | 640-1023px | tablet / mobile 横 |
-| `lg` | ≥ 1024px | desktop |
-
-### 4.2 Desktop (`lg`)
-
-- Sidebar：常時表示、200px 固定。Nav（運用4タブ）/ Search / New Session / Config utility を含む
-- Top Bar：なし
-- Chat：timeline / composer のみで構成され、チャットが縦領域をすべて使う
-- Sleep：2 ペイン（run 一覧 + 詳細）。diff は split をデフォルトに
-
-### 4.3 Tablet (`md`)
-
-- Sidebar：200px、常時表示
-- Sleep：1 ペイン。run 一覧が全幅で表示され、run 選択で詳細へ切替（`←` で戻る）。768-1023px は詳細が全幅でも meta×steps は 2 カラムを維持
-- Sleep / Pulse diff：unified をデフォルトに（split は選択可能）
-
-### 4.4 Mobile (`sm`)
-
-- Sidebar：非表示、hamburger ボタンで overlay 表示
-  - overlay 時：固定配置（幅は desktop と同一の 200px）、左からスライドイン（slow motion）
-  - backdrop：暗い半透明、タップで閉じる
-  - 開閉状態は ephemeral state（URL には乗せない）
-- Top Bar：高さ 44px のスリムバー（§3）
-- Chat：
-  - timeline / composer の左右 padding を狭める
-  - composer の送信ボタンと hamburger のタッチターゲットを拡大
-- Sleep：1 ペイン + run 詳細の meta×steps を縦積み。run 選択で詳細が全画面に切替（`←` で戻る）
-- Sleep / Pulse diff：常に unified
-- Metrics：数値カードを2列 → 1列へ
-
-### 4.5 Sidebar 開閉の状態機械
-
-| 画面サイズ | デフォルト状態 | 開閉トリガ |
-|---|---|---|
-| desktop (`lg`) | 常時 open | collapse ボタンで icon-only 化 |
-| tablet / mobile | closed | hamburger tap / 右スワイプ で open、backdrop tap / item tap / ESC / route 変更 / 左スワイプ で close |
+`/` は既定 agent の Chat を表示する。各画面の詳細は個別ドキュメントを参照。
 
 ---
 
-## 5. フォーカス制御
+## 5. レスポンシブ
 
-- アプリ起動直後：agent が1つでもあれば最初の agent を選択、Chat タブを表示。Composer へはフォーカスを当てない（認証モーダル等が優先されうるため）
-- New Session ボタン押下：Composer へフォーカス
-- Tab 切替：タブ内容の最初のインタラクティブ要素へフォーカス
-- Modal 開閉：focus trap を実装。開いたとき最初のインタラクティブ要素へ、閉じたとき呼び出し元へ復帰
-- Command Palette 開閉：同上
+| 名前 | 幅 | Sidebar | 2ペイン画面（Schedule 等） |
+|---|---|---|---|
+| `sm` | < 640px | hamburger overlay | 1ペイン。選択で詳細を全画面表示（`←` で戻る） |
+| `md` | 640–1023px | 常時表示 | 1ペイン。同上 |
+| `lg` | ≥ 1024px | 常時表示（collapse 可） | 一覧 + 詳細の2ペイン |
 
----
-
-## 6. ローディング・エラー表示
-
-### 6.1 初期ロード
-
-アプリ起動時、必要な初期データ（agents / sessions / config / health）を並列取得する。
-
-- 取得完了まで Top Bar と Sidebar は spinner 付きでスケルトン表示
-- 取得失敗時：該当セクションを EmptyState で表示し Retry button を提供
-- 認証未設定時：AuthModal を overlay として表示し、他操作をブロック
-
-### 6.2 個別データロード
-
-各タブ・パネルごとのデータロードでは、以下を使い分ける：
-
-| 状態 | UI |
-|---|---|
-| 初回ロード | 対象領域全体を大 spinner 中央表示 |
-| 再取得（refetch） | 既存内容を表示したまま、右上に小 spinner |
-| 取得失敗 | 対象領域を EmptyState で差し替え、Retry button 表示 |
-| 取得済み・データ空 | EmptyState で説明と次アクションを提示 |
+- Mobile の overlay は backdrop / 項目選択 / ESC / route 変更 / 左スワイプで閉じる。開閉状態は URL に乗せない
+- diff の既定表示は `lg` で split、それ以下で unified
 
 ---
 
-## 7. グローバルキーボードショートカット
+## 6. フォーカス・ロード・エラー
+
+- 起動時は既定 agent の Chat を表示する。認証未設定なら AuthModal を最優先で表示する
+- 画面切替時はその画面の最初のインタラクティブ要素へフォーカスする。Modal / Palette は focus trap を持ち、閉じたら呼び出し元へ戻す
+- データロードは、初回は領域中央の spinner、再取得は既存内容を残して小 spinner、失敗は EmptyState + Retry、空は EmptyState で次アクションを示す
+
+---
+
+## 7. キーボードショートカット
 
 | キー | 動作 |
 |---|---|
-| `Cmd/Ctrl + K` | Command Palette 開く |
+| `Cmd/Ctrl + K` | Command Palette |
 | `Cmd/Ctrl + N` | New Session（選択 agent） |
-| `Cmd/Ctrl + [` | 前のタブ |
-| `Cmd/Ctrl + ]` | 次のタブ |
+| `Cmd/Ctrl + [` / `]` | 前 / 次の agent 画面 |
 | `Esc` | Modal / Palette / Sidebar overlay を閉じる |
 
-### 制約
-
-- ブラウザが予約しているショートカットと衝突する組み合わせは避ける：
-  - `Cmd+1..9`：ブラウザタブ切り替え（タブ直接選択には使わない）
-  - `Cmd+,`：macOS でブラウザ設定（Config タブ起動には使わない）
-  - `Cmd+W` / `Cmd+T` / `Cmd+Shift+N` 等：ブラウザ基本操作
-- `Cmd+,` での Config タブ起動は諦め、Config タブへの遷移は Tab クリックまたは Command Palette 経由とする
-- 入力フィールド・textarea フォーカス中は、`Cmd/Ctrl` 付きでないショートカットは無効化する
+ブラウザ予約の組み合わせ（`Cmd+1..9`、`Cmd+,`、`Cmd+W` 等）は使わない。入力欄フォーカス中は修飾キーなしのショートカットを無効にする。

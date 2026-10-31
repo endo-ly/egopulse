@@ -1,6 +1,6 @@
 import { memo } from "react";
 import type { ChatMessage } from "../../shared/api/types";
-import { MarkdownRenderer } from "./MarkdownRenderer";
+import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
 import { PulseTrace } from "./PulseTrace";
 import type { PulseTraceData } from "./timelineEntries";
 

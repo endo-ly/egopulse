@@ -1,111 +1,121 @@
 import { describe, it, expect } from "vitest";
-import { parseRoute, buildRoutePath } from "../router";
+import { parseRoute, buildRoutePath, SCHEDULE_ACTIVITY, type AppRoute, type ScheduleView } from "../router";
 
 describe("router", () => {
-  it("router_parses_root_and_agent_scoped_paths", () => {
-    expect(parseRoute("/")).toEqual({
-      tab: "chat",
-      agentId: "",
-      sessionKey: null,
-      sleepView: "runs",
-      runId: null,
-    });
+  it("router_parses_chat_and_global_paths", () => {
+    // Arrange / Act / Assert
+    expect(parseRoute("/")).toEqual({ tab: "chat", agentId: "", sessionKey: null });
     expect(parseRoute("/agents/lyre/chat")).toEqual({
       tab: "chat",
       agentId: "lyre",
       sessionKey: null,
-      sleepView: "runs",
-      runId: null,
     });
     expect(parseRoute("/agents/lyre/chat/s/web-chat")).toEqual({
       tab: "chat",
       agentId: "lyre",
       sessionKey: "web-chat",
-      sleepView: "runs",
-      runId: null,
     });
-    expect(parseRoute("/agents/lyre/sleep")).toEqual({
-      tab: "sleep",
-      agentId: "lyre",
-      sessionKey: null,
-      sleepView: "runs",
-      runId: null,
-    });
-    expect(parseRoute("/metrics")).toEqual({
-      tab: "metrics",
-      agentId: "",
-      sessionKey: null,
-      sleepView: "runs",
-      runId: null,
-    });
+    expect(parseRoute("/metrics")).toEqual({ tab: "metrics" });
+    expect(parseRoute("/config")).toEqual({ tab: "config" });
   });
 
-  it("router_parses_sleep_run_selection_and_memory_view", () => {
-    expect(parseRoute("/agents/lyre/sleep/runs/run-123")).toEqual({
-      tab: "sleep",
-      agentId: "lyre",
-      sessionKey: null,
-      sleepView: "runs",
-      runId: "run-123",
-    });
-    expect(parseRoute("/agents/lyre/sleep/memory")).toEqual({
-      tab: "sleep",
-      agentId: "lyre",
-      sessionKey: null,
-      sleepView: "memory",
-      runId: null,
-    });
+  it("router_parses_agent_sections", () => {
+    // Arrange / Act / Assert
+    expect(parseRoute("/agents/lyre")).toEqual({ tab: "agent", agentId: "lyre", section: "overview" });
+    for (const section of ["soul", "rules", "secret", "memory", "skills"] as const) {
+      expect(parseRoute(`/agents/lyre/${section}`)).toEqual({ tab: "agent", agentId: "lyre", section });
+    }
+  });
+
+  it("router_parses_schedule_sections", () => {
+    // Arrange
+    const cases: [string, ScheduleView][] = [
+      ["/agents/lyre/schedule", { section: "activity", run: null }],
+      ["/agents/lyre/schedule/runs/sleep/run-123", { section: "activity", run: { kind: "sleep", id: "run-123" } }],
+      ["/agents/lyre/schedule/runs/pulse/run-9", { section: "activity", run: { kind: "pulse", id: "run-9" } }],
+      ["/agents/lyre/schedule/pulse", { section: "pulse", intentionId: null }],
+      ["/agents/lyre/schedule/pulse/morning", { section: "pulse", intentionId: "morning" }],
+      ["/agents/lyre/schedule/sleep", { section: "sleep" }],
+    ];
+
+    // Act / Assert
+    for (const [path, view] of cases) {
+      expect(parseRoute(path), path).toEqual({ tab: "schedule", agentId: "lyre", view });
+    }
   });
 
   it("router_rejects_paths_that_do_not_map_to_a_view", () => {
-    expect(parseRoute("/agents/lyre")).toBeNull();
-    expect(parseRoute("/agents//chat")).toBeNull();
-    expect(parseRoute("/agents/lyre/chat/s/")).toBeNull();
-    expect(parseRoute("/agents/lyre/config")).toBeNull();
-    expect(parseRoute("/agents/lyre/chat/extra")).toBeNull();
-    expect(parseRoute("/agents/lyre/sleep/runs/")).toBeNull();
-    expect(parseRoute("/agents/lyre/sleep/memory/extra")).toBeNull();
-    expect(parseRoute("/nope")).toBeNull();
+    // Arrange
+    const invalid = [
+      "/agents",
+      "/agents//chat",
+      "/agents/lyre/chat/s/",
+      "/agents/lyre/chat/extra",
+      "/agents/lyre/config",
+      "/agents/lyre/sleep",
+      "/agents/lyre/overview",
+      "/agents/lyre/memory/semantic",
+      "/agents/lyre/soul/extra",
+      "/agents/lyre/schedule/intentions/morning",
+      "/agents/lyre/schedule/pulse/morning/extra",
+      "/agents/lyre/schedule/runs/r1",
+      "/agents/lyre/schedule/runs/chat/r1",
+      "/agents/lyre/schedule/runs/pulse/r1/extra",
+      "/agents/lyre/schedule/sleep/r1",
+      "/metrics/extra",
+      "/nope",
+    ];
+
+    // Act / Assert
+    for (const path of invalid) {
+      expect(parseRoute(path), path).toBeNull();
+    }
   });
 
   it("router_builds_paths_round_trip", () => {
-    expect(
-      buildRoutePath({ tab: "chat", agentId: "lyre", sessionKey: null, sleepView: "runs", runId: null }),
-    ).toBe("/agents/lyre/chat");
-    expect(
-      buildRoutePath({ tab: "chat", agentId: "lyre", sessionKey: "web-chat", sleepView: "runs", runId: null }),
-    ).toBe("/agents/lyre/chat/s/web-chat");
-    expect(
-      buildRoutePath({ tab: "sleep", agentId: "lyre", sessionKey: null, sleepView: "runs", runId: null }),
-    ).toBe("/agents/lyre/sleep");
-    expect(
-      buildRoutePath({ tab: "sleep", agentId: "lyre", sessionKey: null, sleepView: "runs", runId: "r1" }),
-    ).toBe("/agents/lyre/sleep/runs/r1");
-    expect(
-      buildRoutePath({ tab: "sleep", agentId: "lyre", sessionKey: null, sleepView: "memory", runId: null }),
-    ).toBe("/agents/lyre/sleep/memory");
-    expect(
-      buildRoutePath({ tab: "metrics", agentId: "", sessionKey: null, sleepView: "runs", runId: null }),
-    ).toBe("/metrics");
-
-    // Without an agent, chat collapses to the boot view ("/") and a session
-    // cannot be represented; sleep has no representation at all.
-    expect(buildRoutePath({ tab: "chat", agentId: "", sessionKey: null, sleepView: "runs", runId: null })).toBe("/");
-    expect(buildRoutePath({ tab: "chat", agentId: "", sessionKey: "s1", sleepView: "runs", runId: null })).toBeNull();
-    expect(buildRoutePath({ tab: "sleep", agentId: "", sessionKey: null, sleepView: "runs", runId: null })).toBeNull();
-
-    for (const path of [
+    // Arrange
+    const paths = [
       "/",
       "/agents/lyre/chat",
       "/agents/lyre/chat/s/web-chat",
-      "/agents/lyre/sleep",
-      "/agents/lyre/sleep/runs/r1",
-      "/agents/lyre/sleep/memory",
+      "/agents/lyre",
+      "/agents/lyre/soul",
+      "/agents/lyre/rules",
+      "/agents/lyre/secret",
+      "/agents/lyre/skills",
+      "/agents/lyre/memory",
+      "/agents/lyre/schedule",
+      "/agents/lyre/schedule/runs/sleep/r1",
+      "/agents/lyre/schedule/runs/pulse/r2",
+      "/agents/lyre/schedule/pulse",
+      "/agents/lyre/schedule/pulse/morning",
+      "/agents/lyre/schedule/sleep",
       "/metrics",
-    ]) {
+      "/config",
+    ];
+
+    // Act / Assert
+    for (const path of paths) {
       const route = parseRoute(path);
-      expect(route).not.toBeNull();
+      expect(route, path).not.toBeNull();
       expect(buildRoutePath(route!)).toBe(path);
+    }
+  });
+
+  it("router_cannot_represent_agent_scoped_routes_without_an_agent", () => {
+    // Arrange
+    const routes: AppRoute[] = [
+      { tab: "chat", agentId: "", sessionKey: "s1" },
+      { tab: "agent", agentId: "", section: "overview" },
+      { tab: "schedule", agentId: "", view: SCHEDULE_ACTIVITY },
+    ];
+
+    // Act / Assert
+    // Without an agent, chat collapses to the boot view ("/") only when no
+    // session is selected; other agent-scoped routes have no representation.
+    expect(buildRoutePath({ tab: "chat", agentId: "", sessionKey: null })).toBe("/");
+    for (const route of routes) {
+      expect(buildRoutePath(route)).toBeNull();
     }
   });
 });

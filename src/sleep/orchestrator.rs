@@ -28,7 +28,7 @@ use super::event_rollup;
 use super::memory_update;
 
 /// Threshold (≤ 64) at which sleep is skipped due to too few new messages.
-const SKIP_THRESHOLD: i64 = 64;
+pub(crate) const SKIP_THRESHOLD: i64 = 64;
 /// Maximum number of source sessions included in sleep input.
 const MAX_SOURCE_SESSIONS: usize = 20;
 /// Number of trailing messages kept in `sessions.messages_json` after a sleep
@@ -68,8 +68,9 @@ pub(crate) fn collect_sleep_input(
     let new_message_count = db.count_agent_pending_sleep_messages(agent_id)?;
 
     if new_message_count <= SKIP_THRESHOLD {
-        let reason =
-            format!("new messages ({new_message_count}) at or below threshold ({SKIP_THRESHOLD})");
+        let reason = format!(
+            "{new_message_count} new messages; runs when there are more than {SKIP_THRESHOLD}"
+        );
         return Ok(InputDecision::Skip {
             reason,
             new_message_count,
@@ -176,6 +177,10 @@ pub(crate) async fn run_sleep_batch_with_snapshot(
                 reason,
                 "sleep batch skipped"
             );
+            call_blocking(db, move |db| {
+                db.record_skipped_sleep_run(&resolved_agent, trigger, &reason)
+            })
+            .await?;
             Ok(())
         }
         InputDecision::Proceed {
@@ -2111,10 +2116,26 @@ mod tests {
 
     #[tokio::test]
     async fn run_sleep_batch_skips_when_input_below_threshold() {
+        // Arrange
         let (db, dir) = test_db();
         let state = build_test_state(db, dir.path());
+
+        // Act
         let result = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
+
+        // Assert
         assert!(result.is_ok());
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, SleepRunStatus::Skipped);
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Manual);
+        assert_eq!(
+            runs[0].error_message.as_deref(),
+            Some("0 new messages; runs when there are more than 64")
+        );
     }
 
     #[tokio::test]
@@ -2128,7 +2149,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
     }
@@ -2246,7 +2270,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs.len(), 1);
 
         let snapshots = state
@@ -2267,7 +2294,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs[0].status, SleepRunStatus::Success);
     }
 
@@ -2310,7 +2340,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         let snapshots = state
             .db
             .get_snapshots_for_run(&runs[0].id)
@@ -2367,7 +2400,10 @@ mod tests {
         // manual edit is preserved on disk.
         let _ = run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual).await;
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(
             runs[0].status,
             SleepRunStatus::Running,
@@ -2822,7 +2858,10 @@ mod tests {
             .await
             .expect("batch completes even with step failures");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs[0].status, SleepRunStatus::Failed);
     }
 
@@ -2872,7 +2911,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
     }
@@ -3028,7 +3070,10 @@ mod tests {
             .await
             .expect("batch completes even with step failures");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, SleepRunStatus::Failed);
     }
@@ -3045,7 +3090,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert!(runs[0].input_tokens > 0 || runs[0].output_tokens > 0);
     }
 
@@ -3135,7 +3183,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs[0].status, SleepRunStatus::Success);
 
         let events = state
@@ -3194,7 +3245,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         let events = state
             .db
             .list_episode_events_by_run(&runs[0].id)
@@ -3232,7 +3286,10 @@ mod tests {
             .await
             .expect("batch should continue despite extract failure");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs[0].status, SleepRunStatus::PartialFailure);
 
         let events = state
@@ -3260,7 +3317,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         let steps = state.db.list_sleep_run_steps(&runs[0].id).expect("steps");
 
         let episodic = steps
@@ -3315,7 +3375,10 @@ mod tests {
             .await
             .expect("batch");
 
-        let runs = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert!(runs[0].input_tokens > 0);
         assert!(runs[0].output_tokens > 0);
     }
@@ -3378,7 +3441,7 @@ mod tests {
             } => {
                 assert_eq!(new_message_count, 0);
                 assert!(reason.contains("0"));
-                assert!(reason.contains("threshold"));
+                assert!(reason.contains("more than 64"));
             }
             other => panic!("expected Skip, got {other:?}"),
         }
@@ -3638,7 +3701,7 @@ mod tests {
                 assert!(!reason.is_empty(), "reason should not be empty");
                 assert!(reason.contains("3"), "reason should mention count");
                 assert!(
-                    reason.contains("threshold"),
+                    reason.contains("more than 64"),
                     "reason should mention threshold"
                 );
                 assert_eq!(new_message_count, 3);
@@ -3667,7 +3730,10 @@ mod tests {
             .await
             .expect("first batch");
 
-        let runs_after_first = state.db.list_sleep_runs("test-agent", 10, 0).expect("list");
+        let runs_after_first = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
         assert_eq!(runs_after_first.len(), 1);
 
         let steps_first = state
@@ -3700,7 +3766,7 @@ mod tests {
 
         let runs_after_second = state2
             .db
-            .list_sleep_runs("test-agent", 10, 0)
+            .list_sleep_runs("test-agent", &[], None, 10)
             .expect("list");
         assert_eq!(runs_after_second.len(), 2);
         assert_eq!(runs_after_second[0].status, SleepRunStatus::Success);

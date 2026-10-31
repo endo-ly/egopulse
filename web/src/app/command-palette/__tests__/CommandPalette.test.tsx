@@ -103,7 +103,7 @@ describe("CommandPalette", () => {
     expect(titles).toContain("Navigation");
     expect(titles).toContain("Agents");
     expect(titles).toContain("Sessions");
-    expect(titles).toContain("Sleep & Pulse Runs");
+    expect(titles).toContain("Schedule Runs");
 
     const agentItems = container.querySelectorAll(".palette-item");
     const labels = Array.from(agentItems).map((i) => i.textContent?.trim());

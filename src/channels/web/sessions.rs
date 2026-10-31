@@ -1442,7 +1442,7 @@ mod tests {
         .expect("store user tool call");
 
         let run_id = "run-1";
-        db.try_create_pulse_run(run_id, "lyre", "morning_review", "2026-10-30")
+        db.try_create_pulse_run(run_id, "lyre", "morning_review", "2026-10-30", "attention")
             .expect("create pulse run");
         let pulse_input = StoredMessage {
             id: crate::pulse::message_id::input(run_id),

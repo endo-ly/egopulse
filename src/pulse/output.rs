@@ -457,7 +457,7 @@ mod tests {
     }
 
     fn create_pulse_run(db: &Database, id: &str, agent_id: &str, intention_id: &str) {
-        db.try_create_pulse_run(id, agent_id, intention_id, "2026-05-11T09:00")
+        db.try_create_pulse_run(id, agent_id, intention_id, "2026-05-11T09:00", "attention")
             .expect("create pulse run");
     }
 

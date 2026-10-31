@@ -34,6 +34,16 @@ describe("api client", () => {
     await expect(apiFetch("/api/agents", "")).rejects.toBeInstanceOf(AuthRequiredError);
   });
 
+  it("api_fetch_rejects_a_successful_response_that_is_not_json", async () => {
+    // Arrange: e.g. the dev server answering an unknown API path with index.html
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("<!doctype html>", { status: 200, headers: { "Content-Type": "text/html" } }),
+    );
+
+    // Act / Assert
+    await expect(apiFetch("/api/unknown", "")).rejects.toThrow("invalid JSON response");
+  });
+
   it("create_session_key_keeps_web_session_format", () => {
     const key = createSessionKey(
       new Date(2026, 6, 3, 12, 34, 56),
