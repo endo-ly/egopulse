@@ -213,6 +213,7 @@ async fn process_intention_with_activation_timeout(
         agent_id_str,
         &intention.id,
         &due_check.due_key,
+        &intention.attention,
     )
     .await
     {
@@ -387,13 +388,15 @@ async fn create_pulse_run(
     agent_id: &str,
     intention_id: &str,
     due_key: &str,
+    attention: &str,
 ) -> Result<(), crate::error::StorageError> {
     let id = id.to_string();
     let agent_id = agent_id.to_string();
     let intention_id = intention_id.to_string();
     let due_key = due_key.to_string();
+    let attention = attention.to_string();
     crate::storage::call_blocking(Arc::clone(db), move |db| {
-        db.try_create_pulse_run(&id, &agent_id, &intention_id, &due_key)
+        db.try_create_pulse_run(&id, &agent_id, &intention_id, &due_key, &attention)
     })
     .await
 }

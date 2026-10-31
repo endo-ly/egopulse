@@ -2,7 +2,12 @@ use rusqlite::params;
 
 use crate::error::StorageError;
 
-use super::{ChatInfo, Database, PulseOutputKind, PulseRunStatus};
+use super::{ChatInfo, Database, PulseOutputKind, PulseRunStatus, status_filter_sql};
+
+/// Column list matching the positions [`row_to_pulse_run`] reads.
+const PULSE_RUN_COLUMNS: &str = "id, agent_id, intention_id, due_key, chat_id, message_id,
+     status, started_at, finished_at, output_kind, output_text, error_message,
+     attention_snapshot";
 
 /// Parses a `pulse_runs` row into [`super::PulseRun`].
 fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::PulseRun> {
@@ -35,6 +40,7 @@ fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::PulseRun
         output_kind,
         output_text: row.get(10)?,
         error_message: row.get(11)?,
+        attention_snapshot: row.get(12)?,
     })
 }
 
@@ -43,7 +49,8 @@ fn row_to_pulse_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<super::PulseRun
 // ---------------------------------------------------------------------------
 
 impl Database {
-    /// Inserts a new `pulse_run` row with status "running".
+    /// Inserts a new `pulse_run` row with status "running", recording the
+    /// attention text the run is activated with.
     ///
     /// Returns `Err(StorageError::Conflict)` when the `(agent_id,
     /// intention_id, due_key)` unique index is already satisfied.
@@ -57,6 +64,7 @@ impl Database {
         agent_id: &str,
         intention_id: &str,
         due_key: &str,
+        attention: &str,
     ) -> Result<(), StorageError> {
         let conn = self.get_conn()?;
         let status = PulseRunStatus::Running.to_string();
@@ -65,9 +73,18 @@ impl Database {
         match conn.execute(
             "INSERT INTO pulse_runs
                  (id, agent_id, intention_id, due_key, chat_id, message_id,
-                  status, started_at, finished_at, output_kind, output_text, error_message)
-             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, NULL, NULL, NULL, NULL)",
-            params![id, agent_id, intention_id, due_key, status, started_at],
+                  status, started_at, finished_at, output_kind, output_text, error_message,
+                  attention_snapshot)
+             VALUES (?1, ?2, ?3, ?4, NULL, NULL, ?5, ?6, NULL, NULL, NULL, NULL, ?7)",
+            params![
+                id,
+                agent_id,
+                intention_id,
+                due_key,
+                status,
+                started_at,
+                attention
+            ],
         ) {
             Ok(_) => Ok(()),
             Err(rusqlite::Error::SqliteFailure(err, Some(msg)))
@@ -280,14 +297,45 @@ impl Database {
 
         let conn = self.get_conn()?;
         conn.query_row(
-            "SELECT id, agent_id, intention_id, due_key, chat_id, message_id,
-                    status, started_at, finished_at, output_kind, output_text, error_message
-             FROM pulse_runs WHERE id = ?1",
+            &format!("SELECT {PULSE_RUN_COLUMNS} FROM pulse_runs WHERE id = ?1"),
             params![id],
             row_to_pulse_run,
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Lists an agent's pulse runs, newest first. `intention_id` narrows the
+    /// list to one intention and a non-empty `statuses` to those statuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query failures.
+    pub(crate) fn list_pulse_runs(
+        &self,
+        agent_id: &str,
+        intention_id: Option<&str>,
+        statuses: &[PulseRunStatus],
+        limit: usize,
+    ) -> Result<Vec<super::PulseRun>, StorageError> {
+        let conn = self.get_conn()?;
+        let mut sql = format!("SELECT {PULSE_RUN_COLUMNS} FROM pulse_runs WHERE agent_id = ?");
+        let mut values: Vec<rusqlite::types::Value> = vec![agent_id.to_string().into()];
+        if let Some(intention_id) = intention_id {
+            sql.push_str(" AND intention_id = ?");
+            values.push(intention_id.to_string().into());
+        }
+        if !statuses.is_empty() {
+            sql.push_str(&status_filter_sql(statuses.len()));
+            values.extend(statuses.iter().map(|status| status.to_string().into()));
+        }
+        sql.push_str(" ORDER BY started_at DESC, rowid DESC LIMIT ?");
+        values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
+
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(values), row_to_pulse_run)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     /// Returns agent chats matching the given channels, ordered by `last_message_time` descending.
@@ -352,7 +400,7 @@ mod tests {
         intention_id: &str,
         due_key: &str,
     ) {
-        db.try_create_pulse_run(id, agent_id, intention_id, due_key)
+        db.try_create_pulse_run(id, agent_id, intention_id, due_key, "attention")
             .expect("create pulse run");
     }
 
@@ -394,7 +442,8 @@ mod tests {
         create_test_pulse_run(&db, "run-1", "agent-a", "int-1", "2025-01-01");
 
         // Act: attempt to create a second run with the same (agent_id, intention_id, due_key)
-        let result = db.try_create_pulse_run("run-2", "agent-a", "int-1", "2025-01-01");
+        let result =
+            db.try_create_pulse_run("run-2", "agent-a", "int-1", "2025-01-01", "attention");
 
         // Assert: second insert should fail with Conflict
         assert!(matches!(result, Err(StorageError::Conflict(_))));
@@ -531,7 +580,8 @@ mod tests {
         );
 
         // Attempting to create a second run with same due_key should conflict
-        let result = db.try_create_pulse_run("run-2", "agent-a", "int-1", "2025-01-01");
+        let result =
+            db.try_create_pulse_run("run-2", "agent-a", "int-1", "2025-01-01", "attention");
         assert!(matches!(result, Err(StorageError::Conflict(_))));
     }
 
@@ -798,6 +848,93 @@ mod tests {
             matches!(result, Err(StorageError::InvalidAsset(_))),
             "corrupt started_at should surface as InvalidAsset, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn pulse_run_records_attention_snapshot() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        // Act
+        db.try_create_pulse_run(
+            "run-1",
+            "agent-a",
+            "int-1",
+            "2025-01-01",
+            "check the calendar",
+        )
+        .expect("create pulse run");
+
+        // Assert
+        let run = db.get_pulse_run("run-1").expect("query").expect("run");
+        assert_eq!(
+            run.attention_snapshot.as_deref(),
+            Some("check the calendar")
+        );
+    }
+
+    #[test]
+    fn list_pulse_runs_filters_by_agent_intention_and_status_newest_first() {
+        // Arrange
+        let (db, _dir) = test_db();
+        for (id, agent, intention, started_at, status) in [
+            (
+                "a-old",
+                "agent-a",
+                "morning",
+                "2025-01-01T09:00:00Z",
+                PulseRunStatus::Success,
+            ),
+            (
+                "a-new",
+                "agent-a",
+                "morning",
+                "2025-01-03T09:00:00Z",
+                PulseRunStatus::Failed,
+            ),
+            (
+                "a-other",
+                "agent-a",
+                "evening",
+                "2025-01-02T21:00:00Z",
+                PulseRunStatus::Skipped,
+            ),
+            (
+                "b-run",
+                "agent-b",
+                "morning",
+                "2025-01-04T09:00:00Z",
+                PulseRunStatus::Success,
+            ),
+        ] {
+            insert_terminal_pulse_run(&db, id, agent, intention, id, started_at, status);
+        }
+        let ids = |runs: Vec<super::super::PulseRun>| -> Vec<String> {
+            runs.into_iter().map(|run| run.id).collect()
+        };
+
+        // Act
+        let all = db.list_pulse_runs("agent-a", None, &[], 10).expect("all");
+        let morning = db
+            .list_pulse_runs("agent-a", Some("morning"), &[], 10)
+            .expect("morning");
+        let failed_or_skipped = db
+            .list_pulse_runs(
+                "agent-a",
+                None,
+                &[PulseRunStatus::Failed, PulseRunStatus::Skipped],
+                10,
+            )
+            .expect("filtered");
+        let limited = db
+            .list_pulse_runs("agent-a", None, &[], 1)
+            .expect("limited");
+
+        // Assert
+        assert_eq!(ids(all), ["a-new", "a-other", "a-old"]);
+        assert_eq!(ids(morning), ["a-new", "a-old"]);
+        assert_eq!(ids(failed_or_skipped), ["a-new", "a-other"]);
+        assert_eq!(ids(limited), ["a-new"]);
     }
 
     // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use serde::Serialize;
 use std::collections::HashMap;
 
-use super::WebState;
+use super::{ApiError, ApiResult, WebState, api_error, bad_request, internal_error, not_found};
 use crate::config::AgentId;
 
 type AvatarImageResponse = ([(HeaderName, String); 3], Vec<u8>);
@@ -26,9 +26,7 @@ const MAX_AVATAR_BYTES: usize = 1024 * 1024;
 
 const ALLOWED_AVATAR_CONTENT_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
 
-pub(super) async fn list_agents(
-    State(state): State<WebState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+pub(super) async fn list_agents(State(state): State<WebState>) -> ApiResult {
     let snapshot = state.app_state.config_manager.current_blocking();
     let config = &snapshot.config;
     let default_agent = &config.default_agent;
@@ -70,10 +68,10 @@ pub(super) async fn put_agent_avatar(
     Path(agent_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult {
     let agent_id = match resolved_agent_id(&state, &agent_id) {
         Some(id) => id,
-        None => return Err(not_found()),
+        None => return Err(not_found("agent_not_found")),
     };
 
     let content_type = headers
@@ -89,21 +87,18 @@ pub(super) async fn put_agent_avatar(
         })
         .unwrap_or_default();
     if !ALLOWED_AVATAR_CONTENT_TYPES.contains(&content_type.as_str()) {
-        return Err((
+        return Err(api_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            Json(serde_json::json!({"ok": false, "error": "unsupported_media_type"})),
+            "unsupported_media_type",
         ));
     }
     if body.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"ok": false, "error": "empty_body"})),
-        ));
+        return Err(bad_request("empty_body"));
     }
     if body.len() > MAX_AVATAR_BYTES {
-        return Err((
+        return Err(api_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"ok": false, "error": "payload_too_large"})),
+            "payload_too_large",
         ));
     }
 
@@ -134,10 +129,10 @@ pub(super) async fn put_agent_avatar(
 pub(super) async fn get_agent_avatar(
     State(state): State<WebState>,
     Path(agent_id): Path<String>,
-) -> Result<AvatarImageResponse, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<AvatarImageResponse, ApiError> {
     let agent_id = match resolved_agent_id(&state, &agent_id) {
         Some(id) => id,
-        None => return Err(not_found()),
+        None => return Err(not_found("agent_not_found")),
     };
 
     let db = state.app_state.db.clone();
@@ -152,7 +147,7 @@ pub(super) async fn get_agent_avatar(
             tracing::warn!(%error, agent_id = %agent_id, "failed to load agent avatar");
             internal_error()
         })?
-        .ok_or(not_found())?;
+        .ok_or_else(|| not_found("agent_not_found"))?;
 
     Ok((
         [
@@ -170,10 +165,10 @@ pub(super) async fn get_agent_avatar(
 pub(super) async fn delete_agent_avatar(
     State(state): State<WebState>,
     Path(agent_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult {
     let agent_id = match resolved_agent_id(&state, &agent_id) {
         Some(id) => id,
-        None => return Err(not_found()),
+        None => return Err(not_found("agent_not_found")),
     };
 
     let db = state.app_state.db.clone();
@@ -223,20 +218,6 @@ fn percent_encode_rfc3339(version: &str) -> String {
         }
     }
     encoded
-}
-
-fn not_found() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"ok": false, "error": "agent_not_found"})),
-    )
-}
-
-fn internal_error() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"ok": false, "error": "internal_error"})),
-    )
 }
 
 #[cfg(test)]

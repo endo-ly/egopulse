@@ -13,6 +13,9 @@ use crate::storage::SleepRunTrigger;
 
 use super::{SleepBatchError, recover_memory_publication};
 
+/// Skip reason recorded when a scheduled check finds the agent mid-turn.
+const ACTIVE_AGENT_SKIP_REASON: &str = "agent was mid-conversation";
+
 /// Returns the next scheduled run as a UTC instant, or `None` if the scheduler
 /// is disabled or the configuration is incomplete.
 ///
@@ -94,6 +97,18 @@ pub(crate) async fn run_scheduled_cycle(state: Arc<AppState>) {
     for agent_id in &agents {
         if state.active_turns.is_active(agent_id.as_str()) {
             info!(agent_id = %agent_id, "scheduled cycle: agent active, deferring");
+            let agent = agent_id.to_string();
+            let recorded = crate::storage::call_blocking(Arc::clone(&state.db), move |db| {
+                db.record_skipped_sleep_run(
+                    &agent,
+                    SleepRunTrigger::Scheduled,
+                    ACTIVE_AGENT_SKIP_REASON,
+                )
+            })
+            .await;
+            if let Err(e) = recorded {
+                warn!(agent_id = %agent_id, error = %e, "scheduled cycle: failed to record deferral");
+            }
             continue;
         }
 
@@ -559,64 +574,68 @@ mod tests {
         assert_eq!(agents[0], AgentId::new("default"));
     }
 
-    #[tokio::test]
-    async fn scheduler_uses_scheduled_trigger() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = std::sync::Arc::new(test_util::build_state_with_provider(
-            dir.path().to_str().unwrap(),
-            Box::new(MockLlm::new()),
-        ));
-
-        run_scheduled_cycle(Arc::clone(&state)).await;
-
-        let runs = state
-            .db
-            .list_sleep_runs("default", 10, 0)
-            .expect("list runs");
-        let scheduled_runs: Vec<_> = runs
-            .iter()
-            .filter(|r| r.trigger == SleepRunTrigger::Scheduled)
-            .collect();
-        assert!(scheduled_runs.is_empty());
+    /// Builds a state whose sleep scheduler is enabled for the default agent.
+    fn scheduler_state(dir: &tempfile::TempDir) -> Arc<AppState> {
+        let mut config = test_util::test_config(dir.path().to_str().unwrap());
+        config.sleep_batch = scheduler_config_with_agents(true, Some(vec!["default"]));
+        Arc::new(test_util::build_state_with_config(
+            config,
+            Some(Arc::new(MockLlm::new())),
+            None,
+            None,
+            None,
+        ))
     }
 
     #[tokio::test]
-    async fn scheduler_defers_active_agent() {
+    async fn scheduler_records_a_check_below_the_threshold_as_skipped() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = std::sync::Arc::new(test_util::build_state_with_provider(
-            dir.path().to_str().unwrap(),
-            Box::new(MockLlm::new()),
-        ));
+        let state = scheduler_state(&dir);
 
-        state.active_turns.begin_turn("default");
-        assert!(state.active_turns.is_active("default"));
-
+        // Act
         run_scheduled_cycle(Arc::clone(&state)).await;
 
+        // Assert
+        let runs = state
+            .db
+            .list_sleep_runs("default", &[], 10)
+            .expect("list runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
+        assert_eq!(runs[0].status, crate::storage::SleepRunStatus::Skipped);
+        assert!(
+            runs[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|reason| reason.contains("new messages")),
+            "skip reason: {:?}",
+            runs[0].error_message
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_records_a_deferred_check_for_an_active_agent() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = scheduler_state(&dir);
+        state.active_turns.begin_turn("default");
+
+        // Act
+        run_scheduled_cycle(Arc::clone(&state)).await;
         state.active_turns.end_turn("default");
 
+        // Assert
         let runs = state
             .db
-            .list_sleep_runs("default", 10, 0)
+            .list_sleep_runs("default", &[], 10)
             .expect("list runs");
-        assert!(runs.is_empty());
-    }
-
-    #[tokio::test]
-    async fn scheduler_continues_after_skip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let state = std::sync::Arc::new(test_util::build_state_with_provider(
-            dir.path().to_str().unwrap(),
-            Box::new(MockLlm::new()),
-        ));
-
-        run_scheduled_cycle(Arc::clone(&state)).await;
-
-        let runs = state
-            .db
-            .list_sleep_runs("default", 10, 0)
-            .expect("list runs");
-        assert!(runs.is_empty());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, crate::storage::SleepRunStatus::Skipped);
+        assert_eq!(
+            runs[0].error_message.as_deref(),
+            Some(ACTIVE_AGENT_SKIP_REASON)
+        );
     }
 
     #[tokio::test]
@@ -637,7 +656,7 @@ mod tests {
 
         let runs = state
             .db
-            .list_sleep_runs("default", 10, 0)
+            .list_sleep_runs("default", &[], 10)
             .expect("list runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, SleepRunTrigger::Manual);

@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 20;
+pub(super) const SCHEMA_VERSION: i64 = 21;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1081,6 +1081,18 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         set_schema_version_in_tx(&tx, 20, "clear chat titles seeded from surface threads")?;
         tx.commit()?;
         version = 20;
+    }
+
+    if version < 21 {
+        let tx = conn.unchecked_transaction()?;
+
+        // The attention text a Pulse run was activated with, kept so the run
+        // stays auditable after PULSE.yaml changes. Older runs have none.
+        add_column_if_missing(&tx, "pulse_runs", "attention_snapshot", "TEXT")?;
+
+        set_schema_version_in_tx(&tx, 21, "add pulse_runs.attention_snapshot")?;
+        tx.commit()?;
+        version = 21;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -3080,5 +3092,34 @@ mod tests {
             .expect("named title");
         assert_eq!(seeded, None);
         assert_eq!(named.as_deref(), Some("設計相談"));
+    }
+
+    #[test]
+    fn migration_v21_adds_pulse_attention_snapshot_keeping_existing_runs() {
+        // Arrange
+        let conn = rusqlite::Connection::open_in_memory().expect("conn");
+        super::run_migrations(&conn).expect("fresh migrations");
+        conn.execute_batch("ALTER TABLE pulse_runs DROP COLUMN attention_snapshot")
+            .expect("drop column to emulate v20");
+        conn.execute(
+            "INSERT INTO pulse_runs (id, agent_id, intention_id, due_key, status, started_at)
+             VALUES ('run-1', 'lyre', 'morning', 'lyre:morning:2026-10-30', 'success', '2026-10-30T00:00:00Z')",
+            [],
+        )
+        .expect("insert v20 run");
+        super::set_schema_version(&conn, 20, "test v20 baseline").expect("set v20");
+
+        // Act
+        super::run_migrations(&conn).expect("upgrade to v21");
+
+        // Assert
+        let snapshot: Option<String> = conn
+            .query_row(
+                "SELECT attention_snapshot FROM pulse_runs WHERE id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("existing run survives");
+        assert_eq!(snapshot, None);
     }
 }

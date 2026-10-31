@@ -9,16 +9,13 @@ use axum::extract::{Path as UrlPath, Query, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use super::WebState;
 use super::agents::resolved_agent_id;
+use super::{ApiError, ApiResult, WebState, api_error, bad_request, internal_error, not_found};
 use crate::agent_loop::prompt::{PromptFileKind, PromptFileLayer, PromptFileScope};
 use crate::config::{AgentId, Config, LlmSettingSource};
 use crate::skills::{
     SkillFileError, SkillManager, SkillMetadata, list_skill_files, read_skill_file,
 };
-
-type ApiError = (StatusCode, Json<serde_json::Value>);
-type ApiResult = Result<Json<serde_json::Value>, ApiError>;
 
 const DEFAULT_HISTORY_LIMIT: usize = 20;
 const MAX_HISTORY_LIMIT: usize = 100;
@@ -84,10 +81,14 @@ pub(super) async fn get_agent_profile(
     State(state): State<WebState>,
     UrlPath(agent_id): UrlPath<String>,
 ) -> ApiResult {
-    let agent_id = resolved_agent_id(&state, &agent_id).ok_or_else(agent_not_found)?;
+    let agent_id =
+        resolved_agent_id(&state, &agent_id).ok_or_else(|| not_found("agent_not_found"))?;
     let snapshot = state.app_state.config_manager.current_blocking();
     let config = &snapshot.config;
-    let agent = config.agents.get(&agent_id).ok_or_else(agent_not_found)?;
+    let agent = config
+        .agents
+        .get(&agent_id)
+        .ok_or_else(|| not_found("agent_not_found"))?;
 
     let mut profile_channels: Vec<&String> = agent.profiles.keys().collect();
     profile_channels.sort();
@@ -104,7 +105,7 @@ pub(super) async fn get_agent_profile(
             let layers = app_state
                 .soul_agents
                 .prompt_file_layers(&id, kind)
-                .ok_or_else(agent_not_found)?;
+                .ok_or_else(|| not_found("agent_not_found"))?;
             Ok(layers
                 .into_iter()
                 .filter(|layer| layer.applied)
@@ -128,7 +129,7 @@ pub(super) async fn get_agent_profile(
                 .soul_agents
                 .prompt_file_layers(&id, PromptFileKind::Secret)
                 .and_then(|layers| layers.into_iter().next())
-                .ok_or_else(agent_not_found)?
+                .ok_or_else(|| not_found("agent_not_found"))?
                 .path,
         );
         Ok(serde_json::json!({
@@ -170,7 +171,8 @@ pub(super) async fn get_agent_prompt_file(
     State(state): State<WebState>,
     UrlPath((agent_id, kind)): UrlPath<(String, String)>,
 ) -> ApiResult {
-    let agent_id = resolved_agent_id(&state, &agent_id).ok_or_else(agent_not_found)?;
+    let agent_id =
+        resolved_agent_id(&state, &agent_id).ok_or_else(|| not_found("agent_not_found"))?;
     let kind =
         parse_prompt_file_kind(&kind).ok_or_else(|| bad_request("invalid_prompt_file_kind"))?;
 
@@ -188,7 +190,7 @@ pub(super) async fn get_agent_prompt_file(
             })
     })
     .await?
-    .ok_or_else(agent_not_found)?;
+    .ok_or_else(|| not_found("agent_not_found"))?;
 
     Ok(Json(serde_json::json!({ "ok": true, "layers": layers })))
 }
@@ -199,7 +201,8 @@ pub(super) async fn get_agent_memory_history(
     UrlPath(agent_id): UrlPath<String>,
     Query(query): Query<HistoryQuery>,
 ) -> ApiResult {
-    let agent_id = resolved_agent_id(&state, &agent_id).ok_or_else(agent_not_found)?;
+    let agent_id =
+        resolved_agent_id(&state, &agent_id).ok_or_else(|| not_found("agent_not_found"))?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_HISTORY_LIMIT)
@@ -252,7 +255,7 @@ pub(super) async fn get_skill(
         let skills = &app_state.skills;
         let loaded = skills.load_skill_checked(&name).map_err(|error| {
             tracing::debug!(skill = %name, %error, "skill is not loadable");
-            skill_not_found()
+            not_found("skill_not_found")
         })?;
         let files = list_skill_files(&loaded.metadata.dir_path).map_err(|error| {
             tracing::warn!(%error, skill = %name, "failed to list skill files");
@@ -291,20 +294,15 @@ pub(super) async fn get_skill_file(
             .discover_skills()
             .into_iter()
             .find(|meta| meta.name == name)
-            .ok_or_else(skill_not_found)?;
+            .ok_or_else(|| not_found("skill_not_found"))?;
         read_skill_file(&meta.dir_path, &file).map_err(|error| match error {
-            SkillFileError::NotFound => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"ok": false, "error": "skill_file_not_found"})),
-            ),
-            SkillFileError::TooLarge => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                Json(serde_json::json!({"ok": false, "error": "skill_file_too_large"})),
-            ),
-            SkillFileError::NotText => (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                Json(serde_json::json!({"ok": false, "error": "skill_file_not_text"})),
-            ),
+            SkillFileError::NotFound => not_found("skill_file_not_found"),
+            SkillFileError::TooLarge => {
+                api_error(StatusCode::PAYLOAD_TOO_LARGE, "skill_file_too_large")
+            }
+            SkillFileError::NotText => {
+                api_error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "skill_file_not_text")
+            }
             SkillFileError::Io(error) => {
                 tracing::warn!(%error, skill = %name, "failed to read skill file");
                 internal_error()
@@ -400,34 +398,6 @@ where
         tracing::warn!(%error, "agent profile task panicked");
         internal_error()
     })
-}
-
-fn skill_not_found() -> ApiError {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"ok": false, "error": "skill_not_found"})),
-    )
-}
-
-fn agent_not_found() -> ApiError {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"ok": false, "error": "agent_not_found"})),
-    )
-}
-
-fn bad_request(error: &str) -> ApiError {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({"ok": false, "error": error})),
-    )
-}
-
-fn internal_error() -> ApiError {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(serde_json::json!({"ok": false, "error": "internal_error"})),
-    )
 }
 
 #[cfg(test)]

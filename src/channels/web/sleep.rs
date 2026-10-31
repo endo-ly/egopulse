@@ -1,83 +1,143 @@
 //! Sleep batch audit API endpoints.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use std::sync::Arc;
+use chrono::Utc;
+use serde::Deserialize;
 
 use crate::memory::MemoryError;
-use crate::storage::{SleepStepName, call_blocking};
+use crate::sleep::SKIP_THRESHOLD;
+use crate::sleep::scheduler::{next_scheduled_run, resolve_target_agents};
+use crate::storage::{MemoryFile, SleepRun, SleepRunStatus, SleepStepName, call_blocking};
 
-use super::WebState;
+use super::agents::resolved_agent_id;
+use super::{
+    ApiResult, DEFAULT_RUN_LIMIT, MAX_RUN_LIMIT, WebState, bad_request, internal_error, not_found,
+    parse_statuses,
+};
 
-const DEFAULT_LIMIT: i64 = 20;
-const DEFAULT_OFFSET: i64 = 0;
+#[derive(Deserialize)]
+pub(super) struct SleepRunsQuery {
+    agent_id: String,
+    /// Comma-separated statuses; every status when absent.
+    status: Option<String>,
+    limit: Option<usize>,
+}
 
-/// Lists sleep runs, optionally filtered by agent_id.
+/// Lists an agent's sleep runs, newest first.
 ///
 /// Query parameters:
-/// - `agent_id` (optional): filter runs to a specific agent
-/// - `limit` (optional, default 20): maximum number of runs to return
-/// - `offset` (optional, default 0): number of runs to skip (pagination)
+/// - `agent_id`: the agent whose runs to list
+/// - `status` (optional): comma-separated statuses to keep
+/// - `limit` (optional, default 20, at most 200): maximum number of runs
+///
+/// Each run carries `changed_memory`: the memory files it published changes
+/// to (see [`crate::storage::Database::changed_memory_files`]).
+///
+/// # Errors
+///
+/// Returns `400` for an unknown status and `500` on database errors.
 pub(super) async fn list_sleep_runs(
     State(state): State<WebState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    Query(query): Query<SleepRunsQuery>,
+) -> ApiResult {
+    let statuses = parse_statuses::<SleepRunStatus>(query.status.as_deref())?;
+    let limit = query.limit.unwrap_or(DEFAULT_RUN_LIMIT).min(MAX_RUN_LIMIT);
     let db = Arc::clone(&state.app_state.db);
-    let agent_id = params.get("agent_id").map(|s| s.to_string());
-    let limit: i64 = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_LIMIT);
-    let offset: i64 = params
-        .get("offset")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_OFFSET);
+    let agent_id = query.agent_id;
 
-    let runs = match call_blocking(db, move |db| {
-        if let Some(ref agent_id) = agent_id {
-            db.list_sleep_runs(agent_id, limit, offset)
-        } else {
-            db.list_all_sleep_runs(limit, offset)
-        }
+    let (runs, changed) = call_blocking(db, move |db| {
+        let runs = db.list_sleep_runs(&agent_id, &statuses, limit)?;
+        let run_ids: Vec<String> = runs.iter().map(|run| run.id.clone()).collect();
+        let changed = db.changed_memory_files(&run_ids)?;
+        Ok((runs, changed))
     })
     .await
-    {
-        Ok(runs) => runs,
-        Err(error) => {
-            tracing::warn!(%error, "failed to list sleep runs");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-            ));
-        }
-    };
+    .map_err(|error| {
+        tracing::warn!(%error, "failed to list sleep runs");
+        internal_error()
+    })?;
 
     let runs_json: Vec<serde_json::Value> = runs
         .into_iter()
         .map(|run| {
-            let session_count = parse_session_count(&run.source_chats_json);
-            serde_json::json!({
-                "id": run.id,
-                "agent_id": run.agent_id,
-                "status": run.status.to_string(),
-                "trigger": run.trigger.to_string(),
-                "started_at": run.started_at,
-                "finished_at": run.finished_at,
-                "source_chats_json": run.source_chats_json,
-                "source_digest_md": run.source_digest_md,
-                "input_tokens": run.input_tokens,
-                "output_tokens": run.output_tokens,
-                "total_tokens": run.total_tokens,
-                "error_message": run.error_message,
-                "session_count": session_count,
-            })
+            let changed_memory = changed.get(&run.id).map(Vec::as_slice).unwrap_or(&[]);
+            sleep_run_json(&run, changed_memory)
         })
         .collect();
 
     Ok(Json(serde_json::json!({"ok": true, "runs": runs_json})))
+}
+
+/// Describes the agent's next scheduled sleep check and the condition it
+/// will decide on.
+///
+/// `next_check_at` is null when the scheduler is disabled or the agent is not
+/// one of its targets. Pending messages above `threshold` make the check run.
+///
+/// # Errors
+///
+/// Returns `404` for an unknown agent and `500` on database errors.
+pub(super) async fn get_agent_sleep_outlook(
+    State(state): State<WebState>,
+    Path(agent_id): Path<String>,
+) -> ApiResult {
+    let agent_id =
+        resolved_agent_id(&state, &agent_id).ok_or_else(|| not_found("agent_not_found"))?;
+    let snapshot = state.app_state.config_manager.current_blocking();
+    let config = &snapshot.config;
+    let next_check = next_scheduled_run(&config.sleep_batch, &config.timezone, Utc::now());
+    let targeted =
+        resolve_target_agents(&config.sleep_batch, &config.agents, &config.default_agent)
+            .contains(&agent_id);
+
+    let db = Arc::clone(&state.app_state.db);
+    let pending = call_blocking(db, move |db| {
+        db.count_agent_pending_sleep_messages(agent_id.as_str())
+    })
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, "failed to count pending sleep messages");
+        internal_error()
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "outlook": {
+            "scheduler_enabled": next_check.is_some(),
+            "targeted": targeted,
+            "next_check_at": next_check
+                .filter(|_| targeted)
+                .map(|instant| instant.to_rfc3339()),
+            "pending_messages": pending,
+            "threshold": SKIP_THRESHOLD,
+        }
+    })))
+}
+
+/// A sleep run as the API returns it, with the memory files it changed.
+fn sleep_run_json(run: &SleepRun, changed_memory: &[MemoryFile]) -> serde_json::Value {
+    serde_json::json!({
+        "id": run.id,
+        "agent_id": run.agent_id,
+        "status": run.status.to_string(),
+        "trigger": run.trigger.to_string(),
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+        "source_chats_json": run.source_chats_json,
+        "source_digest_md": run.source_digest_md,
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
+        "error_message": run.error_message,
+        "session_count": parse_session_count(&run.source_chats_json),
+        "changed_memory": changed_memory
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn parse_session_count(source_chats_json: &str) -> usize {
@@ -87,6 +147,9 @@ fn parse_session_count(source_chats_json: &str) -> usize {
 }
 
 /// Gets a single sleep run with its step results and memory snapshots.
+///
+/// The `run` object has the same shape as a run in the listing, so the
+/// screen can show the detail of a run it has not listed.
 ///
 /// # Path parameters
 /// - `run_id`: the sleep run identifier
@@ -98,62 +161,33 @@ fn parse_session_count(source_chats_json: &str) -> usize {
 pub(super) async fn get_sleep_run_detail(
     State(state): State<WebState>,
     Path(run_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult {
     let db = Arc::clone(&state.app_state.db);
 
-    let run = match call_blocking(Arc::clone(&db), {
+    // One blocking hop for the run and everything hanging off it: the screen
+    // needs all of it, and the queries are independent.
+    let detail = call_blocking(db, {
         let run_id = run_id.clone();
-        move |db| db.get_sleep_run(&run_id)
+        move |db| {
+            let Some(run) = db.get_sleep_run(&run_id)? else {
+                return Ok(None);
+            };
+            let changed = db.changed_memory_files(std::slice::from_ref(&run_id))?;
+            let snapshots = db.get_snapshots_for_run(&run_id)?;
+            let steps = db.list_sleep_run_steps(&run_id)?;
+            let changed_memory = changed.get(&run_id).cloned().unwrap_or_default();
+            Ok(Some((run, changed_memory, snapshots, steps)))
+        }
     })
     .await
-    {
-        Ok(Some(run)) => run,
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"ok": false, "error": "not_found"})),
-            ));
-        }
-        Err(error) => {
-            tracing::warn!(%error, run_id = %run_id, "failed to get sleep run");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-            ));
-        }
+    .map_err(|error| {
+        tracing::warn!(%error, run_id = %run_id, "failed to get sleep run detail");
+        internal_error()
+    })?;
+    let Some((run, changed_memory, snapshots, mut steps)) = detail else {
+        return Err(not_found("not_found"));
     };
 
-    let snapshots = match call_blocking(Arc::clone(&db), {
-        let run_id = run_id.clone();
-        move |db| db.get_snapshots_for_run(&run_id)
-    })
-    .await
-    {
-        Ok(snapshots) => snapshots,
-        Err(error) => {
-            tracing::warn!(%error, run_id = %run_id, "failed to get snapshots for run");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-            ));
-        }
-    };
-
-    let mut steps = match call_blocking(db, {
-        let run_id = run_id.clone();
-        move |db| db.list_sleep_run_steps(&run_id)
-    })
-    .await
-    {
-        Ok(steps) => steps,
-        Err(error) => {
-            tracing::warn!(%error, run_id = %run_id, "failed to get steps for run");
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-            ));
-        }
-    };
     // The storage layer orders by step_name (alphabetical); reorder to the
     // pipeline execution order so the UI can render steps top-to-bottom.
     steps.sort_by_key(|step| {
@@ -193,24 +227,9 @@ pub(super) async fn get_sleep_run_detail(
         })
         .collect();
 
-    let run_json = serde_json::json!({
-        "id": run.id,
-        "agent_id": run.agent_id,
-        "status": run.status.to_string(),
-        "trigger": run.trigger.to_string(),
-        "started_at": run.started_at,
-        "finished_at": run.finished_at,
-        "source_chats_json": run.source_chats_json,
-        "source_digest_md": run.source_digest_md,
-        "input_tokens": run.input_tokens,
-        "output_tokens": run.output_tokens,
-        "total_tokens": run.total_tokens,
-        "error_message": run.error_message,
-    });
-
     Ok(Json(serde_json::json!({
         "ok": true,
-        "run": run_json,
+        "run": sleep_run_json(&run, &changed_memory),
         "snapshots": snapshots_json,
         "steps": steps_json,
     })))
@@ -228,7 +247,7 @@ pub(super) async fn get_sleep_run_detail(
 pub(super) async fn get_agent_memory(
     State(state): State<WebState>,
     Path(agent_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> ApiResult {
     let loader = Arc::clone(&state.app_state.memory_loader);
     let lookup_agent_id = agent_id.clone();
     let bundle =
@@ -236,24 +255,15 @@ pub(super) async fn get_agent_memory(
             Ok(Ok(bundle)) => bundle,
             Ok(Err(MemoryError::UnsafeAgentId(id))) => {
                 tracing::warn!(agent_id = %id, "rejected unsafe agent id for memory request");
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({"ok": false, "error": "invalid_agent_id"})),
-                ));
+                return Err(bad_request("invalid_agent_id"));
             }
             Ok(Err(error)) => {
                 tracing::warn!(%error, agent_id = %agent_id, "failed to load memory bundle");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-                ));
+                return Err(internal_error());
             }
             Err(error) => {
                 tracing::warn!(%error, agent_id = %agent_id, "memory loader task panicked");
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"ok": false, "error": error.to_string()})),
-                ));
+                return Err(internal_error());
             }
         };
 
@@ -272,13 +282,13 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use axum::extract::State as AxumState;
-    use std::collections::HashMap;
+    use axum::http::StatusCode;
     use std::sync::Arc;
 
     use crate::channels::web::{RunHub, WebState};
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse};
-    use crate::storage::Database;
+    use crate::storage::{Database, SleepRunTrigger};
 
     struct DummyLlm;
 
@@ -371,132 +381,151 @@ mod tests {
         std::fs::write(path, content).expect("write memory file");
     }
 
+    fn runs_query(
+        agent_id: &str,
+        status: Option<&str>,
+        limit: Option<usize>,
+    ) -> Query<SleepRunsQuery> {
+        Query(SleepRunsQuery {
+            agent_id: agent_id.to_string(),
+            status: status.map(str::to_string),
+            limit,
+        })
+    }
+
     #[tokio::test]
-    async fn api_sleep_runs_returns_runs_with_session_count() {
+    async fn api_sleep_runs_returns_the_agents_runs_with_session_count_and_changed_memory() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
-
         insert_sleep_run(
             &web_state.app_state.db,
             "run-1",
             "agent-a",
             r#"[{"chat_id": 1}, {"chat_id": 2}]"#,
         );
-        insert_sleep_run(
-            &web_state.app_state.db,
-            "run-2",
-            "agent-b",
-            r#"[{"chat_id": 3}]"#,
-        );
-
-        let state = AxumState(web_state);
-        let query = Query(HashMap::new());
-        let result = list_sleep_runs(state, query).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
-        let runs = body["runs"].as_array().expect("runs array");
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[1]["id"], "run-1");
-        assert_eq!(runs[1]["session_count"], 2);
-        assert_eq!(runs[0]["id"], "run-2");
-        assert_eq!(runs[0]["session_count"], 1);
-    }
-
-    #[tokio::test]
-    async fn api_sleep_runs_filters_by_agent_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let web_state = test_web_state(&dir);
-
-        insert_sleep_run(&web_state.app_state.db, "run-a", "agent-a", "[]");
+        insert_memory_snapshot(&web_state.app_state.db, "snap-1", "run-1", "agent-a");
         insert_sleep_run(&web_state.app_state.db, "run-b", "agent-b", "[]");
 
-        let state = AxumState(web_state);
-        let query = Query(HashMap::from([(
-            "agent_id".to_string(),
-            "agent-a".to_string(),
-        )]));
-        let result = list_sleep_runs(state, query).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
+        // Act
+        let body = list_sleep_runs(AxumState(web_state), runs_query("agent-a", None, None))
+            .await
+            .expect("ok")
+            .0;
+
+        // Assert
         let runs = body["runs"].as_array().expect("runs array");
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0]["id"], "run-a");
+        assert_eq!(runs[0]["id"], "run-1");
         assert_eq!(runs[0]["agent_id"], "agent-a");
+        assert_eq!(runs[0]["session_count"], 2);
+        assert_eq!(runs[0]["changed_memory"], serde_json::json!(["episodic"]));
     }
 
     #[tokio::test]
     async fn api_sleep_runs_respects_limit() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
+        for id in ["run-1", "run-2", "run-3"] {
+            insert_sleep_run(&web_state.app_state.db, id, "agent-a", "[]");
+        }
 
-        insert_sleep_run(&web_state.app_state.db, "run-1", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-2", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-3", "agent-a", "[]");
+        // Act
+        let body = list_sleep_runs(AxumState(web_state), runs_query("agent-a", None, Some(1)))
+            .await
+            .expect("ok")
+            .0;
 
-        let state = AxumState(web_state);
-        let query = Query(HashMap::from([("limit".to_string(), "1".to_string())]));
-        let result = list_sleep_runs(state, query).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
+        // Assert
+        assert_eq!(body["runs"].as_array().expect("runs array").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_sleep_runs_filters_by_status_list() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        insert_sleep_run(&web_state.app_state.db, "run-ok", "agent-a", "[]");
+        let skipped = web_state
+            .app_state
+            .db
+            .record_skipped_sleep_run("agent-a", SleepRunTrigger::Scheduled, "agent was active")
+            .expect("record skip");
+
+        // Act
+        let body = list_sleep_runs(
+            AxumState(web_state),
+            runs_query("agent-a", Some("skipped,failed"), None),
+        )
+        .await
+        .expect("ok")
+        .0;
+
+        // Assert
         let runs = body["runs"].as_array().expect("runs array");
         assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["id"], skipped.as_str());
+        assert_eq!(runs[0]["error_message"], "agent was active");
     }
 
     #[tokio::test]
-    async fn api_sleep_runs_offset_paginates() {
+    async fn api_sleep_runs_rejects_an_unknown_status() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
 
-        insert_sleep_run(&web_state.app_state.db, "run-1", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-2", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-3", "agent-a", "[]");
+        // Act
+        let result = list_sleep_runs(
+            AxumState(web_state),
+            runs_query("agent-a", Some("finished"), None),
+        )
+        .await;
 
-        let state = AxumState(web_state);
-        let query = Query(HashMap::from([
-            ("limit".to_string(), "1".to_string()),
-            ("offset".to_string(), "1".to_string()),
-        ]));
-        let result = list_sleep_runs(state, query).await.expect("ok");
-        let body = result.0;
-        let runs = body["runs"].as_array().expect("runs array");
-        assert_eq!(runs.len(), 1);
-        // Newest-first ordering: skipping the first page lands on run-2.
-        assert_eq!(runs[0]["id"], "run-2");
+        // Assert
+        let (status, _) = result.expect_err("bad request");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn api_sleep_runs_default_limit() {
+    async fn api_sleep_outlook_reports_pending_messages_against_the_threshold() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
 
-        insert_sleep_run(&web_state.app_state.db, "run-1", "agent-a", "[]");
-        insert_sleep_run(&web_state.app_state.db, "run-2", "agent-a", "[]");
+        // Act
+        let body = get_agent_sleep_outlook(AxumState(web_state), Path("default".to_string()))
+            .await
+            .expect("ok")
+            .0;
 
-        let state = AxumState(web_state);
-        let query = Query(HashMap::new());
-        let result = list_sleep_runs(state, query).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
-        let runs = body["runs"].as_array().expect("runs array");
-        assert_eq!(runs.len(), 2);
+        // Assert
+        let outlook = &body["outlook"];
+        assert_eq!(outlook["scheduler_enabled"], false);
+        assert_eq!(outlook["targeted"], true);
+        assert_eq!(outlook["next_check_at"], serde_json::Value::Null);
+        assert_eq!(outlook["pending_messages"], 0);
+        assert_eq!(outlook["threshold"], SKIP_THRESHOLD);
     }
 
     #[tokio::test]
-    async fn api_sleep_runs_empty() {
+    async fn api_sleep_outlook_rejects_an_unknown_agent() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
 
-        let state = AxumState(web_state);
-        let query = Query(HashMap::new());
-        let result = list_sleep_runs(state, query).await.expect("ok");
-        let body = result.0;
-        assert_eq!(body["ok"], serde_json::json!(true));
-        let runs = body["runs"].as_array().expect("runs array");
-        assert!(runs.is_empty());
+        // Act
+        let result =
+            get_agent_sleep_outlook(AxumState(web_state), Path("nobody".to_string())).await;
+
+        // Assert
+        let (status, _) = result.expect_err("not found");
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn api_sleep_run_detail_returns_run_and_snapshots() {
+        // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let web_state = test_web_state(&dir);
 
@@ -508,15 +537,24 @@ mod tests {
         );
         insert_memory_snapshot(&web_state.app_state.db, "snap-1", "run-1", "agent-a");
 
-        let state = AxumState(web_state);
-        let path = Path("run-1".to_string());
-        let result = get_sleep_run_detail(state, path).await.expect("ok");
+        // Act
+        let result = get_sleep_run_detail(AxumState(web_state), Path("run-1".to_string()))
+            .await
+            .expect("ok");
+
+        // Assert
         let body = result.0;
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["run"]["id"], "run-1");
         assert_eq!(body["run"]["agent_id"], "agent-a");
         assert_eq!(body["run"]["status"], "success");
         assert_eq!(body["run"]["trigger"], "manual");
+        // Same shape as a listed run, so the detail can stand alone.
+        assert_eq!(body["run"]["session_count"], 1);
+        assert_eq!(
+            body["run"]["changed_memory"],
+            serde_json::json!(["episodic"])
+        );
 
         let snapshots = body["snapshots"].as_array().expect("snapshots array");
         assert_eq!(snapshots.len(), 1);
@@ -689,11 +727,9 @@ mod tests {
         .expect("insert partial_failure run");
 
         let state = AxumState(web_state);
-        let query = Query(HashMap::from([(
-            "agent_id".to_string(),
-            "agent-a".to_string(),
-        )]));
-        let result = list_sleep_runs(state, query).await.expect("ok");
+        let result = list_sleep_runs(state, runs_query("agent-a", None, None))
+            .await
+            .expect("ok");
         let body = result.0;
         let runs = body["runs"].as_array().expect("runs array");
         assert_eq!(runs.len(), 1);

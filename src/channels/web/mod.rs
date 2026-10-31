@@ -4,11 +4,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::Json;
 use axum::extract::OriginalUri;
 use axum::http::{HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware;
@@ -27,6 +29,7 @@ mod agents;
 pub(crate) mod auth;
 mod config;
 pub(crate) mod health;
+mod pulse;
 mod sessions;
 mod sleep;
 pub(crate) mod sse;
@@ -41,6 +44,47 @@ pub(crate) const WEB_ACTOR: &str = "web-user";
 pub(crate) const RUN_HISTORY_LIMIT: usize = 512;
 /// Defines how long completed runs remain replayable.
 pub(crate) const RUN_TTL_SECONDS: u64 = 300;
+/// Run listings return this many rows when the request does not say otherwise.
+pub(super) const DEFAULT_RUN_LIMIT: usize = 20;
+/// Upper bound on rows a run listing returns, whatever the request asks for.
+pub(super) const MAX_RUN_LIMIT: usize = 200;
+
+/// JSON error body of a Web API handler.
+pub(super) type ApiError = (StatusCode, Json<serde_json::Value>);
+/// Result of a Web API handler that answers with a JSON object.
+pub(super) type ApiResult = Result<Json<serde_json::Value>, ApiError>;
+
+/// Builds the error body `{"ok": false, "error": code}`.
+pub(super) fn api_error(status: StatusCode, code: &str) -> ApiError {
+    (
+        status,
+        Json(serde_json::json!({"ok": false, "error": code})),
+    )
+}
+
+/// A `400` carrying the reason as its error code.
+pub(super) fn bad_request(code: &str) -> ApiError {
+    api_error(StatusCode::BAD_REQUEST, code)
+}
+
+/// A `404` carrying what was not found as its error code.
+pub(super) fn not_found(code: &str) -> ApiError {
+    api_error(StatusCode::NOT_FOUND, code)
+}
+
+/// A `500` that does not reveal the internal failure.
+pub(super) fn internal_error() -> ApiError {
+    api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+}
+
+/// Parses a comma-separated `status` query value; `None` keeps every status.
+pub(super) fn parse_statuses<T: FromStr>(raw: Option<&str>) -> Result<Vec<T>, ApiError> {
+    raw.into_iter()
+        .flat_map(|raw| raw.split(','))
+        .filter(|status| !status.is_empty())
+        .map(|status| status.parse().map_err(|_| bad_request("invalid_status")))
+        .collect()
+}
 
 /// Adapts the local web surface to the shared channel interface.
 pub(crate) struct WebAdapter;
@@ -474,6 +518,11 @@ fn build_router(web_state: WebState) -> Router {
             "/api/agents/{agent_id}/memory/history",
             get(agent_profile::get_agent_memory_history),
         )
+        .route("/api/agents/{agent_id}/pulse", get(pulse::get_agent_pulse))
+        .route(
+            "/api/agents/{agent_id}/sleep/next",
+            get(sleep::get_agent_sleep_outlook),
+        )
         .route("/api/skills", get(agent_profile::list_skills))
         .route("/api/skills/{name}", get(agent_profile::get_skill))
         .route(
@@ -482,6 +531,8 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route("/api/sleep/runs", get(sleep::list_sleep_runs))
         .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
+        .route("/api/pulse/runs", get(pulse::list_pulse_runs))
+        .route("/api/pulse/runs/{run_id}", get(pulse::get_pulse_run_detail))
         .route("/api/status", get(health::status))
         .route("/telemetry", get(health::telemetry_handler))
         .route_layer(middleware::from_fn_with_state(

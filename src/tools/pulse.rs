@@ -14,10 +14,10 @@ use serde_json::json;
 use crate::config::ConfigManager;
 use crate::conversation::ConversationScope;
 use crate::pulse::definition::{
-    self, DeliverySpec, PulseDefinition, TemporalIntention, TemporalSchedule, check_due,
-    estimate_next_due, format_schedule, generate_due_key, load_pulse_definition,
-    save_pulse_definition, suggest_intention_id,
+    self, DeliverySpec, PulseDefinition, TemporalIntention, TemporalSchedule, format_schedule,
+    load_pulse_definition, save_pulse_definition, suggest_intention_id,
 };
+use crate::pulse::next_due::{NextDue, resolve_next_due};
 use crate::storage::Database;
 use crate::tools::{Tool, ToolErrorKind, ToolExecutionContext, ToolResult};
 
@@ -49,12 +49,8 @@ impl PulseTool {
         Self { config_manager, db }
     }
 
-    /// Explain when this intention will next fire, using the same two-stage
-    /// judgment as the scheduler: the calendar estimate
-    /// ([`estimate_next_due`]) combined with the run history the gate
-    /// ([`Database::has_pulse_due_run`]) enforces. This keeps `list` and
-    /// `add` from promising a firing the scheduler will suppress, and from
-    /// missing one it will perform.
+    /// Explain when this intention will next fire, using the scheduler's own
+    /// judgment ([`resolve_next_due`]).
     ///
     /// # Errors
     /// Returns `StorageError` when run-history lookups fail.
@@ -65,53 +61,17 @@ impl PulseTool {
         timezone: &str,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<String, crate::error::StorageError> {
-        let last_success_at = if matches!(intention.schedule, TemporalSchedule::Interval { .. }) {
-            let agent_id = agent_id.to_string();
-            let intention_id = intention.id.clone();
-            let db = Arc::clone(&self.db);
-            crate::storage::call_blocking(db, move |db| {
-                db.get_last_success_started_at(&agent_id, &intention_id)
-            })
-            .await?
-        } else {
-            None
-        };
-
-        let current_key = generate_due_key(agent_id, intention, now, timezone);
-        let consumed = {
-            let agent_id = agent_id.to_string();
-            let intention_id = intention.id.clone();
-            let key = current_key.clone();
-            let db = Arc::clone(&self.db);
-            crate::storage::call_blocking(db, move |db| {
-                db.has_pulse_due_run(&agent_id, &intention_id, &key)
-            })
-            .await?
-        };
-
-        if check_due(agent_id, intention, now, timezone, last_success_at).due && !consumed {
-            return Ok("due now (pending next scan)".to_string());
-        }
-        if consumed && matches!(intention.schedule, TemporalSchedule::Once { .. }) {
-            return Ok("already attempted (no automatic retry)".to_string());
-        }
-
-        match estimate_next_due(intention, now, timezone, last_success_at) {
-            None => Ok("no upcoming due".to_string()),
-            Some(candidate) => {
-                let candidate_key = generate_due_key(agent_id, intention, candidate, timezone);
-                if consumed && candidate_key == current_key {
-                    Ok("already attempted for current period".to_string())
-                } else if candidate <= now {
-                    Ok("due now (pending next scan)".to_string())
-                } else {
-                    Ok(format!(
-                        "next due {} ({timezone})",
-                        format_local(candidate, timezone)
-                    ))
+        Ok(
+            match resolve_next_due(&self.db, agent_id, intention, timezone, now).await? {
+                NextDue::DueNow => "due now (pending next scan)".to_string(),
+                NextDue::At(instant) => {
+                    format!("next due {} ({timezone})", format_local(instant, timezone))
                 }
-            }
-        }
+                NextDue::AttemptedThisPeriod => "already attempted for current period".to_string(),
+                NextDue::AttemptedOnce => "already attempted (no automatic retry)".to_string(),
+                NextDue::NoUpcoming => "no upcoming due".to_string(),
+            },
+        )
     }
 
     async fn op_list(&self, state_root: &str, agent_id: &str, timezone: &str) -> ToolResult {
@@ -1417,6 +1377,7 @@ mod tests {
                 "lyre",
                 "daily_check",
                 "lyre:daily_check:2026-05-10",
+                "attention",
             )
             .expect("insert run");
 
@@ -1458,6 +1419,7 @@ mod tests {
                 "lyre",
                 "failed_check",
                 "lyre:failed_check:2026-05-10",
+                "attention",
             )
             .expect("insert run");
         env._state
@@ -1471,6 +1433,7 @@ mod tests {
                 "lyre",
                 "window_check",
                 "lyre:window_check:2026-05-10",
+                "attention",
             )
             .expect("insert run");
         {
@@ -1525,7 +1488,13 @@ mod tests {
         let env = build_env();
         env._state
             .db
-            .try_create_pulse_run("run-1", "lyre", "reminder", "lyre:reminder:2026-05-10")
+            .try_create_pulse_run(
+                "run-1",
+                "lyre",
+                "reminder",
+                "lyre:reminder:2026-05-10",
+                "attention",
+            )
             .expect("insert run");
 
         // Act + Assert: an attempted once never retries

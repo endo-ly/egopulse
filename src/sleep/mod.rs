@@ -52,5 +52,5 @@ pub enum SleepBatchError {
     },
 }
 
-pub(crate) use orchestrator::recover_memory_publication;
+pub(crate) use orchestrator::{SKIP_THRESHOLD, recover_memory_publication};
 pub use orchestrator::{run_events_extract, run_sleep_batch};

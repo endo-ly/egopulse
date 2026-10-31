@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -7,7 +8,7 @@ use crate::error::StorageError;
 use super::{
     AgentSessionInfo, CheckpointSourceKind, Database, EpisodeEvent, MemoryFile, MemorySnapshot,
     SleepRun, SleepRunStatus, SleepRunStep, SleepRunTrigger, SleepStepCheckpoint, SleepStepName,
-    SleepStepResult, SleepStepStatus,
+    SleepStepResult, SleepStepStatus, placeholders, status_filter_sql,
 };
 
 fn commit_checkpoints_in_tx(
@@ -390,44 +391,70 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Lists an agent's sleep runs, newest first. A non-empty `statuses`
+    /// narrows the list to those statuses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or query failures.
     pub(crate) fn list_sleep_runs(
         &self,
         agent_id: &str,
-        limit: i64,
-        offset: i64,
+        statuses: &[SleepRunStatus],
+        limit: usize,
     ) -> Result<Vec<SleepRun>, StorageError> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
+        let mut sql = "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
                     source_chats_json, source_digest_md,
                     input_tokens, output_tokens, total_tokens, error_message
              FROM sleep_runs
-             WHERE agent_id = ?1
-             ORDER BY started_at DESC, rowid DESC
-             LIMIT ?2 OFFSET ?3",
-        )?;
-        stmt.query_map(params![agent_id, limit, offset], row_to_sleep_run)?
+             WHERE agent_id = ?"
+            .to_string();
+        let mut values: Vec<rusqlite::types::Value> = vec![agent_id.to_string().into()];
+        if !statuses.is_empty() {
+            sql.push_str(&status_filter_sql(statuses.len()));
+            values.extend(statuses.iter().map(|status| status.to_string().into()));
+        }
+        sql.push_str(" ORDER BY started_at DESC, rowid DESC LIMIT ?");
+        values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
+
+        let mut stmt = conn.prepare(&sql)?;
+        stmt.query_map(rusqlite::params_from_iter(values), row_to_sleep_run)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
 
-    pub(crate) fn list_all_sleep_runs(
+    /// Records a sleep check that decided not to run, as a finished `skipped`
+    /// run carrying the reason. Returns the run id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database connection or execution failures.
+    pub(crate) fn record_skipped_sleep_run(
         &self,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<SleepRun>, StorageError> {
+        agent_id: &str,
+        trigger: SleepRunTrigger,
+        reason: &str,
+    ) -> Result<String, StorageError> {
         let conn = self.get_conn()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT id, agent_id, status, trigger_type, started_at, finished_at,
-                    source_chats_json, source_digest_md,
-                    input_tokens, output_tokens, total_tokens, error_message
-             FROM sleep_runs
-             ORDER BY started_at DESC, rowid DESC
-             LIMIT ?1 OFFSET ?2",
+        let id = uuid::Uuid::new_v4().to_string();
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sleep_runs
+                 (id, agent_id, status, trigger_type, started_at, finished_at,
+                  source_chats_json, source_digest_md,
+                  input_tokens, output_tokens, total_tokens, error_message)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, '[]', NULL, 0, 0, 0, ?6)",
+            params![
+                id,
+                agent_id,
+                SleepRunStatus::Skipped.to_string(),
+                trigger.to_string(),
+                checked_at,
+                reason,
+            ],
         )?;
-        stmt.query_map(params![limit, offset], row_to_sleep_run)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        Ok(id)
     }
 
     /// Marks a sleep run step as running and sets `started_at`.
@@ -1030,6 +1057,54 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Returns, for each of `run_ids` that published changes, the memory files
+    /// it changed in `episodic` → `semantic` → `prospective` order.
+    ///
+    /// The same publication rule as [`Database::list_memory_changes`] applies:
+    /// only runs finalized as `success` / `partial_failure` count, and
+    /// unchanged snapshots are ignored. Runs without changes are absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database access failure.
+    pub(crate) fn changed_memory_files(
+        &self,
+        run_ids: &[String],
+    ) -> Result<HashMap<String, Vec<MemoryFile>>, StorageError> {
+        let mut changed: HashMap<String, Vec<MemoryFile>> = HashMap::new();
+        if run_ids.is_empty() {
+            return Ok(changed);
+        }
+        let conn = self.get_conn()?;
+        let run_id_placeholders = placeholders(run_ids.len());
+        let sql = format!(
+            "SELECT ms.run_id, ms.file
+             FROM memory_snapshots ms
+             JOIN sleep_runs sr ON sr.id = ms.run_id
+             WHERE ms.run_id IN ({run_id_placeholders})
+               AND ms.content_before != ms.content_after
+               AND sr.status IN (?, ?)
+             ORDER BY CASE ms.file
+                 WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 ELSE 2 END"
+        );
+        let mut values: Vec<rusqlite::types::Value> =
+            run_ids.iter().map(|id| id.clone().into()).collect();
+        values.push(SleepRunStatus::Success.to_string().into());
+        values.push(SleepRunStatus::PartialFailure.to_string().into());
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            let run_id: String = row.get(0)?;
+            let file = parse_row_enum!(row, 1, MemoryFile)?;
+            Ok((run_id, file))
+        })?;
+        for row in rows {
+            let (run_id, file) = row?;
+            changed.entry(run_id).or_default().push(file);
+        }
+        Ok(changed)
+    }
+
     /// Inserts a `before == after == base` snapshot for every memory file that
     /// does not yet have one for this run, so the publication bundle has a
     /// complete snapshot set regardless of which steps ran or were skipped.
@@ -1469,43 +1544,59 @@ mod tests {
         let id_a3 = create_test_sleep_run(&db, "agent-a");
         let _id_b1 = create_test_sleep_run(&db, "agent-b");
 
-        let runs = db.list_sleep_runs("agent-a", 2, 0).expect("list");
+        let runs = db.list_sleep_runs("agent-a", &[], 2).expect("list");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, id_a3);
         assert_eq!(runs[1].id, id_a2);
     }
 
     #[test]
-    fn list_all_sleep_runs_returns_all_agents() {
+    fn list_sleep_runs_filters_by_status() {
+        // Arrange
         let (db, _dir) = test_db();
+        let running = create_test_sleep_run(&db, "agent-a");
+        let skipped = db
+            .record_skipped_sleep_run("agent-a", SleepRunTrigger::Scheduled, "agent was active")
+            .expect("record skip");
 
-        let id_a = create_test_sleep_run(&db, "agent-a");
-        let id_b = create_test_sleep_run(&db, "agent-b");
-        let id_c = create_test_sleep_run(&db, "agent-c");
+        // Act
+        let only_skipped = db
+            .list_sleep_runs("agent-a", &[SleepRunStatus::Skipped], 10)
+            .expect("skipped");
+        let both = db
+            .list_sleep_runs(
+                "agent-a",
+                &[SleepRunStatus::Running, SleepRunStatus::Skipped],
+                10,
+            )
+            .expect("both");
 
-        let runs = db.list_all_sleep_runs(10, 0).expect("list all");
-        assert_eq!(runs.len(), 3);
-
-        assert_eq!(runs[0].id, id_c);
-        assert_eq!(runs[0].agent_id, "agent-c");
-        assert_eq!(runs[1].id, id_b);
-        assert_eq!(runs[1].agent_id, "agent-b");
-        assert_eq!(runs[2].id, id_a);
-        assert_eq!(runs[2].agent_id, "agent-a");
+        // Assert
+        assert_eq!(
+            only_skipped.iter().map(|run| &run.id).collect::<Vec<_>>(),
+            [&skipped]
+        );
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().any(|run| run.id == running));
     }
 
     #[test]
-    fn list_all_sleep_runs_respects_limit() {
+    fn record_skipped_sleep_run_stores_a_finished_run_with_the_reason() {
+        // Arrange
         let (db, _dir) = test_db();
 
-        create_test_sleep_run(&db, "agent-a");
-        create_test_sleep_run(&db, "agent-b");
-        create_test_sleep_run(&db, "agent-c");
-        create_test_sleep_run(&db, "agent-d");
-        create_test_sleep_run(&db, "agent-e");
+        // Act
+        let id = db
+            .record_skipped_sleep_run("agent-a", SleepRunTrigger::Scheduled, "pending 3 <= 64")
+            .expect("record skip");
 
-        let runs = db.list_all_sleep_runs(3, 0).expect("list all");
-        assert_eq!(runs.len(), 3);
+        // Assert
+        let run = db.get_sleep_run(&id).expect("query").expect("run");
+        assert_eq!(run.status, SleepRunStatus::Skipped);
+        assert_eq!(run.trigger, SleepRunTrigger::Scheduled);
+        assert_eq!(run.finished_at.as_deref(), Some(run.started_at.as_str()));
+        assert_eq!(run.error_message.as_deref(), Some("pending 3 <= 64"));
+        assert!(db.list_sleep_run_steps(&id).expect("steps").is_empty());
     }
 
     // ---------------------------------------------------------------------------
@@ -1570,7 +1661,8 @@ mod tests {
     // Memory change history
     // ---------------------------------------------------------------------------
 
-    /// Inserts a run with one snapshot; `change` is `(file, before, after)`.
+    /// Inserts one snapshot, creating its run on first use; `change` is
+    /// `(file, before, after)`.
     fn insert_run_with_snapshot(
         db: &Database,
         run_id: &str,
@@ -1582,7 +1674,7 @@ mod tests {
         let (file, before, after) = change;
         let conn = db.get_conn().expect("pool");
         conn.execute(
-            "INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+            "INSERT OR IGNORE INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
              VALUES (?1, ?2, ?3, 'scheduled', ?4)",
             params![run_id, agent_id, status, created_at],
         )
@@ -1663,5 +1755,35 @@ mod tests {
         // Assert
         let run_ids: Vec<_> = changes.iter().map(|c| c.run_id.as_str()).collect();
         assert_eq!(run_ids, vec!["run-3", "run-2"]);
+    }
+
+    #[test]
+    fn changed_memory_files_lists_published_changes_per_run_in_layer_order() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let fixtures = [
+            ("both", "success", ("semantic", "a", "b")),
+            ("both", "success", ("episodic", "a", "b")),
+            ("partial", "partial_failure", ("prospective", "a", "b")),
+            ("unchanged", "success", ("episodic", "a", "a")),
+            ("pending", "running", ("episodic", "a", "b")),
+            ("not-asked", "success", ("episodic", "a", "b")),
+        ];
+        for (day, (run_id, status, change)) in (1..).zip(fixtures) {
+            let created_at = format!("2026-10-{day:02}T03:00:00+00:00");
+            insert_run_with_snapshot(&db, run_id, "lyre", status, change, &created_at);
+        }
+        let asked = ["both", "partial", "unchanged", "pending"].map(String::from);
+
+        // Act
+        let changed = db.changed_memory_files(&asked).expect("changed");
+
+        // Assert
+        assert_eq!(changed.len(), 2);
+        assert_eq!(
+            changed["both"],
+            vec![MemoryFile::Episodic, MemoryFile::Semantic]
+        );
+        assert_eq!(changed["partial"], vec![MemoryFile::Prospective]);
     }
 }
