@@ -5,7 +5,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use super::definition::{
-    TemporalIntention, TemporalSchedule, check_due, estimate_next_due, generate_due_key,
+    TemporalIntention, TemporalSchedule, check_due, estimate_next_day_at, estimate_next_due,
+    generate_due_key,
 };
 use crate::error::StorageError;
 use crate::storage::Database;
@@ -78,7 +79,17 @@ pub(crate) async fn resolve_next_due(
             Some(candidate) => {
                 let candidate_key = generate_due_key(agent_id, intention, candidate, timezone);
                 if consumed && candidate_key == current_key {
-                    NextDue::AttemptedThisPeriod
+                    match &intention.schedule {
+                        // A daily, weekly or once period is spent by its run. An
+                        // interval window stays open until a run succeeds and the
+                        // key advances with the local date, so the scheduler fires
+                        // it again tomorrow instead of never within this period.
+                        TemporalSchedule::Interval { at, .. } => {
+                            estimate_next_day_at(at, now, timezone)
+                                .map_or(NextDue::AttemptedThisPeriod, NextDue::At)
+                        }
+                        _ => NextDue::AttemptedThisPeriod,
+                    }
                 } else if candidate <= now {
                     NextDue::DueNow
                 } else {
@@ -87,4 +98,86 @@ pub(crate) async fn resolve_next_due(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_util::test_config;
+
+    fn utc(year: i32, month: u32, day: u32, hour: u32) -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, year, month, day, hour, 0, 0)
+            .single()
+            .expect("instant")
+    }
+
+    fn database() -> (Arc<Database>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8"));
+        let db = Arc::new(Database::new(&config.db_path()).expect("db"));
+        (db, dir)
+    }
+
+    fn intention(schedule: TemporalSchedule) -> TemporalIntention {
+        TemporalIntention {
+            id: "check".to_string(),
+            enabled: true,
+            schedule,
+            attention: String::new(),
+            delivery: None,
+        }
+    }
+
+    fn interval(days: u32, at: &str) -> TemporalIntention {
+        intention(TemporalSchedule::Interval {
+            interval_days: days,
+            at: at.to_string(),
+        })
+    }
+
+    async fn resolve(
+        db: &Arc<Database>,
+        intention: &TemporalIntention,
+        now: DateTime<Utc>,
+    ) -> NextDue {
+        resolve_next_due(db, "lyre", intention, "UTC", now)
+            .await
+            .expect("resolve")
+    }
+
+    #[tokio::test]
+    async fn interval_that_already_ran_today_fires_again_tomorrow() {
+        // Arrange: an open window that already had its run today.
+        let (db, _dir) = database();
+        let intention = interval(1, "09:00");
+        let now = utc(2026, 5, 10, 10);
+        let key = generate_due_key("lyre", &intention, now, "UTC");
+        db.try_create_pulse_run("run-1", "lyre", "check", &key, "x")
+            .expect("run");
+
+        // Act
+        let next = resolve(&db, &intention, now).await;
+
+        // Assert: the scheduler retries once the local date advances, not never.
+        assert_eq!(next, NextDue::At(utc(2026, 5, 11, 9)));
+    }
+
+    #[tokio::test]
+    async fn daily_that_already_ran_today_has_no_firing_left_today() {
+        // Arrange: today's slot is spent before its time arrives.
+        let (db, _dir) = database();
+        let intention = intention(TemporalSchedule::Daily {
+            at: "09:00".to_string(),
+        });
+        let now = utc(2026, 5, 10, 8);
+        let key = generate_due_key("lyre", &intention, now, "UTC");
+        db.try_create_pulse_run("run-1", "lyre", "check", &key, "x")
+            .expect("run");
+
+        // Act
+        let next = resolve(&db, &intention, now).await;
+
+        // Assert: a daily period is spent by its attempt.
+        assert_eq!(next, NextDue::AttemptedThisPeriod);
+    }
 }

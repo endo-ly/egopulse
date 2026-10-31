@@ -868,6 +868,22 @@ pub(crate) fn estimate_next_due(
 }
 
 /// Parse a `HH:MM` time string into a [`NaiveTime`].
+/// The firing on the local day after `now` at `at`.
+///
+/// An interval window stays open until a run succeeds and the scheduler's
+/// `due_key` is the local date, so a day that already ran is retried the next
+/// day at the same time.
+pub(crate) fn estimate_next_day_at(
+    at: &str,
+    now: DateTime<Utc>,
+    timezone: &str,
+) -> Option<DateTime<Utc>> {
+    let tz: Tz = timezone.parse().ok()?;
+    let time = parse_hhmm(at)?;
+    let tomorrow = now.with_timezone(&tz).date_naive().succ_opt()?;
+    local_datetime(&tz, tomorrow, time)
+}
+
 fn parse_hhmm(at: &str) -> Option<NaiveTime> {
     NaiveTime::parse_from_str(at, "%H:%M").ok()
 }

@@ -707,7 +707,7 @@ GET /api/agents/{agent_id}/pulse
 |---|---|
 | `scheduled` | `at` に発火する |
 | `due_now` | 時刻を過ぎ、次のスキャンで発火する |
-| `attempted_this_period` | 今の期間は実行済み |
+| `attempted_this_period` | 今の期間は実行済み（`interval` は翌日に再試行できるので、その場合は `scheduled` で翌日の時刻を返す） |
 | `attempted_once` | `once` が実行済み（自動リトライなし） |
 | `no_upcoming` | 今後の発火がない |
 

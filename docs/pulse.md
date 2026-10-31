@@ -246,7 +246,7 @@ Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エー�
 - **並行書き込みは直列化される**: load → 変更 → save をプロセス共通の排他ゲート内で行うため、複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない
 - **`add` の delivery デフォルトは現在の会話**。TUI / Web など送信可能チャネル以外で頼まれた場合は intention を作らず、Discord / Telegram の配送先を問い返す
 - **同日の再発火はしない**: daily の `due_key` は日付単位のため、09:00 発火済みの日に 10:00 に変更しても当日は再発火しない。再発火させたい場合は id を変える
-- **発火見込みの表示は scheduler と同じ判定**: `list` / `add` の次回発火テキストは、カレンダー候補（`estimate_next_due`）に実行履歴（`pulse_runs` / due_key）を加えた scheduler と同一の判定で作る。時刻到達かつ未実行は `due now (pending next scan)`、候補が実行済み期間に属する場合は `already attempted for current period`、`once` 実行済みは `already attempted (no automatic retry)` と表示する。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す
+- **発火見込みの表示は scheduler と同じ判定**: `list` / `add` の次回発火テキストは、カレンダー候補（`estimate_next_due`）に実行履歴（`pulse_runs` / due_key）を加えた scheduler と同一の判定で作る。時刻到達かつ未実行は `due now (pending next scan)`、候補が実行済み期間に属する場合は `already attempted for current period`（`interval` は翌日に再試行できるので、代わりに翌日の時刻を次回発火として示す）、`once` 実行済みは `already attempted (no automatic retry)` と表示する。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す
 - **`once` は成功時に自動アーカイブされる**: run 成功後、実行時点の内容が現在の PULSE.yaml と一致する場合にのみ PULSE.yaml から除去される。activation 中にユーザーが再スケジュールした場合はそちらを優先して残す。失敗・skipped の場合はファイルに残り、`list` で可視化されるため、エージェントが原因を説明して `remove` → `add` で再設定する。自動リトライはしない
 - **v1 は自 agent のみ操作可能**（他 agent の PULSE.yaml は操作しない）。将来的な委譲拡張の余地は `agent_id` 引数の追加として残す
 - 編集は次の tick で反映される。再起動は不要。保存が成功すると scheduler へ起床信号が送られるため、`once` を追加した場合も次の tick を待たずに指定時刻へ起床する

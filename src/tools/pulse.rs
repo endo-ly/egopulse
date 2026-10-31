@@ -1455,7 +1455,8 @@ mod tests {
             )
             .expect("mark success");
 
-        // Act + Assert: a failed attempt still consumes the day — no "due now"
+        // Act + Assert: a failed attempt consumes the day, so the next firing
+        // is tomorrow's slot rather than "due now" or nothing at all.
         let text = env
             .tool
             .next_due_text(
@@ -1466,7 +1467,7 @@ mod tests {
             )
             .await
             .expect("next due");
-        assert_eq!(text, "already attempted for current period");
+        assert_eq!(text, "next due 2026-05-11 09:00 (UTC)");
 
         // Act + Assert: a success anchors the next window three days out
         let text = env
