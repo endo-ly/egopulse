@@ -141,7 +141,7 @@ jobs:
             asset_triple: aarch64-unknown-linux-gnu
 
           - label: macos-arm64
-            os: macos-14
+            os: macos-15
             bin: egopulse
             target_triple: aarch64-apple-darwin
             asset_triple: aarch64-apple-darwin
