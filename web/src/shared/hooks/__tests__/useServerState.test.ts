@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { renderHook, waitFor, cleanup } from "@testing-library/react";
-import { useServerState, invalidateQueries } from "../useServerState";
+import { renderHook, waitFor, cleanup, act } from "@testing-library/react";
+import { useServerState, invalidateQueries, invalidateQuery } from "../useServerState";
 
 describe("useServerState", () => {
   afterEach(() => {
@@ -65,6 +65,75 @@ describe("useServerState", () => {
       () => expect(fetcher.mock.calls.length).toBeGreaterThan(countAfterHide),
       { timeout: 2000 },
     );
+  });
+
+  it("keeps polling when the caller passes a new fetcher on every render", async () => {
+    // Arrange
+    const fetcher = vi.fn().mockResolvedValue("stable");
+    const { rerender } = renderHook(
+      ({ tick }: { tick: number }) =>
+        useServerState("test-stable-poll", () => fetcher(tick), { pollIntervalMs: 40 }),
+      { initialProps: { tick: 0 } },
+    );
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(1));
+
+    // Act: re-render more often than the poll interval, as a parent that
+    // animates or polls on its own does.
+    for (let tick = 1; tick <= 12; tick += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      rerender({ tick });
+    }
+
+    // Assert: those renders did not restart the timer, so it kept firing
+    expect(fetcher.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("ignores a response that arrives after a newer request", async () => {
+    // Arrange: two requests whose answers arrive on demand
+    const pending: Array<(value: string) => void> = [];
+    const fetcher = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    const { result } = renderHook(() => useServerState("test-race", fetcher));
+    await waitFor(() => expect(pending).toHaveLength(1));
+
+    // Act: a second request starts before the first one answers, and the newer
+    // one answers first
+    act(() => result.current.invalidate());
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () => pending[1]("newer"));
+    await waitFor(() => expect(result.current.data).toBe("newer"));
+    await act(async () => pending[0]("stale"));
+
+    // Assert: the late answer from the older request is dropped
+    expect(result.current.data).toBe("newer");
+  });
+
+  it("drops a response that was in flight when the cache was invalidated", async () => {
+    // Arrange
+    const pending: Array<(value: string) => void> = [];
+    const fetcher = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          pending.push(resolve);
+        }),
+    );
+    const { result } = renderHook(() => useServerState("test-invalidate-race", fetcher));
+    await waitFor(() => expect(pending).toHaveLength(1));
+
+    // Act: the cache is dropped while the first request is still running
+    act(() => invalidateQuery("test-invalidate-race"));
+    await waitFor(() => expect(pending.length).toBeGreaterThanOrEqual(2));
+    await act(async () => pending[0]("stale"));
+
+    // Assert: the dropped request must not resurrect the cache, and the request
+    // that replaced it still lands
+    expect(result.current.data).toBeUndefined();
+    await act(async () => pending[1]("fresh"));
+    await waitFor(() => expect(result.current.data).toBe("fresh"));
   });
 
   it("revalidates cached data on mount while keeping it visible", async () => {
