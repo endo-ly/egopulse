@@ -226,22 +226,16 @@ export function WebUI() {
     return () => globalThis.removeEventListener("popstate", onPopState);
   }, []);
 
+  // Selecting a session always shows it in Chat, from whichever screen asked.
   const handleSelectSession = useCallback(
     (key: string) => {
+      setActiveTab("chat");
       setSelectedSession(key);
       setSessionExplicit(true);
       setDraftSessionKey(createSessionKey());
       navigateTo({ tab: "chat", agentId: selectedAgent, sessionKey: key });
     },
     [selectedAgent],
-  );
-
-  const handleOpenSession = useCallback(
-    (key: string) => {
-      setActiveTab("chat");
-      handleSelectSession(key);
-    },
-    [handleSelectSession],
   );
 
   const handleSelectAgent = useCallback(
@@ -500,7 +494,7 @@ export function WebUI() {
               view={scheduleView}
               sessions={sessions}
               onChangeView={handleChangeScheduleView}
-              onOpenSession={handleOpenSession}
+              onOpenSession={handleSelectSession}
             />
           ) : activeTab === "metrics" || activeTab === "config" ? (
             <EmptyState
