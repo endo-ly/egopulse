@@ -113,8 +113,8 @@ interface Segment {
  * one is split on the lines that appear exactly once on each side, because a
  * line without duplicates is the context a reader recognizes as unchanged;
  * the pieces between them are then small enough to align exactly. A region
- * without such a line is halved until its pieces can be aligned exactly, and
- * one that shares no line at all is reported as replaced.
+ * that shares only repeated lines is matched line by line to the next place
+ * each line appears, which still pairs a moved block with its counterpart.
  *
  * The diff and the line counts both come from this walk, so the counts shown
  * for a change always describe the diff it expands to.
@@ -151,27 +151,7 @@ function alignRegion(before: string[], after: string[], emit: (line: DiffLine) =
 
     const anchors = uniqueLineAnchors(before, beforeRange, after, afterRange);
     if (anchors.length === 0) {
-      if (!sharesAnyLine(before, beforeRange, after, afterRange)) {
-        for (let index = beforeRange.start; index < beforeRange.end; index += 1) {
-          emit({ type: "remove", content: before[index] });
-        }
-        for (let index = afterRange.start; index < afterRange.end; index += 1) {
-          emit({ type: "add", content: after[index] });
-        }
-        continue;
-      }
-      // Only repeated lines in common: halve the region so each half becomes
-      // small enough to align exactly.
-      const beforeMiddle = beforeRange.start + (rows >> 1);
-      const afterMiddle = afterRange.start + (columns >> 1);
-      pending.push({
-        before: { start: beforeMiddle, end: beforeRange.end },
-        after: { start: afterMiddle, end: afterRange.end },
-      });
-      pending.push({
-        before: { start: beforeRange.start, end: beforeMiddle },
-        after: { start: afterRange.start, end: afterMiddle },
-      });
+      emitRepeatedLineDiff(before, beforeRange, after, afterRange, emit);
       continue;
     }
 
@@ -255,21 +235,57 @@ function uniqueLineAnchors(
   return chain.reverse();
 }
 
-/** Whether the two ranges have at least one line in common. */
-function sharesAnyLine(
+/**
+ * Aligns a region whose lines all repeat by matching each line to the next
+ * place the same line appears on the other side. Repeated lines carry no
+ * context to split on, so this is as far as the region can be aligned, but it
+ * still pairs a moved or reordered block with its counterpart instead of
+ * reporting the whole region as replaced.
+ */
+function emitRepeatedLineDiff(
   before: string[],
   beforeRange: Range,
   after: string[],
   afterRange: Range,
-): boolean {
-  const afterLines = new Set<string>();
+  emit: (line: DiffLine) => void,
+): void {
+  const positions = new Map<string, number[]>();
   for (let index = afterRange.start; index < afterRange.end; index += 1) {
-    afterLines.add(after[index]);
+    const line = after[index];
+    const found = positions.get(line);
+    if (found === undefined) positions.set(line, [index]);
+    else found.push(index);
   }
-  for (let index = beforeRange.start; index < beforeRange.end; index += 1) {
-    if (afterLines.has(before[index])) return true;
+
+  let afterIndex = afterRange.start;
+  for (let beforeIndex = beforeRange.start; beforeIndex < beforeRange.end; beforeIndex += 1) {
+    const found = positions.get(before[beforeIndex]);
+    const match = found === undefined ? undefined : firstAtOrAfter(found, afterIndex);
+    if (match === undefined) {
+      emit({ type: "remove", content: before[beforeIndex] });
+      continue;
+    }
+    for (; afterIndex < match; afterIndex += 1) {
+      emit({ type: "add", content: after[afterIndex] });
+    }
+    emit(unchangedLine(before[beforeIndex]));
+    afterIndex = match + 1;
   }
-  return false;
+  for (; afterIndex < afterRange.end; afterIndex += 1) {
+    emit({ type: "add", content: after[afterIndex] });
+  }
+}
+
+/** The first value in the ascending `values` that is at least `value`. */
+function firstAtOrAfter(values: number[], value: number): number | undefined {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = (low + high) >> 1;
+    if (values[middle] < value) low = middle + 1;
+    else high = middle;
+  }
+  return values[low];
 }
 
 /** Index of each line that occurs once in the range; repeated lines are absent. */

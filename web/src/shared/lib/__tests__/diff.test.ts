@@ -39,18 +39,28 @@ describe("countLineChanges", () => {
     expect(counts).toEqual({ add: 10, remove: 10 });
   });
 
-  it("keeps_a_region_of_repeated_lines_local", () => {
-    // Arrange: two texts that share lines but never a unique one, so they offer
-    // no context to align on
+  it("aligns_a_swapped_block_of_repeated_lines", () => {
+    // Arrange: two blocks swapped, with no line unique to either side
+    const before = `${text(600, () => "A")}\n${text(600, () => "B")}`;
+    const after = `${text(600, () => "B")}\n${text(600, () => "A")}`;
+
+    // Act
+    const counts = countLineChanges(before, after);
+
+    // Assert: one block moved, so it counts once as removed and once as added
+    expect(counts).toEqual({ add: 600, remove: 600 });
+  });
+
+  it("aligns_a_shifted_run_of_repeated_lines", () => {
+    // Arrange: two lines alternating in opposite orders
     const before = text(2000, (index) => (index % 2 === 0 ? "x" : "y"));
     const after = text(2000, (index) => (index % 2 === 0 ? "y" : "x"));
 
     // Act
     const counts = countLineChanges(before, after);
 
-    // Assert: the shift is reported where it happens, not as a full rewrite
-    expect(counts.add).toBeLessThan(50);
-    expect(counts.remove).toBeLessThan(50);
+    // Assert: the run is shifted by one line, not rewritten
+    expect(counts).toEqual({ add: 1, remove: 1 });
   });
 
   it("adds_a_large_number_of_lines_without_exceeding_the_argument_limit", () => {
@@ -130,6 +140,23 @@ describe("computeLineDiff", () => {
     const diff = computeLineDiff(before, after);
 
     // Assert: unchanged lines carry both sides, so each side rebuilds exactly
+    const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
+    const rebuiltAfter = diff.flatMap((line) =>
+      line.type === "remove" ? [] : [lineContent(line)],
+    );
+    expect(rebuiltBefore.join("\n")).toBe(before);
+    expect(rebuiltAfter.join("\n")).toBe(after);
+  });
+
+  it("rebuilds_both_sides_of_a_region_of_repeated_lines", () => {
+    // Arrange: a moved block of repeated lines, so no line is unique
+    const before = `${text(600, () => "A")}\n${text(600, () => "B")}`;
+    const after = `${text(600, () => "B")}\n${text(600, () => "A")}`;
+
+    // Act
+    const diff = computeLineDiff(before, after);
+
+    // Assert
     const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
     const rebuiltAfter = diff.flatMap((line) =>
       line.type === "remove" ? [] : [lineContent(line)],
