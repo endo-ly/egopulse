@@ -392,7 +392,8 @@ impl Database {
     }
 
     /// Lists an agent's sleep runs, newest first. A non-empty `statuses`
-    /// narrows the list to those statuses.
+    /// narrows the list to those statuses, and `before` to runs started
+    /// earlier than it, so a caller can page back through the whole history.
     ///
     /// # Errors
     ///
@@ -401,6 +402,7 @@ impl Database {
         &self,
         agent_id: &str,
         statuses: &[SleepRunStatus],
+        before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SleepRun>, StorageError> {
         let conn = self.get_conn()?;
@@ -414,6 +416,10 @@ impl Database {
         if !statuses.is_empty() {
             sql.push_str(&status_filter_sql(statuses.len()));
             values.extend(statuses.iter().map(|status| status.to_string().into()));
+        }
+        if let Some(before) = before {
+            sql.push_str(" AND started_at < ?");
+            values.push(before.to_string().into());
         }
         sql.push_str(" ORDER BY started_at DESC, rowid DESC LIMIT ?");
         values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
@@ -1544,7 +1550,7 @@ mod tests {
         let id_a3 = create_test_sleep_run(&db, "agent-a");
         let _id_b1 = create_test_sleep_run(&db, "agent-b");
 
-        let runs = db.list_sleep_runs("agent-a", &[], 2).expect("list");
+        let runs = db.list_sleep_runs("agent-a", &[], None, 2).expect("list");
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[0].id, id_a3);
         assert_eq!(runs[1].id, id_a2);
@@ -1561,12 +1567,13 @@ mod tests {
 
         // Act
         let only_skipped = db
-            .list_sleep_runs("agent-a", &[SleepRunStatus::Skipped], 10)
+            .list_sleep_runs("agent-a", &[SleepRunStatus::Skipped], None, 10)
             .expect("skipped");
         let both = db
             .list_sleep_runs(
                 "agent-a",
                 &[SleepRunStatus::Running, SleepRunStatus::Skipped],
+                None,
                 10,
             )
             .expect("both");
@@ -1578,6 +1585,41 @@ mod tests {
         );
         assert_eq!(both.len(), 2);
         assert!(both.iter().any(|run| run.id == running));
+    }
+
+    #[test]
+    fn list_sleep_runs_pages_back_through_the_history() {
+        // Arrange
+        let (db, _dir) = test_db();
+        insert_run_with_snapshot(
+            &db,
+            "newer",
+            "agent-a",
+            "success",
+            ("episodic", "a", "b"),
+            "2026-10-03T03:00:00+00:00",
+        );
+        insert_run_with_snapshot(
+            &db,
+            "older",
+            "agent-a",
+            "success",
+            ("episodic", "a", "b"),
+            "2026-10-02T03:00:00+00:00",
+        );
+        let ids = |runs: Vec<SleepRun>| runs.into_iter().map(|run| run.id).collect::<Vec<_>>();
+
+        // Act
+        let first_page = db
+            .list_sleep_runs("agent-a", &[], None, 1)
+            .expect("first page");
+        let next_page = db
+            .list_sleep_runs("agent-a", &[], Some("2026-10-03T03:00:00+00:00"), 10)
+            .expect("next page");
+
+        // Assert: the cursor is exclusive, so pages never overlap.
+        assert_eq!(ids(first_page), ["newer"]);
+        assert_eq!(ids(next_page), ["older"]);
     }
 
     #[test]

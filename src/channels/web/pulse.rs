@@ -12,7 +12,7 @@ use serde::Deserialize;
 use super::agents::resolved_agent_id;
 use super::{
     ApiError, ApiResult, DEFAULT_RUN_LIMIT, MAX_RUN_LIMIT, WebState, internal_error, not_found,
-    parse_statuses,
+    parse_before, parse_statuses,
 };
 use crate::pulse::capsule::{HomeSurface, resolve_home_surface};
 use crate::pulse::definition::{
@@ -29,6 +29,8 @@ pub(super) struct PulseRunsQuery {
     agent_id: String,
     /// Comma-separated statuses; every status when absent.
     status: Option<String>,
+    /// Only runs started before this instant, for paging back through history.
+    before: Option<String>,
     limit: Option<usize>,
 }
 
@@ -117,7 +119,13 @@ pub(super) async fn get_agent_pulse(
             let agent = agent_id.as_str().to_string();
             let intention_id = intention.id.clone();
             call_blocking(Arc::clone(&state.app_state.db), move |db| {
-                db.list_pulse_runs(&agent, Some(&intention_id), &[], RECENT_RUNS_PER_INTENTION)
+                db.list_pulse_runs(
+                    &agent,
+                    Some(&intention_id),
+                    &[],
+                    None,
+                    RECENT_RUNS_PER_INTENTION,
+                )
             })
             .await
             .map_err(storage_error)?
@@ -147,20 +155,31 @@ pub(super) async fn get_agent_pulse(
 /// Query parameters:
 /// - `agent_id`: the agent whose runs to list
 /// - `status` (optional): comma-separated statuses to keep
+/// - `before` (optional): only runs started before this RFC 3339 instant, so
+///   the caller can page back through the whole history
 /// - `limit` (optional, default 20, at most 200): maximum number of runs
+///
+/// `has_more` says whether older runs exist beyond the returned page.
 ///
 /// # Errors
 ///
-/// Returns `400` for an unknown status and `500` on database errors.
+/// Returns `400` for an unknown status or `before` value and `500` on database
+/// errors.
 pub(super) async fn list_pulse_runs(
     State(state): State<WebState>,
     Query(query): Query<PulseRunsQuery>,
 ) -> ApiResult {
     let statuses = parse_statuses::<PulseRunStatus>(query.status.as_deref())?;
+    let before = parse_before(query.before.as_deref())?;
     let limit = query.limit.unwrap_or(DEFAULT_RUN_LIMIT).min(MAX_RUN_LIMIT);
     let agent_id = query.agent_id;
-    let runs = call_blocking(Arc::clone(&state.app_state.db), move |db| {
-        db.list_pulse_runs(&agent_id, None, &statuses, limit)
+    let (runs, has_more) = call_blocking(Arc::clone(&state.app_state.db), move |db| {
+        // One row past the page tells us whether older runs exist.
+        let mut runs =
+            db.list_pulse_runs(&agent_id, None, &statuses, before.as_deref(), limit + 1)?;
+        let has_more = runs.len() > limit;
+        runs.truncate(limit);
+        Ok((runs, has_more))
     })
     .await
     .map_err(storage_error)?;
@@ -168,6 +187,7 @@ pub(super) async fn list_pulse_runs(
     Ok(Json(serde_json::json!({
         "ok": true,
         "runs": runs.iter().map(pulse_run_json).collect::<Vec<_>>(),
+        "has_more": has_more,
     })))
 }
 
@@ -351,6 +371,7 @@ mod tests {
         Query(PulseRunsQuery {
             agent_id: "default".to_string(),
             status: status.map(str::to_string),
+            before: None,
             limit: None,
         })
     }
@@ -477,6 +498,89 @@ intentions:
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["id"], "run-skip");
         assert_eq!(runs[0]["error_message"], "no sendable home surface");
+    }
+
+    #[tokio::test]
+    async fn pulse_runs_report_whether_older_runs_exist() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = web_state(&dir);
+        let db = &state.app_state.db;
+        db.try_create_pulse_run("run-1", "default", "morning", "k1", "x")
+            .expect("run");
+        db.try_create_pulse_run("run-2", "default", "morning", "k2", "x")
+            .expect("run");
+
+        let page = |limit: usize| {
+            let state = state.clone();
+            async move {
+                list_pulse_runs(
+                    AxumState(state),
+                    Query(PulseRunsQuery {
+                        agent_id: "default".to_string(),
+                        status: None,
+                        before: None,
+                        limit: Some(limit),
+                    }),
+                )
+                .await
+                .expect("ok")
+                .0
+            }
+        };
+
+        // Act
+        let first = page(1).await;
+        let all = page(10).await;
+
+        // Assert
+        assert_eq!(first["runs"].as_array().expect("runs").len(), 1);
+        assert_eq!(first["has_more"], serde_json::json!(true));
+        assert_eq!(all["runs"].as_array().expect("runs").len(), 2);
+        assert_eq!(all["has_more"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn pulse_runs_page_back_from_the_before_cursor() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = web_state(&dir);
+        let db = &state.app_state.db;
+        db.try_create_pulse_run("run-old", "default", "morning", "k1", "x")
+            .expect("run");
+        db.try_create_pulse_run("run-new", "default", "morning", "k2", "x")
+            .expect("run");
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "UPDATE pulse_runs SET started_at = '2026-10-01T09:00:00+00:00' WHERE id = 'run-old'",
+            [],
+        )
+        .expect("pin old");
+        conn.execute(
+            "UPDATE pulse_runs SET started_at = '2026-10-02T09:00:00+00:00' WHERE id = 'run-new'",
+            [],
+        )
+        .expect("pin new");
+
+        // Act
+        let older = list_pulse_runs(
+            AxumState(state),
+            Query(PulseRunsQuery {
+                agent_id: "default".to_string(),
+                status: None,
+                before: Some("2026-10-02T09:00:00+00:00".to_string()),
+                limit: None,
+            }),
+        )
+        .await
+        .expect("ok")
+        .0;
+
+        // Assert: the cursor is exclusive.
+        let runs = older["runs"].as_array().expect("runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["id"], "run-old");
+        assert_eq!(older["has_more"], serde_json::json!(false));
     }
 
     #[tokio::test]

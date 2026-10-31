@@ -15,7 +15,7 @@ use crate::storage::{MemoryFile, SleepRun, SleepRunStatus, SleepStepName, call_b
 use super::agents::resolved_agent_id;
 use super::{
     ApiResult, DEFAULT_RUN_LIMIT, MAX_RUN_LIMIT, WebState, bad_request, internal_error, not_found,
-    parse_statuses,
+    parse_before, parse_statuses,
 };
 
 #[derive(Deserialize)]
@@ -23,6 +23,8 @@ pub(super) struct SleepRunsQuery {
     agent_id: String,
     /// Comma-separated statuses; every status when absent.
     status: Option<String>,
+    /// Only runs started before this instant, for paging back through history.
+    before: Option<String>,
     limit: Option<usize>,
 }
 
@@ -31,28 +33,36 @@ pub(super) struct SleepRunsQuery {
 /// Query parameters:
 /// - `agent_id`: the agent whose runs to list
 /// - `status` (optional): comma-separated statuses to keep
+/// - `before` (optional): only runs started before this RFC 3339 instant, so
+///   the caller can page back through the whole history
 /// - `limit` (optional, default 20, at most 200): maximum number of runs
 ///
-/// Each run carries `changed_memory`: the memory files it published changes
-/// to (see [`crate::storage::Database::changed_memory_files`]).
+/// `has_more` says whether older runs exist beyond the returned page. Each run
+/// carries `changed_memory`: the memory files it published changes to (see
+/// [`crate::storage::Database::changed_memory_files`]).
 ///
 /// # Errors
 ///
-/// Returns `400` for an unknown status and `500` on database errors.
+/// Returns `400` for an unknown status or `before` value and `500` on database
+/// errors.
 pub(super) async fn list_sleep_runs(
     State(state): State<WebState>,
     Query(query): Query<SleepRunsQuery>,
 ) -> ApiResult {
     let statuses = parse_statuses::<SleepRunStatus>(query.status.as_deref())?;
+    let before = parse_before(query.before.as_deref())?;
     let limit = query.limit.unwrap_or(DEFAULT_RUN_LIMIT).min(MAX_RUN_LIMIT);
     let db = Arc::clone(&state.app_state.db);
     let agent_id = query.agent_id;
 
-    let (runs, changed) = call_blocking(db, move |db| {
-        let runs = db.list_sleep_runs(&agent_id, &statuses, limit)?;
+    let (runs, changed, has_more) = call_blocking(db, move |db| {
+        // One row past the page tells us whether older runs exist.
+        let mut runs = db.list_sleep_runs(&agent_id, &statuses, before.as_deref(), limit + 1)?;
+        let has_more = runs.len() > limit;
+        runs.truncate(limit);
         let run_ids: Vec<String> = runs.iter().map(|run| run.id.clone()).collect();
         let changed = db.changed_memory_files(&run_ids)?;
-        Ok((runs, changed))
+        Ok((runs, changed, has_more))
     })
     .await
     .map_err(|error| {
@@ -68,7 +78,9 @@ pub(super) async fn list_sleep_runs(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({"ok": true, "runs": runs_json})))
+    Ok(Json(
+        serde_json::json!({"ok": true, "runs": runs_json, "has_more": has_more}),
+    ))
 }
 
 /// Describes the agent's next scheduled sleep check and the condition it
@@ -389,7 +401,17 @@ mod tests {
         Query(SleepRunsQuery {
             agent_id: agent_id.to_string(),
             status: status.map(str::to_string),
+            before: None,
             limit,
+        })
+    }
+
+    fn paged_runs_query(agent_id: &str, before: &str) -> Query<SleepRunsQuery> {
+        Query(SleepRunsQuery {
+            agent_id: agent_id.to_string(),
+            status: None,
+            before: Some(before.to_string()),
+            limit: None,
         })
     }
 
@@ -439,6 +461,85 @@ mod tests {
 
         // Assert
         assert_eq!(body["runs"].as_array().expect("runs array").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn api_sleep_runs_reports_whether_older_runs_exist() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        insert_sleep_run(&web_state.app_state.db, "run-1", "agent-a", "[]");
+        insert_sleep_run(&web_state.app_state.db, "run-2", "agent-a", "[]");
+
+        // Act
+        let page = list_sleep_runs(
+            AxumState(web_state.clone()),
+            runs_query("agent-a", None, Some(1)),
+        )
+        .await
+        .expect("ok")
+        .0;
+        let all = list_sleep_runs(AxumState(web_state), runs_query("agent-a", None, None))
+            .await
+            .expect("ok")
+            .0;
+
+        // Assert
+        assert_eq!(page["runs"].as_array().expect("runs").len(), 1);
+        assert_eq!(page["has_more"], serde_json::json!(true));
+        assert_eq!(all["has_more"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn api_sleep_runs_pages_back_from_the_before_cursor() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        insert_sleep_run(&web_state.app_state.db, "run-1", "agent-a", "[]");
+        let conn = web_state.app_state.db.get_conn().expect("pool");
+        conn.execute(
+            "UPDATE sleep_runs SET started_at = '2024-01-02T00:00:00+00:00' WHERE id = 'run-1'",
+            [],
+        )
+        .expect("pin started_at");
+
+        // Act
+        let older = list_sleep_runs(
+            AxumState(web_state.clone()),
+            paged_runs_query("agent-a", "2024-01-03T00:00:00+00:00"),
+        )
+        .await
+        .expect("ok")
+        .0;
+        let not_older = list_sleep_runs(
+            AxumState(web_state),
+            paged_runs_query("agent-a", "2024-01-02T00:00:00+00:00"),
+        )
+        .await
+        .expect("ok")
+        .0;
+
+        // Assert
+        assert_eq!(older["runs"][0]["id"], "run-1");
+        assert!(not_older["runs"].as_array().expect("runs").is_empty());
+    }
+
+    #[tokio::test]
+    async fn api_sleep_runs_rejects_an_unparseable_before_cursor() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+
+        // Act
+        let result = list_sleep_runs(
+            AxumState(web_state),
+            paged_runs_query("agent-a", "yesterday"),
+        )
+        .await;
+
+        // Assert
+        let (status, _) = result.expect_err("bad request");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

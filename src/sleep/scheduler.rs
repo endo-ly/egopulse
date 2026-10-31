@@ -599,7 +599,7 @@ mod tests {
         // Assert
         let runs = state
             .db
-            .list_sleep_runs("default", &[], 10)
+            .list_sleep_runs("default", &[], None, 10)
             .expect("list runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
@@ -628,7 +628,7 @@ mod tests {
         // Assert
         let runs = state
             .db
-            .list_sleep_runs("default", &[], 10)
+            .list_sleep_runs("default", &[], None, 10)
             .expect("list runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, crate::storage::SleepRunStatus::Skipped);
@@ -656,7 +656,7 @@ mod tests {
 
         let runs = state
             .db
-            .list_sleep_runs("default", &[], 10)
+            .list_sleep_runs("default", &[], None, 10)
             .expect("list runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].trigger, SleepRunTrigger::Manual);

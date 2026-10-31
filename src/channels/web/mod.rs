@@ -77,6 +77,21 @@ pub(super) fn internal_error() -> ApiError {
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
 }
 
+/// Parses a `before` paging cursor; `None` starts from the newest run.
+///
+/// The cursor is compared as text against `started_at`, so it is normalized to
+/// the format that column is written in: RFC 3339 in UTC. Any other spelling of
+/// the same instant (e.g. `Z` instead of `+00:00`) would otherwise compare as a
+/// different time.
+pub(super) fn parse_before(raw: Option<&str>) -> Result<Option<String>, ApiError> {
+    raw.map(|before| {
+        chrono::DateTime::parse_from_rfc3339(before)
+            .map(|instant| instant.with_timezone(&chrono::Utc).to_rfc3339())
+            .map_err(|_| bad_request("invalid_before"))
+    })
+    .transpose()
+}
+
 /// Parses a comma-separated `status` query value; `None` keeps every status.
 pub(super) fn parse_statuses<T: FromStr>(raw: Option<&str>) -> Result<Vec<T>, ApiError> {
     raw.into_iter()
@@ -586,6 +601,24 @@ mod tests {
     };
     use crate::llm::MessagesResponse;
     use crate::test_util::{build_state_with_config, test_config};
+
+    #[test]
+    fn parse_before_normalizes_the_cursor_to_the_stored_format() {
+        // Arrange / Act
+        let none = parse_before(None).expect("no cursor");
+        let zulu = parse_before(Some("2026-10-02T09:00:00Z")).expect("zulu");
+        let offset = parse_before(Some("2026-10-02T18:00:00+09:00")).expect("offset");
+        let broken = parse_before(Some("yesterday"));
+
+        // Assert: every spelling of an instant compares like the stored value.
+        assert_eq!(none, None);
+        assert_eq!(zulu.as_deref(), Some("2026-10-02T09:00:00+00:00"));
+        assert_eq!(offset.as_deref(), Some("2026-10-02T09:00:00+00:00"));
+        assert_eq!(
+            broken.expect_err("invalid cursor").0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 
     struct NoopChannelAdapter(&'static str);
 

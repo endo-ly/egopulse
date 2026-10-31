@@ -306,7 +306,9 @@ impl Database {
     }
 
     /// Lists an agent's pulse runs, newest first. `intention_id` narrows the
-    /// list to one intention and a non-empty `statuses` to those statuses.
+    /// list to one intention, a non-empty `statuses` to those statuses, and
+    /// `before` to runs started earlier than it, so a caller can page back
+    /// through the whole history.
     ///
     /// # Errors
     ///
@@ -316,6 +318,7 @@ impl Database {
         agent_id: &str,
         intention_id: Option<&str>,
         statuses: &[PulseRunStatus],
+        before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<super::PulseRun>, StorageError> {
         let conn = self.get_conn()?;
@@ -328,6 +331,10 @@ impl Database {
         if !statuses.is_empty() {
             sql.push_str(&status_filter_sql(statuses.len()));
             values.extend(statuses.iter().map(|status| status.to_string().into()));
+        }
+        if let Some(before) = before {
+            sql.push_str(" AND started_at < ?");
+            values.push(before.to_string().into());
         }
         sql.push_str(" ORDER BY started_at DESC, rowid DESC LIMIT ?");
         values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
@@ -914,27 +921,35 @@ mod tests {
         };
 
         // Act
-        let all = db.list_pulse_runs("agent-a", None, &[], 10).expect("all");
+        let all = db
+            .list_pulse_runs("agent-a", None, &[], None, 10)
+            .expect("all");
         let morning = db
-            .list_pulse_runs("agent-a", Some("morning"), &[], 10)
+            .list_pulse_runs("agent-a", Some("morning"), &[], None, 10)
             .expect("morning");
         let failed_or_skipped = db
             .list_pulse_runs(
                 "agent-a",
                 None,
                 &[PulseRunStatus::Failed, PulseRunStatus::Skipped],
+                None,
                 10,
             )
             .expect("filtered");
         let limited = db
-            .list_pulse_runs("agent-a", None, &[], 1)
+            .list_pulse_runs("agent-a", None, &[], None, 1)
             .expect("limited");
+        let older = db
+            .list_pulse_runs("agent-a", None, &[], Some("2025-01-03T09:00:00Z"), 10)
+            .expect("older");
 
         // Assert
         assert_eq!(ids(all), ["a-new", "a-other", "a-old"]);
         assert_eq!(ids(morning), ["a-new", "a-old"]);
         assert_eq!(ids(failed_or_skipped), ["a-new", "a-other"]);
         assert_eq!(ids(limited), ["a-new"]);
+        // The cursor is exclusive, so pages never overlap.
+        assert_eq!(ids(older), ["a-other", "a-old"]);
     }
 
     // ---------------------------------------------------------------------------
