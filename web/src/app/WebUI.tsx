@@ -6,6 +6,7 @@ import { ChatTab } from "../features/chat/ChatTab";
 import { AgentPanel } from "../features/agent/AgentPanel";
 import { AGENT_QUERY_PREFIX } from "../features/agent/agentQuery";
 import { SchedulePanel } from "../features/schedule/SchedulePanel";
+import { SCHEDULE_QUERY_PREFIX } from "../features/schedule/scheduleQuery";
 import { EmptyState } from "../shared/ui/EmptyState";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
@@ -19,7 +20,14 @@ import type { SessionPatch } from "../shared/api/sessions";
 import { invalidateQueries, useServerState } from "../shared/hooks/useServerState";
 import { useAgentAvatars } from "../shared/hooks/useAgentAvatars";
 import { useUnreadSessions } from "../shared/hooks/useUnreadSessions";
-import { buildRoutePath, parseRoute, type AgentSection, type AppRoute } from "./router";
+import {
+  buildRoutePath,
+  parseRoute,
+  SCHEDULE_ACTIVITY,
+  type AgentSection,
+  type AppRoute,
+  type ScheduleView,
+} from "./router";
 import { NAV_TABS, isAgentTab, type TabId } from "./navigation";
 import { resolveAutoSessionKey } from "./sessionSelection";
 
@@ -65,7 +73,7 @@ const COMING_SOON_ICON = (
 interface ScreenSelection {
   sessionKey: string | null;
   agentSection: AgentSection;
-  runId: string | null;
+  scheduleView: ScheduleView;
 }
 
 function composeRoute(tab: TabId, agentId: string, selection: ScreenSelection): AppRoute {
@@ -75,7 +83,7 @@ function composeRoute(tab: TabId, agentId: string, selection: ScreenSelection): 
     case "agent":
       return { tab, agentId, section: selection.agentSection };
     case "schedule":
-      return { tab, agentId, runId: selection.runId };
+      return { tab, agentId, view: selection.scheduleView };
     case "metrics":
     case "config":
       return { tab };
@@ -110,8 +118,8 @@ export function WebUI() {
   const [agentSection, setAgentSection] = useState<AgentSection>(
     bootRoute?.tab === "agent" ? bootRoute.section : "overview",
   );
-  const [scheduleRunId, setScheduleRunId] = useState<string | null>(
-    bootRoute?.tab === "schedule" ? bootRoute.runId : null,
+  const [scheduleView, setScheduleView] = useState<ScheduleView>(
+    bootRoute?.tab === "schedule" ? bootRoute.view : SCHEDULE_ACTIVITY,
   );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [messageJump, setMessageJump] = useState<{
@@ -191,11 +199,11 @@ export function WebUI() {
       composeRoute(activeTab, selectedAgent, {
         sessionKey: urlSessionKey,
         agentSection,
-        runId: scheduleRunId,
+        scheduleView,
       }),
       true,
     );
-  }, [activeTab, agentSection, scheduleRunId, selectedAgent, urlSessionKey]);
+  }, [activeTab, agentSection, scheduleView, selectedAgent, urlSessionKey]);
 
   useEffect(() => {
     const onPopState = () => {
@@ -205,7 +213,7 @@ export function WebUI() {
       setActiveTab(route.tab);
       if ("agentId" in route && route.agentId) setSelectedAgent(route.agentId);
       if (route.tab === "agent") setAgentSection(route.section);
-      if (route.tab === "schedule") setScheduleRunId(route.runId);
+      if (route.tab === "schedule") setScheduleView(route.view);
       if (route.tab === "chat" && route.sessionKey) {
         setSelectedSession(route.sessionKey);
         setSessionExplicit(true);
@@ -228,6 +236,14 @@ export function WebUI() {
     [selectedAgent],
   );
 
+  const handleOpenSession = useCallback(
+    (key: string) => {
+      setActiveTab("chat");
+      handleSelectSession(key);
+    },
+    [handleSelectSession],
+  );
+
   const handleSelectAgent = useCallback(
     (id: string) => {
       // Global screens are agent-independent; picking an agent there opens
@@ -237,8 +253,9 @@ export function WebUI() {
       setSelectedAgent(id);
       setSessionExplicit(false);
       setDraftSessionKey(createSessionKey());
-      setScheduleRunId(null);
-      navigateTo(composeRoute(tab, id, { sessionKey: null, agentSection, runId: null }));
+      // Runs and intentions belong to the previous agent.
+      setScheduleView(SCHEDULE_ACTIVITY);
+      navigateTo(composeRoute(tab, id, { sessionKey: null, agentSection, scheduleView: SCHEDULE_ACTIVITY }));
     },
     [activeTab, agentSection],
   );
@@ -250,11 +267,11 @@ export function WebUI() {
         composeRoute(tab, selectedAgent, {
           sessionKey: urlSessionKey,
           agentSection,
-          runId: scheduleRunId,
+          scheduleView,
         }),
       );
     },
-    [agentSection, scheduleRunId, selectedAgent, urlSessionKey],
+    [agentSection, scheduleView, selectedAgent, urlSessionKey],
   );
 
   const handleSelectAgentSection = useCallback(
@@ -266,13 +283,18 @@ export function WebUI() {
     [selectedAgent],
   );
 
-  const handleSelectRun = useCallback(
-    (runId: string | null) => {
+  const handleChangeScheduleView = useCallback(
+    (view: ScheduleView) => {
       setActiveTab("schedule");
-      setScheduleRunId(runId);
-      navigateTo({ tab: "schedule", agentId: selectedAgent, runId });
+      setScheduleView(view);
+      navigateTo({ tab: "schedule", agentId: selectedAgent, view });
     },
     [selectedAgent],
+  );
+
+  const handleOpenSleepRun = useCallback(
+    (runId: string) => handleChangeScheduleView({ section: "activity", run: { kind: "sleep", id: runId } }),
+    [handleChangeScheduleView],
   );
 
   const handleSessionResolved = useCallback((key: string) => {
@@ -393,7 +415,7 @@ export function WebUI() {
       history.invalidate();
       sessionsState.invalidate();
     } else if (activeTab === "schedule") {
-      invalidateQueries("sleep");
+      invalidateQueries(SCHEDULE_QUERY_PREFIX);
     } else if (activeTab === "agent") {
       invalidateQueries(AGENT_QUERY_PREFIX);
     }
@@ -441,7 +463,9 @@ export function WebUI() {
         selectedSession={selectedSession}
         activeTab={activeTab}
         agentSection={agentSection}
+        scheduleView={scheduleView}
         onSelectAgentSection={handleSelectAgentSection}
+        onChangeScheduleView={handleChangeScheduleView}
         healthStatus={transport.connectionState === "closed" ? "degraded" : "ok"}
         onTabChange={handleTabChange}
         onSelectAgent={handleSelectAgent}
@@ -467,16 +491,16 @@ export function WebUI() {
               avatarUrl={agentAvatars[selectedAgent]}
               sessions={sessions}
               onSelectSection={handleSelectAgentSection}
-              onOpenRun={handleSelectRun}
+              onOpenSleepRun={handleOpenSleepRun}
             />
           ) : activeTab === "schedule" && selectedAgent ? (
             <SchedulePanel
-              agents={agents}
               agentId={selectedAgent}
               authToken={authToken}
-              runId={scheduleRunId}
-              onSelectRun={handleSelectRun}
-              onBack={() => handleSelectRun(null)}
+              view={scheduleView}
+              sessions={sessions}
+              onChangeView={handleChangeScheduleView}
+              onOpenSession={handleOpenSession}
             />
           ) : activeTab === "metrics" || activeTab === "config" ? (
             <EmptyState

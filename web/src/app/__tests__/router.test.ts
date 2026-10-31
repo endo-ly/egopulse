@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseRoute, buildRoutePath, type AppRoute } from "../router";
+import { parseRoute, buildRoutePath, SCHEDULE_ACTIVITY, type AppRoute, type ScheduleView } from "../router";
 
 describe("router", () => {
   it("router_parses_chat_and_global_paths", () => {
@@ -27,18 +27,21 @@ describe("router", () => {
     }
   });
 
-  it("router_parses_schedule_run_selection", () => {
-    // Arrange / Act / Assert
-    expect(parseRoute("/agents/lyre/schedule")).toEqual({
-      tab: "schedule",
-      agentId: "lyre",
-      runId: null,
-    });
-    expect(parseRoute("/agents/lyre/schedule/sleep/run-123")).toEqual({
-      tab: "schedule",
-      agentId: "lyre",
-      runId: "run-123",
-    });
+  it("router_parses_schedule_sections", () => {
+    // Arrange
+    const cases: [string, ScheduleView][] = [
+      ["/agents/lyre/schedule", { section: "activity", run: null }],
+      ["/agents/lyre/schedule/runs/sleep/run-123", { section: "activity", run: { kind: "sleep", id: "run-123" } }],
+      ["/agents/lyre/schedule/runs/pulse/run-9", { section: "activity", run: { kind: "pulse", id: "run-9" } }],
+      ["/agents/lyre/schedule/pulse", { section: "pulse", intentionId: null }],
+      ["/agents/lyre/schedule/pulse/morning", { section: "pulse", intentionId: "morning" }],
+      ["/agents/lyre/schedule/sleep", { section: "sleep" }],
+    ];
+
+    // Act / Assert
+    for (const [path, view] of cases) {
+      expect(parseRoute(path), path).toEqual({ tab: "schedule", agentId: "lyre", view });
+    }
   });
 
   it("router_rejects_paths_that_do_not_map_to_a_view", () => {
@@ -53,8 +56,12 @@ describe("router", () => {
       "/agents/lyre/overview",
       "/agents/lyre/memory/semantic",
       "/agents/lyre/soul/extra",
-      "/agents/lyre/schedule/sleep",
-      "/agents/lyre/schedule/pulse/run-1",
+      "/agents/lyre/schedule/intentions/morning",
+      "/agents/lyre/schedule/pulse/morning/extra",
+      "/agents/lyre/schedule/runs/r1",
+      "/agents/lyre/schedule/runs/chat/r1",
+      "/agents/lyre/schedule/runs/pulse/r1/extra",
+      "/agents/lyre/schedule/sleep/r1",
       "/metrics/extra",
       "/nope",
     ];
@@ -78,7 +85,11 @@ describe("router", () => {
       "/agents/lyre/skills",
       "/agents/lyre/memory",
       "/agents/lyre/schedule",
-      "/agents/lyre/schedule/sleep/r1",
+      "/agents/lyre/schedule/runs/sleep/r1",
+      "/agents/lyre/schedule/runs/pulse/r2",
+      "/agents/lyre/schedule/pulse",
+      "/agents/lyre/schedule/pulse/morning",
+      "/agents/lyre/schedule/sleep",
       "/metrics",
       "/config",
     ];
@@ -96,7 +107,7 @@ describe("router", () => {
     const routes: AppRoute[] = [
       { tab: "chat", agentId: "", sessionKey: "s1" },
       { tab: "agent", agentId: "", section: "overview" },
-      { tab: "schedule", agentId: "", runId: null },
+      { tab: "schedule", agentId: "", view: SCHEDULE_ACTIVITY },
     ];
 
     // Act / Assert

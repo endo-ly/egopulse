@@ -59,25 +59,31 @@ export interface ToolEventData {
   duration_ms?: number;
 }
 
+export type SleepRunStatus = "running" | "success" | "partial_failure" | "failed" | "skipped";
+export type SleepRunTrigger = "manual" | "scheduled" | "backfill";
+export type SleepStepStatus = "pending" | "running" | "success" | "failed" | "skipped";
+
 export interface SleepRun {
   id: string;
   agent_id: string;
-  status: string;
-  trigger: string;
+  status: SleepRunStatus;
+  trigger: SleepRunTrigger;
   started_at: string;
   finished_at: string | null;
   source_chats_json: string;
-  source_digest_md: string;
+  source_digest_md: string | null;
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
   error_message: string | null;
   session_count: number;
+  /** Memory files this run published changes to, episodic → semantic → prospective. */
+  changed_memory: string[];
 }
 
 export interface SleepRunStep {
   step: string;
-  status: string;
+  status: SleepStepStatus;
   started_at: string | null;
   finished_at: string | null;
   input_tokens: number;
@@ -89,6 +95,86 @@ export interface SleepRunDetail {
   run: SleepRun;
   snapshots: MemorySnapshot[];
   steps: SleepRunStep[];
+}
+
+/** The agent's next scheduled sleep check and the condition it decides on. */
+export interface SleepOutlook {
+  scheduler_enabled: boolean;
+  /** Whether the agent is one of the scheduler's targets. */
+  targeted: boolean;
+  /** Null when the scheduler is disabled or the agent is not targeted. */
+  next_check_at: string | null;
+  pending_messages: number;
+  /** Pending messages above this make the check run. */
+  threshold: number;
+}
+
+export type PulseRunStatus = "running" | "success" | "failed" | "skipped";
+export type PulseOutputKind = "notify" | "silent";
+
+export interface PulseRun {
+  id: string;
+  agent_id: string;
+  intention_id: string;
+  status: PulseRunStatus;
+  started_at: string;
+  finished_at: string | null;
+  output_kind: PulseOutputKind | null;
+  /** The delivered message for `notify`, `PULSE_OK` for `silent`. */
+  output_text: string | null;
+  /** The error for `failed`, the reason for `skipped`. */
+  error_message: string | null;
+}
+
+export interface PulseRunDetail extends PulseRun {
+  /** Attention the run was activated with; null for runs that predate it. */
+  attention_snapshot: string | null;
+  /** The session a notification was delivered to. */
+  delivery: (PulseDelivery & { session_key: string }) | null;
+}
+
+export interface PulseDelivery {
+  channel: string;
+  external_chat_id: string;
+}
+
+export type PulseSchedule =
+  | { kind: "daily"; at: string }
+  | { kind: "weekly"; day: string; at: string }
+  | { kind: "interval"; interval_days: number; at: string }
+  | { kind: "once"; date: string; at: string };
+
+export interface PulseNextDue {
+  state: "due_now" | "scheduled" | "attempted_this_period" | "attempted_once" | "no_upcoming";
+  /** Set for `scheduled`. */
+  at: string | null;
+}
+
+export interface PulseIntention {
+  id: string;
+  enabled: boolean;
+  schedule: PulseSchedule;
+  attention: string;
+  /** Null when the intention uses the default delivery. */
+  delivery: PulseDelivery | null;
+  /**
+   * The conversation a firing would be delivered to now, resolved as the
+   * scheduler does; null when none resolves, so a firing would be skipped.
+   */
+  target: { channel: string; session_key: string } | null;
+  /** Null while the agent's Pulse or the intention is disabled. */
+  next: PulseNextDue | null;
+  /** Newest first. */
+  recent_runs: Pick<PulseRun, "id" | "status" | "output_kind" | "started_at">[];
+}
+
+export interface AgentPulse {
+  /** Null when PULSE.yaml fails to parse. */
+  enabled: boolean | null;
+  error: string | null;
+  timezone: string;
+  default_delivery: PulseDelivery | null;
+  intentions: PulseIntention[];
 }
 
 export interface MemorySnapshot {

@@ -9,16 +9,16 @@ import { MOON_ICON } from "../../shared/ui/icons";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { useAgentQuery } from "./agentQuery";
 import { DocumentCard } from "./DocumentCard";
-import { QueryState } from "./QueryState";
+import { QueryState } from "../../shared/ui/QueryState";
 
 export interface MemorySectionProps {
   agentId: string;
   authToken: string;
-  onOpenRun: (runId: string) => void;
+  onOpenSleepRun: (runId: string) => void;
 }
 
 /** Long-term memory: the published layers, then how Sleep changed them. */
-export function MemorySection({ agentId, authToken, onOpenRun }: MemorySectionProps) {
+export function MemorySection({ agentId, authToken, onOpenSleepRun }: MemorySectionProps) {
   const memoryState = useAgentQuery(authToken, ["memory", agentId], () =>
     fetchAgentMemory(agentId, authToken),
   );
@@ -79,7 +79,7 @@ export function MemorySection({ agentId, authToken, onOpenRun }: MemorySectionPr
                     key={`${change.run_id}:${change.file}`}
                     change={change}
                     defaultOpen={index === 0}
-                    onOpenRun={onOpenRun}
+                    onOpenSleepRun={onOpenSleepRun}
                   />
                 ))}
               </ol>
@@ -94,11 +94,11 @@ export function MemorySection({ agentId, authToken, onOpenRun }: MemorySectionPr
 function MemoryChangeItem({
   change,
   defaultOpen,
-  onOpenRun,
+  onOpenSleepRun,
 }: {
   change: MemoryChange;
   defaultOpen: boolean;
-  onOpenRun: (runId: string) => void;
+  onOpenSleepRun: (runId: string) => void;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const counts = useMemo(
@@ -128,7 +128,7 @@ function MemoryChangeItem({
         <button
           type="button"
           className="doc-card-action"
-          onClick={() => onOpenRun(change.run_id)}
+          onClick={() => onOpenSleepRun(change.run_id)}
           title="Open the sleep run in Schedule"
         >
           Sleep run #{change.run_id.slice(0, 6)}

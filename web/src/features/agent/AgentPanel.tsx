@@ -13,7 +13,7 @@ export interface AgentPanelProps {
   sessions: SessionEntry[];
   onSelectSection: (section: AgentSection) => void;
   /** Opens a sleep run in the Schedule screen. */
-  onOpenRun: (runId: string) => void;
+  onOpenSleepRun: (runId: string) => void;
 }
 
 const HEADINGS: Record<AgentSection, { title: string; description?: string }> = {
@@ -63,7 +63,7 @@ function AgentSectionBody({
   avatarUrl,
   sessions,
   onSelectSection,
-  onOpenRun,
+  onOpenSleepRun,
 }: AgentPanelProps) {
   switch (section) {
     case "overview":
@@ -74,7 +74,7 @@ function AgentSectionBody({
           avatarUrl={avatarUrl}
           sessions={sessions}
           onSelectSection={onSelectSection}
-          onOpenRun={onOpenRun}
+          onOpenSleepRun={onOpenSleepRun}
         />
       );
     case "soul":
@@ -84,7 +84,7 @@ function AgentSectionBody({
         <PromptFileView key={`${agentId}:${section}`} agentId={agentId} authToken={authToken} kind={section} />
       );
     case "memory":
-      return <MemorySection agentId={agentId} authToken={authToken} onOpenRun={onOpenRun} />;
+      return <MemorySection agentId={agentId} authToken={authToken} onOpenSleepRun={onOpenSleepRun} />;
     case "skills":
       return <SkillsSection authToken={authToken} />;
   }

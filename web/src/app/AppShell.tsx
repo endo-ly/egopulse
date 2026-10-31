@@ -5,7 +5,8 @@ import { MobileBar } from "./shell/MobileBar";
 import { AgentsSection } from "./shell/AgentsSection";
 import { SessionsSection } from "./shell/SessionsSection";
 import { AgentSectionNav } from "../features/agent/AgentSectionNav";
-import type { AgentSection } from "./router";
+import { ScheduleSectionNav } from "../features/schedule/ScheduleSectionNav";
+import { SCHEDULE_ACTIVITY, type AgentSection, type ScheduleView } from "./router";
 import type { HealthStatus } from "./runtimeStatus";
 import type { TabId } from "./navigation";
 import type { AgentEntry, SessionEntry } from "../shared/api/types";
@@ -19,6 +20,8 @@ export interface AppProps {
   activeTab?: TabId;
   /** Current Agent screen section; drives the Agent sidebar context. */
   agentSection?: AgentSection;
+  /** Current Schedule screen state; drives the Schedule sidebar context. */
+  scheduleView?: ScheduleView;
   healthStatus?: HealthStatus;
   onSelectAgent?: (id: string) => void;
   onSelectSession?: (key: string) => void;
@@ -27,6 +30,7 @@ export interface AppProps {
   onNewSession?: (name?: string) => void;
   onUpdateSession?: (chatId: number, patch: SessionPatch) => void;
   onSelectAgentSection?: (section: AgentSection) => void;
+  onChangeScheduleView?: (view: ScheduleView) => void;
   main?: ReactNode;
   authToken?: string;
   agentAvatars?: Readonly<Record<string, string>>;
@@ -47,6 +51,7 @@ export function App({
   selectedSession = "",
   activeTab = "chat",
   agentSection = "overview",
+  scheduleView = SCHEDULE_ACTIVITY,
   healthStatus = "ok",
   onSelectAgent = noop,
   onSelectSession = noop,
@@ -55,6 +60,7 @@ export function App({
   onNewSession = noop,
   onUpdateSession,
   onSelectAgentSection = noop,
+  onChangeScheduleView = noop,
   main,
   authToken,
   agentAvatars,
@@ -165,6 +171,10 @@ export function App({
     onSelectAgentSection(section);
     dismissOverlayOnMobile();
   };
+  const handleChangeScheduleView = (view: ScheduleView) => {
+    onChangeScheduleView(view);
+    dismissOverlayOnMobile();
+  };
 
   let context: ReactNode = null;
   if (activeTab === "chat") {
@@ -186,6 +196,15 @@ export function App({
         authToken={authToken ?? ""}
         section={agentSection}
         onSelectSection={handleSelectAgentSection}
+      />
+    );
+  } else if (activeTab === "schedule" && selectedAgent) {
+    context = (
+      <ScheduleSectionNav
+        agentId={selectedAgent}
+        authToken={authToken ?? ""}
+        section={scheduleView.section}
+        onChangeView={handleChangeScheduleView}
       />
     );
   }

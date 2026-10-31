@@ -2,12 +2,29 @@
 export const AGENT_SECTIONS = ["overview", "soul", "rules", "secret", "memory", "skills"] as const;
 export type AgentSection = (typeof AGENT_SECTIONS)[number];
 
+/** One Pulse or Sleep run. */
+export interface ScheduleRun {
+  kind: "pulse" | "sleep";
+  id: string;
+}
+
+/**
+ * The Schedule screen's section and its selection: Activity with the run
+ * open beside the timeline, Pulse with the selected intention (null for the
+ * first), or Sleep.
+ */
+export type ScheduleView =
+  | { section: "activity"; run: ScheduleRun | null }
+  | { section: "pulse"; intentionId: string | null }
+  | { section: "sleep" };
+
+export const SCHEDULE_ACTIVITY: ScheduleView = { section: "activity", run: null };
+
 export type AppRoute =
   /** `sessionKey` is null when the session is left to auto-selection. */
   | { tab: "chat"; agentId: string; sessionKey: string | null }
   | { tab: "agent"; agentId: string; section: AgentSection }
-  /** `runId` is the selected sleep run; null when none is selected. */
-  | { tab: "schedule"; agentId: string; runId: string | null }
+  | { tab: "schedule"; agentId: string; view: ScheduleView }
   | { tab: "metrics" }
   | { tab: "config" };
 
@@ -28,17 +45,50 @@ function parseAgentScoped(agentId: string, rest: string[]): AppRoute | null {
     return null;
   }
   if (scope === "schedule") {
-    if (tail.length === 0) return { tab: "schedule", agentId, runId: null };
-    if (tail.length === 2 && tail[0] === "sleep" && tail[1]) {
-      return { tab: "schedule", agentId, runId: tail[1] };
-    }
-    return null;
+    const view = parseScheduleView(tail);
+    return view ? { tab: "schedule", agentId, view } : null;
   }
   // The overview is the agent root, so it has no segment of its own.
   if (scope !== "overview" && isAgentSection(scope) && tail.length === 0) {
     return { tab: "agent", agentId, section: scope };
   }
   return null;
+}
+
+function isRunKind(value: string | undefined): value is ScheduleRun["kind"] {
+  return value === "pulse" || value === "sleep";
+}
+
+/**
+ * Parses the segments after `schedule`: Activity (nothing, or
+ * `runs/{pulse|sleep}/:id`), Pulse (`pulse`, `pulse/:intentionId`), or Sleep
+ * (`sleep`).
+ */
+function parseScheduleView(tail: string[]): ScheduleView | null {
+  const [first, second, third] = tail;
+  if (tail.length === 0) return SCHEDULE_ACTIVITY;
+  if (first === "runs") {
+    return tail.length === 3 && isRunKind(second) && third
+      ? { section: "activity", run: { kind: second, id: third } }
+      : null;
+  }
+  if (first === "pulse" && tail.length <= 2) {
+    if (tail.length === 1) return { section: "pulse", intentionId: null };
+    return second ? { section: "pulse", intentionId: second } : null;
+  }
+  if (first === "sleep" && tail.length === 1) return { section: "sleep" };
+  return null;
+}
+
+function scheduleViewPath(view: ScheduleView): string {
+  switch (view.section) {
+    case "activity":
+      return view.run === null ? "" : `/runs/${view.run.kind}/${view.run.id}`;
+    case "pulse":
+      return view.intentionId === null ? "/pulse" : `/pulse/${view.intentionId}`;
+    case "sleep":
+      return "/sleep";
+  }
 }
 
 /**
@@ -83,6 +133,6 @@ export function buildRoutePath(route: AppRoute): string | null {
     case "agent":
       return route.section === "overview" ? base : `${base}/${route.section}`;
     case "schedule":
-      return route.runId ? `${base}/schedule/sleep/${route.runId}` : `${base}/schedule`;
+      return `${base}/schedule${scheduleViewPath(route.view)}`;
   }
 }

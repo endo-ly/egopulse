@@ -773,13 +773,13 @@ const SLEEP_RUNS = [
     status: "skipped",
     trigger: "scheduled",
     started_at: "2026-07-02T03:00:00.000Z",
-    finished_at: "2026-07-02T03:00:04.000Z",
+    finished_at: "2026-07-02T03:00:00.000Z",
     source_chats_json: "[]",
-    source_digest_md: "no new messages since last run",
+    source_digest_md: null,
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
-    error_message: null,
+    error_message: "41 new messages; runs when there are more than 64",
     session_count: 0,
   },
 ];
@@ -927,6 +927,312 @@ const SLEEP_STEPS: Record<string, Array<Record<string, unknown>>> = {
     { step: "prospective_update", status: "pending", started_at: null, finished_at: null, input_tokens: 0, output_tokens: 0, error_message: null },
   ],
 };
+
+// Recent schedule activity, relative to server start so Upcoming and History
+// read naturally whenever the mock runs.
+const MOCK_NOW = Date.now();
+const HOUR_MS = 3600_000;
+
+function hoursAgo(hours: number): string {
+  return new Date(MOCK_NOW - hours * HOUR_MS).toISOString();
+}
+
+/** The next local occurrence of `hh:mm`, `addDays` days after today at the earliest. */
+function nextLocal(hhmm: string, addDays = 0): string {
+  const [hours, minutes] = hhmm.split(":").map(Number);
+  const date = new Date(MOCK_NOW);
+  date.setDate(date.getDate() + addDays);
+  date.setHours(hours, minutes, 0, 0);
+  if (date.getTime() <= MOCK_NOW) date.setDate(date.getDate() + 1);
+  return date.toISOString();
+}
+
+SLEEP_RUNS.push(
+  {
+    id: "run-recent-lyre-active",
+    agent_id: "lyre",
+    status: "skipped",
+    trigger: "scheduled",
+    started_at: hoursAgo(20),
+    finished_at: hoursAgo(20),
+    source_chats_json: "[]",
+    source_digest_md: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    error_message: "agent was mid-conversation",
+    session_count: 0,
+  },
+  {
+    id: "run-recent-lyre-success",
+    agent_id: "lyre",
+    status: "success",
+    trigger: "scheduled",
+    started_at: hoursAgo(44),
+    finished_at: new Date(MOCK_NOW - 44 * HOUR_MS + 252_000).toISOString(),
+    source_chats_json: '["web:web-chat", "discord:dev-discussion", "web:quick-test"]',
+    source_digest_md: "3 chats · 88 messages",
+    input_tokens: 21400,
+    output_tokens: 3900,
+    total_tokens: 25300,
+    error_message: null,
+    session_count: 3,
+  },
+);
+SLEEP_RUNS.push(
+  ...[66, 90].map((hours) => ({
+    id: `run-recent-lyre-skip-${hours}`,
+    agent_id: "lyre",
+    status: "skipped",
+    trigger: "scheduled",
+    started_at: hoursAgo(hours),
+    finished_at: hoursAgo(hours),
+    source_chats_json: "[]",
+    source_digest_md: null,
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    error_message: "12 new messages; runs when there are more than 64",
+    session_count: 0,
+  })),
+);
+SLEEP_SNAPSHOTS["run-recent-lyre-success"] = SLEEP_SNAPSHOTS["run-20260704-lyre-manual"].map((snapshot) => ({
+  ...snapshot,
+  id: `${String(snapshot.id)}-recent`,
+  run_id: "run-recent-lyre-success",
+  created_at: hoursAgo(44),
+}));
+SLEEP_STEPS["run-recent-lyre-success"] = [
+  { step: "event_extraction", status: "success", started_at: null, finished_at: null, input_tokens: 9800, output_tokens: 1200, error_message: null },
+  { step: "episodic_update", status: "success", started_at: null, finished_at: null, input_tokens: 5200, output_tokens: 1100, error_message: null },
+  { step: "semantic_update", status: "success", started_at: null, finished_at: null, input_tokens: 4100, output_tokens: 900, error_message: null },
+  { step: "prospective_update", status: "success", started_at: null, finished_at: null, input_tokens: 2300, output_tokens: 700, error_message: null },
+];
+
+const MEMORY_LAYERS = ["episodic", "semantic", "prospective"];
+
+// Mirrors `changed_memory` of GET /api/sleep/runs: layers a published run
+// (success / partial_failure) actually changed.
+function changedMemory(run: { id: string; status: string }): string[] {
+  if (run.status !== "success" && run.status !== "partial_failure") return [];
+  const changed = new Set(
+    (SLEEP_SNAPSHOTS[run.id] ?? [])
+      .filter((snapshot) => snapshot.content_before !== snapshot.content_after)
+      .map((snapshot) => String(snapshot.file)),
+  );
+  return MEMORY_LAYERS.filter((layer) => changed.has(layer));
+}
+
+// Mirrors GET /api/agents/:id/sleep/next (src/channels/web/sleep.rs).
+function sleepOutlook(agentId: string) {
+  const targeted = agentId !== "ace";
+  return {
+    scheduler_enabled: true,
+    targeted,
+    next_check_at: targeted ? nextLocal("03:00") : null,
+    pending_messages: agentId === "lyre" ? 41 : 97,
+    threshold: 64,
+  };
+}
+
+type MockPulseRun = {
+  id: string;
+  agent_id: string;
+  intention_id: string;
+  status: "running" | "success" | "failed" | "skipped";
+  started_at: string;
+  finished_at: string | null;
+  output_kind: "notify" | "silent" | null;
+  output_text: string | null;
+  error_message: string | null;
+  attention_snapshot: string | null;
+  delivery: { channel: string; external_chat_id: string; session_key: string } | null;
+};
+
+const MORNING_ATTENTION = "今日の予定、未解決事項、昨日から持ち越している設計論点を確認する。";
+const HOME_DELIVERY = {
+  channel: "discord",
+  external_chat_id: "discord:1234567890123456789",
+  session_key: PULSE_HOME_SESSION,
+};
+
+function pulseRun(
+  id: string,
+  intention: string,
+  startedHoursAgo: number,
+  outcome: Pick<MockPulseRun, "status" | "output_kind" | "output_text" | "error_message">,
+  attention: string | null = MORNING_ATTENTION,
+): MockPulseRun {
+  return {
+    id,
+    agent_id: "lyre",
+    intention_id: intention,
+    started_at: hoursAgo(startedHoursAgo),
+    finished_at: outcome.status === "running" ? null : new Date(MOCK_NOW - startedHoursAgo * HOUR_MS + 8_000).toISOString(),
+    attention_snapshot: attention,
+    delivery: outcome.output_kind === "notify" ? HOME_DELIVERY : null,
+    ...outcome,
+  };
+}
+
+// Mirrors GET /api/pulse/runs and /api/pulse/runs/:id (src/channels/web/pulse.rs).
+const PULSE_RUNS: MockPulseRun[] = [
+  pulseRun("pulse-m0", "morning_review", 2, {
+    status: "success",
+    output_kind: "notify",
+    output_text: "おはようございます。今日は **10:00 設計レビュー** と **15:00 1on1** があります。\n\n- 昨日の宿題: Schedule 画面の Upcoming 表示\n- 持ち越し: Sleep スキップ判定の記録方法",
+    error_message: null,
+  }),
+  pulseRun("pulse-e1", "evening_check", 14, {
+    status: "success",
+    output_kind: "silent",
+    output_text: "PULSE_OK",
+    error_message: null,
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-m1", "morning_review", 26, {
+    status: "success",
+    output_kind: "notify",
+    output_text: "今日は予定がありません。持ち越しの設計論点を 1 つ片付けるのはどうでしょう。",
+    error_message: null,
+  }),
+  pulseRun("pulse-e2", "evening_check", 38, {
+    status: "failed",
+    output_kind: null,
+    output_text: null,
+    error_message: "activation timed out after 30m",
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-m2", "morning_review", 50, {
+    status: "skipped",
+    output_kind: null,
+    output_text: null,
+    error_message: "no sendable home surface",
+  }),
+  pulseRun("pulse-e3", "evening_check", 62, {
+    status: "success",
+    output_kind: "silent",
+    output_text: "PULSE_OK",
+    error_message: null,
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-e4", "evening_check", 86, {
+    status: "success",
+    output_kind: "silent",
+    output_text: "PULSE_OK",
+    error_message: null,
+  }, "今日やり残したことがあれば軽く確認する。"),
+  pulseRun("pulse-w1", "weekly_reflection", 120, {
+    status: "success",
+    output_kind: "notify",
+    output_text: "今週の振り返りです。Agent 画面を仕上げ、Schedule 画面の設計に入りました。",
+    error_message: null,
+  }, null),
+];
+
+function pulseSummary(run: MockPulseRun) {
+  const { attention_snapshot: _attention, delivery: _delivery, ...summary } = run;
+  return summary;
+}
+
+function recentRuns(intentionId: string) {
+  return PULSE_RUNS.filter((run) => run.intention_id === intentionId)
+    .slice(0, 10)
+    .map(({ id, status, output_kind, started_at }) => ({ id, status, output_kind, started_at }));
+}
+
+/** The home conversation the default delivery resolves to. */
+const HOME_TARGET = { channel: "discord", session_key: PULSE_HOME_SESSION };
+
+// Mirrors GET /api/agents/:id/pulse (src/channels/web/pulse.rs). `target` is
+// the conversation a firing would be delivered to; the Telegram destination
+// of evening_check matches no conversation, so it does not resolve.
+function agentPulse(agentId: string) {
+  if (agentId === "vega") {
+    return {
+      enabled: null,
+      error: "pulse_parse_error: vega: intentions[1].schedule.at: expected HH:MM, got \"9am\"",
+      timezone: "Asia/Tokyo",
+      default_delivery: null,
+      intentions: [],
+    };
+  }
+  if (agentId !== "lyre") {
+    return { enabled: agentId !== "ace", error: null, timezone: "Asia/Tokyo", default_delivery: null, intentions: [] };
+  }
+  return {
+    enabled: true,
+    error: null,
+    timezone: "Asia/Tokyo",
+    default_delivery: { channel: "discord", external_chat_id: "1234567890123456789" },
+    intentions: [
+      {
+        id: "morning_review",
+        enabled: true,
+        schedule: { kind: "daily", at: "09:00" },
+        attention: MORNING_ATTENTION,
+        delivery: null,
+        target: HOME_TARGET,
+        next: { state: "scheduled", at: nextLocal("09:00") },
+        recent_runs: recentRuns("morning_review"),
+      },
+      {
+        id: "evening_check",
+        enabled: true,
+        schedule: { kind: "daily", at: "21:00" },
+        attention: "今日やり残したことがあれば軽く確認する。",
+        delivery: { channel: "telegram", external_chat_id: "987654321" },
+        target: null,
+        next: { state: "scheduled", at: nextLocal("21:00") },
+        recent_runs: recentRuns("evening_check"),
+      },
+      {
+        id: "weekly_reflection",
+        enabled: true,
+        schedule: { kind: "weekly", day: "sun", at: "21:00" },
+        attention: [
+          "週の振り返り。",
+          "- 今週決めたこと",
+          "- 進まなかったこととその理由",
+          "- 来週の最初の一歩",
+          "- 体調とリズム",
+          "- 次の週に持ち越す問い",
+        ].join("\n"),
+        delivery: null,
+        target: HOME_TARGET,
+        next: { state: "scheduled", at: nextLocal("21:00", 2) },
+        recent_runs: recentRuns("weekly_reflection"),
+      },
+      {
+        id: "dentist_reminder",
+        enabled: true,
+        schedule: { kind: "once", date: "2026-11-03", at: "10:00" },
+        attention: "歯医者の予約を思い出させる。",
+        delivery: null,
+        target: HOME_TARGET,
+        next: { state: "scheduled", at: nextLocal("10:00", 3) },
+        recent_runs: [],
+      },
+      {
+        id: "stretch_break",
+        enabled: false,
+        schedule: { kind: "interval", interval_days: 2, at: "15:00" },
+        attention: "ストレッチ休憩を促す。",
+        delivery: null,
+        target: HOME_TARGET,
+        next: null,
+        recent_runs: [],
+      },
+    ],
+  };
+}
+
+/** Filters by the comma-separated `status` query and caps at `limit`. */
+function filterRuns<T extends { status: string; started_at: string }>(runs: T[], params: URLSearchParams): T[] {
+  const statuses = (params.get("status") ?? "").split(",").filter(Boolean);
+  const limit = Number(params.get("limit") ?? "20");
+  return runs
+    .filter((run) => statuses.length === 0 || statuses.includes(run.status))
+    .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at))
+    .slice(0, limit);
+}
 
 // Mirrors ~/.egopulse/agents/<id>/memory/*.md served by GET /api/agents/:id/memory.
 const AGENT_MEMORY: Record<string, Record<string, string>> = {
@@ -1268,11 +1574,37 @@ export function mockApiPlugin(): Plugin | null {
           );
         }
         if (pathname === "/api/sleep/runs") {
-          const agentId = parsed.searchParams.get("agent_id") ?? "";
-          const runs = SLEEP_RUNS.filter(
-            (run) => !agentId || run.agent_id === agentId,
-          ).sort((a, b) => b.started_at.localeCompare(a.started_at));
+          const agentId = parsed.searchParams.get("agent_id");
+          const runs = filterRuns(
+            SLEEP_RUNS.filter((run) => run.agent_id === agentId),
+            parsed.searchParams,
+          ).map((run) => ({ ...run, changed_memory: changedMemory(run) }));
           return sendJson(res, { ok: true, runs });
+        }
+        if (pathname === "/api/pulse/runs") {
+          const agentId = parsed.searchParams.get("agent_id");
+          const runs = filterRuns(
+            PULSE_RUNS.filter((run) => run.agent_id === agentId),
+            parsed.searchParams,
+          ).map(pulseSummary);
+          return sendJson(res, { ok: true, runs });
+        }
+        if (pathname.startsWith("/api/pulse/runs/")) {
+          const runId = decodeURIComponent(pathname.slice("/api/pulse/runs/".length));
+          const run = PULSE_RUNS.find((candidate) => candidate.id === runId);
+          if (!run) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "not_found" });
+          }
+          return sendJson(res, { ok: true, run });
+        }
+        const pulseMatch = pathname.match(/^\/api\/agents\/([^/]+)\/pulse$/);
+        if (pulseMatch) {
+          return sendJson(res, { ok: true, pulse: agentPulse(decodeURIComponent(pulseMatch[1])) });
+        }
+        const outlookMatch = pathname.match(/^\/api\/agents\/([^/]+)\/sleep\/next$/);
+        if (outlookMatch) {
+          return sendJson(res, { ok: true, outlook: sleepOutlook(decodeURIComponent(outlookMatch[1])) });
         }
         if (pathname.startsWith("/api/sleep/runs/")) {
           const runId = decodeURIComponent(pathname.slice("/api/sleep/runs/".length));

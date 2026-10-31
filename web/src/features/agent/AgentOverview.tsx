@@ -2,15 +2,15 @@ import type { ReactNode } from "react";
 
 import type { AgentSection } from "../../app/router";
 import { fetchAgentProfile, fetchMemoryHistory } from "../../shared/api/agents";
-import { fetchSleepRuns } from "../../shared/api/sleep";
+import { WORKED_SLEEP_STATUSES, fetchSleepRuns } from "../../shared/api/sleep";
 import type { AgentProfile, MemoryChange, SessionEntry, SleepRun } from "../../shared/api/types";
 import { countLineChanges } from "../../shared/lib/diff";
 import { channelLabel, formatRelativeTime } from "../../shared/lib/format";
 import { StatusDot } from "../../shared/ui/StatusDot";
-import { statusLabel, statusTone, triggerLabel } from "../schedule/sleepStatus";
+import { statusLabel, statusTone, triggerLabel } from "../schedule/runStatus";
 import { useAgentQuery } from "./agentQuery";
 import { formatChars, llmSourceKey, totalMemoryChars } from "./profileFormat";
-import { QueryState } from "./QueryState";
+import { QueryState } from "../../shared/ui/QueryState";
 
 export interface AgentOverviewProps {
   agentId: string;
@@ -19,7 +19,7 @@ export interface AgentOverviewProps {
   /** All sessions; the overview keeps the ones of this agent. */
   sessions: SessionEntry[];
   onSelectSection: (section: AgentSection) => void;
-  onOpenRun: (runId: string) => void;
+  onOpenSleepRun: (runId: string) => void;
 }
 
 const RECENT_ACTIVITY = 5;
@@ -33,8 +33,9 @@ export function AgentOverview(props: AgentOverviewProps) {
   const historyState = useAgentQuery(authToken, ["memory-history", agentId], () =>
     fetchMemoryHistory(agentId, authToken),
   );
+  // Skipped checks are recorded daily; only runs that did work are activity.
   const runsState = useAgentQuery(authToken, ["sleep-runs", agentId], () =>
-    fetchSleepRuns(agentId, RECENT_ACTIVITY, authToken),
+    fetchSleepRuns(agentId, RECENT_ACTIVITY, authToken, WORKED_SLEEP_STATUSES),
   );
 
   return (
@@ -54,7 +55,7 @@ export function AgentOverview(props: AgentOverviewProps) {
           <ActivityCard
             runs={runsState.data ?? []}
             changes={historyState.data ?? []}
-            onOpenRun={props.onOpenRun}
+            onOpenSleepRun={props.onOpenSleepRun}
             onSelectSection={props.onSelectSection}
           />
         </div>
@@ -285,12 +286,12 @@ type Activity =
 function ActivityCard({
   runs,
   changes,
-  onOpenRun,
+  onOpenSleepRun,
   onSelectSection,
 }: {
   runs: SleepRun[];
   changes: MemoryChange[];
-  onOpenRun: (runId: string) => void;
+  onOpenSleepRun: (runId: string) => void;
   onSelectSection: (section: AgentSection) => void;
 }) {
   const items: Activity[] = [
@@ -309,7 +310,7 @@ function ActivityCard({
           {items.map((item) =>
             item.kind === "sleep" ? (
               <li key={`sleep:${item.run.id}`}>
-                <button type="button" className="agent-activity-row" onClick={() => onOpenRun(item.run.id)}>
+                <button type="button" className="agent-activity-row" onClick={() => onOpenSleepRun(item.run.id)}>
                   <StatusDot tone={statusTone(item.run.status)} />
                   <span className="agent-activity-title">Sleep · {triggerLabel(item.run.trigger)}</span>
                   <span className="agent-activity-detail">

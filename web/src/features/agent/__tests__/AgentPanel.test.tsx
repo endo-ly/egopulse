@@ -118,7 +118,7 @@ function renderPanel(section: AgentSection, overrides: Partial<Parameters<typeof
     avatarUrl: undefined,
     sessions: SESSIONS,
     onSelectSection: vi.fn(),
-    onOpenRun: vi.fn(),
+    onOpenSleepRun: vi.fn(),
     ...overrides,
   };
   render(<AgentPanel {...props} />);
@@ -147,6 +147,7 @@ describe("AgentPanel", () => {
       total_tokens: 0,
       error_message: null,
       session_count: 2,
+      changed_memory: [],
     };
     stubApi({
       "/api/agents/lyre/profile": { profile: PROFILE },
@@ -186,7 +187,7 @@ describe("AgentPanel", () => {
     await waitFor(() => expect(screen.getByText("Sleep · Scheduled")).toBeTruthy());
     expect(screen.getByText("Memory · semantic")).toBeTruthy();
     fireEvent.click(screen.getByText("Sleep · Scheduled"));
-    expect(props.onOpenRun).toHaveBeenCalledWith("run-sleep1");
+    expect(props.onOpenSleepRun).toHaveBeenCalledWith("run-sleep1");
   });
 
   it("soul_marks_the_applied_layer_and_the_fallback", async () => {
@@ -260,7 +261,7 @@ describe("AgentPanel", () => {
     await waitFor(() => expect(document.querySelector(".diff-container")).not.toBeNull());
     expect(document.querySelector(".memory-change")!.textContent).toContain("+1 −1");
     fireEvent.click(screen.getByRole("button", { name: /Sleep run #run-ab/ }));
-    expect(props.onOpenRun).toHaveBeenCalledWith("run-abcdef");
+    expect(props.onOpenSleepRun).toHaveBeenCalledWith("run-abcdef");
   });
 
   it("memory_folds_long_files", async () => {

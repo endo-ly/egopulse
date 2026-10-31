@@ -5,7 +5,7 @@ import type { SkillDetail } from "../../shared/api/types";
 import { EmptyState } from "../../shared/ui/EmptyState";
 import { useAgentQuery } from "./agentQuery";
 import { DocumentCard } from "./DocumentCard";
-import { QueryState } from "./QueryState";
+import { QueryState } from "../../shared/ui/QueryState";
 
 const BOOK_ICON = (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">

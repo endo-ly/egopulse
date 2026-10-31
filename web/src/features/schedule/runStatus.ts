@@ -1,6 +1,8 @@
 import type { StatusTone } from "../../shared/ui/StatusDot";
 
-/** Maps a sleep run/step status to the shared status color vocabulary. */
+/**
+ * Maps a Pulse/Sleep run or step status to the shared status color vocabulary.
+ */
 export function statusTone(status: string): StatusTone {
   switch (status) {
     case "running":
@@ -14,6 +16,11 @@ export function statusTone(status: string): StatusTone {
     default:
       return "idle";
   }
+}
+
+/** A Pulse run's color: a skipped firing could not be delivered, so it warns. */
+export function pulseTone(status: string): StatusTone {
+  return status === "skipped" ? "warning" : statusTone(status);
 }
 
 const STEP_LABELS: Record<string, string> = {

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 
-import { Spinner } from "../../shared/ui/Spinner";
+import { Spinner } from "./Spinner";
 
 interface QueryStateProps<T> {
   state: { data: T | undefined; loading: boolean; error: Error | null };
@@ -18,7 +18,7 @@ export function QueryState<T>({ state, children }: QueryStateProps<T>) {
     );
   }
   return (
-    <div className="agent-loading">
+    <div className="query-loading">
       <Spinner />
     </div>
   );

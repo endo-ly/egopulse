@@ -1,57 +1,66 @@
-import type { AgentEntry } from "../../shared/api/types";
-import { EmptyState } from "../../shared/ui/EmptyState";
-import { MOON_ICON } from "../../shared/ui/icons";
-import { RunDetail } from "./RunDetail";
-import { RunList } from "./RunList";
+import type { ScheduleView } from "../../app/router";
+import type { SessionEntry } from "../../shared/api/types";
+import { ActivitySection } from "./ActivitySection";
+import { useScheduleOutlook } from "./outlook";
+import { PulseSection } from "./PulseSection";
+import { SleepSection } from "./SleepSection";
 
 export interface SchedulePanelProps {
-  agents: AgentEntry[];
   agentId: string;
   authToken: string;
-  runId: string | null;
-  onSelectRun: (runId: string) => void;
-  onBack: () => void;
+  view: ScheduleView;
+  sessions: readonly SessionEntry[];
+  onChangeView: (view: ScheduleView) => void;
+  onOpenSession: (sessionKey: string) => void;
 }
 
-/** Schedule screen: the selected agent's sleep run history and run audit. */
-export function SchedulePanel({
-  agents,
-  agentId,
-  authToken,
-  runId,
-  onSelectRun,
-  onBack,
-}: SchedulePanelProps) {
+const HEADINGS = {
+  pulse: { title: "Pulse", description: "Wakes the agent at set times to check on something." },
+  sleep: { title: "Sleep", description: "Distills recent conversations into long-term memory." },
+} as const;
+
+/**
+ * Schedule screen: what the agent does on its own. Activity watches what
+ * comes next and what happened; Pulse and Sleep hold how each is set up.
+ */
+export function SchedulePanel({ agentId, authToken, view, sessions, onChangeView, onOpenSession }: SchedulePanelProps) {
+  const { pulse, sleep, lastSleep } = useScheduleOutlook(agentId, authToken);
+
+  if (view.section === "activity") {
+    return (
+      <ActivitySection
+        agentId={agentId}
+        authToken={authToken}
+        pulse={pulse.data}
+        outlook={sleep.data}
+        lastSleep={lastSleep.data}
+        sessions={sessions}
+        run={view.run}
+        onOpenRun={(run) => onChangeView({ section: "activity", run })}
+        onOpenSession={onOpenSession}
+      />
+    );
+  }
+
+  const heading = HEADINGS[view.section];
   return (
     <div className="screen-panel">
       <header className="screen-header">
-        <h1 className="panel-title">Schedule</h1>
-        <p className="panel-description">Sleep runs of this agent and what each one changed.</p>
+        <h1 className="panel-title">{heading.title}</h1>
+        <p className="panel-description">{heading.description}</p>
       </header>
-
-      <div className="sleep-runs-layout" data-mobile-view={runId ? "detail" : "list"}>
-        <div className="sleep-runs-pane">
-          <h2 className="section-title">SLEEP RUNS</h2>
-          <div className="sleep-runs-scroll">
-            <RunList
-              agentId={agentId}
-              authToken={authToken}
-              selectedRunId={runId}
-              onSelectRun={onSelectRun}
-            />
-          </div>
-        </div>
-        <div className="sleep-detail-pane">
-          {runId ? (
-            <RunDetail runId={runId} authToken={authToken} agents={agents} onBack={onBack} />
-          ) : (
-            <EmptyState
-              icon={MOON_ICON}
-              title="No run selected"
-              description="Select a run from the list to audit what the sleep batch changed."
-            />
-          )}
-        </div>
+      <div className="agent-panel-body">
+        {view.section === "pulse" ? (
+          <PulseSection
+            pulse={pulse}
+            sessions={sessions}
+            intentionId={view.intentionId}
+            onSelectIntention={(intentionId) => onChangeView({ section: "pulse", intentionId })}
+            onOpenSession={onOpenSession}
+          />
+        ) : (
+          <SleepSection outlook={sleep} />
+        )}
       </div>
     </div>
   );

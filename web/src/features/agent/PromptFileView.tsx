@@ -5,7 +5,7 @@ import type { PromptFileKind, PromptFileLayer } from "../../shared/api/types";
 import { Button } from "../../shared/ui/Button";
 import { useAgentQuery } from "./agentQuery";
 import { DocumentCard } from "./DocumentCard";
-import { QueryState } from "./QueryState";
+import { QueryState } from "../../shared/ui/QueryState";
 
 export interface PromptFileViewProps {
   agentId: string;
