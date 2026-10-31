@@ -389,10 +389,34 @@ pub(crate) fn list_skill_files(dir: &Path) -> std::io::Result<Vec<SkillFile>> {
     Ok(files)
 }
 
+/// Whether a skill serves the file at `relative`: no hidden segment, and no
+/// excluded build directory on the way down. [`list_skill_files`] applies this
+/// same rule, so a file it does not list cannot be read either.
+fn is_served_relative_path(relative: &Path) -> bool {
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        if name.starts_with('.') {
+            return false;
+        }
+        // The last segment names the file itself, not a directory to walk.
+        if components.peek().is_some() && is_excluded_dir_name(name) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Reads a UTF-8 text file bundled with the skill in `dir`.
 ///
 /// `relative` is resolved inside `dir`; paths that escape it (via `..`,
-/// absolute paths, or symlinks) are reported as [`SkillFileError::NotFound`].
+/// absolute paths, or symlinks) and paths the skill does not serve (hidden
+/// files, excluded directories) are reported as [`SkillFileError::NotFound`].
 ///
 /// # Errors
 ///
@@ -403,7 +427,11 @@ pub(crate) fn read_skill_file(dir: &Path, relative: &str) -> Result<String, Skil
         .join(relative)
         .canonicalize()
         .map_err(|_| SkillFileError::NotFound)?;
-    if !path.starts_with(&root) || !path.is_file() {
+    // Check the canonical path, so a symlink is judged by what it resolves to.
+    let Ok(served) = path.strip_prefix(&root) else {
+        return Err(SkillFileError::NotFound);
+    };
+    if !is_served_relative_path(served) || !path.is_file() {
         return Err(SkillFileError::NotFound);
     }
     if path.metadata()?.len() > MAX_SKILL_FILE_BYTES {
@@ -917,6 +945,30 @@ mod tests {
 
         // Assert
         assert_eq!(content, "# Guide");
+    }
+
+    #[test]
+    fn read_skill_file_rejects_paths_the_listing_does_not_serve() {
+        // Arrange: files the skill keeps out of its listing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill = dir.path().join("notes");
+        create_skill_at(&skill, "notes", "Body.");
+        write(&skill.join(".env"), b"TOKEN=secret");
+        write(&skill.join(".git/config"), b"[remote]");
+        write(&skill.join("node_modules/pkg/index.js"), b"x");
+        write(&skill.join("references/guide.md"), b"# Guide");
+
+        // Act
+        let env = super::read_skill_file(&skill, ".env");
+        let git = super::read_skill_file(&skill, ".git/config");
+        let vendored = super::read_skill_file(&skill, "node_modules/pkg/index.js");
+        let dotted = super::read_skill_file(&skill, "./references/guide.md");
+
+        // Assert: the same rule the listing applies, so nothing hidden leaks.
+        assert!(matches!(env, Err(super::SkillFileError::NotFound)));
+        assert!(matches!(git, Err(super::SkillFileError::NotFound)));
+        assert!(matches!(vendored, Err(super::SkillFileError::NotFound)));
+        assert_eq!(dotted.expect("read"), "# Guide");
     }
 
     #[test]

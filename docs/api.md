@@ -664,7 +664,7 @@ GET /api/skills/{name}/files/{path}
   | `instructions` | SKILL.md の本文（frontmatter を除く） |
   | `files[]` | SKILL.md 以外の同梱ファイル（`path`: スキルディレクトリからの相対、`bytes`）。隠しファイル・ビルド成果物ディレクトリ・シンボリックリンクは除外し、最大 200 件 |
 
-- 同梱ファイル: `{ "ok": true, "content": "…" }`。スキルディレクトリ外を指すパス・存在しないファイルは `404`（`skill_file_not_found`）、256 KiB 超は `413`（`skill_file_too_large`）、UTF-8 テキストでないものは `415`（`skill_file_not_text`）
+- 同梱ファイル: `{ "ok": true, "content": "…" }`。読み取りは一覧と同じ規則に従う（隠しファイル・ビルド成果物ディレクトリ・スキルディレクトリ外・存在しないファイルは `404`）。`404` は `skill_file_not_found`、256 KiB 超は `413`（`skill_file_too_large`）、UTF-8 テキストでないものは `415`（`skill_file_not_text`）
 
 ---
 
