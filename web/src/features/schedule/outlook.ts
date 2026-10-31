@@ -11,9 +11,9 @@ export function useScheduleOutlook(agentId: string, authToken: string) {
   const pulse = useScheduleQuery(authToken, ["pulse", agentId], () => fetchAgentPulse(agentId, authToken));
   const sleep = useScheduleQuery(authToken, ["sleep-outlook", agentId], () => fetchSleepOutlook(agentId, authToken));
   const lastSleep = useScheduleQuery(authToken, ["sleep-last", agentId], () =>
-    fetchSleepRuns(agentId, 1, authToken, WORKED_SLEEP_STATUSES),
+    fetchSleepRuns(agentId, authToken, { limit: 1, statuses: WORKED_SLEEP_STATUSES }),
   );
-  return { pulse, sleep, lastSleep: { ...lastSleep, data: lastSleep.data?.[0] } };
+  return { pulse, sleep, lastSleep: { ...lastSleep, data: lastSleep.data?.runs[0] } };
 }
 
 /** Whether a sleep check would run on the messages so far. */

@@ -3,7 +3,7 @@ import { useState } from "react";
 import type { ScheduleRun } from "../../app/router";
 import { fetchPulseRuns } from "../../shared/api/pulse";
 import { fetchSleepRuns } from "../../shared/api/sleep";
-import type { AgentPulse, SessionEntry, SleepOutlook } from "../../shared/api/types";
+import type { AgentPulse, PulseRun, RunPage, SessionEntry, SleepOutlook, SleepRun } from "../../shared/api/types";
 import { Spinner } from "../../shared/ui/Spinner";
 import { sleepWillRun, upcomingItems, type UpcomingItem } from "./outlook";
 import { LaneGlyph, OutcomeLabel } from "./parts";
@@ -14,7 +14,6 @@ import {
   formatClock,
   formatDay,
   formatRunTime,
-  intentionTitle,
   markdownPreview,
   pulseOutcomeLabel,
   sleepTitle,
@@ -32,6 +31,10 @@ export interface TimelineProps {
   sessions: readonly SessionEntry[];
   openRun: ScheduleRun | null;
   onOpenRun: (run: ScheduleRun) => void;
+  /** Opens an intention in the Pulse section, where it is set up. */
+  onOpenIntention: (intentionId: string) => void;
+  /** Opens the Sleep section, where the check is set up. */
+  onOpenSleep: () => void;
 }
 
 /** What the agent will do next, then what it did, newest first and grouped by day. */
@@ -48,7 +51,7 @@ export function Timeline(props: TimelineProps) {
 }
 
 /** What comes next; past runs belong to the history. */
-function Upcoming({ pulse, outlook, sessions }: TimelineProps) {
+function Upcoming({ pulse, outlook, sessions, onOpenIntention, onOpenSleep }: TimelineProps) {
   if (pulse === undefined || outlook === undefined) return null;
   const items = upcomingItems(pulse, outlook);
   return (
@@ -63,11 +66,23 @@ function Upcoming({ pulse, outlook, sessions }: TimelineProps) {
         <ul className="timeline-rows">
           {items.map((item) => (
             <li key={item.kind === "pulse" ? `pulse:${item.intention.id}` : "sleep"}>
-              <div className="timeline-row">
+              {/* A row is what will happen; it opens where that is set up. */}
+              <button
+                type="button"
+                className="timeline-row"
+                aria-label={
+                  item.kind === "pulse"
+                    ? `Open intention ${item.intention.id} in Pulse`
+                    : "Open Sleep"
+                }
+                onClick={() =>
+                  item.kind === "pulse" ? onOpenIntention(item.intention.id) : onOpenSleep()
+                }
+              >
                 <UpcomingTime at={item.at} />
                 <LaneGlyph kind={item.kind} />
                 <UpcomingText item={item} pulse={pulse} sessions={sessions} />
-              </div>
+              </button>
             </li>
           ))}
         </ul>
@@ -121,7 +136,7 @@ function UpcomingText({
   const delivery = describeDelivery(item.intention, pulse.default_delivery, sessions);
   return (
     <span className="timeline-text">
-      <span className="timeline-title">{intentionTitle(item.intention)}</span>
+      <span className="timeline-title">{item.intention.id}</span>
       <span className="timeline-summary">
         {delivery.sessionKey === null && <OutcomeLabel tone="warning">Not deliverable</OutcomeLabel>}
         <span className="timeline-summary-text">
@@ -132,17 +147,73 @@ function UpcomingText({
   );
 }
 
-function History({ agentId, authToken, pulse, openRun, onOpenRun }: TimelineProps) {
-  const [limit, setLimit] = useState(PAGE_SIZE);
+/** The runs fetched so far, per mechanism, once the user pages back. */
+interface PagedRuns {
+  pulse: RunPage<PulseRun>;
+  sleep: RunPage<SleepRun>;
+}
+
+/** The `started_at` of the oldest run in a page, to continue from. */
+function oldest(page: RunPage<{ started_at: string }>): string | null {
+  const runs = page.runs;
+  return runs.length > 0 ? runs[runs.length - 1].started_at : null;
+}
+
+function History({ agentId, authToken, openRun, onOpenRun }: TimelineProps) {
   const [showQuiet, setShowQuiet] = useState(false);
   const [expandedQuiet, setExpandedQuiet] = useState<ReadonlySet<string>>(new Set());
+  // Null while the newest page is live. Paging back freezes the list: the page
+  // the cursors came from stays as it was, so a poll cannot leave a hole
+  // between the live head and the pages fetched below it.
+  const [paged, setPaged] = useState<PagedRuns | null>(null);
+  const [olderError, setOlderError] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
 
-  const pulseRuns = useScheduleQuery(authToken, ["pulse-runs", agentId, String(limit)], () =>
-    fetchPulseRuns(agentId, [], limit, authToken),
+  const pulseRuns = useScheduleQuery(
+    authToken,
+    ["pulse-runs", agentId],
+    () => fetchPulseRuns(agentId, authToken, { limit: PAGE_SIZE }),
+    { poll: paged === null },
   );
-  const sleepRuns = useScheduleQuery(authToken, ["sleep-runs", agentId, String(limit)], () =>
-    fetchSleepRuns(agentId, limit, authToken),
+  const sleepRuns = useScheduleQuery(
+    authToken,
+    ["sleep-runs", agentId],
+    () => fetchSleepRuns(agentId, authToken, { limit: PAGE_SIZE }),
+    { poll: paged === null },
   );
+
+  const loadEarlier = async () => {
+    if (loadingOlder || pulseRuns.data === undefined || sleepRuns.data === undefined) return;
+    const from: PagedRuns = paged ?? { pulse: pulseRuns.data, sleep: sleepRuns.data };
+    const pulseFrom = from.pulse.has_more ? oldest(from.pulse) : null;
+    const sleepFrom = from.sleep.has_more ? oldest(from.sleep) : null;
+    setLoadingOlder(true);
+    setOlderError(null);
+    try {
+      const [nextPulse, nextSleep] = await Promise.all([
+        pulseFrom === null
+          ? null
+          : fetchPulseRuns(agentId, authToken, { limit: PAGE_SIZE, before: pulseFrom }),
+        sleepFrom === null
+          ? null
+          : fetchSleepRuns(agentId, authToken, { limit: PAGE_SIZE, before: sleepFrom }),
+      ]);
+      setPaged({
+        pulse: {
+          runs: [...from.pulse.runs, ...(nextPulse?.runs ?? [])],
+          has_more: nextPulse?.has_more ?? false,
+        },
+        sleep: {
+          runs: [...from.sleep.runs, ...(nextSleep?.runs ?? [])],
+          has_more: nextSleep?.has_more ?? false,
+        },
+      });
+    } catch (error) {
+      setOlderError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   const error = pulseRuns.error ?? sleepRuns.error;
   let body;
@@ -155,7 +226,7 @@ function History({ agentId, authToken, pulse, openRun, onOpenRun }: TimelineProp
       </div>
     );
   } else {
-    const { runs, hasMore } = mergeRunPages({ runs: pulseRuns.data, limit }, { runs: sleepRuns.data, limit });
+    const { runs, hasMore } = mergeRunPages(paged?.pulse ?? pulseRuns.data, paged?.sleep ?? sleepRuns.data);
     const days = groupTimeline(runs, showQuiet);
     const expand = (key: string) => setExpandedQuiet((keys) => new Set(keys).add(key));
     body =
@@ -177,7 +248,6 @@ function History({ agentId, authToken, pulse, openRun, onOpenRun }: TimelineProp
                       <li key={row.item.run.id}>
                         <RunRow
                           item={row.item}
-                          pulse={pulse}
                           showTitle
                           open={openRun?.kind === row.item.kind && openRun.id === row.item.run.id}
                           onOpen={() => onOpenRun({ kind: row.item.kind, id: row.item.run.id })}
@@ -190,10 +260,11 @@ function History({ agentId, authToken, pulse, openRun, onOpenRun }: TimelineProp
             </div>
           ))}
           {hasMore && (
-            <button type="button" className="timeline-more" onClick={() => setLimit((count) => count + PAGE_SIZE)}>
-              Load earlier
+            <button type="button" className="timeline-more" onClick={loadEarlier} disabled={loadingOlder}>
+              {loadingOlder ? "Loading…" : "Load earlier"}
             </button>
           )}
+          {olderError !== null && <p className="timeline-note timeline-note-error">{olderError}</p>}
         </>
       );
   }
@@ -267,10 +338,8 @@ function runTone(item: TimelineRun) {
 }
 
 /** The run's title on the timeline: the intention it fired, or the kind of sleep. */
-function runTitle(item: TimelineRun, pulse: AgentPulse | undefined): string {
-  if (item.kind === "sleep") return sleepTitle(item.run.trigger);
-  const intention = pulse?.intentions.find((candidate) => candidate.id === item.run.intention_id);
-  return intention ? intentionTitle(intention) : item.run.intention_id;
+function runTitle(item: TimelineRun): string {
+  return item.kind === "sleep" ? sleepTitle(item.run.trigger) : item.run.intention_id;
 }
 
 /** One line on what came of a run. */
@@ -288,13 +357,11 @@ function runSummary(item: TimelineRun): string | null {
 /** One run as a timeline row: time, mechanism, title, outcome, and a one-line summary. */
 function RunRow({
   item,
-  pulse,
   showTitle,
   open,
   onOpen,
 }: {
   item: TimelineRun;
-  pulse: AgentPulse | undefined;
   showTitle: boolean;
   open: boolean;
   onOpen: () => void;
@@ -313,7 +380,7 @@ function RunRow({
       </time>
       <LaneGlyph kind={item.kind} />
       <span className="timeline-text">
-        {showTitle && <span className="timeline-title">{runTitle(item, pulse)}</span>}
+        {showTitle && <span className="timeline-title">{runTitle(item)}</span>}
         <span className="timeline-summary">
           <OutcomeLabel tone={runTone(item)}>{runOutcome(item)}</OutcomeLabel>
           {summary && <span className="timeline-summary-text">{summary}</span>}

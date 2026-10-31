@@ -47,8 +47,8 @@ const ids = (runs: readonly TimelineRun[]) => runs.map((item) => item.run.id);
 describe("mergeRunPages", () => {
   it("interleaves_both_sources_newest_first_when_both_are_exhausted", () => {
     // Arrange
-    const pulse = { runs: [pulseRun("p2", at(31, 9)), pulseRun("p1", at(29, 9))], limit: 5 };
-    const sleep = { runs: [sleepRun("s1", at(30, 3))], limit: 5 };
+    const pulse = { runs: [pulseRun("p2", at(31, 9)), pulseRun("p1", at(29, 9))], has_more: false };
+    const sleep = { runs: [sleepRun("s1", at(30, 3))], has_more: false };
 
     // Act
     const merged = mergeRunPages(pulse, sleep);
@@ -58,12 +58,12 @@ describe("mergeRunPages", () => {
     expect(merged.hasMore).toBe(false);
   });
 
-  it("stops_at_the_boundary_of_a_full_page_so_no_gap_is_shown", () => {
+  it("stops_at_the_boundary_of_a_source_with_more_so_no_gap_is_shown", () => {
     // Arrange
-    // Pulse filled its page at Oct 30 09:00; older pulse runs may exist, so
-    // the sleep run of Oct 29 must wait until more is fetched.
-    const pulse = { runs: [pulseRun("p2", at(31, 9)), pulseRun("p1", at(30, 9))], limit: 2 };
-    const sleep = { runs: [sleepRun("s2", at(30, 12)), sleepRun("s1", at(29, 3))], limit: 5 };
+    // Pulse has older runs past Oct 30 09:00, so the sleep run of Oct 29 must
+    // wait until more is fetched instead of leaving a gap in the pulse lane.
+    const pulse = { runs: [pulseRun("p2", at(31, 9)), pulseRun("p1", at(30, 9))], has_more: true };
+    const sleep = { runs: [sleepRun("s2", at(30, 12)), sleepRun("s1", at(29, 3))], has_more: false };
 
     // Act
     const merged = mergeRunPages(pulse, sleep);

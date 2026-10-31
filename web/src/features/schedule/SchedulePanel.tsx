@@ -38,6 +38,8 @@ export function SchedulePanel({ agentId, authToken, view, sessions, onChangeView
         run={view.run}
         onOpenRun={(run) => onChangeView({ section: "activity", run })}
         onOpenSession={onOpenSession}
+        onOpenIntention={(intentionId) => onChangeView({ section: "pulse", intentionId })}
+        onOpenSleep={() => onChangeView({ section: "sleep" })}
       />
     );
   }

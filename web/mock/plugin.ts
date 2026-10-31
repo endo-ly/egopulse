@@ -1224,14 +1224,22 @@ function agentPulse(agentId: string) {
   };
 }
 
-/** Filters by the comma-separated `status` query and caps at `limit`. */
-function filterRuns<T extends { status: string; started_at: string }>(runs: T[], params: URLSearchParams): T[] {
+/**
+ * Mirrors the run listings: the comma-separated `status` filter, the `before`
+ * paging cursor, and `has_more` for whether older runs are left.
+ */
+function filterRuns<T extends { status: string; started_at: string }>(
+  runs: T[],
+  params: URLSearchParams,
+): { runs: T[]; has_more: boolean } {
   const statuses = (params.get("status") ?? "").split(",").filter(Boolean);
+  const before = params.get("before");
   const limit = Number(params.get("limit") ?? "20");
-  return runs
+  const matching = runs
     .filter((run) => statuses.length === 0 || statuses.includes(run.status))
-    .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at))
-    .slice(0, limit);
+    .filter((run) => before === null || run.started_at < before)
+    .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
+  return { runs: matching.slice(0, limit), has_more: matching.length > limit };
 }
 
 // Mirrors ~/.egopulse/agents/<id>/memory/*.md served by GET /api/agents/:id/memory.
@@ -1575,19 +1583,20 @@ export function mockApiPlugin(): Plugin | null {
         }
         if (pathname === "/api/sleep/runs") {
           const agentId = parsed.searchParams.get("agent_id");
-          const runs = filterRuns(
+          const page = filterRuns(
             SLEEP_RUNS.filter((run) => run.agent_id === agentId),
             parsed.searchParams,
-          ).map((run) => ({ ...run, changed_memory: changedMemory(run) }));
-          return sendJson(res, { ok: true, runs });
+          );
+          const runs = page.runs.map((run) => ({ ...run, changed_memory: changedMemory(run) }));
+          return sendJson(res, { ok: true, runs, has_more: page.has_more });
         }
         if (pathname === "/api/pulse/runs") {
           const agentId = parsed.searchParams.get("agent_id");
-          const runs = filterRuns(
+          const page = filterRuns(
             PULSE_RUNS.filter((run) => run.agent_id === agentId),
             parsed.searchParams,
-          ).map(pulseSummary);
-          return sendJson(res, { ok: true, runs });
+          );
+          return sendJson(res, { ok: true, runs: page.runs.map(pulseSummary), has_more: page.has_more });
         }
         if (pathname.startsWith("/api/pulse/runs/")) {
           const runId = decodeURIComponent(pathname.slice("/api/pulse/runs/".length));

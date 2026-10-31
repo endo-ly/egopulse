@@ -5,7 +5,7 @@ import { PULSE_ICON } from "../../shared/ui/icons";
 import { QueryState } from "../../shared/ui/QueryState";
 import { DocumentCard } from "../agent/DocumentCard";
 import { MetaLine, OutcomeLabel } from "./parts";
-import { describeDelivery, describeNextDue, describeSchedule, intentionTitle } from "./scheduleFormat";
+import { describeDelivery, describeNextDue, describeSchedule } from "./scheduleFormat";
 
 export interface PulseSectionProps {
   pulse: { data: AgentPulse | undefined; loading: boolean; error: Error | null };
@@ -99,7 +99,7 @@ function Intentions({
                 onClick={() => onSelectIntention(intention.id)}
               >
                 <span className="skill-row-name">
-                  {intentionTitle(intention)}
+                  {intention.id}
                   {!on && <span className="skill-row-source">Off</span>}
                 </span>
                 <span className="skill-row-description">
@@ -143,17 +143,13 @@ function IntentionDetail({
   const delivery = describeDelivery(intention, pulse.default_delivery, sessions);
   const { sessionKey } = delivery;
   const origin = ORIGIN_NOTES[delivery.origin];
-  const title = intentionTitle(intention);
 
   return (
-    <section className="skill-detail" aria-label={title}>
+    <section className="skill-detail" aria-label={intention.id}>
       <header className="run-detail-head">
-        <h2 className="run-detail-title">{title}</h2>
+        <h2 className="run-detail-title">{intention.id}</h2>
         <MetaLine
           items={[
-            <span key="id" className="row-meta-id">
-              {intention.id}
-            </span>,
             <OutcomeLabel key="state" tone={on ? "success" : "idle"}>
               {on ? "Active" : pulse.enabled === false ? "Off (Pulse is off)" : "Off"}
             </OutcomeLabel>,

@@ -113,6 +113,17 @@ interface Api {
   pulseDetails?: Record<string, PulseRunDetail>;
 }
 
+/** One page of runs, as the listings serve it. */
+function pageOf<T extends { status: string; started_at: string }>(runs: T[], url: URL) {
+  const statuses = url.searchParams.get("status")?.split(",") ?? null;
+  const before = url.searchParams.get("before");
+  const limit = Number(url.searchParams.get("limit") ?? "20");
+  const matching = runs
+    .filter((run) => statuses === null || statuses.includes(run.status))
+    .filter((run) => before === null || run.started_at < before);
+  return { runs: matching.slice(0, limit), has_more: matching.length > limit };
+}
+
 /** Serves the Schedule APIs from fixtures and records requested URLs. */
 function stubApi({ pulseRuns = [], sleepRuns = [], pulseDetails = {} }: Api) {
   const requested: URL[] = [];
@@ -121,16 +132,12 @@ function stubApi({ pulseRuns = [], sleepRuns = [], pulseDetails = {} }: Api) {
     vi.fn().mockImplementation((input: RequestInfo | URL) => {
       const url = new URL(String(input), "http://localhost");
       requested.push(url);
-      const limit = Number(url.searchParams.get("limit") ?? "20");
       let body: unknown;
       if (url.pathname.endsWith("/pulse")) body = { ok: true, pulse: PULSE };
       else if (url.pathname.endsWith("/sleep/next")) body = { ok: true, outlook: OUTLOOK };
-      else if (url.pathname === "/api/pulse/runs") body = { ok: true, runs: pulseRuns.slice(0, limit) };
-      else if (url.pathname === "/api/sleep/runs") {
-        const statuses = url.searchParams.get("status")?.split(",") ?? null;
-        const runs = sleepRuns.filter((run) => statuses === null || statuses.includes(run.status));
-        body = { ok: true, runs: runs.slice(0, limit) };
-      } else if (url.pathname.startsWith("/api/pulse/runs/")) {
+      else if (url.pathname === "/api/pulse/runs") body = { ok: true, ...pageOf(pulseRuns, url) };
+      else if (url.pathname === "/api/sleep/runs") body = { ok: true, ...pageOf(sleepRuns, url) };
+      else if (url.pathname.startsWith("/api/pulse/runs/")) {
         body = { ok: true, run: pulseDetails[url.pathname.split("/").pop()!] };
       }
       return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
@@ -174,10 +181,11 @@ describe("SchedulePanel", () => {
       expect(upcoming.querySelectorAll(".timeline-row")).toHaveLength(3);
     });
     const rows = Array.from(upcoming.querySelectorAll(".timeline-row"));
+    // Intentions are named by id; the attention is read in the Pulse section.
     expect(rows.map((row) => row.querySelector(".timeline-title")!.textContent)).toEqual([
-      "Check the calendar.",
+      "morning",
       "Sleep",
-      "Wrap up the day.",
+      "evening",
     ]);
     expect(rows[0].textContent).toContain("Every day 09:00 → Discord · Team chat");
     expect(rows[1].textContent).toContain("Likely to skip");
@@ -214,6 +222,35 @@ describe("SchedulePanel", () => {
     expect(rows[2].textContent).toContain("only 3");
   });
 
+  it("pages_back_through_the_history_without_gaps_or_duplicates", async () => {
+    // Arrange: 45 runs, so the newest page of 20 leaves two older pages.
+    const runs = Array.from({ length: 45 }, (_, index) =>
+      pulseRun(`run-${String(index).padStart(2, "0")}`, "morning", index + 1),
+    );
+    stubApi({ pulseRuns: runs });
+    const { getByRole, findByRole, queryByRole } = renderPanel("t-paging");
+    const history = getByRole("region", { name: "History" });
+    const stamps = () =>
+      Array.from(history.querySelectorAll(".timeline-row time")).map((el) => el.getAttribute("datetime"));
+    await waitFor(() => {
+      expect(stamps()).toHaveLength(20);
+    });
+
+    // Act: page back twice, until the history runs out.
+    fireEvent.click(await findByRole("button", { name: "Load earlier" }));
+    await waitFor(() => {
+      expect(stamps()).toHaveLength(40);
+    });
+    fireEvent.click(await findByRole("button", { name: "Load earlier" }));
+
+    // Assert: every run shows up exactly once and the button goes away.
+    await waitFor(() => {
+      expect(stamps()).toHaveLength(45);
+    });
+    expect(new Set(stamps()).size).toBe(45);
+    expect(queryByRole("button", { name: "Load earlier" })).toBeNull();
+  });
+
   it("opens_a_run_beside_the_timeline_and_closes_it_again", async () => {
     // Arrange
     const run = pulseRun("notify", "morning", 0.2);
@@ -235,7 +272,8 @@ describe("SchedulePanel", () => {
     fireEvent.click(within(pane).getByRole("button", { name: "Close" }));
 
     // Assert
-    expect(pane.querySelector(".run-detail-title")!.textContent).toBe("Check the calendar.");
+    // The title is a way back to the intention, so it carries a glyph too.
+    expect(pane.querySelector(".title-link")!.textContent).toContain("morning");
     expect(pane.textContent).toContain("Sent to Discord · Team chat");
     expect(onOpenSession).toHaveBeenCalledWith("chat:7");
     expect(onChangeView).toHaveBeenLastCalledWith({ section: "activity", run: null });
@@ -257,7 +295,7 @@ describe("SchedulePanel", () => {
 
     // Assert
     const items = Array.from(alert.querySelectorAll("li")).map((item) => item.textContent);
-    expect(items[0]).toContain("Wrap up the day. failed on its last firing");
+    expect(items[0]).toContain("evening failed on its last firing");
     expect(items[1]).toContain("Sleep failed on its last run");
     expect(onChangeView).toHaveBeenCalledWith({ section: "activity", run: { kind: "pulse", id: "evening-fail" } });
   });
@@ -274,8 +312,45 @@ describe("SchedulePanel", () => {
     await waitFor(() => {
       expect(upcoming.querySelectorAll(".timeline-row")).toHaveLength(3);
     });
-    expect(upcoming.querySelector("button")).toBeNull();
+    // Upcoming is a plan, not history: its rows carry no run outcome.
     expect(upcoming.querySelector(".outcome")?.textContent).not.toBe("Notified");
+  });
+
+  it("opens_the_intention_or_the_sleep_setup_from_an_upcoming_row", async () => {
+    // Arrange
+    stubApi({});
+    const { findByRole, onChangeView } = renderPanel("t-upcoming-nav");
+    const upcoming = await findByRole("region", { name: "Upcoming" });
+    await waitFor(() => {
+      expect(upcoming.querySelectorAll(".timeline-row")).toHaveLength(3);
+    });
+
+    // Act
+    fireEvent.click(within(upcoming).getByRole("button", { name: "Open intention morning in Pulse" }));
+    fireEvent.click(within(upcoming).getByRole("button", { name: "Open Sleep" }));
+
+    // Assert
+    expect(onChangeView).toHaveBeenNthCalledWith(1, { section: "pulse", intentionId: "morning" });
+    expect(onChangeView).toHaveBeenNthCalledWith(2, { section: "sleep" });
+  });
+
+  it("opens_the_intention_a_pulse_run_fired", async () => {
+    // Arrange
+    const run = pulseRun("notify", "morning", 0.2);
+    const detail: PulseRunDetail = { ...run, attention_snapshot: "Check the calendar.", delivery: null };
+    stubApi({ pulseRuns: [run], pulseDetails: { notify: detail } });
+    const view: ScheduleView = { section: "activity", run: { kind: "pulse", id: "notify" } };
+    const { getByRole, onChangeView } = renderPanel("t-intention-nav", view);
+    const pane = getByRole("complementary", { name: "Pulse run" });
+    await waitFor(() => {
+      expect(pane.querySelector(".title-link")).toBeTruthy();
+    });
+
+    // Act
+    fireEvent.click(within(pane).getByRole("button", { name: "Open intention" }));
+
+    // Assert
+    expect(onChangeView).toHaveBeenCalledWith({ section: "pulse", intentionId: "morning" });
   });
 
   it("shows_each_intention_definition_in_the_pulse_section", async () => {
@@ -294,13 +369,14 @@ describe("SchedulePanel", () => {
     );
 
     // Act
-    const detail = await findByRole("region", { name: "Wrap up the day." });
+    const detail = await findByRole("region", { name: "evening" });
     fireEvent.click(container.querySelectorAll(".skill-row")[0]);
 
     // Assert
     const rows = Array.from(container.querySelectorAll(".skill-row"));
     expect(rows.map((row) => row.getAttribute("aria-current"))).toEqual([null, "true"]);
     expect(detail.textContent).toContain("Every day 09:00 (Asia/Tokyo)");
+    expect(detail.querySelector(".run-detail-title")!.textContent).toBe("evening");
     expect(detail.textContent).toContain("Telegram · 987");
     expect(detail.querySelector(".field-warning")!.textContent).toContain("firings are skipped");
     expect(detail.querySelector(".doc-card")!.textContent).toContain("Wrap up the day.");

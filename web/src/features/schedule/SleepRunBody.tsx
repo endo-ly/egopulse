@@ -1,13 +1,13 @@
 import { useMemo, useState } from "react";
 
 import { fetchSleepRunDetail } from "../../shared/api/sleep";
-import type { MemorySnapshot, SleepRun, SleepRunStep } from "../../shared/api/types";
+import type { MemorySnapshot, SleepRun, SleepRunStep, SleepStepStatus } from "../../shared/api/types";
 import { countLineChanges } from "../../shared/lib/diff";
 import { formatDuration, formatTokens } from "../../shared/lib/format";
 import { DiffViewer } from "../../shared/ui/DiffViewer";
 import { QueryState } from "../../shared/ui/QueryState";
 import { Spinner } from "../../shared/ui/Spinner";
-import { MetaLine, OutcomeLabel } from "./parts";
+import { OutcomeLabel } from "./parts";
 import { statusLabel, statusTone, stepLabel } from "./runStatus";
 import { formatRunTime, sleepTitle } from "./scheduleFormat";
 import { useScheduleQuery } from "./scheduleQuery";
@@ -41,51 +41,73 @@ function SleepRunContent({
 }) {
   return (
     <>
-      <header className="run-detail-head">
-        <h2 className="run-detail-title">{sleepTitle(run.trigger)}</h2>
-        <MetaLine
-          items={[
-            <OutcomeLabel key="status" tone={statusTone(run.status)}>
-              {statusLabel(run.status)}
-            </OutcomeLabel>,
-            <span key="at">{formatRunTime(run.started_at)}</span>,
-            run.finished_at && (
-              <span key="took">took {formatDuration(Date.parse(run.finished_at) - Date.parse(run.started_at))}</span>
-            ),
-            run.total_tokens > 0 && <span key="tokens">{formatTokens(run.total_tokens)} tokens</span>,
-            <span key="id" className="row-meta-id">
-              #{run.id.slice(0, 6)}
-            </span>,
-          ]}
-        />
-      </header>
-      {run.status === "skipped" ? (
-        <p className="field-note">Did not run: {run.error_message ?? "no reason recorded"}.</p>
-      ) : (
-        <>
-          {steps.length === 0 && run.error_message && <pre className="row-error">{run.error_message}</pre>}
-          {PUBLISHED.has(run.status) && <MemoryChanges snapshots={snapshots} />}
-          {steps.length > 0 && <Pipeline steps={steps} />}
-        </>
+      <h2 className="run-detail-title">{sleepTitle(run.trigger)}</h2>
+      {/* The run's facts and its steps read together, side by side; the memory
+          diff needs the whole width below them. */}
+      <div className="sleep-run-overview">
+        <section className="sleep-run-summary" aria-label="Run summary">
+          <OutcomeLabel tone={statusTone(run.status)}>{statusLabel(run.status)}</OutcomeLabel>
+          <RunFacts run={run} />
+          {run.status === "skipped" && (
+            <p className="field-note">Did not run: {run.error_message ?? "no reason recorded"}.</p>
+          )}
+        </section>
+        {steps.length > 0 && <Pipeline steps={steps} />}
+      </div>
+      {steps.length === 0 && run.status !== "skipped" && run.error_message && (
+        <pre className="row-error">{run.error_message}</pre>
       )}
+      {PUBLISHED.has(run.status) && <MemoryChanges snapshots={snapshots} />}
     </>
   );
 }
 
-/** The pipeline in one line while every step succeeded; step by step otherwise. */
+/** The run as a few facts: what it cost, when it ran, and which run it was. */
+function RunFacts({ run }: { run: SleepRun }) {
+  const took = run.finished_at
+    ? formatDuration(Date.parse(run.finished_at) - Date.parse(run.started_at))
+    : null;
+  return (
+    <dl className="agent-kv sleep-run-facts">
+      {run.total_tokens > 0 && (
+        <div className="agent-kv-row">
+          <dt>Tokens</dt>
+          <dd>{formatTokens(run.total_tokens)}</dd>
+        </div>
+      )}
+      {run.session_count > 0 && (
+        <div className="agent-kv-row">
+          <dt>Sessions</dt>
+          <dd>{run.session_count}</dd>
+        </div>
+      )}
+      <div className="agent-kv-row">
+        <dt>Started</dt>
+        <dd>{formatRunTime(run.started_at)}</dd>
+      </div>
+      {took !== null && (
+        <div className="agent-kv-row">
+          <dt>Took</dt>
+          <dd>{took}</dd>
+        </div>
+      )}
+      <div className="agent-kv-row">
+        <dt>Run</dt>
+        <dd className="row-meta-id" title={run.id}>
+          #{run.id.slice(0, 6)}
+        </dd>
+      </div>
+    </dl>
+  );
+}
+
+/**
+ * The pipeline step by step: how far it got, which steps cleared, and what
+ * each one cost. Steps stay listed even when all of them succeeded, so the
+ * run's shape and cost are readable at a glance.
+ */
 function Pipeline({ steps }: { steps: SleepRunStep[] }) {
   const failures = steps.filter((step) => step.error_message);
-  const allDone = steps.every((step) => step.status === "success");
-  if (allDone) {
-    return (
-      <p className="run-detail-line pipeline-done">
-        <span className="pipeline-step-icon" aria-hidden="true">
-          ✓
-        </span>
-        All {steps.length} steps done
-      </p>
-    );
-  }
   return (
     <section className="run-detail-section" aria-label="Pipeline">
       <h3 className="run-detail-section-title">Pipeline</h3>
@@ -98,9 +120,8 @@ function Pipeline({ steps }: { steps: SleepRunStep[] }) {
                 {step.status === "running" ? <Spinner size="sm" /> : stepGlyph(step.status)}
               </span>
               <span className="pipeline-step-name">{stepLabel(step.step)}</span>
-              {step.status === "success" && tokens > 0 && (
-                <span className="pipeline-step-meta">{formatTokens(tokens)}</span>
-              )}
+              {/* Always rendered so the token column stays aligned. */}
+              <span className="pipeline-step-meta">{tokens > 0 ? formatTokens(tokens) : ""}</span>
             </li>
           );
         })}
@@ -115,7 +136,7 @@ function Pipeline({ steps }: { steps: SleepRunStep[] }) {
   );
 }
 
-function stepGlyph(status: string): string {
+function stepGlyph(status: SleepStepStatus): string {
   switch (status) {
     case "success":
       return "✓";
@@ -145,11 +166,9 @@ function MemoryChanges({ snapshots }: { snapshots: MemorySnapshot[] }) {
 
   return (
     <section className="run-detail-section" aria-label="Memory changes">
-      <h3 className="run-detail-section-title">Memory changes</h3>
-      {active === undefined ? (
-        <p className="field-note">Memory was left unchanged.</p>
-      ) : (
-        <>
+      <div className="run-detail-section-head">
+        <h3 className="run-detail-section-title">Memory changes</h3>
+        {active !== undefined && (
           <div className="file-chips" role="group" aria-label="Changed files">
             {changed.map(({ snapshot, counts }) => (
               <button
@@ -165,13 +184,17 @@ function MemoryChanges({ snapshots }: { snapshots: MemorySnapshot[] }) {
               </button>
             ))}
           </div>
-          <DiffViewer
-            key={active.snapshot.file}
-            before={active.snapshot.content_before}
-            after={active.snapshot.content_after}
-            fileName={active.snapshot.file}
-          />
-        </>
+        )}
+      </div>
+      {active === undefined ? (
+        <p className="field-note">Memory was left unchanged.</p>
+      ) : (
+        <DiffViewer
+          key={active.snapshot.file}
+          before={active.snapshot.content_before}
+          after={active.snapshot.content_after}
+          fileName={active.snapshot.file}
+        />
       )}
     </section>
   );

@@ -35,11 +35,12 @@ export function stepLabel(step: string): string {
 }
 
 const STATUS_LABELS: Record<string, string> = {
+  pending: "Pending",
+  running: "Running",
   success: "Success",
   partial_failure: "Partial failure",
   failed: "Failed",
   skipped: "Skipped",
-  running: "Running",
 };
 
 export function statusLabel(status: string): string {

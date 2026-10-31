@@ -1,4 +1,4 @@
-import type { SleepOutlook, SleepRun, SleepRunDetail, SleepRunStatus } from "./types";
+import type { RunPage, SleepOutlook, SleepRun, SleepRunDetail, SleepRunStatus } from "./types";
 import { apiFetch } from "./client";
 
 /**
@@ -12,23 +12,28 @@ export const WORKED_SLEEP_STATUSES: readonly SleepRunStatus[] = [
   "failed",
 ];
 
-/**
- * Fetches up to `limit` sleep runs of one agent, newest first. A non-empty
- * `statuses` keeps only those statuses.
- */
+export interface SleepRunsQuery {
+  limit: number;
+  /** Keeps only these statuses; every status when omitted. */
+  statuses?: readonly SleepRunStatus[];
+  /** Pages back to runs started before this instant. */
+  before?: string;
+}
+
+/** Fetches one page of an agent's sleep runs, newest first. */
 export async function fetchSleepRuns(
   agentId: string,
-  limit: number,
   authToken: string,
-  statuses: readonly SleepRunStatus[] = [],
-): Promise<SleepRun[]> {
+  { limit, statuses = [], before }: SleepRunsQuery,
+): Promise<RunPage<SleepRun>> {
   const params = new URLSearchParams({ agent_id: agentId, limit: String(limit) });
   if (statuses.length > 0) params.set("status", statuses.join(","));
-  const data = await apiFetch<{ ok: boolean; runs: SleepRun[] }>(
+  if (before !== undefined) params.set("before", before);
+  const data = await apiFetch<{ ok: boolean } & RunPage<SleepRun>>(
     `/api/sleep/runs?${params}`,
     authToken,
   );
-  return data.runs;
+  return { runs: data.runs, has_more: data.has_more };
 }
 
 export function fetchSleepRunDetail(runId: string, authToken: string): Promise<SleepRunDetail> {

@@ -35,7 +35,7 @@ export function AgentOverview(props: AgentOverviewProps) {
   );
   // Skipped checks are recorded daily; only runs that did work are activity.
   const runsState = useAgentQuery(authToken, ["sleep-runs", agentId], () =>
-    fetchSleepRuns(agentId, RECENT_ACTIVITY, authToken, WORKED_SLEEP_STATUSES),
+    fetchSleepRuns(agentId, authToken, { limit: RECENT_ACTIVITY, statuses: WORKED_SLEEP_STATUSES }),
   );
 
   return (
@@ -53,7 +53,7 @@ export function AgentOverview(props: AgentOverviewProps) {
             <PromptCard profile={profile} onSelectSection={props.onSelectSection} />
           </div>
           <ActivityCard
-            runs={runsState.data ?? []}
+            runs={runsState.data?.runs ?? []}
             changes={historyState.data ?? []}
             onOpenSleepRun={props.onOpenSleepRun}
             onSelectSection={props.onSelectSection}

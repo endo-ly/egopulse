@@ -59,6 +59,13 @@ export interface ToolEventData {
   duration_ms?: number;
 }
 
+/** One page of a run listing, as the API returns it. */
+export interface RunPage<T> {
+  runs: T[];
+  /** Whether older runs exist beyond this page. */
+  has_more: boolean;
+}
+
 export type SleepRunStatus = "running" | "success" | "partial_failure" | "failed" | "skipped";
 export type SleepRunTrigger = "manual" | "scheduled" | "backfill";
 export type SleepStepStatus = "pending" | "running" | "success" | "failed" | "skipped";

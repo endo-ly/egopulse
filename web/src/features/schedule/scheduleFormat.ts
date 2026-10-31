@@ -114,11 +114,6 @@ export function markdownPreview(markdown: string | null): string | null {
     .replace(/(\*\*|__|`)/g, "");
 }
 
-/** What an intention is about, as a title: the first line of its attention, else its id. */
-export function intentionTitle(intention: Pick<PulseIntention, "id" | "attention">): string {
-  return markdownPreview(intention.attention) || intention.id;
-}
-
 /** Where an intention's firings go, as shown to people. */
 interface DeliveryDescription {
   /** "Discord · Team chat", or the configured destination when it does not resolve. */

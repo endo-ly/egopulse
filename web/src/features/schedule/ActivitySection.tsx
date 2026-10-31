@@ -4,7 +4,7 @@ import { StatusDot } from "../../shared/ui/StatusDot";
 import { LaneGlyph } from "./parts";
 import { PulseRunBody } from "./PulseRunBody";
 import { pulseTone, statusTone } from "./runStatus";
-import { formatRunTime, intentionTitle } from "./scheduleFormat";
+import { formatRunTime } from "./scheduleFormat";
 import { SleepRunBody } from "./SleepRunBody";
 import { latestProblems, type Problem } from "./timeline";
 import { Timeline } from "./Timeline";
@@ -20,6 +20,10 @@ export interface ActivitySectionProps {
   run: ScheduleRun | null;
   onOpenRun: (run: ScheduleRun | null) => void;
   onOpenSession: (sessionKey: string) => void;
+  /** Opens an intention in the Pulse section, where it is set up. */
+  onOpenIntention: (intentionId: string) => void;
+  /** Opens the Sleep section, where the check is set up. */
+  onOpenSleep: () => void;
 }
 
 /** Activity: problems, what comes next, and what happened, with a run open beside them. */
@@ -33,6 +37,8 @@ export function ActivitySection({
   run,
   onOpenRun,
   onOpenSession,
+  onOpenIntention,
+  onOpenSleep,
 }: ActivitySectionProps) {
   return (
     <div className="schedule-panel" data-detail={run !== null || undefined}>
@@ -52,6 +58,8 @@ export function ActivitySection({
             sessions={sessions}
             openRun={run}
             onOpenRun={onOpenRun}
+            onOpenIntention={onOpenIntention}
+            onOpenSleep={onOpenSleep}
           />
         </div>
       </div>
@@ -60,10 +68,10 @@ export function ActivitySection({
           key={`${run.kind}:${run.id}`}
           run={run}
           authToken={authToken}
-          pulse={pulse}
           sessions={sessions}
           onClose={() => onOpenRun(null)}
           onOpenSession={onOpenSession}
+          onOpenIntention={onOpenIntention}
         />
       )}
     </div>
@@ -102,15 +110,11 @@ function Problems({
       {problems.length > 0 && (
         <ul className="schedule-alert-list">
           {problems.map((problem) => {
-            const intention =
-              problem.intentionId === null
-                ? undefined
-                : pulse?.intentions.find((candidate) => candidate.id === problem.intentionId);
             return (
               <li key={`${problem.run.kind}:${problem.run.id}`} className="schedule-alert-item">
                 <StatusDot tone={problem.run.kind === "pulse" ? pulseTone(problem.status) : statusTone(problem.status)} />
                 <span>
-                  <strong>{intention ? intentionTitle(intention) : (problem.intentionId ?? "Sleep")}</strong>{" "}
+                  <strong>{problem.intentionId ?? "Sleep"}</strong>{" "}
                   {problemText(problem)}
                   <span className="schedule-alert-time"> · {formatRunTime(problem.startedAt)}</span>
                 </span>
@@ -129,17 +133,17 @@ function Problems({
 function RunDetail({
   run,
   authToken,
-  pulse,
   sessions,
   onClose,
   onOpenSession,
+  onOpenIntention,
 }: {
   run: ScheduleRun;
   authToken: string;
-  pulse: AgentPulse | undefined;
   sessions: readonly SessionEntry[];
   onClose: () => void;
   onOpenSession: (sessionKey: string) => void;
+  onOpenIntention: (intentionId: string) => void;
 }) {
   const label = run.kind === "pulse" ? "Pulse run" : "Sleep run";
   return (
@@ -158,9 +162,9 @@ function RunDetail({
           <PulseRunBody
             runId={run.id}
             authToken={authToken}
-            pulse={pulse}
             sessions={sessions}
             onOpenSession={onOpenSession}
+            onOpenIntention={onOpenIntention}
           />
         ) : (
           <SleepRunBody runId={run.id} authToken={authToken} />

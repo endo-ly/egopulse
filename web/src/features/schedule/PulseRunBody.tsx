@@ -1,29 +1,41 @@
 import { fetchPulseRunDetail } from "../../shared/api/pulse";
-import type { AgentPulse, PulseRunDetail, SessionEntry } from "../../shared/api/types";
+import type { PulseRunDetail, SessionEntry } from "../../shared/api/types";
 import { channelLabel, formatDuration } from "../../shared/lib/format";
 import { sessionTitle } from "../../shared/lib/session";
 import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
 import { QueryState } from "../../shared/ui/QueryState";
 import { MetaLine, OutcomeLabel } from "./parts";
 import { pulseTone } from "./runStatus";
-import { formatRunTime, intentionTitle, pulseOutcomeLabel } from "./scheduleFormat";
+import { formatRunTime, pulseOutcomeLabel } from "./scheduleFormat";
 import { useScheduleQuery } from "./scheduleQuery";
 
 export interface PulseRunBodyProps {
   runId: string;
   authToken: string;
-  pulse: AgentPulse | undefined;
   sessions: readonly SessionEntry[];
   onOpenSession: (sessionKey: string) => void;
+  /** Opens the intention that fired, where it is set up. */
+  onOpenIntention: (intentionId: string) => void;
 }
 
 /** One Pulse firing: what came of it, where it went, and what it attended to. */
-export function PulseRunBody({ runId, authToken, pulse, sessions, onOpenSession }: PulseRunBodyProps) {
+export function PulseRunBody({
+  runId,
+  authToken,
+  sessions,
+  onOpenSession,
+  onOpenIntention,
+}: PulseRunBodyProps) {
   const state = useScheduleQuery(authToken, ["pulse-run", runId], () => fetchPulseRunDetail(runId, authToken));
   return (
     <QueryState state={state}>
       {(run) => (
-        <PulseRunContent run={run} pulse={pulse} sessions={sessions} onOpenSession={onOpenSession} />
+        <PulseRunContent
+          run={run}
+          sessions={sessions}
+          onOpenSession={onOpenSession}
+          onOpenIntention={onOpenIntention}
+        />
       )}
     </QueryState>
   );
@@ -31,46 +43,65 @@ export function PulseRunBody({ runId, authToken, pulse, sessions, onOpenSession 
 
 function PulseRunContent({
   run,
-  pulse,
   sessions,
   onOpenSession,
+  onOpenIntention,
 }: {
   run: PulseRunDetail;
-  pulse: AgentPulse | undefined;
   sessions: readonly SessionEntry[];
   onOpenSession: (sessionKey: string) => void;
+  onOpenIntention: (intentionId: string) => void;
 }) {
-  const intention = pulse?.intentions.find((candidate) => candidate.id === run.intention_id);
   const { delivery } = run;
   const session = delivery && sessions.find((candidate) => candidate.session_key === delivery.session_key);
+  const took = run.finished_at
+    ? formatDuration(Date.parse(run.finished_at) - Date.parse(run.started_at))
+    : null;
   return (
     <>
       <header className="run-detail-head">
-        <h2 className="run-detail-title">{intention ? intentionTitle(intention) : run.intention_id}</h2>
+        <h2 className="run-detail-title">
+          <button
+            type="button"
+            className="title-link"
+            title="Open this intention in Pulse"
+            onClick={() => onOpenIntention(run.intention_id)}
+          >
+            {run.intention_id}
+            <span className="title-link-glyph" aria-hidden="true">
+              ↗
+            </span>
+          </button>
+        </h2>
         <MetaLine
           items={[
             <OutcomeLabel key="outcome" tone={pulseTone(run.status)}>
               {pulseOutcomeLabel(run)}
             </OutcomeLabel>,
-            <span key="at">{formatRunTime(run.started_at)}</span>,
-            run.finished_at && (
-              <span key="took">took {formatDuration(Date.parse(run.finished_at) - Date.parse(run.started_at))}</span>
-            ),
+            <span key="at">
+              {formatRunTime(run.started_at)}
+              {took !== null && <span className="run-meta-duration"> ({took})</span>}
+            </span>,
           ]}
         />
       </header>
 
       <PulseOutcome run={run} />
 
-      {delivery && (
-        <p className="run-detail-line">
-          Sent to {channelLabel(delivery.channel)}
-          {session && ` · ${sessionTitle(session)}`}{" "}
-          <button type="button" className="text-link" onClick={() => onOpenSession(delivery.session_key)}>
-            Open in Chat
-          </button>
-        </p>
-      )}
+      <p className="run-detail-line">
+        {delivery && (
+          <>
+            Sent to {channelLabel(delivery.channel)}
+            {session && ` · ${sessionTitle(session)}`}{" "}
+            <button type="button" className="text-link" onClick={() => onOpenSession(delivery.session_key)}>
+              Open in Chat
+            </button>{" "}
+          </>
+        )}
+        <button type="button" className="text-link" onClick={() => onOpenIntention(run.intention_id)}>
+          Open intention
+        </button>
+      </p>
 
       <section className="run-detail-section" aria-label="Attention">
         <h3 className="run-detail-section-title">Attention</h3>

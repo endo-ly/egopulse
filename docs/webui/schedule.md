@@ -48,8 +48,8 @@ Timeline の上に、直近の run に問題がある intention / Sleep を新�
 
 | 対象 | 問題とみなす条件 | 表示 |
 |---|---|---|
-| Pulse intention | 最新の run が `failed` | `{title} failed on its last firing` |
-| Pulse intention | 最新の run が `skipped`（配送先の会話が解決できず通知できなかった） | `{title} could not deliver its last notification` |
+| Pulse intention | 最新の run が `failed` | `{intention id} failed on its last firing` |
+| Pulse intention | 最新の run が `skipped`（配送先の会話が解決できず通知できなかった） | `{intention id} could not deliver its last notification` |
 | Sleep | 実際に処理した最新の run（`skipped` を除く）が `failed` / `partial_failure` | `Sleep failed on its last run` / `Sleep partly failed on its last run` |
 
 - 各行は status dot・タイトル・時刻と `View`（その run を右に開く）
@@ -58,7 +58,7 @@ Timeline の上に、直近の run に問題がある intention / Sleep を新�
 
 ### 2.2 Upcoming
 
-これから起きることだけを並べる。有効な intention の次回発火と Sleep の次回チェックを時刻順に並べ、発火時刻を過ぎて次のスキャン待ちの intention を先頭にする。行は選択できない（定義は Pulse / Sleep の区画で見る）。
+これから起きることだけを並べる。有効な intention の次回発火と Sleep の次回チェックを時刻順に並べ、発火時刻を過ぎて次のスキャン待ちの intention を先頭にする。行はどれも、それが設定されている区画への入口になる（Pulse 行 → その intention、Sleep 行 → Sleep 区画）。設定を直したいときはここから 1 クリックで届く。
 
 - 各行は時刻（日付ラベルと `09:00`。スキャン待ちは `Due`）・アイコン・タイトルと、2 行目
   - Pulse: `{schedule} → {配送先}`。配送先が解決できなければ `Not deliverable` を warning 色で添える
@@ -75,13 +75,15 @@ Pulse run と Sleep run を新しい順に 1 本にまとめ、ローカル日�
 | 要素 | 内容 |
 |---|---|
 | 時刻 | `07:00`（ホバーで日時） |
-| タイトル | Pulse は intention のタイトル（attention の 1 行目。PULSE.yaml から消えていれば id）、Sleep は `Sleep`（trigger が `manual` / `backfill` なら `Manual sleep` / `Backfill sleep`） |
+| タイトル | Pulse は intention の id、Sleep は `Sleep`（trigger が `manual` / `backfill` なら `Manual sleep` / `Backfill sleep`）。attention は行に出さず、Pulse 区画と run 詳細で読む |
 | 結果 | Pulse: `Notified` / `Silent` / `Failed` / `Not delivered` / `Running`。Sleep: status。status の色で示す |
 | 要約 | Pulse: 通知本文の先頭行（Markdown 記法を除く）/ `Nothing worth reporting` / エラー / skip 理由。Sleep: `Updated episodic, semantic` / `Memory unchanged` / エラー / skip 理由 |
 
 - **Quiet run**: 何も変えず注意も要らない run（報告することがなかった Pulse run と、実行しないと判定した Sleep run）。同じ日に 2 件以上続く quiet run は `{n} quiet runs`（時間帯と内訳 `Silent ×1 · Skipped ×1`）の 1 行にまとめ、選ぶとその場で展開する。`Show quiet runs` で全件を展開する。skip された Pulse run は通知が届かなかったことを意味するので quiet ではない
 - 行を選ぶと右に run 詳細を開く（§5）。開いている run の行は active 表示にする
-- 各仕組みの run を 20 件ずつ取得し、`Load earlier` で 20 件ずつ追加する。一方の仕組みが取得件数に達している場合、その最古の run より古い run はまだ取得されていない可能性があるため、その時点より前は表示しない（取得済みの範囲に抜けを作らない）
+- 最新の 20 件だけを表示時に取得し、以降は可視時ポーリングで追従する。`Load earlier` は各仕組みの最古の `started_at` を `before` として 20 件ずつ遡り、取得した分を足していく。`has_more` が偽になったら履歴の先頭まで到達したので、ボタンを消す（黙って止めない）
+- 遡り始めたら一覧はその時点で凍結し、ポーリングも止める。追従を続けると最新ページの範囲がずれ、取得済みのページとの間に抜けができるため。開いている run の詳細は別途追従する
+- 一方の仕組みにまだ古い run が残っている間は、その最古の run より前を表示しない（もう一方だけが古い run を出すと、抜けがあるように見えるため）
 
 ---
 
@@ -92,8 +94,8 @@ Skills と同じく、intention の一覧と選んだ intention の定義を左�
 | 要素 | 内容 |
 |---|---|
 | agent 単位の設定 | Status（`On` / `Off`）・Timezone・Default destination（`default_delivery`。なければ直近の Discord / Telegram 会話） |
-| 一覧 | PULSE.yaml の定義順。各行はタイトル（attention の 1 行目、空なら id）と `{schedule} · next {次回発火}`。無効な intention（または agent の Pulse が無効）は薄くして `Off` を添える |
-| 定義 | タイトル・id・状態（`Active` / `Off` / `Off (Pulse is off)`）、When（schedule と timezone）、Next（無効なら `Does not fire while off`）、Sends to（§3.1）、Attention（DocumentCard で全文） |
+| 一覧 | PULSE.yaml の定義順。各行は id と `{schedule} · next {次回発火}`。無効な intention（または agent の Pulse が無効）は薄くして `Off` を添える |
+| 定義 | 見出しは intention の id、状態（`Active` / `Off` / `Off (Pulse is off)`）、When（schedule と timezone）、Next（無効なら `Does not fire while off`）、Sends to（§3.1）、Attention（DocumentCard で全文）。タイトルに attention を出さない（同じ文が二度並ぶため） |
 
 - 選択は URL に持つ。指定がない、または PULSE.yaml から消えた intention を指す場合は先頭の intention を選ぶ
 - PULSE.yaml がパースできない場合は、agent 単位の設定と一覧の代わりにその旨とパースエラーを表示する
@@ -125,22 +127,26 @@ Sleep は決まった時刻に起動するが、実行するかはその時点�
 
 | 要素 | 内容 |
 |---|---|
-| 見出し | intention のタイトル。メタ行に結果・開始時刻・所要時間 |
+| 見出し | intention の id。押すと Pulse 区画のその intention へ移る（`↗` を添える）。メタ行に結果・開始時刻・所要時間（開始時刻の直後に括弧で添える） |
 | Outcome | `notify` は通知本文をカードで Markdown 表示。`silent` は報告することがなく送信しなかった旨。`failed` はエラー、`skipped` は通知できなかった旨と理由（warning 色） |
-| 配送先 | `Sent to Discord · Team chat` と `Open in Chat`（通知を保存した会話を Chat タブで開く） |
+| 配送先 | `Sent to Discord · Team chat` と `Open in Chat`（通知を保存した会話を Chat タブで開く）。通知がなくても `Open intention` を出し、意図の定義へ移れる |
 | Attention | run 開始時点の attention。PULSE.yaml がその後編集されても当時の内容を表示する。記録のない run は `Not recorded for this run.` |
 
 Activation 中のツール実行は、通知を保存した会話の Pulse trace として Chat タブで確認する（[chat.md](./chat.md)）。Pulse Capsule の内部（注入されたコンテキスト等）は表示しない。
 
 ### 5.2 Sleep run
 
+実行の記録（サマリーとステップ）を上段に左右で並べ、その下に Memory changes を全幅で置く。実行の記録は横に広げず、diff が幅を使う。ペインが狭いときは上段を縦積みにする。
+
 | 要素 | 内容 |
 |---|---|
-| 見出し | `Sleep` / `Manual sleep` / `Backfill sleep`。メタ行に status・開始時刻・所要時間・総トークン数・run ID 短縮形（`#` + 先頭6文字） |
-| Memory changes | 公開済みの run（`success` / `partial_failure`）だけに表示する。変更のあったファイルを増減行数付き（`episodic +4 −0`）のチップで並べ、選んだファイルの diff を表示する。既定は最初のファイル。変更がなければ `Memory was left unchanged.` |
-| Pipeline | 全ステップが成功していれば `✓ All 4 steps done` の 1 行。そうでなければ 4 ステップ（Event extraction → Episodic update → Semantic update → Prospective update）を並べ、成功は `✓` とトークン数、失敗は danger 色の `✕`、skipped / pending は薄く表示し、失敗したステップのエラーを全文表示する。ステップを1つも実行せず失敗した run は run のエラーを表示する |
+| 見出し | `Sleep` / `Manual sleep` / `Backfill sleep` |
+| Run summary | 上段の左。status（`Success` / `Partial failure` / `Failed` / `Skipped` / `Running`）と、Tokens（総トークン数）・Sessions（対象セッション数）・Started（開始時刻）・Took（所要時間）・Run（`#` + 先頭6文字、ホバーで全 ID）。Took は Started の下に置く。値のない項目は出さない。ステップの成否は Pipeline の行が示すので件数は繰り返さない |
+| Pipeline | 上段の右。4 ステップ（Event extraction → Episodic update → Semantic update → Prospective update）をパイプライン順に 1 行ずつ並べ、行はアイコン・ステップ名・トークン数（入力 + 出力。0 は非表示）。成功は `✓` と success 色、失敗は danger 色の `✕`、skipped / pending は薄く表示する。全ステップが成功した run でも各ステップを残す。失敗したステップのエラーは全文表示する |
+| Memory changes | 公開済みの run（`success` / `partial_failure`）だけに表示する。見出しの右に、変更のあったファイルを増減行数付き（`episodic +4 −0`）のチップで並べ、選んだファイルの diff を表示する。既定は最初のファイル。変更がなければ `Memory was left unchanged.` |
 
-- 実行しないと判定した run は `Did not run: {理由}.` のみを表示する
+- 実行しないと判定した run は `Did not run: {理由}.` を表示し、Pipeline は出さない
+- ステップを1つも実行せず失敗した run は run のエラーを表示する
 - `running` の run の snapshot は公開前の候補なので Memory changes に出さない
 
 ### 5.3 DiffViewer

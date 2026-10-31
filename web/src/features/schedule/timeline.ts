@@ -1,25 +1,19 @@
 import type { ScheduleRun } from "../../app/router";
-import type { AgentPulse, PulseRun, SleepRun } from "../../shared/api/types";
+import type { AgentPulse, PulseRun, RunPage, SleepRun } from "../../shared/api/types";
 import { dayKey } from "./scheduleFormat";
 
 /** One run on the timeline, of either mechanism. */
 export type TimelineRun = { kind: "pulse"; run: PulseRun } | { kind: "sleep"; run: SleepRun };
-
-/** A source's newest runs, fetched up to `limit`. */
-interface RunPage<T> {
-  runs: T[];
-  limit: number;
-}
 
 function startedAt(item: TimelineRun): number {
   return Date.parse(item.run.started_at);
 }
 
 /**
- * Merges each source's newest runs into one newest-first timeline. A source
- * that filled its page may have older runs not fetched yet, so the merged
- * list stops at the latest such page boundary; nothing older is shown until
- * more is fetched.
+ * Merges each source's fetched runs into one newest-first timeline. While a
+ * source has older runs not fetched yet, the merged list stops at the latest
+ * such boundary: showing the other source's older runs would imply a gap in
+ * this one. `hasMore` reports whether anything is still unfetched.
  */
 export function mergeRunPages(
   pulse: RunPage<PulseRun>,
@@ -31,7 +25,7 @@ export function mergeRunPages(
   ].sort((a, b) => startedAt(b) - startedAt(a));
 
   const boundaries = [pulse, sleep]
-    .filter((page) => page.runs.length >= page.limit && page.runs.length > 0)
+    .filter((page) => page.has_more && page.runs.length > 0)
     .map((page) => Date.parse(page.runs[page.runs.length - 1].started_at));
   if (boundaries.length === 0) return { runs: items, hasMore: false };
   const cutoff = Math.max(...boundaries);

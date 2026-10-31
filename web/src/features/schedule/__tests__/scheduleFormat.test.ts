@@ -5,7 +5,6 @@ import {
   describeSchedule,
   formatDay,
   formatUpcomingTime,
-  intentionTitle,
   markdownPreview,
   pulseOutcomeLabel,
 } from "../scheduleFormat";
@@ -108,14 +107,6 @@ describe("scheduleFormat", () => {
       origin: "latest",
       sessionKey: null,
     });
-  });
-
-  it("titles_an_intention_by_its_attention_else_its_id", () => {
-    // Arrange / Act / Assert
-    expect(intentionTitle({ id: "morning", attention: "## Check **the** calendar\nThen mail." })).toBe(
-      "Check the calendar",
-    );
-    expect(intentionTitle({ id: "morning", attention: "  " })).toBe("morning");
   });
 
   it("says_a_skipped_firing_was_not_delivered", () => {

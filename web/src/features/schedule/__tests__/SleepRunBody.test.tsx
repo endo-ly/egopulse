@@ -52,7 +52,7 @@ const DETAIL = {
 };
 
 describe("SleepRunBody", () => {
-  it("summarizes_the_run_and_shows_the_pipeline_in_order_with_failures", async () => {
+  it("summarizes_the_run_beside_its_steps_in_pipeline_order_with_failures", async () => {
     // Arrange
     stubDetail(DETAIL);
 
@@ -63,11 +63,21 @@ describe("SleepRunBody", () => {
     await waitFor(() => {
       expect(container.querySelectorAll(".pipeline-step")).toHaveLength(4);
     });
-    const meta = container.querySelector(".row-meta")!.textContent;
-    expect(meta).toContain("took 4m 0s");
-    expect(meta).toContain("1.2k tokens");
+    const facts = container.querySelector(".sleep-run-facts")!;
+    // The duration follows the start time; step outcomes are the pipeline rows.
+    expect(Array.from(facts.querySelectorAll("dt")).map((el) => el.textContent)).toEqual([
+      "Tokens",
+      "Sessions",
+      "Started",
+      "Took",
+      "Run",
+    ]);
+    expect(facts.textContent).toContain("1.2k");
+    expect(facts.textContent).toContain("4m 0s");
+    expect(container.querySelector(".run-detail-title")!.textContent).toBe("Sleep");
     const steps = Array.from(container.querySelectorAll(".pipeline-step"));
     expect(steps.map((el) => el.getAttribute("data-status"))).toEqual(["success", "success", "failed", "skipped"]);
+    expect(steps.map((el) => el.querySelector(".pipeline-step-icon")!.textContent)).toEqual(["✓", "✓", "✕", "–"]);
     expect(steps[0].textContent).toContain("150");
     expect(container.querySelector(".pipeline-failure")!.textContent).toContain("rate limited");
   });
@@ -107,7 +117,7 @@ describe("SleepRunBody", () => {
     expect(container.querySelector(".row-error")!.textContent).toContain("rate limited");
   });
 
-  it("folds_a_fully_successful_pipeline_into_one_line", async () => {
+  it("keeps_every_step_listed_with_its_tokens_when_the_run_succeeded", async () => {
     // Arrange
     const steps = DETAIL.steps.map((entry) => ({ ...entry, status: "success", error_message: null }));
     stubDetail({ ...DETAIL, run: { ...RUN, status: "success", error_message: null }, steps });
@@ -117,10 +127,21 @@ describe("SleepRunBody", () => {
 
     // Assert
     await waitFor(() => {
-      expect(container.querySelector(".pipeline-done")).toBeTruthy();
+      expect(container.querySelectorAll(".pipeline-step")).toHaveLength(4);
     });
-    expect(container.querySelector(".pipeline-done")!.textContent).toContain("All 4 steps done");
-    expect(container.querySelector(".pipeline")).toBeNull();
+    const rows = Array.from(container.querySelectorAll(".pipeline-step"));
+    expect(rows.map((el) => el.querySelector(".pipeline-step-name")!.textContent)).toEqual([
+      "Event extraction",
+      "Episodic update",
+      "Semantic update",
+      "Prospective update",
+    ]);
+    expect(rows.map((el) => el.querySelector(".pipeline-step-meta")!.textContent)).toEqual([
+      "150",
+      "150",
+      "150",
+      "150",
+    ]);
     expect(container.querySelectorAll(".file-chip")).toHaveLength(2);
   });
 
