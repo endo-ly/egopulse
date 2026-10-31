@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 
 import type { AgentSection } from "../../app/router";
 import { fetchAgentProfile, fetchMemoryHistory } from "../../shared/api/agents";
@@ -342,7 +342,10 @@ function ActivityCard({
 }
 
 function MemoryChangeCount({ change }: { change: MemoryChange }) {
-  const counts = countLineChanges(change.content_before, change.content_after);
+  const counts = useMemo(
+    () => countLineChanges(change.content_before, change.content_after),
+    [change.content_before, change.content_after],
+  );
   return (
     <span className="agent-activity-detail tab-switch-count">
       <span className="count-add">+{counts.add}</span> <span className="count-remove">−{counts.remove}</span>
