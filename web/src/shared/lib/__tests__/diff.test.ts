@@ -16,8 +16,8 @@ describe("countLineChanges", () => {
   });
 
   it("counts_a_change_surrounded_by_long_common_runs", () => {
-    // Arrange: only one line differs, 2,000 lines apart from the edges
-    const before = Array.from({ length: 2000 }, (_, i) => `line ${i}`).join("\n");
+    // Arrange: only one line differs, far from the edges
+    const before = text(2000, (index) => `line ${index}`);
     const after = before.replace("line 1000", "line 1000 changed");
 
     // Act
@@ -27,7 +27,33 @@ describe("countLineChanges", () => {
     expect(counts).toEqual({ add: 1, remove: 1 });
   });
 
-  it("counts_a_large_insertion_without_exceeding_the_argument_limit", () => {
+  it("aligns_a_large_region_on_the_lines_unique_to_both", () => {
+    // Arrange: 2,000 lines with ten edits, far more than one table can hold
+    const before = text(2000, (index) => `line ${index}`);
+    const after = text(2000, (index) => (index % 200 === 0 ? `changed ${index}` : `line ${index}`));
+
+    // Act
+    const counts = countLineChanges(before, after);
+
+    // Assert: the unchanged lines carry the alignment, so only the edits count
+    expect(counts).toEqual({ add: 10, remove: 10 });
+  });
+
+  it("keeps_a_region_of_repeated_lines_local", () => {
+    // Arrange: two texts that share lines but never a unique one, so they offer
+    // no context to align on
+    const before = text(2000, (index) => (index % 2 === 0 ? "x" : "y"));
+    const after = text(2000, (index) => (index % 2 === 0 ? "y" : "x"));
+
+    // Act
+    const counts = countLineChanges(before, after);
+
+    // Assert: the shift is reported where it happens, not as a full rewrite
+    expect(counts.add).toBeLessThan(50);
+    expect(counts.remove).toBeLessThan(50);
+  });
+
+  it("adds_a_large_number_of_lines_without_exceeding_the_argument_limit", () => {
     // Arrange: an insertion big enough that passing it as arguments would throw
     const after = text(130_000, (index) => `added ${index}`);
 
@@ -104,6 +130,24 @@ describe("computeLineDiff", () => {
     const diff = computeLineDiff(before, after);
 
     // Assert: unchanged lines carry both sides, so each side rebuilds exactly
+    const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
+    const rebuiltAfter = diff.flatMap((line) =>
+      line.type === "remove" ? [] : [lineContent(line)],
+    );
+    expect(rebuiltBefore.join("\n")).toBe(before);
+    expect(rebuiltAfter.join("\n")).toBe(after);
+  });
+
+  it("rebuilds_both_sides_of_a_large_region", () => {
+    // Arrange: a region too large for one table, with edits, deletions and
+    // insertions spread through it
+    const before = text(2000, (index) => `line ${index}`);
+    const after = text(1900, (index) => (index % 150 === 0 ? `changed ${index}` : `line ${index}`));
+
+    // Act
+    const diff = computeLineDiff(before, after);
+
+    // Assert
     const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
     const rebuiltAfter = diff.flatMap((line) =>
       line.type === "remove" ? [] : [lineContent(line)],
