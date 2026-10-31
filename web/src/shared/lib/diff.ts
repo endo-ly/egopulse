@@ -26,7 +26,7 @@ export type DiffLine =
 export function computeLineDiff(before: string, after: string): DiffLine[] {
   const parts = splitAroundCommonEdges(before, after);
   const lines = parts.head.map(unchangedLine);
-  lines.push(...diffMiddle(parts.beforeMiddle, parts.afterMiddle));
+  for (const line of diffMiddle(parts.beforeMiddle, parts.afterMiddle)) lines.push(line);
   for (const line of parts.tail) lines.push(unchangedLine(line));
   return lines;
 }

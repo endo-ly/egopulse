@@ -27,6 +27,19 @@ describe("countLineChanges", () => {
     expect(counts).toEqual({ add: 1, remove: 1 });
   });
 
+  it("counts_a_large_insertion_without_exceeding_the_argument_limit", () => {
+    // Arrange: an insertion big enough that passing it as arguments would throw
+    const after = text(130_000, (index) => `added ${index}`);
+
+    // Act
+    const diff = computeLineDiff("", after);
+
+    // Assert
+    expect(diff).toHaveLength(130_000);
+    expect(diff[0]).toEqual({ type: "add", content: "added 0" });
+    expect(diff[diff.length - 1]).toEqual({ type: "add", content: "added 129999" });
+  });
+
   it("counts_duplicate_heavy_texts_like_a_naive_lcs", () => {
     // Arrange: repeated lines, where trimming must not change the result
     const cases: Array<[string, string]> = [
@@ -99,6 +112,10 @@ describe("computeLineDiff", () => {
     expect(rebuiltAfter.join("\n")).toBe(after);
   });
 });
+
+function text(count: number, mutate: (index: number) => string): string {
+  return Array.from({ length: count }, (_, index) => mutate(index)).join("\n");
+}
 
 function lineContent(line: ReturnType<typeof computeLineDiff>[number]): string {
   return line.type === "unchanged" ? line.before : line.content;
