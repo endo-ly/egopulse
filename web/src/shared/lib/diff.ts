@@ -5,11 +5,17 @@ export type DiffLine =
   | { type: "unchanged"; before: string; after: string };
 
 /**
- * Computes a line-level diff between two strings.
+ * Computes a line-level diff between two strings using LCS
+ * (Longest Common Subsequence) dynamic programming.
  *
- * Returns an ordered array of `DiffLine` entries that turn `before` into
- * `after`. Unchanged lines carry both the before and after content for
- * convenient rendering.
+ * Returns an ordered array of `DiffLine` entries representing
+ * the minimal set of additions and removals to transform
+ * `before` into `after`.  Unchanged lines carry both the
+ * before and after content for convenient rendering.
+ *
+ * The table is built only for the lines between the common leading and
+ * trailing runs, so an edit inside a long document costs a table proportional
+ * to the edited region instead of the whole document.
  *
  * # Edge cases
  * - An empty string is treated as having zero lines.
@@ -19,36 +25,36 @@ export type DiffLine =
  */
 export function computeLineDiff(before: string, after: string): DiffLine[] {
   const parts = splitAroundCommonEdges(before, after);
-  const lines: DiffLine[] = [];
-  for (const line of parts.head) lines.push(unchangedLine(line));
-  alignRegion(parts.beforeMiddle, parts.afterMiddle, (line) => lines.push(line));
+  const lines = parts.head.map(unchangedLine);
+  for (const line of diffMiddle(parts.beforeMiddle, parts.afterMiddle)) lines.push(line);
   for (const line of parts.tail) lines.push(unchangedLine(line));
   return lines;
 }
 
-/** Counts added and removed lines between two texts. */
+/**
+ * Counts added and removed lines between two texts.
+ *
+ * Only the counts are needed here, so this keeps two DP rows instead of the
+ * whole table and never materializes the diff itself.
+ */
 export function countLineChanges(before: string, after: string): { add: number; remove: number } {
   const parts = splitAroundCommonEdges(before, after);
-  const counts = { add: 0, remove: 0 };
-  alignRegion(parts.beforeMiddle, parts.afterMiddle, (line) => {
-    if (line.type === "add") counts.add += 1;
-    else if (line.type === "remove") counts.remove += 1;
-  });
-  return counts;
+  // Lines outside the middle are common to both sides by construction; inside
+  // it the LCS length is how many lines survive the diff.
+  const common =
+    parts.head.length + parts.tail.length + lcsLength(parts.beforeMiddle, parts.afterMiddle);
+  return {
+    add: parts.afterLines.length - common,
+    remove: parts.beforeLines.length - common,
+  };
 }
-
-/**
- * Regions up to this many line pairs are aligned exactly, which bounds the
- * table used for one region to a megabyte.
- */
-const MAX_TABLE_CELLS = 250_000;
 
 interface SplitParts {
   beforeLines: string[];
   afterLines: string[];
   /** Lines common to both texts before the first difference. */
   head: string[];
-  /** The differing region, which is all that has to be aligned. */
+  /** The differing region, which is all the DP has to look at. */
   beforeMiddle: string[];
   afterMiddle: string[];
   /** Lines common to both texts after the last difference. */
@@ -58,8 +64,7 @@ interface SplitParts {
 /**
  * Splits both texts into lines and peels off the common leading and trailing
  * runs. A common prefix or suffix is always part of some longest common
- * subsequence, so removing it keeps both the subsequence length and the diff
- * intact.
+ * subsequence, so removing it keeps both the LCS length and the diff intact.
  */
 function splitAroundCommonEdges(before: string, after: string): SplitParts {
   const beforeLines = splitLines(before);
@@ -95,270 +100,83 @@ function unchangedLine(line: string): DiffLine {
   return { type: "unchanged", before: line, after: line };
 }
 
-interface Range {
-  start: number;
-  end: number;
-}
+/** The length of the longest common subsequence of two line arrays. */
+function lcsLength(a: string[], b: string[]): number {
+  if (a.length === 0 || b.length === 0) return 0;
 
-interface Segment {
-  before: Range;
-  after: Range;
-}
+  // Iterate over the longer side and keep the row on the shorter one, so the
+  // two DP rows stay as small as possible.
+  const rows = a.length >= b.length ? a : b;
+  const columns = a.length >= b.length ? b : a;
 
-/**
- * Emits the diff of two line arrays that share no common leading or trailing
- * lines.
- *
- * A region small enough to compare line by line is aligned exactly. A larger
- * one is split on the lines that appear exactly once on each side, because a
- * line without duplicates is the context a reader recognizes as unchanged;
- * the pieces between them are then small enough to align exactly. A region
- * that shares only repeated lines is matched line by line to the next place
- * each line appears, which still pairs a moved block with its counterpart.
- *
- * The diff and the line counts both come from this walk, so the counts shown
- * for a change always describe the diff it expands to.
- */
-function alignRegion(before: string[], after: string[], emit: (line: DiffLine) => void): void {
-  const pending: Segment[] = [
-    {
-      before: { start: 0, end: before.length },
-      after: { start: 0, end: after.length },
-    },
-  ];
-
-  while (pending.length > 0) {
-    const { before: beforeRange, after: afterRange } = pending.pop()!;
-    const rows = beforeRange.end - beforeRange.start;
-    const columns = afterRange.end - afterRange.start;
-
-    if (rows === 0) {
-      for (let index = afterRange.start; index < afterRange.end; index += 1) {
-        emit({ type: "add", content: after[index] });
-      }
-      continue;
-    }
-    if (columns === 0) {
-      for (let index = beforeRange.start; index < beforeRange.end; index += 1) {
-        emit({ type: "remove", content: before[index] });
-      }
-      continue;
-    }
-    if (rows * columns <= MAX_TABLE_CELLS) {
-      emitAlignedRegion(before, beforeRange, after, afterRange, emit);
-      continue;
-    }
-
-    const anchors = uniqueLineAnchors(before, beforeRange, after, afterRange);
-    if (anchors.length === 0) {
-      emitRepeatedLineDiff(before, beforeRange, after, afterRange, emit);
-      continue;
-    }
-
-    // Queue the pieces around the anchors in reverse, so they emit in order.
-    const lastAnchor = anchors[anchors.length - 1];
-    pending.push({
-      before: { start: lastAnchor.before + 1, end: beforeRange.end },
-      after: { start: lastAnchor.after + 1, end: afterRange.end },
-    });
-    for (let index = anchors.length - 1; index >= 0; index -= 1) {
-      const anchor = anchors[index];
-      pending.push({
-        before: { start: anchor.before, end: anchor.before + 1 },
-        after: { start: anchor.after, end: anchor.after + 1 },
-      });
-      const previous = anchors[index - 1];
-      pending.push({
-        before: {
-          start: previous === undefined ? beforeRange.start : previous.before + 1,
-          end: anchor.before,
-        },
-        after: {
-          start: previous === undefined ? afterRange.start : previous.after + 1,
-          end: anchor.after,
-        },
-      });
-    }
-  }
-}
-
-interface Anchor {
-  before: number;
-  after: number;
-}
-
-/**
- * The lines that occur exactly once on each side, chained into the longest run
- * that keeps their order on both sides. These are the positions a reader would
- * agree are unchanged, so they make stable split points for a large region.
- */
-function uniqueLineAnchors(
-  before: string[],
-  beforeRange: Range,
-  after: string[],
-  afterRange: Range,
-): Anchor[] {
-  const beforeIndexes = uniqueIndexes(before, beforeRange);
-  const afterIndexes = uniqueIndexes(after, afterRange);
-
-  const candidates: Anchor[] = [];
-  for (const [line, beforeIndex] of beforeIndexes) {
-    const afterIndex = afterIndexes.get(line);
-    if (afterIndex !== undefined) candidates.push({ before: beforeIndex, after: afterIndex });
-  }
-  candidates.sort((left, right) => left.before - right.before);
-
-  // Keep only the candidates whose `after` positions increase, so the chain
-  // runs forward in both texts.
-  const tails: number[] = [];
-  const tailCandidate: number[] = [];
-  const previous: number[] = [];
-  for (let index = 0; index < candidates.length; index += 1) {
-    const afterIndex = candidates[index].after;
-    const length = firstTailNotBelow(tails, afterIndex);
-    previous.push(length === 0 ? -1 : tailCandidate[length - 1]);
-    if (length === tails.length) {
-      tails.push(afterIndex);
-      tailCandidate.push(index);
-    } else {
-      tails[length] = afterIndex;
-      tailCandidate[length] = index;
-    }
-  }
-
-  const chain: Anchor[] = [];
-  let index = tailCandidate[tails.length - 1] ?? -1;
-  while (index >= 0) {
-    chain.push(candidates[index]);
-    index = previous[index];
-  }
-  return chain.reverse();
-}
-
-/**
- * Aligns a region whose lines all repeat by matching each line to the next
- * place the same line appears on the other side. Repeated lines carry no
- * context to split on, so this is as far as the region can be aligned, but it
- * still pairs a moved or reordered block with its counterpart instead of
- * reporting the whole region as replaced.
- */
-function emitRepeatedLineDiff(
-  before: string[],
-  beforeRange: Range,
-  after: string[],
-  afterRange: Range,
-  emit: (line: DiffLine) => void,
-): void {
-  const positions = new Map<string, number[]>();
-  for (let index = afterRange.start; index < afterRange.end; index += 1) {
-    const line = after[index];
-    const found = positions.get(line);
-    if (found === undefined) positions.set(line, [index]);
-    else found.push(index);
-  }
-
-  let afterIndex = afterRange.start;
-  for (let beforeIndex = beforeRange.start; beforeIndex < beforeRange.end; beforeIndex += 1) {
-    const found = positions.get(before[beforeIndex]);
-    const match = found === undefined ? undefined : firstAtOrAfter(found, afterIndex);
-    if (match === undefined) {
-      emit({ type: "remove", content: before[beforeIndex] });
-      continue;
-    }
-    for (; afterIndex < match; afterIndex += 1) {
-      emit({ type: "add", content: after[afterIndex] });
-    }
-    emit(unchangedLine(before[beforeIndex]));
-    afterIndex = match + 1;
-  }
-  for (; afterIndex < afterRange.end; afterIndex += 1) {
-    emit({ type: "add", content: after[afterIndex] });
-  }
-}
-
-/** The first value in the ascending `values` that is at least `value`. */
-function firstAtOrAfter(values: number[], value: number): number | undefined {
-  let low = 0;
-  let high = values.length;
-  while (low < high) {
-    const middle = (low + high) >> 1;
-    if (values[middle] < value) low = middle + 1;
-    else high = middle;
-  }
-  return values[low];
-}
-
-/** Index of each line that occurs once in the range; repeated lines are absent. */
-function uniqueIndexes(lines: string[], range: Range): Map<string, number> {
-  const seen = new Map<string, number>();
-  for (let index = range.start; index < range.end; index += 1) {
-    const line = lines[index];
-    const existing = seen.get(line);
-    // -1 marks a line that repeats, which cannot serve as an anchor.
-    seen.set(line, existing === undefined ? index : -1);
-  }
-  for (const [line, index] of seen) {
-    if (index < 0) seen.delete(line);
-  }
-  return seen;
-}
-
-/** The first index in `tails` whose value is at least `value`. */
-function firstTailNotBelow(tails: number[], value: number): number {
-  let low = 0;
-  let high = tails.length;
-  while (low < high) {
-    const middle = (low + high) >> 1;
-    if (tails[middle] < value) low = middle + 1;
-    else high = middle;
-  }
-  return low;
-}
-
-/**
- * Aligns one region with a longest-common-subsequence table. Callers keep the
- * region within [`MAX_TABLE_CELLS`], so the table stays small.
- */
-function emitAlignedRegion(
-  before: string[],
-  beforeRange: Range,
-  after: string[],
-  afterRange: Range,
-  emit: (line: DiffLine) => void,
-): void {
-  const rows = beforeRange.end - beforeRange.start;
-  const columns = afterRange.end - afterRange.start;
-
-  // table[i][j] = LCS length of the first i before lines and j after lines.
-  const table = Array.from({ length: rows + 1 }, () => new Uint32Array(columns + 1));
-  for (let i = 1; i <= rows; i += 1) {
-    const line = before[beforeRange.start + i - 1];
-    const previous = table[i - 1];
-    const current = table[i];
-    for (let j = 1; j <= columns; j += 1) {
+  let previous = new Uint32Array(columns.length + 1);
+  let current = new Uint32Array(columns.length + 1);
+  for (const line of rows) {
+    for (let j = 1; j <= columns.length; j++) {
       current[j] =
-        line === after[afterRange.start + j - 1]
-          ? previous[j - 1] + 1
-          : Math.max(previous[j], current[j - 1]);
+        line === columns[j - 1] ? previous[j - 1] + 1 : Math.max(previous[j], current[j - 1]);
+    }
+    const swap = previous;
+    previous = current;
+    current = swap;
+  }
+  return previous[columns.length];
+}
+
+/** Diffs two line arrays that share no common prefix or suffix. */
+function diffMiddle(beforeLines: string[], afterLines: string[]): DiffLine[] {
+  const m = beforeLines.length;
+  const n = afterLines.length;
+  if (m === 0 && n === 0) return [];
+
+  // ------------------------------------------------------------------
+  // LCS table: dp[i][j] = LCS length of beforeLines[..i] & afterLines[..j]
+  // ------------------------------------------------------------------
+  const dp = Array.from({ length: m + 1 }, () => new Uint32Array(n + 1));
+
+  for (let i = 1; i <= m; i++) {
+    const bl = beforeLines[i - 1];
+    const row = dp[i - 1];
+    const cur = dp[i];
+    for (let j = 1; j <= n; j++) {
+      if (bl === afterLines[j - 1]) {
+        cur[j] = row[j - 1] + 1;
+      } else {
+        // Explicit branch for clarity — equivalent to Math.max
+        cur[j] = row[j] >= cur[j - 1] ? row[j] : cur[j - 1];
+      }
     }
   }
 
-  // Walk back from the end, then emit the reversed result in document order.
-  const lines: DiffLine[] = [];
-  let i = rows;
-  let j = columns;
+  // ------------------------------------------------------------------
+  // Backtrack through the DP table to reconstruct the diff.
+  // The traversal builds the result in reverse order.
+  // ------------------------------------------------------------------
+  const result: DiffLine[] = [];
+  let i = m;
+  let j = n;
+
   while (i > 0 || j > 0) {
-    if (i > 0 && j > 0 && before[beforeRange.start + i - 1] === after[afterRange.start + j - 1]) {
-      lines.push(unchangedLine(before[beforeRange.start + i - 1]));
-      i -= 1;
-      j -= 1;
-    } else if (j > 0 && (i === 0 || table[i][j - 1] >= table[i - 1][j])) {
-      lines.push({ type: "add", content: after[afterRange.start + j - 1] });
-      j -= 1;
+    if (i > 0 && j > 0 && beforeLines[i - 1] === afterLines[j - 1]) {
+      // Common line — unchanged
+      result.push({
+        type: "unchanged",
+        before: beforeLines[i - 1],
+        after: afterLines[j - 1],
+      });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      // Line exists only in `after` → addition
+      result.push({ type: "add", content: afterLines[j - 1] });
+      j--;
     } else {
-      lines.push({ type: "remove", content: before[beforeRange.start + i - 1] });
-      i -= 1;
+      // Line exists only in `before` → removal
+      result.push({ type: "remove", content: beforeLines[i - 1] });
+      i--;
     }
   }
-  for (let index = lines.length - 1; index >= 0; index -= 1) emit(lines[index]);
+
+  result.reverse();
+  return result;
 }

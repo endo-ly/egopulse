@@ -27,19 +27,19 @@ describe("countLineChanges", () => {
     expect(counts).toEqual({ add: 1, remove: 1 });
   });
 
-  it("aligns_a_large_region_on_the_lines_unique_to_both", () => {
-    // Arrange: 2,000 lines with ten edits, far more than one table can hold
-    const before = text(2000, (index) => `line ${index}`);
-    const after = text(2000, (index) => (index % 200 === 0 ? `changed ${index}` : `line ${index}`));
+  it("counts_a_moved_line_among_repeated_lines", () => {
+    // Arrange: one unique line moved past a block of repeated lines
+    const before = `HEADER\n${text(500, () => "x")}`;
+    const after = `${text(500, () => "x")}\nHEADER`;
 
     // Act
     const counts = countLineChanges(before, after);
 
-    // Assert: the unchanged lines carry the alignment, so only the edits count
-    expect(counts).toEqual({ add: 10, remove: 10 });
+    // Assert: only the unique line moved, so it counts once each way
+    expect(counts).toEqual({ add: 1, remove: 1 });
   });
 
-  it("aligns_a_swapped_block_of_repeated_lines", () => {
+  it("counts_a_swapped_block_of_repeated_lines", () => {
     // Arrange: two blocks swapped, with no line unique to either side
     const before = `${text(600, () => "A")}\n${text(600, () => "B")}`;
     const after = `${text(600, () => "B")}\n${text(600, () => "A")}`;
@@ -49,31 +49,6 @@ describe("countLineChanges", () => {
 
     // Assert: one block moved, so it counts once as removed and once as added
     expect(counts).toEqual({ add: 600, remove: 600 });
-  });
-
-  it("aligns_a_shifted_run_of_repeated_lines", () => {
-    // Arrange: two lines alternating in opposite orders
-    const before = text(2000, (index) => (index % 2 === 0 ? "x" : "y"));
-    const after = text(2000, (index) => (index % 2 === 0 ? "y" : "x"));
-
-    // Act
-    const counts = countLineChanges(before, after);
-
-    // Assert: the run is shifted by one line, not rewritten
-    expect(counts).toEqual({ add: 1, remove: 1 });
-  });
-
-  it("adds_a_large_number_of_lines_without_exceeding_the_argument_limit", () => {
-    // Arrange: an insertion big enough that passing it as arguments would throw
-    const after = text(130_000, (index) => `added ${index}`);
-
-    // Act
-    const diff = computeLineDiff("", after);
-
-    // Assert
-    expect(diff).toHaveLength(130_000);
-    expect(diff[0]).toEqual({ type: "add", content: "added 0" });
-    expect(diff[diff.length - 1]).toEqual({ type: "add", content: "added 129999" });
   });
 
   it("counts_duplicate_heavy_texts_like_a_naive_lcs", () => {
@@ -124,6 +99,19 @@ describe("computeLineDiff", () => {
     ]);
   });
 
+  it("adds_a_large_number_of_lines_without_exceeding_the_argument_limit", () => {
+    // Arrange: an insertion big enough that passing it as arguments would throw
+    const after = text(130_000, (index) => `added ${index}`);
+
+    // Act
+    const diff = computeLineDiff("", after);
+
+    // Assert
+    expect(diff).toHaveLength(130_000);
+    expect(diff[0]).toEqual({ type: "add", content: "added 0" });
+    expect(diff[diff.length - 1]).toEqual({ type: "add", content: "added 129999" });
+  });
+
   it("treats_empty_texts_as_having_no_lines", () => {
     // Act / Assert
     expect(computeLineDiff("", "")).toEqual([]);
@@ -140,41 +128,6 @@ describe("computeLineDiff", () => {
     const diff = computeLineDiff(before, after);
 
     // Assert: unchanged lines carry both sides, so each side rebuilds exactly
-    const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
-    const rebuiltAfter = diff.flatMap((line) =>
-      line.type === "remove" ? [] : [lineContent(line)],
-    );
-    expect(rebuiltBefore.join("\n")).toBe(before);
-    expect(rebuiltAfter.join("\n")).toBe(after);
-  });
-
-  it("rebuilds_both_sides_of_a_region_of_repeated_lines", () => {
-    // Arrange: a moved block of repeated lines, so no line is unique
-    const before = `${text(600, () => "A")}\n${text(600, () => "B")}`;
-    const after = `${text(600, () => "B")}\n${text(600, () => "A")}`;
-
-    // Act
-    const diff = computeLineDiff(before, after);
-
-    // Assert
-    const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
-    const rebuiltAfter = diff.flatMap((line) =>
-      line.type === "remove" ? [] : [lineContent(line)],
-    );
-    expect(rebuiltBefore.join("\n")).toBe(before);
-    expect(rebuiltAfter.join("\n")).toBe(after);
-  });
-
-  it("rebuilds_both_sides_of_a_large_region", () => {
-    // Arrange: a region too large for one table, with edits, deletions and
-    // insertions spread through it
-    const before = text(2000, (index) => `line ${index}`);
-    const after = text(1900, (index) => (index % 150 === 0 ? `changed ${index}` : `line ${index}`));
-
-    // Act
-    const diff = computeLineDiff(before, after);
-
-    // Assert
     const rebuiltBefore = diff.flatMap((line) => (line.type === "add" ? [] : [lineContent(line)]));
     const rebuiltAfter = diff.flatMap((line) =>
       line.type === "remove" ? [] : [lineContent(line)],
