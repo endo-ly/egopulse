@@ -392,8 +392,8 @@ impl Database {
     }
 
     /// Lists an agent's sleep runs, newest first. A non-empty `statuses`
-    /// narrows the list to those statuses, and `before` to runs started
-    /// earlier than it, so a caller can page back through the whole history.
+    /// narrows the list to those statuses, and `before` to runs below it in
+    /// that order, so a caller can page back through the whole history.
     ///
     /// # Errors
     ///
@@ -402,7 +402,7 @@ impl Database {
         &self,
         agent_id: &str,
         statuses: &[SleepRunStatus],
-        before: Option<&str>,
+        before: Option<&super::RunCursor>,
         limit: usize,
     ) -> Result<Vec<SleepRun>, StorageError> {
         let conn = self.get_conn()?;
@@ -418,10 +418,13 @@ impl Database {
             values.extend(statuses.iter().map(|status| status.to_string().into()));
         }
         if let Some(before) = before {
-            sql.push_str(" AND started_at < ?");
-            values.push(before.to_string().into());
+            // The same keys as the ordering, so a page boundary never falls
+            // inside a group of runs that share a `started_at`.
+            sql.push_str(" AND (started_at, id) < (?, ?)");
+            values.push(before.started_at.clone().into());
+            values.push(before.id.clone().into());
         }
-        sql.push_str(" ORDER BY started_at DESC, rowid DESC LIMIT ?");
+        sql.push_str(" ORDER BY started_at DESC, id DESC LIMIT ?");
         values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
 
         let mut stmt = conn.prepare(&sql)?;
@@ -1614,12 +1617,57 @@ mod tests {
             .list_sleep_runs("agent-a", &[], None, 1)
             .expect("first page");
         let next_page = db
-            .list_sleep_runs("agent-a", &[], Some("2026-10-03T03:00:00+00:00"), 10)
+            .list_sleep_runs(
+                "agent-a",
+                &[],
+                Some(&super::super::RunCursor {
+                    started_at: "2026-10-03T03:00:00+00:00".to_string(),
+                    id: "newer".to_string(),
+                }),
+                10,
+            )
             .expect("next page");
 
         // Assert: the cursor is exclusive, so pages never overlap.
         assert_eq!(ids(first_page), ["newer"]);
         assert_eq!(ids(next_page), ["older"]);
+    }
+
+    #[test]
+    fn list_sleep_runs_pages_through_runs_that_share_a_started_at() {
+        // Arrange: two runs of the same instant, one per page.
+        let (db, _dir) = test_db();
+        for id in ["same-a", "same-b"] {
+            insert_run_with_snapshot(
+                &db,
+                id,
+                "agent-a",
+                "success",
+                ("episodic", "a", "b"),
+                "2026-10-03T03:00:00+00:00",
+            );
+        }
+        let ids = |runs: Vec<SleepRun>| runs.into_iter().map(|run| run.id).collect::<Vec<_>>();
+
+        // Act
+        let first_page = db
+            .list_sleep_runs("agent-a", &[], None, 1)
+            .expect("first page");
+        let next_page = db
+            .list_sleep_runs(
+                "agent-a",
+                &[],
+                Some(&super::super::RunCursor {
+                    started_at: "2026-10-03T03:00:00+00:00".to_string(),
+                    id: "same-b".to_string(),
+                }),
+                1,
+            )
+            .expect("next page");
+
+        // Assert: the tie is broken by id, so the second run is still reachable.
+        assert_eq!(ids(first_page), ["same-b"]);
+        assert_eq!(ids(next_page), ["same-a"]);
     }
 
     #[test]

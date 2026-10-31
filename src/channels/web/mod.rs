@@ -23,6 +23,7 @@ use crate::channels::adapter::ChannelAdapter;
 use crate::channels::adapter::ConversationKind;
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
+use crate::storage::RunCursor;
 
 mod agent_profile;
 mod agents;
@@ -77,17 +78,28 @@ pub(super) fn internal_error() -> ApiError {
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
 }
 
-/// Parses a `before` paging cursor; `None` starts from the newest run.
+/// Parses a `before` paging cursor: the `started_at` and id of the oldest run
+/// already returned, joined by `|`. `None` starts from the newest run.
 ///
-/// The cursor is compared as text against `started_at`, so it is normalized to
-/// the format that column is written in: RFC 3339 in UTC. Any other spelling of
-/// the same instant (e.g. `Z` instead of `+00:00`) would otherwise compare as a
+/// The timestamp is normalized to the format `started_at` is written in
+/// (RFC 3339, UTC), because the cursor is compared as text. Any other spelling
+/// of the same instant (e.g. `Z` instead of `+00:00`) would compare as a
 /// different time.
-pub(super) fn parse_before(raw: Option<&str>) -> Result<Option<String>, ApiError> {
+pub(super) fn parse_before(raw: Option<&str>) -> Result<Option<RunCursor>, ApiError> {
     raw.map(|before| {
-        chrono::DateTime::parse_from_rfc3339(before)
+        let (started_at, id) = before
+            .split_once('|')
+            .ok_or_else(|| bad_request("invalid_before"))?;
+        if id.is_empty() {
+            return Err(bad_request("invalid_before"));
+        }
+        let started_at = chrono::DateTime::parse_from_rfc3339(started_at)
             .map(|instant| instant.with_timezone(&chrono::Utc).to_rfc3339())
-            .map_err(|_| bad_request("invalid_before"))
+            .map_err(|_| bad_request("invalid_before"))?;
+        Ok(RunCursor {
+            started_at,
+            id: id.to_string(),
+        })
     })
     .transpose()
 }
@@ -603,21 +615,31 @@ mod tests {
     use crate::test_util::{build_state_with_config, test_config};
 
     #[test]
-    fn parse_before_normalizes_the_cursor_to_the_stored_format() {
+    fn parse_before_reads_the_run_the_cursor_points_at() {
         // Arrange / Act
         let none = parse_before(None).expect("no cursor");
-        let zulu = parse_before(Some("2026-10-02T09:00:00Z")).expect("zulu");
-        let offset = parse_before(Some("2026-10-02T18:00:00+09:00")).expect("offset");
-        let broken = parse_before(Some("yesterday"));
+        let zulu = parse_before(Some("2026-10-02T09:00:00Z|run-1")).expect("zulu");
+        let offset = parse_before(Some("2026-10-02T18:00:00+09:00|run-1")).expect("offset");
+        let no_run = parse_before(Some("2026-10-02T09:00:00Z|"));
+        let no_instant = parse_before(Some("run-1"));
+        let broken = parse_before(Some("yesterday|run-1"));
 
-        // Assert: every spelling of an instant compares like the stored value.
+        // Assert: every spelling of the instant compares like the stored value.
         assert_eq!(none, None);
-        assert_eq!(zulu.as_deref(), Some("2026-10-02T09:00:00+00:00"));
-        assert_eq!(offset.as_deref(), Some("2026-10-02T09:00:00+00:00"));
         assert_eq!(
-            broken.expect_err("invalid cursor").0,
-            StatusCode::BAD_REQUEST
+            zulu,
+            Some(RunCursor {
+                started_at: "2026-10-02T09:00:00+00:00".to_string(),
+                id: "run-1".to_string(),
+            })
         );
+        assert_eq!(offset, zulu);
+        for invalid in [no_run, no_instant, broken] {
+            assert_eq!(
+                invalid.expect_err("invalid cursor").0,
+                StatusCode::BAD_REQUEST
+            );
+        }
     }
 
     struct NoopChannelAdapter(&'static str);

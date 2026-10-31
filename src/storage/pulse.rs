@@ -307,7 +307,7 @@ impl Database {
 
     /// Lists an agent's pulse runs, newest first. `intention_id` narrows the
     /// list to one intention, a non-empty `statuses` to those statuses, and
-    /// `before` to runs started earlier than it, so a caller can page back
+    /// `before` to runs below it in that order, so a caller can page back
     /// through the whole history.
     ///
     /// # Errors
@@ -318,7 +318,7 @@ impl Database {
         agent_id: &str,
         intention_id: Option<&str>,
         statuses: &[PulseRunStatus],
-        before: Option<&str>,
+        before: Option<&super::RunCursor>,
         limit: usize,
     ) -> Result<Vec<super::PulseRun>, StorageError> {
         let conn = self.get_conn()?;
@@ -333,10 +333,13 @@ impl Database {
             values.extend(statuses.iter().map(|status| status.to_string().into()));
         }
         if let Some(before) = before {
-            sql.push_str(" AND started_at < ?");
-            values.push(before.to_string().into());
+            // The same keys as the ordering, so a page boundary never falls
+            // inside a group of runs that share a `started_at`.
+            sql.push_str(" AND (started_at, id) < (?, ?)");
+            values.push(before.started_at.clone().into());
+            values.push(before.id.clone().into());
         }
-        sql.push_str(" ORDER BY started_at DESC, rowid DESC LIMIT ?");
+        sql.push_str(" ORDER BY started_at DESC, id DESC LIMIT ?");
         values.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
 
         let mut stmt = conn.prepare(&sql)?;
@@ -940,7 +943,16 @@ mod tests {
             .list_pulse_runs("agent-a", None, &[], None, 1)
             .expect("limited");
         let older = db
-            .list_pulse_runs("agent-a", None, &[], Some("2025-01-03T09:00:00Z"), 10)
+            .list_pulse_runs(
+                "agent-a",
+                None,
+                &[],
+                Some(&super::super::RunCursor {
+                    started_at: "2025-01-03T09:00:00+00:00".to_string(),
+                    id: "a-new".to_string(),
+                }),
+                10,
+            )
             .expect("older");
 
         // Assert
@@ -950,6 +962,47 @@ mod tests {
         assert_eq!(ids(limited), ["a-new"]);
         // The cursor is exclusive, so pages never overlap.
         assert_eq!(ids(older), ["a-other", "a-old"]);
+    }
+
+    #[test]
+    fn list_pulse_runs_pages_through_runs_that_share_a_started_at() {
+        // Arrange: two runs of the same instant, one per page.
+        let (db, _dir) = test_db();
+        for id in ["same-a", "same-b"] {
+            insert_terminal_pulse_run(
+                &db,
+                id,
+                "agent-a",
+                "morning",
+                id,
+                "2025-01-03T09:00:00+00:00",
+                PulseRunStatus::Success,
+            );
+        }
+        let ids = |runs: Vec<super::super::PulseRun>| -> Vec<String> {
+            runs.into_iter().map(|run| run.id).collect()
+        };
+
+        // Act
+        let first_page = db
+            .list_pulse_runs("agent-a", None, &[], None, 1)
+            .expect("first page");
+        let next_page = db
+            .list_pulse_runs(
+                "agent-a",
+                None,
+                &[],
+                Some(&super::super::RunCursor {
+                    started_at: "2025-01-03T09:00:00+00:00".to_string(),
+                    id: "same-b".to_string(),
+                }),
+                1,
+            )
+            .expect("next page");
+
+        // Assert: the tie is broken by id, so the second run is still reachable.
+        assert_eq!(ids(first_page), ["same-b"]);
+        assert_eq!(ids(next_page), ["same-a"]);
     }
 
     // ---------------------------------------------------------------------------

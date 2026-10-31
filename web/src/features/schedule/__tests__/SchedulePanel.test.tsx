@@ -113,14 +113,20 @@ interface Api {
   pulseDetails?: Record<string, PulseRunDetail>;
 }
 
-/** One page of runs, as the listings serve it. */
-function pageOf<T extends { status: string; started_at: string }>(runs: T[], url: URL) {
+/** One page of runs, as the listings serve it, keyed the same way they order. */
+function pageOf<T extends { id: string; status: string; started_at: string }>(runs: T[], url: URL) {
   const statuses = url.searchParams.get("status")?.split(",") ?? null;
   const before = url.searchParams.get("before");
+  const [beforeAt, beforeId] = before === null ? [] : before.split("|");
   const limit = Number(url.searchParams.get("limit") ?? "20");
   const matching = runs
     .filter((run) => statuses === null || statuses.includes(run.status))
-    .filter((run) => before === null || run.started_at < before);
+    .filter(
+      (run) =>
+        beforeAt === undefined ||
+        run.started_at < beforeAt ||
+        (run.started_at === beforeAt && run.id < beforeId),
+    );
   return { runs: matching.slice(0, limit), has_more: matching.length > limit };
 }
 

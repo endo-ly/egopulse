@@ -153,10 +153,15 @@ interface PagedRuns {
   sleep: RunPage<SleepRun>;
 }
 
-/** The `started_at` of the oldest run in a page, to continue from. */
-function oldest(page: RunPage<{ started_at: string }>): string | null {
+/**
+ * The cursor to continue a listing from: its oldest run, named by both its
+ * `started_at` and its id so the page boundary never splits runs that share a
+ * `started_at`.
+ */
+function pageCursor(page: RunPage<{ id: string; started_at: string }>): string | null {
   const runs = page.runs;
-  return runs.length > 0 ? runs[runs.length - 1].started_at : null;
+  const last = runs[runs.length - 1];
+  return last ? `${last.started_at}|${last.id}` : null;
 }
 
 function History({ agentId, authToken, openRun, onOpenRun }: TimelineProps) {
@@ -185,8 +190,8 @@ function History({ agentId, authToken, openRun, onOpenRun }: TimelineProps) {
   const loadEarlier = async () => {
     if (loadingOlder || pulseRuns.data === undefined || sleepRuns.data === undefined) return;
     const from: PagedRuns = paged ?? { pulse: pulseRuns.data, sleep: sleepRuns.data };
-    const pulseFrom = from.pulse.has_more ? oldest(from.pulse) : null;
-    const sleepFrom = from.sleep.has_more ? oldest(from.sleep) : null;
+    const pulseFrom = from.pulse.has_more ? pageCursor(from.pulse) : null;
+    const sleepFrom = from.sleep.has_more ? pageCursor(from.sleep) : null;
     setLoadingOlder(true);
     setOlderError(null);
     try {

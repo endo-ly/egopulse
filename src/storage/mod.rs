@@ -661,6 +661,15 @@ pub(crate) struct MemorySnapshot {
     pub created_at: String,
 }
 
+/// Where to continue a run listing from: the `started_at` and id of the oldest
+/// run already returned. The id breaks ties, so runs that share a `started_at`
+/// are never lost across a page boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunCursor {
+    pub started_at: String,
+    pub id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PulseRun {
     pub id: String,

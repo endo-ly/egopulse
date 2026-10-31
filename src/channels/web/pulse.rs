@@ -29,7 +29,8 @@ pub(super) struct PulseRunsQuery {
     agent_id: String,
     /// Comma-separated statuses; every status when absent.
     status: Option<String>,
-    /// Only runs started before this instant, for paging back through history.
+    /// The `started_at` and id of the oldest run already returned, for paging
+    /// back through history.
     before: Option<String>,
     limit: Option<usize>,
 }
@@ -155,8 +156,8 @@ pub(super) async fn get_agent_pulse(
 /// Query parameters:
 /// - `agent_id`: the agent whose runs to list
 /// - `status` (optional): comma-separated statuses to keep
-/// - `before` (optional): only runs started before this RFC 3339 instant, so
-///   the caller can page back through the whole history
+/// - `before` (optional): cursor of the oldest run already returned, so the
+///   caller can page back through the whole history
 /// - `limit` (optional, default 20, at most 200): maximum number of runs
 ///
 /// `has_more` says whether older runs exist beyond the returned page.
@@ -176,7 +177,7 @@ pub(super) async fn list_pulse_runs(
     let (runs, has_more) = call_blocking(Arc::clone(&state.app_state.db), move |db| {
         // One row past the page tells us whether older runs exist.
         let mut runs =
-            db.list_pulse_runs(&agent_id, None, &statuses, before.as_deref(), limit + 1)?;
+            db.list_pulse_runs(&agent_id, None, &statuses, before.as_ref(), limit + 1)?;
         let has_more = runs.len() > limit;
         runs.truncate(limit);
         Ok((runs, has_more))
@@ -568,7 +569,7 @@ intentions:
             Query(PulseRunsQuery {
                 agent_id: "default".to_string(),
                 status: None,
-                before: Some("2026-10-02T09:00:00+00:00".to_string()),
+                before: Some("2026-10-02T09:00:00+00:00|run-new".to_string()),
                 limit: None,
             }),
         )

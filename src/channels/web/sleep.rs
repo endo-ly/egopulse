@@ -23,7 +23,8 @@ pub(super) struct SleepRunsQuery {
     agent_id: String,
     /// Comma-separated statuses; every status when absent.
     status: Option<String>,
-    /// Only runs started before this instant, for paging back through history.
+    /// The `started_at` and id of the oldest run already returned, for paging
+    /// back through history.
     before: Option<String>,
     limit: Option<usize>,
 }
@@ -33,8 +34,8 @@ pub(super) struct SleepRunsQuery {
 /// Query parameters:
 /// - `agent_id`: the agent whose runs to list
 /// - `status` (optional): comma-separated statuses to keep
-/// - `before` (optional): only runs started before this RFC 3339 instant, so
-///   the caller can page back through the whole history
+/// - `before` (optional): cursor of the oldest run already returned, so the
+///   caller can page back through the whole history
 /// - `limit` (optional, default 20, at most 200): maximum number of runs
 ///
 /// `has_more` says whether older runs exist beyond the returned page. Each run
@@ -57,7 +58,7 @@ pub(super) async fn list_sleep_runs(
 
     let (runs, changed, has_more) = call_blocking(db, move |db| {
         // One row past the page tells us whether older runs exist.
-        let mut runs = db.list_sleep_runs(&agent_id, &statuses, before.as_deref(), limit + 1)?;
+        let mut runs = db.list_sleep_runs(&agent_id, &statuses, before.as_ref(), limit + 1)?;
         let has_more = runs.len() > limit;
         runs.truncate(limit);
         let run_ids: Vec<String> = runs.iter().map(|run| run.id.clone()).collect();
@@ -506,14 +507,14 @@ mod tests {
         // Act
         let older = list_sleep_runs(
             AxumState(web_state.clone()),
-            paged_runs_query("agent-a", "2024-01-03T00:00:00+00:00"),
+            paged_runs_query("agent-a", "2024-01-03T00:00:00+00:00|run-1"),
         )
         .await
         .expect("ok")
         .0;
         let not_older = list_sleep_runs(
             AxumState(web_state),
-            paged_runs_query("agent-a", "2024-01-02T00:00:00+00:00"),
+            paged_runs_query("agent-a", "2024-01-02T00:00:00+00:00|run-1"),
         )
         .await
         .expect("ok")

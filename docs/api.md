@@ -403,7 +403,7 @@ GET /api/sleep/runs?agent_id={agent_id}&status={status}&before={before}&limit={l
 |-----------|:---:|----------|------|
 | `agent_id` | 必須 | — | エージェント ID |
 | `status` | 任意 | — | カンマ区切りの status。省略時はすべて。未知の値は `400`（`invalid_status`） |
-| `before` | 任意 | — | この時刻（RFC 3339）より前に開始した run だけを返す。前のページの最古の `started_at` を渡すと履歴を遡れる。パースできない値は `400`（`invalid_before`） |
+| `before` | 任意 | — | 前のページの最古の run を `{started_at}\|{id}` の形で渡すと、その run より古いものを返す。`id` で決着するので、同じ時刻の run がページ境界で欠けない。パースできない値は `400`（`invalid_before`） |
 | `limit` | 任意 | `20` | 1 ページの最大取得件数（上限 `200`） |
 
 レスポンスの `runs` 配列は `started_at` 降順。各要素のフィールド: `id`, `agent_id`, `status`, `trigger`, `started_at`, `finished_at`, `source_chats_json`, `source_digest_md`, `input_tokens`, `output_tokens`, `total_tokens`, `error_message`, `session_count`, `changed_memory`。
@@ -416,7 +416,7 @@ GET /api/sleep/runs?agent_id={agent_id}&status={status}&before={before}&limit={l
 | `session_count` | `number` | `source_chats_json` から算出した対象セッション数 |
 | `changed_memory` | `string[]` | 内容が変わった記憶ファイル（`episodic` → `semantic` → `prospective` の順）。公開済みの run（`success` / `partial_failure`）だけが持ち、それ以外は空 |
 
-`has_more` は、返したページより古い run が残っているかを示す。`before` と併用して履歴の末尾まで遡れる。
+`has_more` は、返したページより古い run が残っているかを示す。`before` と併用して履歴の末尾まで遡れる。並び順は `started_at` 降順・`id` 降順で、`before` はその順序で比較する。
 
 `skipped` は実行しないと判定した Sleep の記録で、ステップとスナップショットを持たない（[sleep.md](./sleep.md)）。
 
@@ -723,12 +723,12 @@ GET /api/pulse/runs?agent_id={agent_id}&status={status}&before={before}&limit={l
 |-----------|:---:|----------|------|
 | `agent_id` | 必須 | — | エージェント ID |
 | `status` | 任意 | — | カンマ区切りの status（`running`, `success`, `failed`, `skipped`）。未知の値は `400` |
-| `before` | 任意 | — | この時刻（RFC 3339）より前に開始した run だけを返す。前のページの最古の `started_at` を渡すと履歴を遡れる。パースできない値は `400`（`invalid_before`） |
+| `before` | 任意 | — | 前のページの最古の run を `{started_at}\|{id}` の形で渡すと、その run より古いものを返す。`id` で決着するので、同じ時刻の run がページ境界で欠けない。パースできない値は `400`（`invalid_before`） |
 | `limit` | 任意 | `20` | 1 ページの最大取得件数（上限 `200`） |
 
 `runs` は `started_at` 降順。各要素: `id`, `agent_id`, `intention_id`, `status`, `started_at`, `finished_at`, `output_kind`（`notify` / `silent`、成功時のみ）, `output_text`（`notify` は配送した本文、`silent` は `PULSE_OK`）, `error_message`（`failed` はエラー、`skipped` は理由）。
 
-`has_more` は、返したページより古い run が残っているかを示す。`before` と併用して履歴の末尾まで遡れる。
+`has_more` は、返したページより古い run が残っているかを示す。`before` と併用して履歴の末尾まで遡れる。並び順は `started_at` 降順・`id` 降順で、`before` はその順序で比較する。
 
 ---
 

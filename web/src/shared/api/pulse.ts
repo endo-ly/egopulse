@@ -13,7 +13,7 @@ export interface PulseRunsQuery {
   limit: number;
   /** Keeps only these statuses; every status when omitted. */
   statuses?: readonly PulseRunStatus[];
-  /** Pages back to runs started before this instant. */
+  /** Cursor below which to continue listing: `{started_at}|{id}` of the oldest run already shown. */
   before?: string;
 }
 

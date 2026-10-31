@@ -1225,21 +1225,44 @@ function agentPulse(agentId: string) {
 }
 
 /**
- * Mirrors the run listings: the comma-separated `status` filter, the `before`
- * paging cursor, and `has_more` for whether older runs are left.
+ * Orders runs newest first, breaking ties on the id: the same keys the API
+ * orders by, so its `before` cursor compares like the listing does.
  */
-function filterRuns<T extends { status: string; started_at: string }>(
+function compareRuns(
+  a: { id: string; started_at: string },
+  b: { id: string; started_at: string },
+): number {
+  if (a.started_at !== b.started_at) return a.started_at < b.started_at ? -1 : 1;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
+/**
+ * Mirrors the run listings: the comma-separated `status` filter, the `before`
+ * paging cursor (`{started_at}|{id}`), and `has_more` for whether older runs
+ * are left.
+ */
+function filterRuns<T extends { id: string; status: string; started_at: string }>(
   runs: T[],
   params: URLSearchParams,
-): { runs: T[]; has_more: boolean } {
+): { runs: T[]; has_more: boolean } | null {
   const statuses = (params.get("status") ?? "").split(",").filter(Boolean);
   const before = params.get("before");
+  const cursor = before === null ? null : parseRunCursor(before);
+  if (before !== null && cursor === null) return null;
   const limit = Number(params.get("limit") ?? "20");
   const matching = runs
     .filter((run) => statuses.length === 0 || statuses.includes(run.status))
-    .filter((run) => before === null || run.started_at < before)
-    .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
+    .filter((run) => cursor === null || compareRuns(run, cursor) < 0)
+    .sort((a, b) => compareRuns(b, a));
   return { runs: matching.slice(0, limit), has_more: matching.length > limit };
+}
+
+/** `{started_at}|{id}`, as the listings hand out; null when malformed. */
+function parseRunCursor(before: string): { id: string; started_at: string } | null {
+  const [startedAt, id] = before.split("|");
+  if (!startedAt || !id || Number.isNaN(Date.parse(startedAt))) return null;
+  return { started_at: startedAt, id };
 }
 
 // Mirrors ~/.egopulse/agents/<id>/memory/*.md served by GET /api/agents/:id/memory.
@@ -1587,6 +1610,10 @@ export function mockApiPlugin(): Plugin | null {
             SLEEP_RUNS.filter((run) => run.agent_id === agentId),
             parsed.searchParams,
           );
+          if (page === null) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid_before" });
+          }
           const runs = page.runs.map((run) => ({ ...run, changed_memory: changedMemory(run) }));
           return sendJson(res, { ok: true, runs, has_more: page.has_more });
         }
@@ -1596,6 +1623,10 @@ export function mockApiPlugin(): Plugin | null {
             PULSE_RUNS.filter((run) => run.agent_id === agentId),
             parsed.searchParams,
           );
+          if (page === null) {
+            res.statusCode = 400;
+            return sendJson(res, { ok: false, error: "invalid_before" });
+          }
           return sendJson(res, { ok: true, runs: page.runs.map(pulseSummary), has_more: page.has_more });
         }
         if (pathname.startsWith("/api/pulse/runs/")) {
