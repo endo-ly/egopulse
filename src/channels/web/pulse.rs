@@ -89,19 +89,42 @@ pub(super) async fn get_agent_pulse(
 
     let now = Utc::now();
     let available_channels = state.app_state.channels.names();
-    let mut intentions = Vec::with_capacity(definition.intentions.len());
-    for intention in &definition.intentions {
-        let target = resolve_home_surface(
+    // Intentions without an explicit delivery all fall back to the same
+    // auto-resolved home surface, so resolve it once instead of per intention.
+    let auto_target = if definition.default_delivery.is_none()
+        && definition
+            .intentions
+            .iter()
+            .any(|intention| intention.delivery.is_none())
+    {
+        resolve_home_surface(
             &state.app_state.db,
             agent_id.as_str(),
             &available_channels,
-            intention
-                .delivery
-                .as_ref()
-                .or(definition.default_delivery.as_ref()),
+            None,
         )
         .await
-        .map_err(storage_error)?;
+        .map_err(storage_error)?
+    } else {
+        None
+    };
+    let mut intentions = Vec::with_capacity(definition.intentions.len());
+    for intention in &definition.intentions {
+        let delivery = intention
+            .delivery
+            .as_ref()
+            .or(definition.default_delivery.as_ref());
+        let target = match delivery {
+            Some(spec) => resolve_home_surface(
+                &state.app_state.db,
+                agent_id.as_str(),
+                &available_channels,
+                Some(spec),
+            )
+            .await
+            .map_err(storage_error)?,
+            None => auto_target.clone(),
+        };
         let next = if definition.enabled && intention.enabled {
             let next = resolve_next_due(
                 &state.app_state.db,
@@ -447,6 +470,47 @@ intentions:
         assert_eq!(paused["next"], serde_json::Value::Null);
         assert_eq!(paused["delivery"]["external_chat_id"], "456");
         assert_eq!(paused["target"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn agent_pulse_resolves_the_auto_target_for_every_intention() {
+        // Arrange: no default delivery, so each intention falls back to the
+        // agent's home surface
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_pulse(
+            &dir,
+            r#"
+enabled: true
+intentions:
+  - id: morning
+    schedule: { kind: daily, at: "09:00" }
+    attention: Check the calendar.
+  - id: evening
+    schedule: { kind: daily, at: "21:00" }
+    attention: Reflect.
+"#,
+        );
+        let state = web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("discord", "discord:123:agent:default", "dm", "default")
+            .expect("chat");
+
+        // Act
+        let body = get_agent_pulse(AxumState(state), Path("default".to_string()))
+            .await
+            .expect("ok")
+            .0;
+
+        // Assert: both intentions point at the same auto-resolved conversation
+        let expected =
+            serde_json::json!({"channel": "discord", "session_key": format!("chat:{chat_id}")});
+        let intentions = body["pulse"]["intentions"].as_array().expect("intentions");
+        assert_eq!(intentions.len(), 2);
+        for intention in intentions {
+            assert_eq!(intention["target"], expected);
+        }
     }
 
     #[tokio::test]
