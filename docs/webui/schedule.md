@@ -93,7 +93,7 @@ Skills と同じく、intention の一覧と選んだ intention の定義を左�
 
 | 要素 | 内容 |
 |---|---|
-| agent 単位の設定 | Status（`On` / `Off`）・Timezone・Default destination（`default_delivery`。なければ直近の Discord / Telegram 会話） |
+| agent 単位の設定 | Status（`On` / `Off`）・Timezone・Default destination（`default_delivery`。なければ直近の Discord / Telegram / Web 会話） |
 | 一覧 | PULSE.yaml の定義順。各行は id と `{schedule} · next {次回発火}`。無効な intention（または agent の Pulse が無効）は薄くして `Off` を添える |
 | 定義 | 見出しは intention の id、状態（`Active` / `Off` / `Off (Pulse is off)`）、When（schedule と timezone）、Next（無効なら `Does not fire while off`）、Sends to（§3.1）、Attention（DocumentCard で全文）。タイトルに attention を出さない（同じ文が二度並ぶため） |
 
@@ -104,7 +104,7 @@ Skills と同じく、intention の一覧と選んだ intention の定義を左�
 
 ### 3.1 配送先の表示
 
-配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI はその会話を Sessions と同じ名前（[layout.md §2.6](./layout.md#26-sessions)）で `Discord · Team chat` のように示し、どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示し、発火が skip されることを warning 色で伝える。
+配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram / Web 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI はその会話を Sessions と同じ名前（[layout.md §2.6](./layout.md#26-sessions)）で `Discord · Team chat` のように示し、どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。Web の配送先はセッション ID（`chat:{id}`）で指定し、`target.session_key` も同じ形式になる。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示し、発火が skip されることを warning 色で伝える。
 
 ---
 

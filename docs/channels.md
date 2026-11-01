@@ -75,7 +75,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 - **Pulse の表示**: Pulse 通知は配送先チャネルへ最終応答だけが届くのに対し、セッション履歴には Activation の経過（合成入力・途中発話・ツールカード）も保存される。Web UI は経過を最終応答の下に折りたたみ、最終応答の本文の上に intention 名を 1 行だけ表示する。この行を開くとその通知の経過をその場で表示する。開閉状態は保存しない。折りたたみは `GET /api/history` の `pulse`（`run_id` / `role`）による。最終応答が読み込まれていない経過は通常の行として表示する
 - **検索範囲**: コマンドパレットのメッセージ検索は読み込み済みの履歴のみを対象とする。対象はタイムラインの最上位の行で、折りたたまれた Pulse の経過は含まない。全履歴検索は `GET /api/history` のページングとは別の機能である
 - **再接続**: SSEは `last_event_id`、WebSocketは `run.subscribe` によるイベントリプレイ対応（最大 512 イベント、5 分 TTL）。run が保持期間切れの場合は `run_not_found` を返し、クライアントは永続化済み履歴から再構築する
-- **応答**: WebAdapter は local-only で送信不可（Web クライアントへの送信は SSE/WS が直接行う）
+- **応答**: WebAdapter の `send_text` は no-op。通常の返答は SSE/WS のストリーミングで届け、Pulse など他起点の通知は通常セッションへの永続化で届ける。永続化後は WebSocket `session_updated` と履歴ポーリングで Web UI に反映される
 - **既存チャットのagent**: `chat:{id}` を指定した再開時は、`chats.agent_id` を使用する。新規Webセッションだけが `default_agent` を使用する。
 
 ### セッション管理

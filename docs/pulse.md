@@ -233,7 +233,7 @@ Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エー�
 | op | 引数 | 動作 |
 |---|---|---|
 | `list` | — | 現在の設定を表示。各 intention の schedule・enabled・次回発火見積もり、agent の enabled 状態。パースエラー（手編集による破損）もここで報告される |
-| `add` | `schedule` + `attention`、`id` / `delivery` は省略可 | intention を作成。`id` 省略時は schedule から自動採番（重複時は接尾辞）。`delivery` 省略時は**現在の会話**が使われる（チャネルが Discord/Telegram の場合）。`once` は未来日のみ可 |
+| `add` | `schedule` + `attention`、`id` / `delivery` は省略可 | intention を作成。`id` 省略時は schedule から自動採番（重複時は接尾辞）。`delivery` 省略時は**現在の会話**が使われる（チャネルが Discord / Telegram / Web の場合。Web は現在のセッション ID `chat:{id}`）。`once` は未来日のみ可 |
 | `update` | `id` + `schedule` / `attention` / `delivery` | intention を変更 |
 | `remove` | `id` | intention を削除 |
 | `enable` / `disable` | `id` 省略可 | `id` あり: その intention のON/OFF。`id` なし: agent レベルの `enabled` 切替 |
@@ -244,7 +244,7 @@ Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エー�
 - **Secret 会話からは利用できない**: Pulse の実行・配送は Normal スコープで行われるため、Secret 会話からの呼び出しはエラーになる（秘匿内容の意図しない漏洩を防ぐ）。Pulse の設定は通常の会話から行う
 - **書き込みは serialize → parse round-trip → atomic rename**。ツールが書いたファイルがパースできない状態は原理的に発生しない
 - **並行書き込みは直列化される**: load → 変更 → save をプロセス共通の排他ゲート内で行うため、複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない
-- **`add` の delivery デフォルトは現在の会話**。TUI / Web など送信可能チャネル以外で頼まれた場合は intention を作らず、Discord / Telegram の配送先を問い返す
+- **`add` の delivery デフォルトは現在の会話**。TUI / CLI など送信可能チャネル以外で頼まれた場合は intention を作らず、Discord / Telegram / Web の配送先を問い返す。Web の配送先は WebUI のセッション ID（`chat:{id}`）で指定する
 - **同日の再発火はしない**: daily の `due_key` は日付単位のため、09:00 発火済みの日に 10:00 に変更しても当日は再発火しない。再発火させたい場合は id を変える
 - **発火見込みの表示は scheduler と同じ判定**: `list` / `add` の次回発火テキストは、カレンダー候補（`estimate_next_due`）に実行履歴（`pulse_runs` / due_key）を加えた scheduler と同一の判定で作る。時刻到達かつ未実行は `due now (pending next scan)`、候補が実行済み期間に属する場合は `already attempted for current period`（`interval` は翌日に再試行できるので、代わりに翌日の時刻を次回発火として示す）、`once` 実行済みは `already attempted (no automatic retry)` と表示する。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す
 - **`once` は成功時に自動アーカイブされる**: run 成功後、実行時点の内容が現在の PULSE.yaml と一致する場合にのみ PULSE.yaml から除去される。activation 中にユーザーが再スケジュールした場合はそちらを優先して残す。失敗・skipped の場合はファイルに残り、`list` で可視化されるため、エージェントが原因を説明して `remove` → `add` で再設定する。自動リトライはしない
@@ -336,11 +336,11 @@ schedule:
 | `once.at` | `HH:MM` |
 | `attention` | LLM に渡す注意対象。実行命令ではない |
 | `default_delivery` | 省略可能。agent レベルのデフォルト配送先 |
-| `default_delivery.channel` | `discord` / `telegram` のみ |
-| `default_delivery.external_chat_id` | 空不可 |
+| `default_delivery.channel` | `discord` / `telegram` / `web` |
+| `default_delivery.external_chat_id` | 空不可。`web` の場合は WebUI のセッション ID `chat:{id}` |
 | `delivery`（intention 内） | 省略可能。`default_delivery` をオーバーライド |
-| `delivery.channel` | `discord` / `telegram` のみ |
-| `delivery.external_chat_id` | 空不可 |
+| `delivery.channel` | `discord` / `telegram` / `web` |
+| `delivery.external_chat_id` | 空不可。`web` の場合は WebUI のセッション ID `chat:{id}` |
 
 `attention` は `task` ではない。
 「この時間に、この対象へ注意を向ける」という意味を持つ。
@@ -436,7 +436,8 @@ resolve_home_surface(agent_id, delivery):
 
 1. delivery が明示指定されていれば（intention.delivery → default_delivery）、
    channel:external_chat_id を DB から検索
-   （channel が送信可能な discord/telegram の場合のみ）
+   （channel が送信可能な discord / telegram / web の場合のみ）
+   - web は WebUI のセッション ID `chat:{id}` を get_chat_by_id() で解決する
    - 見つからなければ自動解決へフォールバックしない。
      その run は skipped（"explicit delivery could not be resolved"）。
      ユーザーが指定した配送先を暗黙に変更しないため
@@ -446,8 +447,10 @@ resolve_home_surface(agent_id, delivery):
 4. どれも見つからなければ skipped（"no sendable home surface"）
 ```
 
-- 明示指定時の DB ルックアップは `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
-- 送信可能 channel は Discord / Telegram のみ。Web / CLI は対象外
+- 明示指定時、`web` 以外は `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
+- `web` の明示指定は `get_chat_by_id()` を使用し、解決した chat の `channel` が `web`、`agent_id` が対象 agent と一致することを検証する。`chat_id` は DB 全体で一意なため、この検証がないと他 agent のセッションへ配送できてしまう
+- 送信可能 channel は Discord / Telegram / Web。CLI / TUI / Voice は対象外
+- Web の配送は通常 session への永続化そのものである。Web クライアントへのリアルタイム通知は永続化イベント（WebSocket `session_updated`）と履歴ポーリングで行う。ブラウザを開いていない間の通知は保存され、次に開いたときに表示される（OS レベルの push 通知は行わない）
 - Activation の `SurfaceContext` / Tool 実行コンテキストは、Home Surface の `external_chat_id`（session key 形式）から生の `surface_thread` を復元して構築する。これにより Activation 中の `agent_send` は宛先エージェントの通常 session key（`{channel}:{surface_thread}:agent:{to}`）を解決する
 - Home Surface が解決できない場合は、その run を `skipped` として記録する（LLM は呼ばない）
 
@@ -564,7 +567,7 @@ Pulse の出力は 2 種類だけ。
 | 出力 | 意味 | 動作 | `output_kind` |
 |---|---|---|---|
 | `PULSE_OK` | 通知不要 | silent として記録。通常 session には何も保存しない | `silent` |
-| その他の本文 | 通知あり | Home Surface へ送信し、通常 session に保存する | `notify` |
+| その他の本文 | 通知あり | Home Surface へ送信し、通常 session に保存する（Web では保存そのものが配送） | `notify` |
 
 `PULSE_OK` は case-insensitive で前後空白を trim して判定する（空文字も silent 扱い）。
 LLM の出力揺れを許容しつつ、実質的な誤検知は避ける。

@@ -456,7 +456,7 @@ Environment variables:
   - `id: string`。update / remove で必須。enable / disable では省略可（省略時は agent レベルの `enabled` 切替）
   - `schedule: object`。add / update で使用。`kind`（daily / weekly / interval / once）と `at`（HH:MM）、kind ごとに `day` / `interval_days` / `date`
   - `attention: string`。add で必須。その時間に注意を向ける対象（実行命令ではない）
-  - `delivery: object`。省略時は現在の会話（チャネルが Discord / Telegram の場合）。送信可能チャネル以外で省略した場合はエラーになり、明示指定を促す
+  - `delivery: object`。省略時は現在の会話（チャネルが Discord / Telegram / Web の場合。Web は現在のセッション ID `chat:{id}`）。送信可能チャネル以外で省略した場合はエラーになり、明示指定を促す
 - 挙動:
   - Secret 会話からは呼び出せない（エラーを返す）。Pulse の実行・配送は通常スコープで行われるため
   - 操作対象は常に実行中の自エージェント（他エージェントの PULSE.yaml は操作しない）
@@ -467,7 +467,7 @@ Environment variables:
 - 主な失敗:
   - `"pulse: missing required parameter ..."` — 必須引数の欠落
   - `"pulse: intention id '<id>' already exists"` / `"no intention '<id>'"` — id の重複・不存在
-  - `"pulse: notifications can only be delivered to Discord or Telegram ..."` — 配送先を解決できない
+  - `"pulse: notifications can only be delivered to Discord, Telegram, or Web ..."` — 配送先を解決できない
   - `"pulse: the pulse tool is not available in secret conversations ..."` — Secret 会話からの呼び出し
   - `"pulse: PULSE.yaml could not be parsed ..."` — 手編集によるファイル破損
 
