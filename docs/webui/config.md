@@ -37,7 +37,7 @@
 |---|---|---|
 | General | 既定 agent / provider / model、timezone、履歴と compaction の値。Process（log level・state directory）は再起動必須 | Defaults カード |
 | Agents | agent ごとのカード：実効モデルと解決元、reasoning effort、Bot 紐づけ、channel profiles | agent ごと（名前・provider・model・reasoning effort・Discord bot・Telegram bot） |
-| Providers | provider ごとのカード：base URL、API key の状態、default model、models（context window・custom instructions の有無）、追加ヘッダ名、使っている agent | provider ごと（名前・base URL・models・default model・API key の Replace / Remove。プロセス環境変数由来の key を除く） |
+| Providers | provider ごとのカード：base URL、API key の状態、default model、models（context window・custom instructions の有無）、追加ヘッダ名、使っている agent | provider ごと（名前・base URL・models・default model・API key の Replace / Remove。プロセス環境変数由来の key と、API key が必須の provider の Remove を除く） |
 | Channels | Web（listen address・auth token・allowed origins）/ Discord・Telegram（Bot と token 状態・紐づく agent、許可チャネルの表）/ Voice | — |
 | Sleep | 実行時刻、対象 agent、実効モデル、reasoning effort、retry（初回を含む最大試行回数） | Sleep batch カード |
 | Pulse | tick interval。agent ごとの Pulse 定義は Schedule へ | Scheduler カード |
@@ -78,6 +78,8 @@
 - 更新は `ConfigManager` の単一の更新境界を通る（[config.md §10](../config.md#10-設定の変更インターフェース)）。YAML 全体を書き込む経路は設けない
 - API key の新しい値は `.env` に保存され、YAML には SecretRef として記録される
 - API key がプロセス環境変数から解決されている場合、その値は読み取り専用。変更するにはプロセス環境変数を変更する
+- API key が必須の provider では Remove を無効化する。キーを変更する場合は Replace を使う
+- 複数の provider が同じ SecretRef を参照している場合、Replace するとその provider 専用の `.env` 参照へ切り替わる。他の provider の値は変わらない
 - API key の Remove は `.env` の該当キーも削除する。同じ変数を参照する他の SecretRef がある場合は残す
 
 ---

@@ -140,6 +140,15 @@ export function providerTarget(config: RuntimeConfig, providerId: string): EditT
   const provider = config.providers.find((p) => p.id === providerId);
   if (!provider) return null;
   const processManaged = provider.api_key.kind === "env" && provider.api_key.origin === "process";
+  const storageHint =
+    provider.api_key.kind === "literal"
+      ? "Stored in the YAML file. Replacing it stores the new key in .env."
+      : provider.api_key.ref
+        ? `Stored in .env as ${provider.api_key.ref}.`
+        : "A new key is stored in .env; the YAML keeps only a reference.";
+  const removeReason = provider.api_key_optional
+    ? undefined
+    : "This provider requires an API key; it can be replaced but not removed.";
   return {
     target: { kind: "provider", id: provider.id },
     values: {
@@ -167,13 +176,10 @@ export function providerTarget(config: RuntimeConfig, providerId: string): EditT
         readOnlyReason: processManaged
           ? `Set by the process environment (${provider.api_key.ref}). Change it there.`
           : undefined,
+        removeDisabledReason: processManaged ? undefined : removeReason,
         hint: processManaged
           ? undefined
-          : provider.api_key.kind === "literal"
-            ? "Stored in the YAML file. Replacing it stores the new key in .env."
-            : provider.api_key.ref
-              ? `Stored in .env as ${provider.api_key.ref}.`
-              : "A new key is stored in .env; the YAML keeps only a reference.",
+          : [storageHint, removeReason].filter(Boolean).join(" "),
       },
     ],
   };

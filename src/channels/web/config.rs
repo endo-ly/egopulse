@@ -737,6 +737,52 @@ pub(super) async fn api_patch_provider(
 ) -> ApiResult {
     let id = ProviderId::new(&provider_id);
     apply(&state, &patch.expected_fingerprint, |config| {
+        let current_api_key = config
+            .providers
+            .get(&id)
+            .map(|provider| provider.api_key.clone())
+            .ok_or_else(|| not_found("provider_not_found"))?;
+        let process_managed = matches!(
+            &current_api_key,
+            Some(ResolvedValue::EnvRef {
+                origin: EnvOrigin::Process,
+                ..
+            })
+        );
+        let replacing = matches!(&patch.api_key, Some(ApiKeyChange::Replace { .. }));
+        let removing = matches!(&patch.api_key, Some(ApiKeyChange::Remove));
+        if (replacing || removing) && process_managed {
+            return Err(bad_request("api_key_managed_by_process_env"));
+        }
+
+        let replacement = match &patch.api_key {
+            Some(ApiKeyChange::Replace { value }) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(bad_request("empty_api_key"));
+                }
+                let env_name = replacement_provider_api_key_env_name(
+                    config,
+                    id.as_str(),
+                    current_api_key.as_ref(),
+                )?;
+                Some((env_name, value.to_string()))
+            }
+            _ => None,
+        };
+        let removed_dotenv_keys = if removing {
+            match &current_api_key {
+                Some(ResolvedValue::EnvRef {
+                    id: env_id,
+                    origin: EnvOrigin::Dotenv,
+                    ..
+                }) => vec![env_id.clone()],
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
         let provider = config
             .providers
             .get_mut(&id)
@@ -767,52 +813,10 @@ pub(super) async fn api_patch_provider(
                 .entry(provider.default_model.clone())
                 .or_insert_with(ModelConfig::default);
         }
-        let process_managed = matches!(
-            &provider.api_key,
-            Some(ResolvedValue::EnvRef {
-                origin: EnvOrigin::Process,
-                ..
-            })
-        );
-        let mut removed_dotenv_keys = Vec::new();
-        match patch.api_key {
-            Some(ApiKeyChange::Replace { value }) => {
-                if process_managed {
-                    return Err(bad_request("api_key_managed_by_process_env"));
-                }
-                let value = value.trim();
-                if value.is_empty() {
-                    return Err(bad_request("empty_api_key"));
-                }
-                let env_name = match &provider.api_key {
-                    Some(ResolvedValue::EnvRef {
-                        id,
-                        origin: EnvOrigin::Dotenv,
-                        ..
-                    }) => {
-                        if env_is_process_override(id) {
-                            return Err(bad_request("api_key_managed_by_process_env"));
-                        }
-                        id.clone()
-                    }
-                    _ => provider_api_key_env_name_for_write(id.as_str())?,
-                };
-                provider.api_key = Some(env_resolved_value(env_name, value));
-            }
-            Some(ApiKeyChange::Remove) => {
-                if process_managed {
-                    return Err(bad_request("api_key_managed_by_process_env"));
-                }
-                if let Some(ResolvedValue::EnvRef {
-                    id,
-                    origin: EnvOrigin::Dotenv,
-                    ..
-                }) = provider.api_key.take()
-                {
-                    removed_dotenv_keys.push(id);
-                }
-            }
-            None => {}
+        if let Some((env_name, value)) = replacement {
+            provider.api_key = Some(env_resolved_value(env_name, value));
+        } else if removing {
+            provider.api_key = None;
         }
         Ok(removed_dotenv_keys)
     })
@@ -927,16 +931,46 @@ fn env_is_process_override(name: &str) -> bool {
     std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
 }
 
+/// Chooses the reference for a replacement key. An unshared `.env` reference
+/// keeps its name; a shared reference gets a provider-specific name so that
+/// other secrets continue to read the old value.
+fn replacement_provider_api_key_env_name(
+    config: &Config,
+    provider_id: &str,
+    current: Option<&ResolvedValue>,
+) -> Result<String, ApiError> {
+    let Some(ResolvedValue::EnvRef {
+        id: env_id,
+        origin: EnvOrigin::Dotenv,
+        ..
+    }) = current
+    else {
+        return provider_api_key_env_name_for_write(config, provider_id);
+    };
+    if env_is_process_override(env_id) {
+        return Err(bad_request("api_key_managed_by_process_env"));
+    }
+    if config.env_secret_reference_count(env_id) == 1 {
+        Ok(env_id.clone())
+    } else {
+        provider_api_key_env_name_for_write(config, provider_id)
+    }
+}
+
 /// Picks an env name whose `.env` value will actually take effect. The default
-/// name is used unless the process environment already overrides it; in that
-/// case the Egopulse-prefixed name is used instead.
-fn provider_api_key_env_name_for_write(provider_id: &str) -> Result<String, ApiError> {
+/// name is used unless the process environment already overrides it, or
+/// another secret already uses it; in those cases the Egopulse-prefixed name
+/// is used instead.
+fn provider_api_key_env_name_for_write(
+    config: &Config,
+    provider_id: &str,
+) -> Result<String, ApiError> {
     let base = provider_api_key_env_name(provider_id);
-    if !env_is_process_override(&base) {
+    if !env_is_process_override(&base) && config.env_secret_reference_count(&base) == 0 {
         return Ok(base);
     }
     let fallback = format!("EGOPULSE_{base}");
-    if !env_is_process_override(&fallback) {
+    if !env_is_process_override(&fallback) && config.env_secret_reference_count(&fallback) == 0 {
         return Ok(fallback);
     }
     Err(bad_request("api_key_env_override_conflict"))
@@ -1013,8 +1047,10 @@ mod tests {
     #[serial]
     fn provider_key_env_name_uses_prefixed_name_when_default_is_overridden() {
         let _guard = EnvVarGuard::set("REVIEW_FALLBACK_PROVIDER_API_KEY", "from-process");
+        let config = crate::test_util::test_config("/tmp/review-fallback");
 
-        let name = provider_api_key_env_name_for_write("review-fallback-provider").expect("name");
+        let name =
+            provider_api_key_env_name_for_write(&config, "review-fallback-provider").expect("name");
 
         assert_eq!(name, "EGOPULSE_REVIEW_FALLBACK_PROVIDER_API_KEY");
     }
@@ -1026,8 +1062,9 @@ mod tests {
             "EGOPULSE_REVIEW_FALLBACK_PROVIDER_API_KEY",
             "also-from-process",
         );
+        let config = crate::test_util::test_config("/tmp/review-fallback-both");
 
-        let error = provider_api_key_env_name_for_write("review-fallback-provider")
+        let error = provider_api_key_env_name_for_write(&config, "review-fallback-provider")
             .expect_err("both names are overridden");
 
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
@@ -1035,6 +1072,85 @@ mod tests {
             error.1.0["error"].as_str(),
             Some("api_key_env_override_conflict")
         );
+    }
+
+    #[test]
+    #[serial]
+    fn shared_provider_key_gets_a_dedicated_env_name() {
+        let _guard = EnvVarGuard::set("REVIEW_SHARED_API_KEY", "")
+            .also_set("REVIEW_SHARED_PROVIDER_API_KEY", "");
+        let mut config = crate::test_util::test_config("/tmp/review-shared");
+        let shared = env_resolved_value("REVIEW_SHARED_API_KEY", "old-secret");
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(shared.clone());
+        config.providers.insert(
+            ProviderId::new("secondary"),
+            crate::config::ProviderConfig::new(
+                "Secondary".to_string(),
+                "https://api.example.com/v1".to_string(),
+                Some(shared),
+                "gpt-5".to_string(),
+                std::collections::HashMap::from([(
+                    "gpt-5".to_string(),
+                    crate::config::ModelConfig::default(),
+                )]),
+            ),
+        );
+        let current = config
+            .providers
+            .get(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key
+            .as_ref();
+
+        let name =
+            replacement_provider_api_key_env_name(&config, "review-shared-provider", current)
+                .expect("name");
+
+        assert_eq!(name, "REVIEW_SHARED_PROVIDER_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn unshared_provider_key_reuses_its_env_name() {
+        let _guard = EnvVarGuard::set("REVIEW_ONLY_API_KEY", "");
+        let mut config = crate::test_util::test_config("/tmp/review-only");
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(env_resolved_value("REVIEW_ONLY_API_KEY", "old-secret"));
+        let current = config
+            .providers
+            .get(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key
+            .as_ref();
+
+        let name = replacement_provider_api_key_env_name(&config, "openai", current).expect("name");
+
+        assert_eq!(name, "REVIEW_ONLY_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn provider_key_env_name_skips_a_name_already_referenced() {
+        let _guard = EnvVarGuard::set("REVIEW_FALLBACK_PROVIDER_API_KEY", "");
+        let mut config = crate::test_util::test_config("/tmp/review-fallback-ref");
+        let existing = env_resolved_value("REVIEW_FALLBACK_PROVIDER_API_KEY", "existing");
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(existing);
+
+        let name =
+            provider_api_key_env_name_for_write(&config, "review-fallback-provider").expect("name");
+
+        assert_eq!(name, "EGOPULSE_REVIEW_FALLBACK_PROVIDER_API_KEY");
     }
 
     #[test]

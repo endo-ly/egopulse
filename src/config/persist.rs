@@ -697,10 +697,10 @@ fn save_config_sources_locked(
     yaml_path: &Path,
     removed_dotenv_keys: &[String],
 ) -> Result<(), EgoPulseError> {
-    let (dotenv_entries, referenced_env_keys) = collect_dotenv_entries(config);
+    let dotenv_entries = collect_dotenv_entries(config)?;
     let removed_keys: Vec<String> = removed_dotenv_keys
         .iter()
-        .filter(|key| !referenced_env_keys.contains(*key))
+        .filter(|key| !dotenv_entries.referenced.contains(*key))
         .cloned()
         .collect();
     let env_path = DotenvFile::for_config(Some(yaml_path))
@@ -719,7 +719,12 @@ fn save_config_sources_locked(
         return Ok(());
     };
 
-    if let Err(error) = save_dotenv(&env_path, &dotenv_entries, Some(&generation), &removed_keys) {
+    if let Err(error) = save_dotenv(
+        &env_path,
+        &dotenv_entries.entries,
+        Some(&generation),
+        &removed_keys,
+    ) {
         let yaml_restore = restore_file(yaml_path, yaml_backup.as_deref());
         let env_restore = restore_file(
             &env_path,
@@ -814,49 +819,65 @@ fn restore_file(path: &Path, previous: Option<&[u8]>) -> Result<(), EgoPulseErro
     }
 }
 
-fn collect_dotenv_entries(config: &Config) -> (Vec<(String, String)>, HashSet<String>) {
-    let mut entries = Vec::new();
+/// The `.env` values and all env references needed for an atomic config save.
+struct DotenvEntries {
+    entries: Vec<(String, String)>,
+    referenced: HashSet<String>,
+}
+
+fn collect_dotenv_entries(config: &Config) -> Result<DotenvEntries, ConfigError> {
+    let mut values = HashMap::new();
     let mut referenced = HashSet::new();
 
     for provider in config.providers.values() {
-        collect_env_ref(&mut entries, &mut referenced, provider.api_key.as_ref());
+        collect_env_ref(&mut values, &mut referenced, provider.api_key.as_ref())?;
     }
 
     for channel in config.channels.values() {
-        collect_env_ref(&mut entries, &mut referenced, channel.auth_token.as_ref());
+        collect_env_ref(&mut values, &mut referenced, channel.auth_token.as_ref())?;
         if let Some(bots) = &channel.discord_bots {
             for bot in bots.values() {
-                collect_env_ref(&mut entries, &mut referenced, bot.token.as_ref());
+                collect_env_ref(&mut values, &mut referenced, bot.token.as_ref())?;
             }
         }
         if let Some(bots) = &channel.telegram_bots {
             for bot in bots.values() {
-                collect_env_ref(&mut entries, &mut referenced, bot.token.as_ref());
+                collect_env_ref(&mut values, &mut referenced, bot.token.as_ref())?;
             }
         }
     }
 
     for receiver in config.webhooks.receivers.values() {
-        collect_env_ref(&mut entries, &mut referenced, receiver.token.as_ref());
+        collect_env_ref(&mut values, &mut referenced, receiver.token.as_ref())?;
     }
 
-    (entries, referenced)
+    Ok(DotenvEntries {
+        entries: values.into_iter().collect(),
+        referenced,
+    })
 }
 
 /// Records every env reference. Only values owned by `.env` are written there;
 /// process-environment values still count when deciding whether a removed key
-/// is safe to delete.
+/// is safe to delete. Two `.env` references to the same variable must agree.
 fn collect_env_ref(
-    entries: &mut Vec<(String, String)>,
+    values: &mut HashMap<String, String>,
     referenced: &mut HashSet<String>,
     secret: Option<&ResolvedValue>,
-) {
+) -> Result<(), ConfigError> {
     if let Some(ResolvedValue::EnvRef { value, id, origin }) = secret {
         referenced.insert(id.clone());
         if *origin == EnvOrigin::Dotenv {
-            entries.push((id.clone(), value.clone()));
+            if let Some(existing) = values.get(id) {
+                if existing != value {
+                    return Err(ConfigError::ConfigSecretConflict { env: id.clone() });
+                }
+            } else {
+                values.insert(id.clone(), value.clone());
+            }
         }
     }
+    Ok(())
 }
 
 fn acquire_config_lock(path: &Path) -> Result<File, EgoPulseError> {
@@ -1101,6 +1122,64 @@ mod tests {
         assert!(!dotenv.contains("OPENAI_API_KEY"));
         assert!(dotenv.contains("REPLACEMENT_KEY=sk-replacement"));
         assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
+    }
+
+    #[test]
+    fn conflicting_values_for_the_same_env_ref_are_rejected() {
+        // Arrange: two providers share an env reference but hold different values.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let mut config = sample_config();
+        config.providers.insert(
+            ProviderId::new("secondary"),
+            ProviderConfig::new(
+                "Secondary".to_string(),
+                "https://api.example.com/v1".to_string(),
+                Some(env_resolved_value("OPENAI_API_KEY", "sk-different")),
+                "gpt-5".to_string(),
+                HashMap::from([("gpt-5".to_string(), crate::config::ModelConfig::default())]),
+            ),
+        );
+
+        // Act
+        let error = save_config_with_secrets(&config, &path).expect_err("conflict");
+
+        // Assert: the error names the variable but never exposes either value.
+        assert!(matches!(
+            error,
+            EgoPulseError::Config(ConfigError::ConfigSecretConflict { ref env })
+                if env == "OPENAI_API_KEY"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("OPENAI_API_KEY"));
+        assert!(!message.contains("sk-different"));
+        assert!(!message.contains("sk-test"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shared_env_refs_with_the_same_value_are_saved_once() {
+        // Arrange: two providers share an env reference with the same value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let mut config = sample_config();
+        config.providers.insert(
+            ProviderId::new("secondary"),
+            ProviderConfig::new(
+                "Secondary".to_string(),
+                "https://api.example.com/v1".to_string(),
+                Some(env_resolved_value("OPENAI_API_KEY", "sk-test")),
+                "gpt-5".to_string(),
+                HashMap::from([("gpt-5".to_string(), crate::config::ModelConfig::default())]),
+            ),
+        );
+
+        // Act
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        // Assert: the shared key is written exactly once.
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
+        assert_eq!(dotenv.matches("OPENAI_API_KEY=sk-test").count(), 1);
     }
 
     #[test]

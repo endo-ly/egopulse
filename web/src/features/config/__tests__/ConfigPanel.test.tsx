@@ -158,6 +158,38 @@ describe("ConfigPanel", () => {
     expect(within(providers).queryByRole("button", { name: "Replace" })).toBeNull();
   });
 
+  it("disables_remove_for_required_api_keys", async () => {
+    // Arrange: the fixture provider requires an API key.
+    stubConfigApi();
+    renderPanel("t-required-key");
+
+    // Act
+    const providers = await screen.findByRole("region", { name: "Providers" });
+    fireEvent.click(within(providers).getByRole("button", { name: "Edit" }));
+
+    // Assert: replacement is allowed, removal is not.
+    const remove = within(providers).getByRole("button", { name: "Remove" }) as HTMLButtonElement;
+    expect(remove.disabled).toBe(true);
+    expect(within(providers).getByText(/This provider requires an API key/)).toBeTruthy();
+  });
+
+  it("allows_remove_for_optional_api_keys", async () => {
+    // Arrange: an optional key can be removed.
+    const config = runtimeConfig();
+    config.providers[0].api_key_optional = true;
+    stubConfigApi({ config });
+    renderPanel("t-optional-key");
+
+    // Act
+    const providers = await screen.findByRole("region", { name: "Providers" });
+    fireEvent.click(within(providers).getByRole("button", { name: "Edit" }));
+
+    // Assert
+    const remove = within(providers).getByRole("button", { name: "Remove" }) as HTMLButtonElement;
+    expect(remove.disabled).toBe(false);
+    expect(within(providers).queryByText(/This provider requires an API key/)).toBeNull();
+  });
+
   it("uses_total_attempts_for_sleep_retries", async () => {
     // Arrange
     stubConfigApi();

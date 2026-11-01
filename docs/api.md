@@ -195,8 +195,11 @@ GET /api/config/yaml
 - 本文には `expected_fingerprint`（必須）と、変更するフィールドだけを含める。含めないフィールドは変更しない。null を取るフィールドは `null` で未設定に戻す
 - provider 更新では `default_model` をモデル一覧に必ず含める（なければ加える）
 - API key の新しい値は `.env` に保存し、YAML には既存の SecretRef の参照名を記録する。新規の場合は `{PROVIDER_ID}_API_KEY` を使い、その名前がプロセス環境変数で上書きされている場合は `EGOPULSE_{PROVIDER_ID}_API_KEY` を使う
-- API key がプロセス環境変数から解決されている場合、Replace / Remove は `400 api_key_managed_by_process_env`。その値はプロセス環境変数側で変更する。新規保存先の候補が両方ともプロセス環境変数で上書きされている場合は `400 api_key_env_override_conflict`
+- API key がプロセス環境変数から解決されている場合、Replace / Remove は `400 api_key_managed_by_process_env`。その値はプロセス環境変数側で変更する。新規保存先の候補（`{PROVIDER_ID}_API_KEY` と `EGOPULSE_{PROVIDER_ID}_API_KEY`）がどちらもプロセス環境変数で上書きされているか、他の秘密情報が参照している場合は `400 api_key_env_override_conflict`
+- 複数の秘密情報が同じ SecretRef を参照している場合、Replace はその provider 専用の参照名に切り替える。他の参照や `.env` の値は変更しない
 - API key の Remove は `.env` の該当キーも削除する。同じ変数を参照する他の SecretRef が残る場合は削除しない
+- API key が必須の provider で Remove すると `400 invalid_config`（`missing_provider_api_key`）。Config 画面は Remove を無効化する
+- 同じ env 変数に異なる値を持つ SecretRef が残る保存は `400 invalid_config`（`config_secret_conflict`）で拒否する。値はエラーメッセージに含めない
 - 更新は `ConfigManager` の更新境界（検証・永続化・snapshot 交換）を通る
 
 ##### レスポンス

@@ -29,6 +29,8 @@ export interface FieldSpec {
   max?: number;
   /** Shown instead of the input when the field cannot be changed here. */
   readOnlyReason?: string;
+  /** Shown when a secret can be replaced but not removed. */
+  removeDisabledReason?: string;
 }
 
 export interface EditFormProps {
@@ -321,7 +323,14 @@ function Field({
       </div>
     );
   } else if (spec.kind === "secret") {
-    control = <SecretInput id={id} value={value as SecretChange} onChange={onChange} />;
+    control = (
+      <SecretInput
+        id={id}
+        value={value as SecretChange}
+        onChange={onChange}
+        removeDisabledReason={spec.removeDisabledReason}
+      />
+    );
   } else {
     const listId = options.length > 0 ? `${id}-options` : undefined;
     control = (
@@ -405,7 +414,17 @@ function ListInput({ id, values, onChange }: { id: string; values: string[]; onC
   );
 }
 
-function SecretInput({ id, value, onChange }: { id: string; value: SecretChange; onChange: (value: SecretChange) => void }) {
+function SecretInput({
+  id,
+  value,
+  onChange,
+  removeDisabledReason,
+}: {
+  id: string;
+  value: SecretChange;
+  onChange: (value: SecretChange) => void;
+  removeDisabledReason?: string;
+}) {
   if (value.action === "replace") {
     return (
       <div className="secret-input">
@@ -434,7 +453,13 @@ function SecretInput({ id, value, onChange }: { id: string; value: SecretChange;
           Undo
         </Button>
       ) : (
-        <Button variant="danger" type="button" onClick={() => onChange({ action: "remove" })}>
+        <Button
+          variant="danger"
+          type="button"
+          onClick={() => onChange({ action: "remove" })}
+          disabled={Boolean(removeDisabledReason)}
+          title={removeDisabledReason}
+        >
           Remove
         </Button>
       )}
