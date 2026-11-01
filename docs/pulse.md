@@ -450,6 +450,7 @@ resolve_home_surface(agent_id, delivery):
 - 明示指定時、`web` 以外は `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
 - `web` の明示指定は `get_chat_by_id()` を使用し、解決した chat の `channel` が `web`、`agent_id` が対象 agent と一致することを検証する。`chat_id` は DB 全体で一意なため、この検証がないと他 agent のセッションへ配送できてしまう
 - 送信可能 channel は Discord / Telegram / Web。CLI / TUI / Voice は対象外
+- Web は `channels.web.enabled` が有効な runtime でのみ配送先になる。無効時は明示指定・自動解決とも `skipped` になる
 - Web の配送は通常 session への永続化そのものである。Web クライアントへのリアルタイム通知は永続化イベント（WebSocket `session_updated`）と履歴ポーリングで行う。ブラウザを開いていない間の通知は保存され、次に開いたときに表示される（OS レベルの push 通知は行わない）
 - Activation の `SurfaceContext` / Tool 実行コンテキストは、Home Surface の `external_chat_id`（session key 形式）から生の `surface_thread` を復元して構築する。これにより Activation 中の `agent_send` は宛先エージェントの通常 session key（`{channel}:{surface_thread}:agent:{to}`）を解決する
 - Home Surface が解決できない場合は、その run を `skipped` として記録する（LLM は呼ばない）
@@ -462,6 +463,8 @@ Pulse 通知を通常 session に保存すると、その chat の `last_message
 ユーザーが別の場所で同じ agent と会話すれば、その chat が新しい Home Surface になる。
 
 これは自然な挙動である。
+
+Web の自動解決は、WebUI でアーカイブされたセッションも候補に含む。アーカイブは一覧表示の制御であり履歴・配送は保持されるため、配送先を変えたい場合は intention の `delivery` に別の会話を明示するか、Pulse を無効化する。
 
 ---
 
