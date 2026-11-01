@@ -29,8 +29,8 @@ mod agent_profile;
 mod agents;
 pub(crate) mod auth;
 mod config;
-mod metrics;
 pub(crate) mod health;
+mod metrics;
 mod pulse;
 mod sessions;
 mod sleep;
@@ -514,10 +514,20 @@ pub(crate) async fn run_server(
 
 fn build_router(web_state: WebState) -> Router {
     let api_routes = Router::new()
+        .route("/api/config", get(config::api_get_config))
+        .route("/api/config/yaml", get(config::api_get_config_yaml))
+        .route("/api/config/mcp", get(config::api_get_config_mcp))
+        .route("/api/config/general", patch(config::api_patch_general))
         .route(
-            "/api/config",
-            get(config::api_get_config).put(config::api_put_config),
+            "/api/config/agents/{agent_id}",
+            patch(config::api_patch_agent),
         )
+        .route(
+            "/api/config/providers/{provider_id}",
+            patch(config::api_patch_provider),
+        )
+        .route("/api/config/sleep", patch(config::api_patch_sleep))
+        .route("/api/config/pulse", patch(config::api_patch_pulse))
         .route("/api/sessions", get(sessions::list_sessions))
         .route("/api/sessions/{chat_id}", patch(sessions::update_session))
         .route("/api/history", get(sessions::get_history))
