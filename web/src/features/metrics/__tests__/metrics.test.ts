@@ -2,7 +2,13 @@ import { describe, expect, it } from "vitest";
 
 import type { RuntimeStatus } from "../../../shared/api/metrics";
 import { healthIssues } from "../health";
-import { formatChange, formatCount, formatLatency, formatPercent } from "../metricsFormat";
+import {
+  averageInputTokensPerCall,
+  formatChange,
+  formatCount,
+  formatLatency,
+  formatPercent,
+} from "../metricsFormat";
 
 function status(overrides: Partial<RuntimeStatus> = {}): RuntimeStatus {
   return {
@@ -61,6 +67,20 @@ describe("metricsFormat", () => {
     expect(formatPercent(1, 0)).toBeNull();
     expect(formatPercent(41, 100)).toBe("41%");
     expect(formatPercent(1, 400)).toBe("0.3%");
+  });
+
+  it("averages_only_non_sleep_input_tokens_per_call", () => {
+    // Sleep contributes 10,000 input tokens to totals, but neither an LLM call
+    // nor a by_model entry. The average must stay at the conversation value.
+    const usage = {
+      totals: { input_tokens: 10_100, llm_calls: 1 },
+      by_model: [{ input_tokens: 100 }],
+    };
+
+    expect(averageInputTokensPerCall(usage)).toBe(100);
+    expect(
+      averageInputTokensPerCall({ totals: { input_tokens: 0, llm_calls: 0 }, by_model: [] }),
+    ).toBeNull();
   });
 
   it("describes_change_against_the_previous_period", () => {

@@ -787,11 +787,11 @@ WebUI の Metrics 画面の集計。既存テーブル（`llm_usage_logs` / `sle
 | フィールド | 説明 |
 |---|---|
 | `range` | `key`, `start`, `end`, `bucket`（`hour` / `day`）, `timezone`。`start` は UTC。`24h` は UTC の時境界で、DST のフォールバックで同じローカル時刻が2回現れても別バケットになる |
-| `usage.totals` | `tokens`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens`（cached tokens を報告した呼び出しの入力合計。cache hit 率の分母）, `llm_calls` |
+| `usage.totals` | `tokens`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens`（cached tokens を報告した呼び出しの入力合計。cache hit 率の分母）, `llm_calls`。`input_tokens` / `tokens` は Sleep を含むが、`llm_calls` は Sleep を含まない |
 | `usage.previous_tokens` | 直前の同じ長さの期間の合計トークン |
 | `usage.series` | バケットごとの `start`, `by_agent`, `by_kind` |
 | `usage.by_kind` | `kind`（`agent_loop` / `pulse` / `sleep` / `compaction`）, `tokens`, `llm_calls`（Sleep は run 数） |
-| `usage.by_model` | `provider`, `model`, `llm_calls`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens` |
+| `usage.by_model` | `provider`, `model`, `llm_calls`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens`。Sleep は含まない（Sleep の利用は `by_kind` と `totals` に含まれる） |
 | `usage.pulse_intentions` | `agent_id`, `intention_id`, `runs`, `failed_runs`, `input_tokens`, `output_tokens`。Pulse の利用は、同じ agent の run のうち `[started_at, finished_at]` に入る run へ帰属させる |
 | `usage.pulse_unattributed` | どの run にも入らない Pulse 利用 |
 | `reliability.turns` | `total`, `previous_total`, `completed`, `failed`, `cancelled`, `uncertain`, `running`, `duration_p50_ms`, `duration_p95_ms`（完了 turn の受付から完了まで） |

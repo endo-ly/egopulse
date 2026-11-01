@@ -56,7 +56,7 @@ AGENTS
 
 | 要素 | 内容 |
 |---|---|
-| KPI | Tokens（前期間比）/ LLM calls / Cache hit（cached tokens を報告した呼び出しの入力に対する割合。報告がなければ `—`）/ Per call（呼び出しあたりの平均入力） |
+| KPI | Tokens（前期間比）/ LLM calls / Cache hit（cached tokens を報告した呼び出しの入力に対する割合。報告がなければ `—`）/ Per call（Sleep を除く呼び出しあたりの平均入力。`by_model` の input_tokens ÷ `llm_calls`） |
 | 推移 | `24h` は UTC の時単位、それ以外は `Config.timezone` のローカル日単位の積み上げ棒。ラベルは `Config.timezone` で表示する。DST のフォールバックで同じローカル時刻が2回現れても別バケットになる。`By agent` と `By use` を切り替える。hover で内訳を表示 |
 | By use | Conversation（`agent_loop`）/ Pulse / Sleep / Compaction の割合 |
 | By model | provider・model ごとの calls / tokens / cache hit |

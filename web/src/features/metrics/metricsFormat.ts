@@ -28,6 +28,19 @@ export function formatPercent(numerator: number, denominator: number): string | 
   return `${pct >= 10 || pct === 0 ? pct.toFixed(0) : pct.toFixed(1)}%`;
 }
 
+/**
+ * Average input tokens per LLM call. Sleep tokens are part of `totals.input_tokens`
+ * but not of `llm_calls` or `by_model`, so both sides use `by_model`.
+ */
+export function averageInputTokensPerCall(usage: {
+  totals: { input_tokens: number; llm_calls: number };
+  by_model: { input_tokens: number }[];
+}): number | null {
+  if (usage.totals.llm_calls <= 0) return null;
+  const inputTokens = usage.by_model.reduce((sum, model) => sum + model.input_tokens, 0);
+  return inputTokens / usage.totals.llm_calls;
+}
+
 /** Change against the previous period, e.g. "+12%" — null without a baseline. */
 export function formatChange(current: number, previous: number): { text: string; direction: "up" | "down" | "flat" } | null {
   if (previous <= 0) return null;

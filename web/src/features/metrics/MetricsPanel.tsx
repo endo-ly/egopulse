@@ -18,6 +18,7 @@ import { StackedBars, type StackSeries } from "./StackedBars";
 import {
   KIND_ORDER,
   OTHER_COLOR,
+  averageInputTokensPerCall,
   formatChange,
   formatCount,
   formatLatency,
@@ -396,6 +397,7 @@ function UsageView({
     values: split === "agent" ? bucket.by_agent : bucket.by_kind,
   }));
   const cacheRate = formatPercent(totals.cached_input_tokens, totals.cache_reported_input_tokens);
+  const perCall = averageInputTokensPerCall(usage);
 
   return (
     <div className="metrics-stack">
@@ -418,8 +420,8 @@ function UsageView({
         />
         <Kpi
           label="Per call"
-          value={totals.llm_calls > 0 ? formatCount(totals.input_tokens / totals.llm_calls) : "—"}
-          hint="Average input tokens"
+          value={perCall === null ? "—" : formatCount(perCall)}
+          hint="Average input tokens per non-Sleep call"
         />
       </dl>
 
