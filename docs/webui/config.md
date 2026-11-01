@@ -1,100 +1,96 @@
 # EgoPulse WebUI — Config Tab
 
-ランタイム設定（`~/.egopulse/egopulse.config.yaml`）を WebUI から確認・編集するグローバルタブ。全フィールドを構造化して表示し、各値の出どころ・反映タイミング・秘密情報の設定状態を明示する。
+ランタイム設定（`~/.egopulse/egopulse.config.yaml`）を確認し、再起動なしで反映される設定をその場で編集するグローバルタブ。値は「実際に効く形」で見せる：未指定のモデルは解決後の値と解決元を、秘密は設定状態だけを表示する。
 
 ## 1. 構成
 
 ```
-┌ Config ────────────────── ~/.egopulse/egopulse.config.yaml · rev 42 ┐
-│ [Structured | YAML]                                                │
-│ ┌───────────┐  Agents › lyre                                       │
-│ │ General   │  label            Lyre                               │
-│ │ Agents    │  provider         sakura              ⚡ 即時反映     │
-│ │ Providers │  model            preview/Kimi-K2.6   ⚡ 即時反映     │
-│ │ Channels  │  reasoning_effort medium                             │
-│ │ Sleep     │  discord_bot      lyre                               │
-│ │ Pulse     │  profiles.voice   openrouter / gpt-4.1-mini          │
-│ │ Webhooks  │                                                      │
-│ │ Backup    │  Providers › openrouter                              │
-│ │ Web Fetch │  api_key   env:OPENROUTER_API_KEY   ✓ configured     │
-│ │ MCP       │  base_url  https://openrouter.ai/…  ENV override     │
-│ └───────────┘                                                      │
-└────────────────────────────────────────────────────────────────────┘
+┌ Sidebar ──────────────┐ Agents                  ~/.egopulse/egopulse.config.yaml
+│ SECTIONS              │ The model each agent…                      Revision 42
+│ General               │ ┌ Lyre  lyre  default ─────────────────────── [Edit] ┐
+│   Default agent Lyre  │ │ Model             Sakura AI  preview/Kimi-K2.6      │
+│ Agents      4 agents  │ │ Reasoning effort  medium                            │
+│ Providers             │ │ Discord bot       lyre                              │
+│   1 missing API key   │ │ Channel profiles  voice  OpenRouter openai/gpt-4.1… │
+│ Channels  Web, Discord│ └─────────────────────────────────────────────────────┘
+│ …                     │ ┌ Ace  ace ─────────────────────────────────── [Edit] ┐
+│ ───────────────────── │ │ Model             OpenRouter  anthropic/claude-…     │
+│ YAML file  Revision 42│ │                   Provider inherited from the global │
+└───────────────────────┘ └─────────────────────────────────────────────────────┘
 ```
 
-- Header に config ファイルパスと revision を表示する
-- 左にセクションナビ、右に選択セクションの内容。セクションは URL で表現する（`/config/:section`）
-- Sidebar の文脈領域にもセクション一覧を表示する
+- セクションは URL で表す（`/config` が General、`/config/:section`）
+- Sidebar の文脈領域にセクション一覧と 1 行の要約を出す。注意が必要な状態（API key 未設定、MCP 接続失敗、Backup 無効）は warning / danger 色にする
+- Header に設定ファイルのパスと revision を表示する
 
 ---
 
-## 2. 表示
+## 2. セクション
 
-### 2.1 セクション
+| セクション | 内容 | 編集 |
+|---|---|---|
+| General | 既定 agent / provider / model、timezone、履歴と compaction の値。Process（log level・state directory）は再起動必須 | Defaults カード |
+| Agents | agent ごとのカード：実効モデルと解決元、reasoning effort、Bot 紐づけ、channel profiles | agent ごと（名前・provider・model・reasoning effort・Discord bot・Telegram bot） |
+| Providers | provider ごとのカード：base URL、API key の状態、default model、models（context window・custom instructions の有無）、追加ヘッダ名、使っている agent | provider ごと（名前・base URL・models・default model・API key の Replace / Remove） |
+| Channels | Web（listen address・auth token・allowed origins）/ Discord・Telegram（Bot と token 状態・紐づく agent、許可チャネルの表）/ Voice | — |
+| Sleep | 実行時刻、対象 agent、実効モデル、reasoning effort、retry | Sleep batch カード |
+| Pulse | tick interval。agent ごとの Pulse 定義は Schedule へ | Scheduler カード |
+| Webhooks | receiver ごとの配送先・agent・token 状態 | — |
+| Backup / Web Fetch | 値の一覧 | —（再起動必須） |
+| MCP | サーバー定義（transport・command のプログラム名 / endpoint の origin・env と header のキー名・timeout）と接続状態、定義ファイルの探索順 | — |
+| YAML file | マスク済み YAML（行番号・Copy） | — |
 
-[config.md §3](../config.md#3-完全フィールドリファレンス) の構成に従う。
+編集できない設定の変更方法は、セクションまたはカード単位で 1 回だけ示す（「YAML を編集して再起動」など）。フィールドごとのバッジは付けない。
 
-| セクション | 対象 |
+### 2.1 値の表示
+
+| 状況 | 表示 |
 |---|---|
-| General | `default_agent` / `default_provider` / `default_model` / `timezone` / compaction 系 など |
-| Agents | `agents.<id>`（provider / model / reasoning_effort / bot 紐づけ / profiles） |
-| Providers | `providers.<id>`（base_url / models / api_key） |
-| Channels | Web / Discord / Telegram / Voice |
-| Sleep | `sleep_batch` |
-| Pulse | `pulse` |
-| Webhooks | `webhooks` |
-| Backup | `db.backup` |
-| Web Fetch | `web_fetch` |
-| MCP | `mcp.json` / `mcp.d/` のサーバー定義（読み取り専用。接続状態は Metrics タブ） |
+| 環境変数で上書きされている | 値に `env NAME` タグ（hover で説明） |
+| 既定値と同じ（General の数値・timezone、Pulse の tick interval） | 値に `default` タグ |
+| 未指定で継承している（agent / Sleep の provider・model） | 解決後の値と、2 行目に解決元（`Provider inherited from the global default` / `the provider's default model` など） |
+| 秘密（API key・token） | `Set from OPENROUTER_API_KEY` / `Set from a command` / `Set written in the YAML file` / `Not set`。key が不要な provider は `Not needed` 。環境変数で上書きされた token は `Set from the WEB_AUTH_TOKEN environment variable` |
 
-### 2.2 フィールド表示
-
-各フィールドに以下を添える。
-
-| 属性 | 表示 |
-|---|---|
-| 値の出どころ | YAML / 環境変数オーバーライド / デフォルト値 |
-| 反映タイミング | 即時反映 / 要再起動（[config.md §11](../config.md#11-再起動要否と秘匿フィールド) の分類） |
-| 秘密情報 | SecretRef（`env:XXX` 等）と設定有無（`configured` / `not set`）のみ。実値は表示しない |
-
-### 2.3 YAML ビュー
-
-- 設定ファイルの原文を表示する。秘密情報の値はサーバー側でマスクして返す
-- `.env` の内容は扱わない
-
-### 2.4 外部変更の検知
-
-設定ファイルは外部から編集され得る。取得した revision と現在の revision が異なる場合は「外部で変更されました」と表示し、再読み込みを促す。
+値そのもの、`exec` のコマンド、provider の追加ヘッダ値、MCP の args・env と header の値・endpoint のパスと query は返さない。
 
 ---
 
 ## 3. 編集
 
-セクション単位で編集する。
+1. カードの `Edit` でそのカードがフォームになる。編集中は他のカードの `Edit` を無効にする
+2. フォーム下に変更点（`Model: Not set (anthropic/claude-sonnet-4) → google/gemini-2.5-pro`）を常に表示する。変更がなければ Save は無効
+3. `Save` は変更したフィールドだけを `expected_fingerprint` 付きで送る。成功するとカードは閲覧に戻り、トーストで知らせる
 
-1. セクションの `Edit` でフォームに切り替える
-2. 保存前に YAML の diff を確認する（[schedule.md §5.3](./schedule.md#53-diffviewer) の DiffViewer）
-3. `Save` で `expected_fingerprint` 付きで更新する。`409` の場合は最新を再取得させる
+| 状況 | 振る舞い |
+|---|---|
+| 編集中に他所（YAML・スラッシュコマンド）で設定が変わった | 触っていないフィールドは最新値に追従する。触ったフィールドが他所でも変わっていれば、変更点に `Also changed elsewhere; saving replaces it` を出す |
+| `409 config_conflict` | 最新を再取得し、上と同じ三者比較で下書きを残したまま再表示する |
+| `400` | サーバーのメッセージをフォーム上部に表示する |
+| 未保存の変更がある | 画面・セクション・agent の切替とブラウザの戻る / 進むで確認ダイアログ、ページ離脱で `beforeunload` |
 
 - 更新は `ConfigManager` の単一の更新境界を通る（[config.md §10](../config.md#10-設定の変更インターフェース)）。YAML 全体を書き込む経路は設けない
-- 要再起動フィールドは編集不可とし、バッジで理由を示す
-- 秘密情報は新しい値の入力と削除のみ受け付ける。実値は `.env` に保存され、YAML には SecretRef として記録される
-- 未保存の変更がある間は `beforeunload` で離脱を確認する
+- API key の新しい値は `.env` に保存され、YAML には SecretRef として記録される
 
 ---
 
-## 4. バックエンド API
+## 4. データソース
 
-| API | 用途 |
-|---|---|
-| `GET /api/config` | 全フィールド・値の出どころ・反映区分・秘密情報の設定有無・revision・fingerprint を返すよう拡張 |
-| `GET /api/config/yaml` | マスク済み YAML 原文 |
-| `PUT /api/config` | 更新（既存）。編集可能なフィールドをセクション単位で拡張していく |
+| 用途 | API | ポーリング |
+|---|---|---|
+| 構造化した設定 | `GET /api/config` | 可視時 10 秒（外部変更への追従） |
+| YAML ビュー | `GET /api/config/yaml` | revision が変わったとき |
+| MCP の定義 | `GET /api/config/mcp` | MCP セクションを開いたとき |
+| MCP の接続状態 | `GET /api/status` | 10 秒 |
+| 更新 | `PATCH /api/config/{general,sleep,pulse}`、`PATCH /api/config/agents/{id}`、`PATCH /api/config/providers/{id}` | — |
+
+詳細は [api.md §2.4](../api.md#24-設定)。
 
 ---
 
 ## 5. Out of Scope
 
+- agent / provider の追加・削除
+- channel profiles、model ごとのメタデータ（context window・instructions）、Channels・Webhooks の編集
 - `.env` の閲覧
 - 設定バックアップ（`egopulse.config.backups/`）の閲覧・復元
 - 設定の import / export
