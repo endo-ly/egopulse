@@ -56,11 +56,10 @@ describe("ConfigPanel", () => {
     // Act
     renderPanel("t-all");
 
-    // Assert
+    // Assert: every section is on the page, in the documented order.
     await screen.findByRole("heading", { level: 2, name: "General" });
-    for (const label of SECTION_LABELS) {
-      expect(screen.getByRole("heading", { level: 2, name: label })).toBeTruthy();
-    }
+    const headings = screen.getAllByRole("heading", { level: 2 }).map((heading) => heading.textContent);
+    expect(headings).toEqual(SECTION_LABELS);
     expect(screen.getByRole("heading", { level: 3, name: /Lyre/ })).toBeTruthy();
     expect(screen.getByRole("heading", { level: 3, name: /OpenRouter/ })).toBeTruthy();
   });
@@ -103,6 +102,7 @@ describe("ConfigPanel", () => {
 
     // Assert
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.contexts[0]).toBe(document.getElementById(configSectionElementId("providers")));
     expect(onSelectSection).toHaveBeenCalledWith("providers");
   });
 

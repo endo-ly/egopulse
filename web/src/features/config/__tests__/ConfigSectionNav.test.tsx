@@ -47,6 +47,7 @@ describe("ConfigSectionNav", () => {
 
     // Assert
     expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView.mock.contexts[0]).toBe(section);
     expect(onSelectSection).toHaveBeenCalledWith("sleep");
     section.remove();
   });

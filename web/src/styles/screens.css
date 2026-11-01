@@ -963,6 +963,7 @@
     gap: var(--space-md);
     min-width: 0;
     max-width: 920px;
+    /* Keep in sync with ACTIVE_SECTION_OFFSET in ConfigPanel. */
     scroll-margin-top: 64px;
   }
 

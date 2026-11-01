@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ComponentType } from "react";
 
 import type {
   AgentConfigEntry,
@@ -631,10 +631,15 @@ function YamlView({ authToken, revision }: { authToken: string; revision: number
                 variant="secondary"
                 type="button"
                 onClick={() => {
-                  void navigator.clipboard?.writeText(data.content).then(() => {
-                    setCopied(true);
-                    setTimeout(() => setCopied(false), 1500);
-                  });
+                  void navigator.clipboard
+                    ?.writeText(data.content)
+                    .then(() => {
+                      setCopied(true);
+                      setTimeout(() => setCopied(false), 1500);
+                    })
+                    .catch(() => {
+                      // Clipboard access can be denied; the text stays selectable.
+                    });
                 }}
               >
                 {copied ? "Copied" : "Copy"}
@@ -661,30 +666,22 @@ function YamlView({ authToken, revision }: { authToken: string; revision: number
 // Section bodies
 // ---------------------------------------------------------------------------
 
+const SECTION_VIEWS: Record<ConfigSection, ComponentType<SectionProps>> = {
+  general: GeneralSection,
+  agents: AgentsSection,
+  providers: ProvidersSection,
+  channels: ChannelsSection,
+  sleep: SleepSection,
+  pulse: PulseSection,
+  webhooks: WebhooksSection,
+  backup: BackupSection,
+  "web-fetch": WebFetchSection,
+  mcp: McpSection,
+  yaml: YamlSection,
+};
+
 /** The content below one section heading on the one-page Config screen. */
 export function ConfigSectionBody({ section, ctx }: { section: ConfigSection; ctx: ConfigSectionContext }) {
-  switch (section) {
-    case "general":
-      return <GeneralSection ctx={ctx} />;
-    case "agents":
-      return <AgentsSection ctx={ctx} />;
-    case "providers":
-      return <ProvidersSection ctx={ctx} />;
-    case "channels":
-      return <ChannelsSection ctx={ctx} />;
-    case "sleep":
-      return <SleepSection ctx={ctx} />;
-    case "pulse":
-      return <PulseSection ctx={ctx} />;
-    case "webhooks":
-      return <WebhooksSection ctx={ctx} />;
-    case "backup":
-      return <BackupSection ctx={ctx} />;
-    case "web-fetch":
-      return <WebFetchSection ctx={ctx} />;
-    case "mcp":
-      return <McpSection ctx={ctx} />;
-    case "yaml":
-      return <YamlSection ctx={ctx} />;
-  }
+  const Section = SECTION_VIEWS[section];
+  return <Section ctx={ctx} />;
 }
