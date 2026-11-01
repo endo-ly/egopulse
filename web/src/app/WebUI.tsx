@@ -359,6 +359,7 @@ export function WebUI() {
 
   /** Opens a screen of a specific agent from a global screen. */
   const openAgentScreen = useCallback((agentId: string, route: AppRoute) => {
+    if (!confirmDiscardUnsaved()) return;
     setSelectedAgent(agentId);
     setActiveTab(route.tab);
     if (route.tab === "agent") setAgentSection(route.section);

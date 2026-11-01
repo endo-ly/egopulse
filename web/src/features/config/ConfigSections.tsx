@@ -404,7 +404,14 @@ function SleepView({ config }: { config: RuntimeConfig }) {
         sub={inherited.length > 0 ? `${capitalize(inherited.join(" and "))} inherited from the global default` : undefined}
       />
       <Row label="Reasoning effort" value={s.reasoning_effort ?? <None>Provider default</None>} />
-      <Row label="Retry" value={s.retry_max_attempts === 0 ? "No retries" : `Up to ${s.retry_max_attempts} times, ${s.retry_interval_minutes} min apart`} />
+      <Row
+        label="Retry"
+        value={
+          s.retry_max_attempts <= 1
+            ? "No retries"
+            : `Up to ${s.retry_max_attempts} attempts, ${s.retry_interval_minutes} min apart`
+        }
+      />
     </Rows>
   );
 }

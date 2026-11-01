@@ -401,7 +401,7 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 | `sleep_batch.reasoning_effort` | `string \| null` | 任意 | `null` | Sleep Batch 用の推論量。設定時は Chat Completions の `reasoning_effort`、Responses API の `reasoning.effort` へそのまま渡す |
 | `sleep_batch.schedule` | `string \| null` | 任意 | `null` | 自動実行時刻（`HH:MM` 形式、例: `04:00`）。`enabled: true` 時は必須 |
 | `sleep_batch.agents` | `list \| null` | 任意 | `null` | 実行対象 agent ID のリスト。`null` は全 agent（default_agent 優先）。空リストは実行なし |
-| `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 失敗時の最大再試行回数 |
+| `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 初回を含む最大試行回数（1 以上） |
 | `sleep_batch.retry.interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
 
 ### 3.8 Pulse 設定（`pulse`）
@@ -621,11 +621,13 @@ SecretRef 解決は以下の 2 層で構成される。
 1. **Layer 1: YAML SecretRef 解決** — `{ source: env, id: X }` をプロセス環境変数 → `.env` ファイルの順で解決
 2. **Layer 2: プロセス環境変数オーバーライド** — `WEB_AUTH_TOKEN` 等が Layer 1 の結果を上書き（§6 参照）
 
+解決元は保持される。プロセス環境変数から解決した値は Egopulse の管理外として扱い、設定保存時に `.env` へコピーしない。`.env` から解決した値、および setup / WebUI が新たに保存する値だけを `.env` に書き込む。
+
 ### 5.5 環境変数名の規約
 
 | 用途 | 環境変数名 |
 |---|---|
-| プロバイダー API キー | `{PROVIDER_ID}_API_KEY`（例: `OPENAI_API_KEY`） |
+| プロバイダー API キー | `{PROVIDER_ID}_API_KEY`（例: `OPENAI_API_KEY`）。この名前がプロセス環境変数で上書きされている場合、WebUI からの新規保存は `EGOPULSE_{PROVIDER_ID}_API_KEY` を使う |
 | Web 認証トークン | `WEB_AUTH_TOKEN` |
 | Voice 認証トークン | 任意の SecretRef ID（推奨: `EGOPULSE_VOICE_AUTH_TOKEN`） |
 | Discord Bot トークン | `DISCORD_BOT_TOKEN` |
@@ -850,7 +852,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 ### 11.3 秘匿フィールド
 
-以下のフィールドは API レスポンスで値を返さない。`GET /api/config` は秘密の状態（`kind`: `env` / `exec` / `literal`、`env` の参照名、設定有無）だけを返す（[api.md §2.4](./api.md#24-設定)）。
+以下のフィールドは API レスポンスで値を返さない。`GET /api/config` は秘密の状態（`kind`: `env` / `exec` / `literal`、`env` の参照名と取得元、設定有無）だけを返す（[api.md §2.4](./api.md#24-設定)）。`env` の取得元はプロセス環境変数（`process`）または `.env`（`dotenv`）で、前者は WebUI から変更できない。
 
 | フィールド |
 |---|
@@ -887,7 +889,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 1. `expected_fingerprint` と現在 snapshot の fingerprint を比較する。
 2. 候補を検証し、再起動必須フィールドの変更を拒否する。
 3. 設定ソースの現在 fingerprint をロック下で確認する。
-4. 設定 YAML と SecretRef（値は `.env`）を同じロック下で安全に永続化する。
+4. 設定 YAML と `.env` が管理する SecretRef の値を同じロック下で安全に永続化する。プロセス環境変数から解決した値は `.env` に複製しない。
 5. 新しい snapshot を交換し、`revision` / `fingerprint` と watch 通知を公開する。
 
 永続化または検証に失敗した場合は snapshot を交換しない。`revision` は成功した交換でのみ進み、同一 fingerprint の更新は no-op になる。

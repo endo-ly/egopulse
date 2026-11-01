@@ -14,7 +14,14 @@ vi.mock("../../features/schedule/SchedulePanel", () => ({
   SchedulePanel: () => <div>schedule screen</div>,
 }));
 vi.mock("../../features/config/ConfigPanel", () => ({
-  ConfigPanel: () => <div>config screen</div>,
+  ConfigPanel: ({ onOpenSchedule }: { onOpenSchedule: (agentId: string) => void }) => (
+    <div>
+      config screen
+      <button type="button" onClick={() => onOpenSchedule("lyre")}>
+        open schedule
+      </button>
+    </div>
+  ),
 }));
 vi.mock("../../features/config/ConfigSectionNav", () => ({
   ConfigSectionNav: () => <div>config nav</div>,
@@ -90,6 +97,32 @@ describe("WebUI", () => {
     // the Schedule route being restored under the new selection.
     expect(await screen.findByText("chat screen")).toBeTruthy();
     expect(globalThis.location.pathname).toBe("/agents/lyre/chat/s/chat:1");
+  });
+
+  it("asks_before_opening_an_agent_screen_from_config", async () => {
+    // Arrange: Config is showing with an unsaved form open.
+    globalThis.history.replaceState({}, "", "/config");
+    setUnsavedChanges("config-form", true);
+    const confirm = vi.spyOn(globalThis, "confirm").mockReturnValue(false);
+    render(<WebUI />);
+    await screen.findByText("config screen");
+
+    // Act: open Schedule from the Config screen.
+    fireEvent.click(screen.getByRole("button", { name: "open schedule" }));
+
+    // Assert: the draft is not discarded and the screen stays put.
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("config screen")).toBeTruthy();
+    expect(globalThis.location.pathname).toBe("/config");
+
+    // Act: accept the discard.
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "open schedule" }));
+
+    // Assert: the navigation now goes through.
+    expect(await screen.findByText("schedule screen")).toBeTruthy();
+    expect(globalThis.location.pathname.startsWith("/agents/lyre/schedule")).toBe(true);
+    confirm.mockRestore();
   });
 
   it("keeps_a_config_edit_when_history_moves_between_sections", async () => {

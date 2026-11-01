@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use crate::config::loader::active_env_overrides;
 use crate::config::manager::ConfigSnapshot;
 use crate::config::resolve as defaults;
-use crate::config::secret_ref::{ResolvedValue, env_resolved_value, provider_api_key_env_name};
+use crate::config::secret_ref::{
+    EnvOrigin, ResolvedValue, env_resolved_value, provider_api_key_env_name,
+};
 use crate::config::{
     AgentId, BotId, Config, LlmSettingSource, ModelConfig, ProviderId, default_config_path,
     parse_duration,
@@ -79,15 +81,23 @@ fn config_payload(snapshot: &ConfigSnapshot, path: &std::path::Path) -> Value {
 
 fn secret_payload(value: Option<&ResolvedValue>) -> Value {
     match value {
-        None => json!({ "kind": null, "ref": null, "configured": false }),
+        None => json!({ "kind": null, "ref": null, "origin": null, "configured": false }),
         Some(ResolvedValue::Literal(v)) => {
-            json!({ "kind": "literal", "ref": null, "configured": !v.trim().is_empty() })
+            json!({ "kind": "literal", "ref": null, "origin": null, "configured": !v.trim().is_empty() })
         }
-        Some(ResolvedValue::EnvRef { id, value }) => {
-            json!({ "kind": "env", "ref": id, "configured": !value.trim().is_empty() })
+        Some(ResolvedValue::EnvRef { id, value, origin }) => {
+            json!({
+                "kind": "env",
+                "ref": id,
+                "origin": match origin {
+                    EnvOrigin::Process => "process",
+                    EnvOrigin::Dotenv => "dotenv",
+                },
+                "configured": !value.trim().is_empty(),
+            })
         }
         Some(ResolvedValue::ExecRef { value, .. }) => {
-            json!({ "kind": "exec", "ref": null, "configured": !value.trim().is_empty() })
+            json!({ "kind": "exec", "ref": null, "origin": null, "configured": !value.trim().is_empty() })
         }
     }
 }
@@ -635,7 +645,7 @@ pub(super) async fn api_patch_general(
         if let Some(v) = patch.compact_keep_recent {
             config.compact_keep_recent = v;
         }
-        Ok(())
+        Ok(Vec::new())
     })
 }
 
@@ -690,7 +700,7 @@ pub(super) async fn api_patch_agent(
         if let Some(bot) = patch.telegram_bot {
             agent.telegram_bot = clean(bot).map(|b| BotId::new(&b));
         }
-        Ok(())
+        Ok(Vec::new())
     })
 }
 
@@ -712,12 +722,14 @@ pub(super) struct ProviderPatch {
 }
 
 /// Updates one provider's endpoint, models, and API key. A replaced key is
-/// written to `.env` and referenced from the YAML.
+/// written to `.env` and referenced from the YAML. Keys currently supplied by
+/// the process environment are read-only here, because writing them to `.env`
+/// would not change the effective value.
 ///
 /// # Errors
 ///
 /// `404` for an unknown provider, `409` on a fingerprint mismatch, and `400`
-/// when the result is invalid.
+/// when the result is invalid or a process-managed key is changed.
 pub(super) async fn api_patch_provider(
     State(state): State<WebState>,
     Path(provider_id): Path<String>,
@@ -755,22 +767,54 @@ pub(super) async fn api_patch_provider(
                 .entry(provider.default_model.clone())
                 .or_insert_with(ModelConfig::default);
         }
+        let process_managed = matches!(
+            &provider.api_key,
+            Some(ResolvedValue::EnvRef {
+                origin: EnvOrigin::Process,
+                ..
+            })
+        );
+        let mut removed_dotenv_keys = Vec::new();
         match patch.api_key {
             Some(ApiKeyChange::Replace { value }) => {
+                if process_managed {
+                    return Err(bad_request("api_key_managed_by_process_env"));
+                }
                 let value = value.trim();
                 if value.is_empty() {
                     return Err(bad_request("empty_api_key"));
                 }
                 let env_name = match &provider.api_key {
-                    Some(ResolvedValue::EnvRef { id, .. }) => id.clone(),
-                    _ => provider_api_key_env_name(id.as_str()),
+                    Some(ResolvedValue::EnvRef {
+                        id,
+                        origin: EnvOrigin::Dotenv,
+                        ..
+                    }) => {
+                        if env_is_process_override(id) {
+                            return Err(bad_request("api_key_managed_by_process_env"));
+                        }
+                        id.clone()
+                    }
+                    _ => provider_api_key_env_name_for_write(id.as_str())?,
                 };
                 provider.api_key = Some(env_resolved_value(env_name, value));
             }
-            Some(ApiKeyChange::Remove) => provider.api_key = None,
+            Some(ApiKeyChange::Remove) => {
+                if process_managed {
+                    return Err(bad_request("api_key_managed_by_process_env"));
+                }
+                if let Some(ResolvedValue::EnvRef {
+                    id,
+                    origin: EnvOrigin::Dotenv,
+                    ..
+                }) = provider.api_key.take()
+                {
+                    removed_dotenv_keys.push(id);
+                }
+            }
             None => {}
         }
-        Ok(())
+        Ok(removed_dotenv_keys)
     })
 }
 
@@ -828,7 +872,7 @@ pub(super) async fn api_patch_sleep(
         if let Some(v) = patch.retry_interval_minutes {
             sleep.retry_interval_minutes = v;
         }
-        Ok(())
+        Ok(Vec::new())
     })
 }
 
@@ -852,7 +896,7 @@ pub(super) async fn api_patch_pulse(
             config.pulse.tick_interval_secs =
                 parse_duration(&interval).map_err(|_| bad_request("invalid_tick_interval"))?;
         }
-        Ok(())
+        Ok(Vec::new())
     })
 }
 
@@ -861,16 +905,41 @@ pub(super) async fn api_patch_pulse(
 fn apply(
     state: &WebState,
     expected_fingerprint: &str,
-    edit: impl FnOnce(&mut Config) -> Result<(), ApiError>,
+    edit: impl FnOnce(&mut Config) -> Result<Vec<String>, ApiError>,
 ) -> ApiResult {
     let path = config_path(state)?;
     let manager = &state.app_state.config_manager;
     let mut candidate = manager.current_blocking().config.clone();
-    edit(&mut candidate)?;
+    let removed_dotenv_keys = edit(&mut candidate)?;
     let updated = manager
-        .apply_candidate(candidate, Some(expected_fingerprint))
+        .apply_candidate_with_removed_dotenv_keys(
+            candidate,
+            Some(expected_fingerprint),
+            &removed_dotenv_keys,
+        )
         .map_err(map_update_error)?;
     Ok(Json(config_payload(&updated, &path)))
+}
+
+/// Whether the process environment currently supplies a non-empty value for
+/// `name`; such a value wins over the same key in `.env`.
+fn env_is_process_override(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| !value.trim().is_empty())
+}
+
+/// Picks an env name whose `.env` value will actually take effect. The default
+/// name is used unless the process environment already overrides it; in that
+/// case the Egopulse-prefixed name is used instead.
+fn provider_api_key_env_name_for_write(provider_id: &str) -> Result<String, ApiError> {
+    let base = provider_api_key_env_name(provider_id);
+    if !env_is_process_override(&base) {
+        return Ok(base);
+    }
+    let fallback = format!("EGOPULSE_{base}");
+    if !env_is_process_override(&fallback) {
+        return Ok(fallback);
+    }
+    Err(bad_request("api_key_env_override_conflict"))
 }
 
 fn map_update_error(error: EgoPulseError) -> ApiError {
@@ -914,6 +983,59 @@ fn config_path(state: &WebState) -> Result<PathBuf, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvVarGuard;
+    use serial_test::serial;
+
+    #[test]
+    fn secret_payload_reports_env_origin() {
+        let process = ResolvedValue::EnvRef {
+            value: "secret".into(),
+            id: "PROCESS_KEY".into(),
+            origin: EnvOrigin::Process,
+        };
+        let dotenv = ResolvedValue::EnvRef {
+            value: "secret".into(),
+            id: "DOTENV_KEY".into(),
+            origin: EnvOrigin::Dotenv,
+        };
+
+        assert_eq!(
+            secret_payload(Some(&process))["origin"].as_str(),
+            Some("process")
+        );
+        assert_eq!(
+            secret_payload(Some(&dotenv))["origin"].as_str(),
+            Some("dotenv")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn provider_key_env_name_uses_prefixed_name_when_default_is_overridden() {
+        let _guard = EnvVarGuard::set("REVIEW_FALLBACK_PROVIDER_API_KEY", "from-process");
+
+        let name = provider_api_key_env_name_for_write("review-fallback-provider").expect("name");
+
+        assert_eq!(name, "EGOPULSE_REVIEW_FALLBACK_PROVIDER_API_KEY");
+    }
+
+    #[test]
+    #[serial]
+    fn provider_key_env_name_rejects_when_both_names_are_overridden() {
+        let _guard = EnvVarGuard::set("REVIEW_FALLBACK_PROVIDER_API_KEY", "from-process").also_set(
+            "EGOPULSE_REVIEW_FALLBACK_PROVIDER_API_KEY",
+            "also-from-process",
+        );
+
+        let error = provider_api_key_env_name_for_write("review-fallback-provider")
+            .expect_err("both names are overridden");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0["error"].as_str(),
+            Some("api_key_env_override_conflict")
+        );
+    }
 
     #[test]
     fn masked_yaml_hides_literals_exec_commands_and_header_values() {

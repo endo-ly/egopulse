@@ -36,11 +36,29 @@ pub(crate) enum StringOrRef {
     Ref(SecretSource),
 }
 
+/// Where an `env` secret was resolved from.
+///
+/// Only values that live in (or are being moved to) the config's `.env` may be
+/// written there. A value that currently comes from the process environment is
+/// managed outside Egopulse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EnvOrigin {
+    Process,
+    Dotenv,
+}
+
 #[derive(Clone)]
 pub(crate) enum ResolvedValue {
     Literal(String),
-    EnvRef { value: String, id: String },
-    ExecRef { value: String, command: String },
+    EnvRef {
+        value: String,
+        id: String,
+        origin: EnvOrigin,
+    },
+    ExecRef {
+        value: String,
+        command: String,
+    },
 }
 
 impl std::fmt::Debug for ResolvedValue {
@@ -106,10 +124,12 @@ impl ResolvedValue {
     }
 }
 
+/// Builds an env reference for a value that belongs in the config's `.env`.
 pub(crate) fn env_resolved_value(id: impl Into<String>, value: impl Into<String>) -> ResolvedValue {
     ResolvedValue::EnvRef {
         id: id.into(),
         value: value.into(),
+        origin: EnvOrigin::Dotenv,
     }
 }
 
@@ -171,13 +191,21 @@ fn resolve_secret_ref(
             if let Ok(val) = std::env::var(&id) {
                 let trimmed = val.trim().to_string();
                 if !trimmed.is_empty() {
-                    return Ok(ResolvedValue::EnvRef { value: trimmed, id });
+                    return Ok(ResolvedValue::EnvRef {
+                        value: trimmed,
+                        id,
+                        origin: EnvOrigin::Process,
+                    });
                 }
             }
             if let Some(val) = dotenv.get(&id) {
                 let trimmed = val.trim().to_string();
                 if !trimmed.is_empty() {
-                    return Ok(ResolvedValue::EnvRef { value: trimmed, id });
+                    return Ok(ResolvedValue::EnvRef {
+                        value: trimmed,
+                        id,
+                        origin: EnvOrigin::Dotenv,
+                    });
                 }
             }
             Err(ConfigError::SecretRefUnresolved {
@@ -340,9 +368,13 @@ pub(crate) fn save_dotenv(
     path: &Path,
     entries: &[(String, String)],
     generation: Option<&str>,
+    removed_keys: &[String],
 ) -> Result<(), ConfigError> {
     let mut existing = read_dotenv(path);
 
+    for key in removed_keys {
+        existing.remove(key);
+    }
     for (key, value) in entries {
         validate_dotenv_value(key, value)?;
         existing.insert(key.clone(), value.clone());
@@ -477,6 +509,13 @@ mod tests {
         };
         let result = resolve_secret_ref(source, &dotenv).expect("resolve");
         assert_eq!(result.value(), "from-process");
+        assert!(matches!(
+            result,
+            ResolvedValue::EnvRef {
+                origin: EnvOrigin::Process,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -495,6 +534,13 @@ mod tests {
         };
         let result = resolve_secret_ref(source, &dotenv).expect("resolve from dotenv");
         assert_eq!(result.value(), "from-dotenv");
+        assert!(matches!(
+            result,
+            ResolvedValue::EnvRef {
+                origin: EnvOrigin::Dotenv,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -512,6 +558,13 @@ mod tests {
         };
         let result = resolve_secret_ref(source, &dotenv).expect("resolve");
         assert_eq!(result.value(), "from-process");
+        assert!(matches!(
+            result,
+            ResolvedValue::EnvRef {
+                origin: EnvOrigin::Process,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -585,6 +638,7 @@ mod tests {
         let rv = ResolvedValue::EnvRef {
             value: "secret".into(),
             id: "OPENAI_API_KEY".into(),
+            origin: EnvOrigin::Dotenv,
         };
         let yaml_val = rv.to_yaml_value();
 
@@ -640,10 +694,12 @@ mod tests {
             &path,
             &[("EXISTING_KEY".into(), "existing-value".into())],
             None,
+            &[],
         )
         .expect("save first");
 
-        save_dotenv(&path, &[("NEW_KEY".into(), "new-value".into())], None).expect("save second");
+        save_dotenv(&path, &[("NEW_KEY".into(), "new-value".into())], None, &[])
+            .expect("save second");
 
         let map = read_dotenv(&path);
         assert_eq!(
@@ -654,11 +710,30 @@ mod tests {
     }
 
     #[test]
+    fn save_dotenv_removes_only_requested_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".env");
+        fs::write(&path, "KEEP=keep\nREMOVE=remove\n").expect("write dotenv");
+
+        save_dotenv(&path, &[], None, &["REMOVE".to_string()]).expect("save");
+
+        let map = read_dotenv(&path);
+        assert_eq!(map.get("KEEP").map(String::as_str), Some("keep"));
+        assert!(!map.contains_key("REMOVE"));
+    }
+
+    #[test]
     fn save_dotenv_creates_with_0600_permissions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".env");
 
-        save_dotenv(&path, &[("TEST_KEY".into(), "test-value".into())], None).expect("save");
+        save_dotenv(
+            &path,
+            &[("TEST_KEY".into(), "test-value".into())],
+            None,
+            &[],
+        )
+        .expect("save");
 
         #[cfg(unix)]
         {
@@ -674,8 +749,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join(".env");
 
-        let error = save_dotenv(&path, &[("TEST_KEY".into(), "line1\nline2".into())], None)
-            .expect_err("save");
+        let error = save_dotenv(
+            &path,
+            &[("TEST_KEY".into(), "line1\nline2".into())],
+            None,
+            &[],
+        )
+        .expect_err("save");
 
         assert!(matches!(error, ConfigError::SecretRefUnresolved { .. }));
     }
@@ -692,7 +772,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
         }
 
-        save_dotenv(&path, &[("TEST_KEY".into(), "new-value".into())], None).expect("save");
+        save_dotenv(&path, &[("TEST_KEY".into(), "new-value".into())], None, &[]).expect("save");
 
         #[cfg(unix)]
         {

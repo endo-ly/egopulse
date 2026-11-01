@@ -6,6 +6,7 @@ import type { RuntimeStatus } from "../../../shared/api/metrics";
 const secret = (configured: boolean): SecretStatus => ({
   kind: configured ? "env" : null,
   ref: configured ? "TEST_TOKEN" : null,
+  origin: configured ? "dotenv" : null,
   configured,
 });
 

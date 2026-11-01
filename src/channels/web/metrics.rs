@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Query, State};
-use chrono::{DateTime, Datelike, Duration, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +54,7 @@ impl RangeKey {
     }
 }
 
-/// The local-time buckets a range is drawn with and the UTC window they span.
+/// The buckets a range is drawn with and the UTC window they span.
 #[derive(Debug)]
 struct Buckets {
     starts: Vec<DateTime<Utc>>,
@@ -63,10 +63,15 @@ struct Buckets {
 }
 
 impl Buckets {
-    /// Hourly buckets for `24h`, local days otherwise, ending at the bucket
-    /// that contains `now`.
+    /// Hourly buckets for `24h` are aligned to UTC hours so that a DST fall-back
+    /// does not collapse the repeated local hour. Day buckets start at local
+    /// midnight. The client formats labels in the configured timezone.
     fn new(range: RangeKey, now: DateTime<Utc>, tz: Tz) -> Self {
         let local_now = now.with_timezone(&tz);
+        let utc_hour = now
+            - Duration::minutes(i64::from(now.minute()))
+            - Duration::seconds(i64::from(now.second()))
+            - Duration::nanoseconds(i64::from(now.nanosecond()));
         let (count, hourly) = match range {
             RangeKey::Day => (24, true),
             RangeKey::Week => (7, false),
@@ -75,16 +80,15 @@ impl Buckets {
         let mut starts = Vec::with_capacity(count);
         for back in (0..count as i64).rev() {
             let start = if hourly {
-                let hour = local_now - Duration::hours(back);
-                tz.with_ymd_and_hms(hour.year(), hour.month(), hour.day(), hour.hour(), 0, 0)
-                    .earliest()
+                Some(utc_hour - Duration::hours(back))
             } else {
                 let day = local_now.date_naive() - Duration::days(back);
                 day.and_hms_opt(0, 0, 0)
                     .and_then(|midnight| tz.from_local_datetime(&midnight).earliest())
+                    .map(|start| start.with_timezone(&Utc))
             };
             if let Some(start) = start {
-                starts.push(start.with_timezone(&Utc));
+                starts.push(start);
             }
         }
         starts.dedup();
@@ -240,8 +244,9 @@ struct AgentRow {
 /// - `agent` (optional): narrows Usage and Reliability to one agent; the
 ///   agent table always lists every agent
 ///
-/// Buckets follow `Config.timezone` (hours for `24h`, days otherwise). Only
-/// the normal conversation scope is counted.
+/// Hourly buckets for `24h` span UTC hours; day buckets start at local
+/// midnight. Labels are formatted in `Config.timezone`. Only the normal
+/// conversation scope is counted.
 ///
 /// # Errors
 ///
@@ -676,6 +681,25 @@ mod tests {
         assert_eq!(buckets.starts[23], utc("2026-10-10T12:00:00Z"));
         assert_eq!(buckets.index_of("2026-10-10T12:34"), None);
         assert_eq!(buckets.index_of("2026-10-10T12:33"), Some(23));
+    }
+
+    #[test]
+    fn hourly_buckets_keep_repeated_local_hours_on_dst_fallback() {
+        let tz: Tz = "America/New_York".parse().expect("tz");
+        let buckets = Buckets::new(RangeKey::Day, utc("2026-11-01T06:30:00Z"), tz);
+
+        assert_eq!(buckets.starts.len(), 24);
+        assert_eq!(buckets.starts[23], utc("2026-11-01T06:00:00Z"));
+        let repeated: Vec<DateTime<Utc>> = buckets
+            .starts
+            .iter()
+            .copied()
+            .filter(|start| start.with_timezone(&tz).hour() == 1)
+            .collect();
+        assert_eq!(repeated.len(), 2);
+        assert_ne!(repeated[0], repeated[1]);
+        assert_eq!(buckets.index_of("2026-11-01T05:29"), Some(22));
+        assert_eq!(buckets.index_of("2026-11-01T06:29"), Some(23));
     }
 
     #[test]

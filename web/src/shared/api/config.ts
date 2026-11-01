@@ -5,6 +5,8 @@ export interface SecretStatus {
   kind: "env" | "exec" | "literal" | null;
   /** Environment variable name for `env`. */
   ref: string | null;
+  /** For `env`: whether the value comes from the process environment or `.env`. */
+  origin: "process" | "dotenv" | null;
   configured: boolean;
 }
 

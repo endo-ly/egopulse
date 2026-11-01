@@ -139,6 +139,7 @@ export function agentTarget(config: RuntimeConfig, agentId: string): EditTarget 
 export function providerTarget(config: RuntimeConfig, providerId: string): EditTarget | null {
   const provider = config.providers.find((p) => p.id === providerId);
   if (!provider) return null;
+  const processManaged = provider.api_key.kind === "env" && provider.api_key.origin === "process";
   return {
     target: { kind: "provider", id: provider.id },
     values: {
@@ -163,9 +164,16 @@ export function providerTarget(config: RuntimeConfig, providerId: string): EditT
         key: "api_key",
         label: "API key",
         kind: "secret",
-        hint: provider.api_key.ref
-          ? `Stored in .env as ${provider.api_key.ref}.`
-          : "A new key is stored in .env; the YAML keeps only a reference.",
+        readOnlyReason: processManaged
+          ? `Set by the process environment (${provider.api_key.ref}). Change it there.`
+          : undefined,
+        hint: processManaged
+          ? undefined
+          : provider.api_key.kind === "literal"
+            ? "Stored in the YAML file. Replacing it stores the new key in .env."
+            : provider.api_key.ref
+              ? `Stored in .env as ${provider.api_key.ref}.`
+              : "A new key is stored in .env; the YAML keeps only a reference.",
       },
     ],
   };
@@ -200,7 +208,7 @@ export function sleepTarget(config: RuntimeConfig): EditTarget {
         placeholder: (draft) => config.general.default_model ?? providerDefaultModel(config, resolvedProvider(draft)),
       },
       { key: "reasoning_effort", label: "Reasoning effort", kind: "text", nullable: true, options: () => EFFORT_SUGGESTIONS.map((v) => ({ value: v, label: v })), placeholder: () => "provider default" },
-      { key: "retry_max_attempts", label: "Retries", kind: "number", min: 0, hint: "Attempts after a failed run." },
+      { key: "retry_max_attempts", label: "Max attempts", kind: "number", min: 1, hint: "Total attempts, including the first run." },
       { key: "retry_interval_minutes", label: "Retry after", kind: "number", min: 1, hint: "Minutes between attempts." },
     ],
   };

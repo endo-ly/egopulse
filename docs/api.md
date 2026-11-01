@@ -156,7 +156,7 @@ WebUI の Config 画面のセクション構成に合わせた設定の snapshot
 | `webhooks` | `array` | `id`, `token`（秘密の状態）, `channel`, `thread`, `agent` |
 | `backup` / `web_fetch` | `object` | 各設定値 |
 
-秘密の状態は `{ "kind": "env" | "exec" | "literal" | null, "ref": string | null, "configured": boolean }`。`ref` は `env` の変数名。値、`exec` のコマンド、provider の追加ヘッダ値は返さない。
+秘密の状態は `{ "kind": "env" | "exec" | "literal" | null, "ref": string | null, "origin": "process" | "dotenv" | null, "configured": boolean }`。`ref` は `env` の変数名、`origin` はその値の取得元（プロセス環境変数または `.env`）。値、`exec` のコマンド、provider の追加ヘッダ値は返さない。
 
 #### MCP 定義
 
@@ -189,12 +189,14 @@ GET /api/config/yaml
 | `PATCH /api/config/general` | `default_agent`, `default_provider`, `default_model`, `timezone`, `max_history_messages`, `compaction_timeout_secs`, `default_context_window_tokens`, `compaction_threshold_ratio`, `compaction_target_ratio`, `compact_keep_recent` |
 | `PATCH /api/config/agents/{agent_id}` | `label`, `provider`, `model`, `reasoning_effort`, `discord_bot`, `telegram_bot` |
 | `PATCH /api/config/providers/{provider_id}` | `label`, `base_url`, `default_model`, `models`（モデル ID の配列。既存モデルのメタデータは維持）, `api_key`（`{"action": "replace", "value": "..."}` または `{"action": "remove"}`） |
-| `PATCH /api/config/sleep` | `enabled`, `schedule`, `agents`（`null` は全 agent）, `provider`, `model`, `reasoning_effort`, `retry_max_attempts`, `retry_interval_minutes` |
+| `PATCH /api/config/sleep` | `enabled`, `schedule`, `agents`（`null` は全 agent）, `provider`, `model`, `reasoning_effort`, `retry_max_attempts`（初回を含む最大試行回数、1 以上）, `retry_interval_minutes` |
 | `PATCH /api/config/pulse` | `tick_interval`（Duration 文字列） |
 
 - 本文には `expected_fingerprint`（必須）と、変更するフィールドだけを含める。含めないフィールドは変更しない。null を取るフィールドは `null` で未設定に戻す
 - provider 更新では `default_model` をモデル一覧に必ず含める（なければ加える）
-- API key の新しい値は `.env` に保存し、YAML には SecretRef（既存の参照名、なければ `{PROVIDER_ID}_API_KEY`）を記録する
+- API key の新しい値は `.env` に保存し、YAML には既存の SecretRef の参照名を記録する。新規の場合は `{PROVIDER_ID}_API_KEY` を使い、その名前がプロセス環境変数で上書きされている場合は `EGOPULSE_{PROVIDER_ID}_API_KEY` を使う
+- API key がプロセス環境変数から解決されている場合、Replace / Remove は `400 api_key_managed_by_process_env`。その値はプロセス環境変数側で変更する。新規保存先の候補が両方ともプロセス環境変数で上書きされている場合は `400 api_key_env_override_conflict`
+- API key の Remove は `.env` の該当キーも削除する。同じ変数を参照する他の SecretRef が残る場合は削除しない
 - 更新は `ConfigManager` の更新境界（検証・永続化・snapshot 交換）を通る
 
 ##### レスポンス
@@ -202,7 +204,7 @@ GET /api/config/yaml
 | ステータス | 内容 |
 |---|---|
 | 200 | `GET /api/config` と同一形式 |
-| 400 | `invalid_config`（`message` に検証エラー）、`config_reload_forbidden`、`invalid_tick_interval`、`empty_api_key` |
+| 400 | `invalid_config`（`message` に検証エラー）、`config_reload_forbidden`、`invalid_tick_interval`、`empty_api_key`、`api_key_managed_by_process_env`、`api_key_env_override_conflict` |
 | 404 | `agent_not_found` / `provider_not_found` |
 | 409 | `config_conflict`。`expected_fingerprint` が現在の設定と一致しない。GET で最新を取得してから送り直す |
 
@@ -776,12 +778,12 @@ WebUI の Metrics 画面の集計。既存テーブル（`llm_usage_logs` / `sle
 
 | クエリ | 説明 |
 |---|---|
-| `range` | 任意、既定 `7d`。`24h` は直近 24 時間を時単位、`7d` / `30d` は当日を含む日数を日単位で集計する。バケット境界は `Config.timezone` |
+| `range` | 任意、既定 `7d`。`24h` は直近 24 時間を UTC の時単位で区切り、表示ラベルだけ `Config.timezone` に変換する。`7d` / `30d` は当日を含む日数を `Config.timezone` のローカル日単位で集計する |
 | `agent` | 任意。Usage と Reliability をその agent に絞る。`agents` は常に全 agent |
 
 | フィールド | 説明 |
 |---|---|
-| `range` | `key`, `start`, `end`, `bucket`（`hour` / `day`）, `timezone` |
+| `range` | `key`, `start`, `end`, `bucket`（`hour` / `day`）, `timezone`。`start` は UTC。`24h` は UTC の時境界で、DST のフォールバックで同じローカル時刻が2回現れても別バケットになる |
 | `usage.totals` | `tokens`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens`（cached tokens を報告した呼び出しの入力合計。cache hit 率の分母）, `llm_calls` |
 | `usage.previous_tokens` | 直前の同じ長さの期間の合計トークン |
 | `usage.series` | バケットごとの `start`, `by_agent`, `by_kind` |

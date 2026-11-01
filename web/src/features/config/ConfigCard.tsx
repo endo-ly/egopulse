@@ -169,6 +169,7 @@ export function Secret({
     secret.kind === "env" ? (
       <>
         from <code>{secret.ref}</code>
+        {secret.origin === "process" ? " in the process environment" : " in .env"}
       </>
     ) : secret.kind === "exec" ? (
       "from a command"

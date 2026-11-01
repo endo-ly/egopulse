@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -9,7 +9,9 @@ use serde::Serialize;
 
 use super::Config;
 use super::ModelConfig;
-use super::secret_ref::{CONFIG_SOURCE_GENERATION_PREFIX, DotenvFile, ResolvedValue, save_dotenv};
+use super::secret_ref::{
+    CONFIG_SOURCE_GENERATION_PREFIX, DotenvFile, EnvOrigin, ResolvedValue, save_dotenv,
+};
 use crate::error::{ConfigError, EgoPulseError};
 
 static CONFIG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -643,7 +645,7 @@ pub(crate) fn save_config_with_secrets(
         .map_err(|_| EgoPulseError::Internal("config write lock poisoned".to_string()))?;
     let _lock_file = acquire_config_lock(yaml_path)?;
 
-    save_config_sources_locked(config, yaml_path)
+    save_config_sources_locked(config, yaml_path, &[])
 }
 
 /// Saves config only if the persisted source still has the expected fingerprint.
@@ -656,6 +658,7 @@ pub(crate) fn save_config_with_secrets_if_unchanged(
     config: &Config,
     yaml_path: &Path,
     expected_fingerprint: &str,
+    removed_dotenv_keys: &[String],
 ) -> Result<String, EgoPulseError> {
     let _guard = CONFIG_WRITE_LOCK
         .lock()
@@ -670,7 +673,7 @@ pub(crate) fn save_config_with_secrets_if_unchanged(
         }));
     }
 
-    save_config_sources_locked(config, yaml_path)?;
+    save_config_sources_locked(config, yaml_path, removed_dotenv_keys)?;
     crate::config::manager::source_fingerprint(yaml_path).map_err(EgoPulseError::from)
 }
 
@@ -689,8 +692,17 @@ where
     operation()
 }
 
-fn save_config_sources_locked(config: &Config, yaml_path: &Path) -> Result<(), EgoPulseError> {
-    let dotenv_entries = collect_dotenv_entries(config);
+fn save_config_sources_locked(
+    config: &Config,
+    yaml_path: &Path,
+    removed_dotenv_keys: &[String],
+) -> Result<(), EgoPulseError> {
+    let (dotenv_entries, referenced_env_keys) = collect_dotenv_entries(config);
+    let removed_keys: Vec<String> = removed_dotenv_keys
+        .iter()
+        .filter(|key| !referenced_env_keys.contains(*key))
+        .cloned()
+        .collect();
     let env_path = DotenvFile::for_config(Some(yaml_path))
         .path()
         .map(Path::to_path_buf);
@@ -707,7 +719,7 @@ fn save_config_sources_locked(config: &Config, yaml_path: &Path) -> Result<(), E
         return Ok(());
     };
 
-    if let Err(error) = save_dotenv(&env_path, &dotenv_entries, Some(&generation)) {
+    if let Err(error) = save_dotenv(&env_path, &dotenv_entries, Some(&generation), &removed_keys) {
         let yaml_restore = restore_file(yaml_path, yaml_backup.as_deref());
         let env_restore = restore_file(
             &env_path,
@@ -802,46 +814,49 @@ fn restore_file(path: &Path, previous: Option<&[u8]>) -> Result<(), EgoPulseErro
     }
 }
 
-fn collect_dotenv_entries(config: &Config) -> Vec<(String, String)> {
+fn collect_dotenv_entries(config: &Config) -> (Vec<(String, String)>, HashSet<String>) {
     let mut entries = Vec::new();
+    let mut referenced = HashSet::new();
 
-    for (id, provider) in &config.providers {
-        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &provider.api_key {
-            entries.push((env_id.clone(), value.clone()));
-        }
-        let _ = id;
+    for provider in config.providers.values() {
+        collect_env_ref(&mut entries, &mut referenced, provider.api_key.as_ref());
     }
 
     for channel in config.channels.values() {
-        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &channel.auth_token {
-            entries.push((env_id.clone(), value.clone()));
-        }
+        collect_env_ref(&mut entries, &mut referenced, channel.auth_token.as_ref());
         if let Some(bots) = &channel.discord_bots {
-            for (bot_id, bot) in bots {
-                if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &bot.token {
-                    entries.push((env_id.clone(), value.clone()));
-                }
-                let _ = bot_id;
+            for bot in bots.values() {
+                collect_env_ref(&mut entries, &mut referenced, bot.token.as_ref());
             }
         }
         if let Some(bots) = &channel.telegram_bots {
-            for (bot_id, bot) in bots {
-                if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &bot.token {
-                    entries.push((env_id.clone(), value.clone()));
-                }
-                let _ = bot_id;
+            for bot in bots.values() {
+                collect_env_ref(&mut entries, &mut referenced, bot.token.as_ref());
             }
         }
     }
 
-    for (receiver_id, receiver) in &config.webhooks.receivers {
-        if let Some(ResolvedValue::EnvRef { value, id: env_id }) = &receiver.token {
-            entries.push((env_id.clone(), value.clone()));
-        }
-        let _ = receiver_id;
+    for receiver in config.webhooks.receivers.values() {
+        collect_env_ref(&mut entries, &mut referenced, receiver.token.as_ref());
     }
 
-    entries
+    (entries, referenced)
+}
+
+/// Records every env reference. Only values owned by `.env` are written there;
+/// process-environment values still count when deciding whether a removed key
+/// is safe to delete.
+fn collect_env_ref(
+    entries: &mut Vec<(String, String)>,
+    referenced: &mut HashSet<String>,
+    secret: Option<&ResolvedValue>,
+) {
+    if let Some(ResolvedValue::EnvRef { value, id, origin }) = secret {
+        referenced.insert(id.clone());
+        if *origin == EnvOrigin::Dotenv {
+            entries.push((id.clone(), value.clone()));
+        }
+    }
 }
 
 fn acquire_config_lock(path: &Path) -> Result<File, EgoPulseError> {
@@ -1032,6 +1047,60 @@ mod tests {
         assert!(dotenv.contains("OPENAI_API_KEY=sk-test"));
         assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
         assert!(dotenv.contains(&format!("{DISCORD_BOT_TOKEN_ENV_NAME}=discord-token")));
+    }
+
+    #[test]
+    fn process_environment_secrets_are_not_written_to_dotenv() {
+        // Arrange: the provider key resolves from the process environment.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let mut config = sample_config();
+        let process_secret = ResolvedValue::EnvRef {
+            value: "process-secret".into(),
+            id: "PROCESS_ONLY_KEY".into(),
+            origin: EnvOrigin::Process,
+        };
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(process_secret);
+
+        // Act
+        save_config_with_secrets(&config, &path).expect("save config");
+
+        // Assert: the YAML keeps the reference, but the value stays outside .env.
+        let yaml = fs::read_to_string(&path).expect("yaml");
+        assert!(yaml.contains("id: PROCESS_ONLY_KEY"));
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
+        assert!(!dotenv.contains("PROCESS_ONLY_KEY"));
+        assert!(!dotenv.contains("process-secret"));
+        assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
+    }
+
+    #[test]
+    fn removing_a_secret_deletes_its_dotenv_entry() {
+        // Arrange: start with a provider key stored in .env.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("egopulse.config.yaml");
+        let config = sample_config();
+        save_config_with_secrets(&config, &path).expect("save config");
+        let mut candidate = config.clone();
+        candidate
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(env_resolved_value("REPLACEMENT_KEY", "sk-replacement"));
+
+        // Act
+        save_config_sources_locked(&candidate, &path, &["OPENAI_API_KEY".into()])
+            .expect("save config");
+
+        // Assert: only the removed key is gone; the new and unrelated secrets remain.
+        let dotenv = fs::read_to_string(dir.path().join(".env")).expect(".env");
+        assert!(!dotenv.contains("OPENAI_API_KEY"));
+        assert!(dotenv.contains("REPLACEMENT_KEY=sk-replacement"));
+        assert!(dotenv.contains(&format!("{WEB_AUTH_TOKEN_ENV_NAME}=web-token")));
     }
 
     #[test]

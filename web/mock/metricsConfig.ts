@@ -295,7 +295,12 @@ function metricsAgentTokens(range: RangeKey) {
 let revision = 42;
 let fingerprint = "f-42";
 
-const secretEnv = (ref: string) => ({ kind: "env", ref, configured: true });
+const secretEnv = (ref: string, origin: "process" | "dotenv" = "dotenv") => ({
+  kind: "env",
+  ref,
+  origin,
+  configured: true,
+});
 
 const config = {
   general: {
@@ -338,7 +343,12 @@ const config = {
         { name: "google/gemini-2.5-pro", context_window_tokens: 1048576, has_instructions: false },
         { name: "openai/gpt-4.1-mini", context_window_tokens: null, has_instructions: false },
       ],
-      api_key: secretEnv("OPENROUTER_API_KEY") as { kind: string | null; ref: string | null; configured: boolean },
+      api_key: secretEnv("OPENROUTER_API_KEY", "process") as {
+        kind: string | null;
+        ref: string | null;
+        origin: string | null;
+        configured: boolean;
+      },
       api_key_optional: false,
       header_names: ["x-client-name"],
     },
@@ -348,7 +358,12 @@ const config = {
       base_url: "https://api.ai.sakura.ad.jp/v1",
       default_model: "preview/Kimi-K2.6",
       models: [{ name: "preview/Kimi-K2.6", context_window_tokens: 262144, has_instructions: false }],
-      api_key: { kind: null, ref: null, configured: false } as { kind: string | null; ref: string | null; configured: boolean },
+      api_key: { kind: null, ref: null, origin: null, configured: false } as {
+        kind: string | null;
+        ref: string | null;
+        origin: string | null;
+        configured: boolean;
+      },
       api_key_optional: false,
       header_names: [],
     },
@@ -358,7 +373,12 @@ const config = {
       base_url: "https://chatgpt.com/backend-api/codex",
       default_model: "gpt-5.3-codex",
       models: [{ name: "gpt-5.3-codex", context_window_tokens: 400000, has_instructions: false }],
-      api_key: { kind: null, ref: null, configured: false } as { kind: string | null; ref: string | null; configured: boolean },
+      api_key: { kind: null, ref: null, origin: null, configured: false } as {
+        kind: string | null;
+        ref: string | null;
+        origin: string | null;
+        configured: boolean;
+      },
       api_key_optional: true,
       header_names: [],
     },
@@ -433,7 +453,7 @@ export function configPayload() {
         bots: [
           { id: "lyre", token: secretEnv("DISCORD_BOT_TOKEN_LYRE"), agents: ["lyre"] },
           { id: "main", token: secretEnv("DISCORD_BOT_TOKEN"), agents: ["ace"] },
-          { id: "vega", token: { kind: "exec", ref: null, configured: true }, agents: ["vega"] },
+          { id: "vega", token: { kind: "exec", ref: null, origin: null, configured: true }, agents: ["vega"] },
         ],
         channels: [
           { id: "1234567890123456789", agents: ["lyre"], require_mention: false, multi_agent: false, secret: false, tool_progress: true },
@@ -464,7 +484,7 @@ export function configPayload() {
     pulse: { tick_interval: config.pulse.tick_interval, default_tick_interval: "1m" },
     webhooks: [
       { id: "egograph", token: secretEnv("EGOPULSE_WEBHOOK_EGOGRAPH_TOKEN"), channel: "discord", thread: "1234567890123456789", agent: "lyre" },
-      { id: "github", token: { kind: "literal", ref: null, configured: true }, channel: "telegram", thread: "-1001234567890", agent: null },
+      { id: "github", token: { kind: "literal", ref: null, origin: null, configured: true }, channel: "telegram", thread: "-1001234567890", agent: null },
     ],
     backup: { enabled: true, interval_days: 7, time: "03:00", max_generations: 12 },
     web_fetch: {
@@ -579,9 +599,14 @@ export function patchConfig(target: string, body: Record<string, unknown>): { st
       provider.models.push({ name: provider.default_model, context_window_tokens: null, has_instructions: false });
     }
     if (api_key?.action === "replace") {
-      provider.api_key = { kind: "env", ref: provider.api_key.ref ?? `${provider.id.toUpperCase().replace(/-/g, "_")}_API_KEY`, configured: true };
+      provider.api_key = {
+        kind: "env",
+        ref: provider.api_key.ref ?? `${provider.id.toUpperCase().replace(/-/g, "_")}_API_KEY`,
+        origin: "dotenv",
+        configured: true,
+      };
     } else if (api_key?.action === "remove") {
-      provider.api_key = { kind: null, ref: null, configured: false };
+      provider.api_key = { kind: null, ref: null, origin: null, configured: false };
     }
   } else {
     return { status: 404, body: { ok: false, error: "not_found" } };

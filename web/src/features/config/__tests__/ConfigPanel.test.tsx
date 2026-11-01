@@ -123,7 +123,7 @@ describe("ConfigPanel", () => {
   it("marks_a_section_that_needs_attention_in_the_section_bar", async () => {
     // Arrange
     const config = runtimeConfig();
-    config.providers[0].api_key = { kind: null, ref: null, configured: false };
+    config.providers[0].api_key = { kind: null, ref: null, origin: null, configured: false };
     stubConfigApi({ config });
 
     // Act
@@ -135,6 +135,42 @@ describe("ConfigPanel", () => {
     const bar = screen.getByRole("navigation", { name: "Config sections on this page" });
     const chip = within(bar).getByRole("button", { name: "Providers" });
     expect(chip.querySelector(".dot-warning")).toBeTruthy();
+  });
+
+  it("marks_process_environment_api_keys_read_only", async () => {
+    // Arrange: the provider key currently comes from the process environment.
+    const config = runtimeConfig();
+    config.providers[0].api_key = {
+      kind: "env",
+      ref: "OPENAI_API_KEY",
+      origin: "process",
+      configured: true,
+    };
+    stubConfigApi({ config });
+    renderPanel("t-process-key");
+
+    // Act
+    const providers = await screen.findByRole("region", { name: "Providers" });
+    fireEvent.click(within(providers).getByRole("button", { name: "Edit" }));
+
+    // Assert: the key can only be changed outside Egopulse.
+    expect(within(providers).getByText(/Set by the process environment/)).toBeTruthy();
+    expect(within(providers).queryByRole("button", { name: "Replace" })).toBeNull();
+  });
+
+  it("uses_total_attempts_for_sleep_retries", async () => {
+    // Arrange
+    stubConfigApi();
+    renderPanel("t-retry");
+
+    // Act
+    const sleep = await screen.findByRole("region", { name: "Sleep" });
+    fireEvent.click(within(sleep).getByRole("button", { name: "Edit" }));
+
+    // Assert: the field matches the backend's total-attempt semantics.
+    const attempts = within(sleep).getByLabelText("Max attempts") as HTMLInputElement;
+    expect(attempts.min).toBe("1");
+    expect(within(sleep).getByText("Total attempts, including the first run.")).toBeTruthy();
   });
 
   it("loads_the_yaml_only_after_it_is_opened", async () => {

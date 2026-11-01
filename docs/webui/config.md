@@ -37,9 +37,9 @@
 |---|---|---|
 | General | 既定 agent / provider / model、timezone、履歴と compaction の値。Process（log level・state directory）は再起動必須 | Defaults カード |
 | Agents | agent ごとのカード：実効モデルと解決元、reasoning effort、Bot 紐づけ、channel profiles | agent ごと（名前・provider・model・reasoning effort・Discord bot・Telegram bot） |
-| Providers | provider ごとのカード：base URL、API key の状態、default model、models（context window・custom instructions の有無）、追加ヘッダ名、使っている agent | provider ごと（名前・base URL・models・default model・API key の Replace / Remove） |
+| Providers | provider ごとのカード：base URL、API key の状態、default model、models（context window・custom instructions の有無）、追加ヘッダ名、使っている agent | provider ごと（名前・base URL・models・default model・API key の Replace / Remove。プロセス環境変数由来の key を除く） |
 | Channels | Web（listen address・auth token・allowed origins）/ Discord・Telegram（Bot と token 状態・紐づく agent、許可チャネルの表）/ Voice | — |
-| Sleep | 実行時刻、対象 agent、実効モデル、reasoning effort、retry | Sleep batch カード |
+| Sleep | 実行時刻、対象 agent、実効モデル、reasoning effort、retry（初回を含む最大試行回数） | Sleep batch カード |
 | Pulse | tick interval。agent ごとの Pulse 定義は Schedule へ | Scheduler カード |
 | Webhooks | receiver ごとの配送先・agent・token 状態 | — |
 | Backup / Web Fetch | 値の一覧 | —（再起動必須） |
@@ -55,7 +55,7 @@
 | 環境変数で上書きされている | 値に `env NAME` タグ（hover で説明） |
 | 既定値と同じ（General の数値・timezone、Pulse の tick interval） | 値に `default` タグ |
 | 未指定で継承している（agent / Sleep の provider・model） | 解決後の値と、2 行目に解決元（`Provider inherited from the global default` / `the provider's default model` など） |
-| 秘密（API key・token） | `Set from OPENROUTER_API_KEY` / `Set from a command` / `Set written in the YAML file` / `Not set`。key が不要な provider は `Not needed` 。環境変数で上書きされた token は `Set from the WEB_AUTH_TOKEN environment variable` |
+| 秘密（API key・token） | `Set from OPENROUTER_API_KEY in .env` / `Set from OPENAI_API_KEY in the process environment` / `Set from a command` / `Set written in the YAML file` / `Not set`。key が不要な provider は `Not needed` 。環境変数で上書きされた token は `Set from the WEB_AUTH_TOKEN environment variable` |
 
 値そのもの、`exec` のコマンド、provider の追加ヘッダ値、MCP の args・env と header の値・endpoint のパスと query は返さない。
 
@@ -77,6 +77,8 @@
 
 - 更新は `ConfigManager` の単一の更新境界を通る（[config.md §10](../config.md#10-設定の変更インターフェース)）。YAML 全体を書き込む経路は設けない
 - API key の新しい値は `.env` に保存され、YAML には SecretRef として記録される
+- API key がプロセス環境変数から解決されている場合、その値は読み取り専用。変更するにはプロセス環境変数を変更する
+- API key の Remove は `.env` の該当キーも削除する。同じ変数を参照する他の SecretRef がある場合は残す
 
 ---
 
