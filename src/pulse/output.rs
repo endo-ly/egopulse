@@ -655,10 +655,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notify_to_a_web_home_surface_persists_the_activation() {
-        // Arrange
+    async fn notify_to_a_web_home_surface_reaches_the_original_session() {
+        // Arrange: use the production Web adapter and resolve the target from
+        // the WebUI session ID, so the whole delivery path is exercised.
         let dir = tempfile::tempdir().expect("tempdir");
-        let state = build_test_state(&dir);
+        let mut channels = ChannelRegistry::new();
+        channels.register(Arc::new(crate::channels::web::WebAdapter));
+        let state = build_test_state_with_channels(&dir, Arc::new(channels));
         let agent_id = "lyre";
         let intention = test_intention("web_review");
         let pulse_run_id = "run-web-001";
@@ -668,13 +671,16 @@ mod tests {
             .db
             .resolve_or_create_chat_id("web", "web:session-1:agent:lyre", "web", agent_id)
             .expect("chat");
-        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
-        let home_surface = HomeSurface {
-            chat_id,
+        let spec = crate::pulse::definition::DeliverySpec {
             channel: "web".to_string(),
-            external_chat_id: "web:session-1:agent:lyre".to_string(),
-            chat_type: "web".to_string(),
+            external_chat_id: format!("chat:{chat_id}"),
         };
+        let home_surface =
+            crate::pulse::capsule::resolve_home_surface(&state.db, agent_id, &["web"], Some(&spec))
+                .await
+                .expect("resolve")
+                .expect("web surface");
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
         let activation = ActivationResult {
             output_text: notification_text.to_string(),
             output_kind: PulseOutputKind::Notify,

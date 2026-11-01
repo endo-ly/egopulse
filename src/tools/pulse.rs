@@ -1014,8 +1014,13 @@ mod tests {
     async fn add_on_web_defaults_to_the_current_session_id() {
         // Arrange
         let env = build_env();
+        let chat_id = env
+            ._state
+            .db
+            .resolve_or_create_chat_id("web", "web:session-1:agent:lyre", "web", "lyre")
+            .expect("chat");
         let mut web_context = context();
-        web_context.chat_id = 42;
+        web_context.chat_id = chat_id;
         web_context.channel = "web".to_string();
         web_context.surface_thread = "session-1".to_string();
 
@@ -1039,7 +1044,20 @@ mod tests {
                 .expect("load pulse definition");
         let delivery = loaded.intentions[0].delivery.as_ref().expect("delivery");
         assert_eq!(delivery.channel, "web");
-        assert_eq!(delivery.external_chat_id, "chat:42");
+        assert_eq!(delivery.external_chat_id, format!("chat:{chat_id}"));
+
+        // The stored address must resolve back to the same conversation.
+        let surface = crate::pulse::capsule::resolve_home_surface(
+            &env._state.db,
+            "lyre",
+            &["web"],
+            Some(delivery),
+        )
+        .await
+        .expect("resolve")
+        .expect("web surface");
+        assert_eq!(surface.chat_id, chat_id);
+        assert_eq!(surface.channel, "web");
     }
 
     #[tokio::test]
