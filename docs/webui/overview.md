@@ -32,7 +32,7 @@ LLM 応答・ツール実行・Pulse / Sleep の進行は、完了後ではな�
 | agent | **Agent** | 人格・規約・長期記憶・スキル・実効モデルの確認と編集 | [agent.md](./agent.md) |
 | agent | **Schedule** | Pulse と Sleep の次回実行と実行履歴の監査、Pulse intention の管理 | [schedule.md](./schedule.md) |
 | global | **Metrics** | ランタイムの健全性と、agent 別の利用状況の推移 | [metrics.md](./metrics.md) |
-| global | **Config** | 設定 YAML の確認と編集 | [config.md](./config.md) |
+| global | **Config** | 全設定を1ページで確認し、その場で編集 | [config.md](./config.md) |
 
 ### 2.2 配置
 

@@ -897,10 +897,129 @@
     padding-bottom: var(--space-2xl);
   }
 
+  .config-page {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2xl);
+    min-width: 0;
+    padding-top: var(--space-base);
+  }
+
+  /* Section jump bar; sticks to the top of the scrolling body. */
+  .config-toc {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: flex;
+    gap: var(--space-xs);
+    min-width: 0;
+    max-width: 100%;
+    padding: var(--space-sm) 0;
+    overflow-x: auto;
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-bg);
+    scrollbar-width: none;
+  }
+
+  .config-toc::-webkit-scrollbar {
+    display: none;
+  }
+
+  .config-toc-item {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--color-muted);
+    font: inherit;
+    font-size: var(--text-xs);
+    line-height: 20px;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .config-toc-item:hover {
+    background: var(--color-row-hover);
+    color: var(--color-text);
+  }
+
+  .config-toc-item.active {
+    border-color: var(--color-border-strong);
+    background: var(--color-panel-2);
+    color: var(--color-text-strong);
+  }
+
+  .config-toc-item:focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  .config-section {
+    display: grid;
+    gap: var(--space-md);
+    min-width: 0;
+    max-width: 920px;
+    scroll-margin-top: 64px;
+  }
+
+  .config-section-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--space-sm) var(--space-base);
+    padding-bottom: var(--space-sm);
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .config-section-heading {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .config-section-heading h2 {
+    margin: 0;
+    color: var(--color-text-strong);
+    font-size: var(--text-md);
+    font-weight: 600;
+  }
+
+  .config-section-heading p {
+    margin: 0;
+    color: var(--color-muted-2);
+    font-size: var(--text-sm);
+  }
+
+  .config-section-summary {
+    flex-shrink: 0;
+    color: var(--color-muted-2);
+    font-size: var(--text-xs);
+  }
+
+  .config-section-summary.tone-warning {
+    color: var(--color-warning);
+  }
+
+  .config-section-summary.tone-danger {
+    color: var(--color-danger);
+  }
+
   .config-stack {
     display: grid;
     gap: var(--space-md);
-    max-width: 920px;
+    min-width: 0;
+  }
+
+  /* Tables keep their columns on narrow screens and scroll inside the card. */
+  .config-table-scroll {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
   }
 
   .config-section-note {
@@ -912,7 +1031,7 @@
   .config-card {
     display: grid;
     gap: var(--space-md);
-    max-width: 920px;
+    min-width: 0;
     padding: var(--space-base) var(--space-lg);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-xl);
@@ -932,7 +1051,7 @@
     min-height: 32px;
   }
 
-  .config-card-head h2 {
+  .config-card-head h3 {
     margin: 0;
     min-width: 0;
     color: var(--color-text-strong);
@@ -1108,8 +1227,11 @@
     overflow-wrap: anywhere;
   }
 
-  .yaml-card {
-    max-width: none;
+  .yaml-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-sm);
   }
 
   .yaml-view {
@@ -1392,6 +1514,15 @@
 
     .config-source {
       justify-items: start;
+    }
+
+    .config-page {
+      gap: var(--space-xl);
+    }
+
+    .config-section-head {
+      flex-direction: column;
+      align-items: flex-start;
     }
 
     .health-facts {

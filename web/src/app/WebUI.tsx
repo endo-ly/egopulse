@@ -162,6 +162,9 @@ export function WebUI() {
   const [configSection, setConfigSection] = useState<ConfigSection>(
     bootRoute?.tab === "config" ? bootRoute.section : "general",
   );
+  // The Config page is one scrolling document; this follows the section under
+  // its sticky bar so the sidebar highlights where the reader actually is.
+  const [activeConfigSection, setActiveConfigSection] = useState<ConfigSection | null>(null);
   const [metricsFilters, setMetricsFilters] = useState<MetricsFilters>(readMetricsFilters);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [messageJump, setMessageJump] = useState<{
@@ -252,6 +255,10 @@ export function WebUI() {
     syncMetricsFilters(activeTab === "metrics" ? metricsFilters : null);
   }, [activeTab, metricsFilters]);
 
+  useEffect(() => {
+    if (activeTab !== "config") setActiveConfigSection(null);
+  }, [activeTab]);
+
   // The address before a back/forward navigation, restored when the user
   // keeps unsaved edits instead of leaving them.
   const lastHrefRef = useRef<string | null>(null);
@@ -265,13 +272,16 @@ export function WebUI() {
 
   useEffect(() => {
     const onPopState = () => {
-      if (!confirmDiscardUnsaved()) {
-        if (lastHrefRef.current) globalThis.history.pushState(null, "", lastHrefRef.current);
-        return;
-      }
       const pathname = currentPathname();
       const route = pathname === null ? null : parseRoute(pathname);
       if (!route) return;
+      // Moving between Config sections only scrolls the one-page screen, so
+      // an open form survives and the draft must not be discarded.
+      const staysOnConfig = activeTab === "config" && route.tab === "config";
+      if (!staysOnConfig && !confirmDiscardUnsaved()) {
+        if (lastHrefRef.current) globalThis.history.pushState(null, "", lastHrefRef.current);
+        return;
+      }
       setActiveTab(route.tab);
       if ("agentId" in route && route.agentId) setSelectedAgent(route.agentId);
       if (route.tab === "agent") setAgentSection(route.section);
@@ -288,7 +298,7 @@ export function WebUI() {
     };
     globalThis.addEventListener("popstate", onPopState);
     return () => globalThis.removeEventListener("popstate", onPopState);
-  }, []);
+  }, [activeTab]);
 
   // Selecting a session always shows it in Chat, from whichever screen asked.
   const handleSelectSession = useCallback(
@@ -338,10 +348,12 @@ export function WebUI() {
     [activeTab, agentSection, configSection, scheduleView, selectedAgent, urlSessionKey],
   );
 
+  // Config sections share one page, so switching among them keeps any open
+  // edit (and therefore does not ask to discard it).
   const handleSelectConfigSection = useCallback((section: ConfigSection) => {
-    if (!confirmDiscardUnsaved()) return;
     setActiveTab("config");
     setConfigSection(section);
+    setActiveConfigSection(section);
     navigateTo({ tab: "config", section });
   }, []);
 
@@ -573,6 +585,7 @@ export function WebUI() {
         agentSection={agentSection}
         scheduleView={scheduleView}
         configSection={configSection}
+        activeConfigSection={activeConfigSection}
         metricsFilters={metricsFilters}
         onSelectConfigSection={handleSelectConfigSection}
         onSelectAgentSection={handleSelectAgentSection}
@@ -624,7 +637,14 @@ export function WebUI() {
               onOpenRun={handleOpenAgentRun}
             />
           ) : activeTab === "config" ? (
-            <ConfigPanel authToken={authToken} section={configSection} onOpenSchedule={handleOpenAgentSchedule} />
+            <ConfigPanel
+              authToken={authToken}
+              section={configSection}
+              activeSection={activeConfigSection}
+              onSelectSection={handleSelectConfigSection}
+              onActiveSectionChange={setActiveConfigSection}
+              onOpenSchedule={handleOpenAgentSchedule}
+            />
           ) : null
         }
       />

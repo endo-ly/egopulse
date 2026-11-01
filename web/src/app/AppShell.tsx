@@ -28,6 +28,8 @@ export interface AppProps {
   scheduleView?: ScheduleView;
   /** Current Config section; drives the Config sidebar context. */
   configSection?: ConfigSection;
+  /** The Config section currently under the sticky bar. */
+  activeConfigSection?: ConfigSection | null;
   /** Metrics range and agent; the sidebar summaries follow them. */
   metricsFilters?: MetricsFilters;
   onSelectConfigSection?: (section: ConfigSection) => void;
@@ -62,6 +64,7 @@ export function App({
   agentSection = "overview",
   scheduleView = SCHEDULE_ACTIVITY,
   configSection = "general",
+  activeConfigSection = null,
   metricsFilters = { range: "7d", agentId: null },
   onSelectConfigSection = noop,
   healthStatus = "ok",
@@ -229,7 +232,7 @@ export function App({
     context = (
       <ConfigSectionNav
         authToken={authToken ?? ""}
-        section={configSection}
+        activeSection={activeConfigSection ?? configSection}
         onSelectSection={handleSelectConfigSection}
       />
     );

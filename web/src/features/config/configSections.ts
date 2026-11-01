@@ -20,6 +20,42 @@ export function isConfigSection(value: string): value is ConfigSection {
   return (CONFIG_SECTIONS as readonly string[]).includes(value);
 }
 
+/** The DOM id of a section on the one-page Config screen. */
+export function configSectionElementId(section: ConfigSection): string {
+  return `config-section-${section}`;
+}
+
+/** Scrolls the Config screen to a section, under the sticky section bar. */
+export function scrollToConfigSection(section: ConfigSection): void {
+  document.getElementById(configSectionElementId(section))?.scrollIntoView({ block: "start" });
+}
+
+export interface SectionPosition {
+  id: ConfigSection;
+  /** Top of the section relative to the viewport. */
+  top: number;
+}
+
+/**
+ * The section whose heading has most recently crossed `line`, in document
+ * order. At the end of the page the last section wins even when it is too
+ * short to reach the line.
+ */
+export function pickActiveSection(
+  positions: readonly SectionPosition[],
+  line: number,
+  atBottom: boolean,
+): ConfigSection {
+  if (positions.length === 0) return CONFIG_SECTIONS[0];
+  if (atBottom) return positions[positions.length - 1].id;
+  let active = positions[0].id;
+  for (const position of positions) {
+    if (position.top > line) break;
+    active = position.id;
+  }
+  return active;
+}
+
 export const SECTION_INFO: Record<ConfigSection, { label: string; description: string }> = {
   general: { label: "General", description: "Defaults every agent falls back to, and how conversation history is kept." },
   agents: { label: "Agents", description: "The model each agent runs on and the bots it answers through." },

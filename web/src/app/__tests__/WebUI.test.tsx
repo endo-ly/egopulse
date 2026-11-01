@@ -1,6 +1,7 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { setUnsavedChanges } from "../../shared/lib/unsaved";
 import { WebUI } from "../WebUI";
 
 // The screens themselves fetch and stream; this test only exercises how the
@@ -11,6 +12,12 @@ vi.mock("../../features/agent/AgentPanel", () => ({
 }));
 vi.mock("../../features/schedule/SchedulePanel", () => ({
   SchedulePanel: () => <div>schedule screen</div>,
+}));
+vi.mock("../../features/config/ConfigPanel", () => ({
+  ConfigPanel: () => <div>config screen</div>,
+}));
+vi.mock("../../features/config/ConfigSectionNav", () => ({
+  ConfigSectionNav: () => <div>config nav</div>,
 }));
 vi.mock("../../features/chat/useChatTransport", () => ({
   useChatTransport: () => ({
@@ -65,6 +72,11 @@ describe("WebUI", () => {
     globalThis.history.replaceState({}, "", "/agents/lyre/schedule");
   });
 
+  afterEach(() => {
+    cleanup();
+    setUnsavedChanges("config-form", false);
+  });
+
   it("opens the chat screen when a session is picked from the command palette", async () => {
     // Arrange: the Schedule screen is showing.
     render(<WebUI />);
@@ -78,5 +90,24 @@ describe("WebUI", () => {
     // the Schedule route being restored under the new selection.
     expect(await screen.findByText("chat screen")).toBeTruthy();
     expect(globalThis.location.pathname).toBe("/agents/lyre/chat/s/chat:1");
+  });
+
+  it("keeps_a_config_edit_when_history_moves_between_sections", async () => {
+    // Arrange: Config is showing with an unsaved form open.
+    globalThis.history.replaceState({}, "", "/config");
+    setUnsavedChanges("config-form", true);
+    const confirm = vi.spyOn(globalThis, "confirm").mockReturnValue(false);
+    render(<WebUI />);
+    await screen.findByText("config screen");
+
+    // Act: go back/forward to another section of the same page.
+    globalThis.history.pushState({}, "", "/config/providers");
+    globalThis.dispatchEvent(new PopStateEvent("popstate"));
+
+    // Assert: the form is not discarded, so no prompt is shown.
+    expect(confirm).not.toHaveBeenCalled();
+    expect(screen.getByText("config screen")).toBeTruthy();
+    await waitFor(() => expect(globalThis.location.pathname).toBe("/config/providers"));
+    confirm.mockRestore();
   });
 });
