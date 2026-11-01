@@ -52,7 +52,8 @@ Agents と Footer の間の領域。表示中の画面に応じて内容を切�
 | Chat | SESSIONS（§2.6） |
 | Agent | SECTIONS（Overview / Soul / Rules / Secret / Memory / Skills）。SESSIONS と同じ「アイコン + 名前 + 1 行の要約」の行で並べる |
 | Schedule | SECTIONS（Activity / Pulse / Sleep）。各行は名前と 1 行の要約（[schedule.md §1](./schedule.md#1-構成)） |
-| Metrics / Config | セクション一覧 |
+| Metrics | SECTIONS（Health / Usage / Reliability / Agents）。各行は名前と 1 行の要約で、クリックでそのセクションへスクロールする |
+| Config | SECTIONS（General〜MCP と YAML file）。各行は名前と 1 行の要約。クリックで1ページ内のそのセクションへスクロールし、スクロール位置に追従して強調する（[config.md §1](./config.md#1-構成)） |
 
 ### 2.6 SESSIONS
 
@@ -91,10 +92,10 @@ Mobile（< 640px）のみ表示する高さ 44px のバー。
 | Chat | `/agents/:agentId/chat`（セッション選択時 `/s/:sessionKey`） | agent |
 | Agent | `/agents/:agentId`、`/agents/:agentId/:section` | agent |
 | Schedule | `/agents/:agentId/schedule`（Activity）、`/schedule/runs/{pulse\|sleep}/:runId`、`/schedule/pulse/:intentionId`、`/schedule/sleep`（[schedule.md §7](./schedule.md#7-url-構造)） | agent |
-| Metrics | `/metrics?range=` | global |
-| Config | `/config/:section` | global |
+| Metrics | `/metrics`（期間・agent フィルタは `?range=&agent=`） | global |
+| Config | `/config`（General）、`/config/:section`（そのセクションへスクロール） | global |
 
-`/` は既定 agent の Chat を表示する。各画面の詳細は個別ドキュメントを参照。
+`/` は既定 agent の Chat を表示する。Config は1ページなので、`:section` は初期表示のスクロール先（直リンク・戻る / 進む）を表し、ページをスクロールしただけでは URL を書き換えない。各画面の詳細は個別ドキュメントを参照。
 
 ---
 

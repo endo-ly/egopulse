@@ -19,6 +19,7 @@ WebUI と外部 voice client が使用する REST API、および WebSocket の�
     - [Agent Avatar](#211-agent-avatar)
     - [Agent 画面](#212-agent-画面)
     - [Pulse](#213-pulse)
+    - [Metrics](#214-metrics)
 3. [WebSocket](#3-websocket)
 4. [エラーレスポンス](#4-エラーレスポンス)
 5. [静的アセット](#5-静的アセット)
@@ -35,7 +36,7 @@ Authorization: Bearer <token>
 
 ### Web API 認証
 
-`/api/config`、`/api/status`、`/api/sessions`、`/api/history`、`/api/send_stream`、`/api/stream`、`/api/agents`、`/api/sleep/*`、`/telemetry` は `channels.web.auth_token` で認証する。
+`/api/config*`、`/api/metrics`、`/api/status`、`/api/sessions`、`/api/history`、`/api/send_stream`、`/api/stream`、`/api/agents`、`/api/sleep/*`、`/telemetry` は `channels.web.auth_token` で認証する。
 
 ### Voice API 認証
 
@@ -138,54 +139,77 @@ Authorization: Bearer <channels.web.auth_token>
 GET /api/config
 ```
 
+WebUI の Config 画面のセクション構成に合わせた設定の snapshot。値は環境変数オーバーライド適用後の実効値。
+
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `revision` | `number` | 現在の設定世代。設定交換が成功するたびに増加 |
-| `fingerprint` | `string` | 現在の設定 YAML と `.env` を連結したソースの SHA-256。更新時の楽観的同時実行制御に使用 |
-| `default_provider` | `string` | デフォルトプロバイダー ID |
-| `default_model` | `string \| null` | グローバルモデルオーバーライド |
-| `effective_model` | `string` | 解決後の実際のモデル名 |
-| `state_root` | `string` | `~/.egopulse/` の絶対パス |
-| `workspace_dir` | `string` | エージェント作業ディレクトリ |
-| `web_enabled` | `boolean` | Web サーバー有効状態 |
-| `web_host` | `string` | バインドホスト |
-| `web_port` | `number` | バインドポート |
-| `web_auth_enabled` | `boolean` | 認証の有無（`auth_token` 設定時 `true`） |
-| `has_api_key` | `boolean` | デフォルトプロバイダーの API キー設定有無 |
+| `fingerprint` | `string` | 設定 YAML と `.env` を連結したソースの SHA-256。更新時の楽観的同時実行制御に使用 |
 | `config_path` | `string` | 設定ファイルパス |
-| `providers` | `array` | プロバイダー設定一覧。各要素: `id`, `label`, `base_url`, `default_model`, `models`, `has_api_key` |
-| `providers[].has_api_key` | `boolean` | プロバイダーごとの API キー有無 |
+| `env_overrides` | `object` | 環境変数で上書きされているフィールドのパス → 変数名（例: `{"channels.web.host": "WEB_HOST"}`） |
+| `general` | `object` | 既定 agent / provider / model、timezone、履歴・compaction の値、`log_level`、`state_root`、`defaults`（既定値） |
+| `agents` | `array` | `id`, `label`, `is_default`, `provider`, `model`, `reasoning_effort`, `discord_bot`, `telegram_bot`, `effective`（解決後の `provider` / `model` と `provider_source` / `model_source`）, `profiles` |
+| `providers` | `array` | `id`, `label`, `base_url`, `default_model`, `models`（`name`, `context_window_tokens`, `has_instructions`）, `api_key`（秘密の状態）, `api_key_optional`, `header_names`, `used_by` |
+| `channels` | `object` | `web` / `discord` / `telegram` / `voice`。Bot は `id`, `token`（秘密の状態）, `agents`（紐づく agent）。許可チャネルは `id`, `agents`, `require_mention`, `multi_agent`, `secret`, `tool_progress` |
+| `sleep` | `object` | `sleep_batch` の各値と `effective`（解決後の provider / model） |
+| `pulse` | `object` | `tick_interval`, `default_tick_interval`（Duration 文字列） |
+| `webhooks` | `array` | `id`, `token`（秘密の状態）, `channel`, `thread`, `agent` |
+| `backup` / `web_fetch` | `object` | 各設定値 |
+
+秘密の状態は `{ "kind": "env" | "exec" | "literal" | null, "ref": string | null, "origin": "process" | "dotenv" | null, "configured": boolean }`。`ref` は `env` の変数名、`origin` はその値の取得元（プロセス環境変数または `.env`）。値、`exec` のコマンド、provider の追加ヘッダ値は返さない。
+
+#### MCP 定義
+
+```text
+GET /api/config/mcp
+```
+
+`mcp.json` / `mcp.d/` のサーバー定義。ファイルを読むため、ポーリングされる `GET /api/config` とは分けている。
+
+| フィールド | 説明 |
+|---|---|
+| `files` | 探索順の定義ファイル / ディレクトリ。後のものが同名サーバーを上書きする |
+| `servers` | `name`, `transport`, `command`（プログラム名のみ）, `endpoint`（`scheme://host[:port]` のみ）, `env_keys`, `header_keys`, `request_timeout_secs` |
+| `error` | 定義を読めなかった場合の理由 |
+
+args、env と header の値、endpoint のパス・query・認証情報は返さない（hosted MCP はパスにアクセスキーを含むことがある）。接続状態は `GET /api/status` の `mcp`。
+
+#### YAML
+
+```text
+GET /api/config/yaml
+```
+
+`{ "path", "revision", "fingerprint", "content" }`。`content` はディスク上の YAML を正規化して再シリアライズしたもので、`api_key` / `auth_token` / `token` のリテラル値、SecretRef の `command`、provider `headers` の全値を `********` に置換する。`env` SecretRef の `id` は残す。
 
 #### 更新
 
-```text
-PUT /api/config
-```
+| API | 本文のフィールド |
+|-----|------|
+| `PATCH /api/config/general` | `default_agent`, `default_provider`, `default_model`, `timezone`, `max_history_messages`, `compaction_timeout_secs`, `default_context_window_tokens`, `compaction_threshold_ratio`, `compaction_target_ratio`, `compact_keep_recent` |
+| `PATCH /api/config/agents/{agent_id}` | `label`, `provider`, `model`, `reasoning_effort`, `discord_bot`, `telegram_bot` |
+| `PATCH /api/config/providers/{provider_id}` | `label`, `base_url`, `default_model`, `models`（モデル ID の配列。既存モデルのメタデータは維持）, `api_key`（`{"action": "replace", "value": "..."}` または `{"action": "remove"}`） |
+| `PATCH /api/config/sleep` | `enabled`, `schedule`, `agents`（`null` は全 agent）, `provider`, `model`, `reasoning_effort`, `retry_max_attempts`（初回を含む最大試行回数、1 以上）, `retry_interval_minutes` |
+| `PATCH /api/config/pulse` | `tick_interval`（Duration 文字列） |
 
-| フィールド | 必須 | 備考 |
-|-----------|:---:|------|
-| `default_provider` | 必須 | |
-| `default_model` | 任意 | `null` 可 |
-| `expected_fingerprint` | 任意 | GET で取得した fingerprint。省略時はリクエスト処理開始時の値を使用 |
-| `providers` | 任意 | 既存プロバイダーの編集と新規追加。新規追加は `base_url` と `default_model` が必要。削除は非対応 |
-| `providers.<id>.label` | 任意 | プロバイダー表示名。省略時は既存値を維持（新規追加では ID を表示名に使用） |
-| `providers.<id>.api_key` | 任意 | 省略時は変更なし。実値は `.env` に保存、YAML には SecretRef として記録 |
-| `providers.<id>.models` | 任意 | 利用可能なモデル ID の一覧。省略時は既存値を維持し、新規追加ではデフォルトモデルから初期化 |
-| `web_enabled` | 必須 | |
-| `web_host` | 必須 | |
-| `web_port` | 必須 | 1 以上 |
+- 本文には `expected_fingerprint`（必須）と、変更するフィールドだけを含める。含めないフィールドは変更しない。null を取るフィールドは `null` で未設定に戻す
+- provider 更新では `default_model` をモデル一覧に必ず含める（なければ加える）
+- API key の新しい値は `.env` に保存し、YAML には既存の SecretRef の参照名を記録する。新規の場合は `{PROVIDER_ID}_API_KEY` を使い、その名前がプロセス環境変数で上書きされている場合は `EGOPULSE_{PROVIDER_ID}_API_KEY` を使う
+- API key がプロセス環境変数から解決されている場合、Replace / Remove は `400 api_key_managed_by_process_env`。その値はプロセス環境変数側で変更する。新規保存先の候補（`{PROVIDER_ID}_API_KEY` と `EGOPULSE_{PROVIDER_ID}_API_KEY`）がどちらもプロセス環境変数で上書きされているか、他の秘密情報が参照している場合は `400 api_key_env_override_conflict`
+- 複数の秘密情報が同じ SecretRef を参照している場合、Replace はその provider 専用の参照名に切り替える。他の参照や `.env` の値は変更しない
+- API key の Remove は `.env` の該当キーも削除する。同じ変数を参照する他の SecretRef が残る場合は削除しない
+- API key が必須の provider で Remove すると `400 invalid_config`（`missing_provider_api_key`）。Config 画面は Remove を無効化する
+- 同じ env 変数に異なる値を持つ SecretRef が残る保存は `400 invalid_config`（`config_secret_conflict`）で拒否する。値はエラーメッセージに含めない
+- 更新は `ConfigManager` の更新境界（検証・永続化・snapshot 交換）を通る
 
-##### レスポンス (200)
+##### レスポンス
 
-GET と同一形式。
-
-##### 競合レスポンス (409)
-
-`expected_fingerprint` が現在の設定と一致しない場合は更新せず、`config_conflict` を返す。GET で最新の snapshot を取得してから再度送信する。
-
-##### 再起動必須フィールドの拒否 (400)
-
-`web_enabled`、`web_host`、`web_port` の変更は実行中プロセスへ適用できないため、更新せず `400 Bad Request` を返す。これは fingerprint の競合とは異なるエラーである。メッセージには拒否されたフィールド名（`channels.web.enabled`、`channels.web.host`、`channels.web.port` のいずれか）と `restart required` が含まれる。
+| ステータス | 内容 |
+|---|---|
+| 200 | `GET /api/config` と同一形式 |
+| 400 | `invalid_config`（`message` に検証エラー）、`config_reload_forbidden`、`invalid_tick_interval`、`empty_api_key`、`api_key_managed_by_process_env`、`api_key_env_override_conflict` |
+| 404 | `agent_not_found` / `provider_not_found` |
+| 409 | `config_conflict`。`expected_fingerprint` が現在の設定と一致しない。GET で最新を取得してから送り直す |
 
 ---
 
@@ -747,6 +771,40 @@ GET /api/pulse/runs/{run_id}
 
 ---
 
+### 2.14 Metrics
+
+```text
+GET /api/metrics?range={24h|7d|30d}&agent={agent_id}
+```
+
+WebUI の Metrics 画面の集計。既存テーブル（`llm_usage_logs` / `sleep_runs` / `pulse_runs` / `turn_runs` / `tool_calls` / `chats`）を読むだけで、通常スコープのみを対象にする。
+
+| クエリ | 説明 |
+|---|---|
+| `range` | 任意、既定 `7d`。`24h` は直近 24 時間を UTC の時単位で区切り、表示ラベルだけ `Config.timezone` に変換する。`7d` / `30d` は当日を含む日数を `Config.timezone` のローカル日単位で集計する |
+| `agent` | 任意。Usage と Reliability をその agent に絞る。`agents` は常に全 agent |
+
+| フィールド | 説明 |
+|---|---|
+| `range` | `key`, `start`, `end`, `bucket`（`hour` / `day`）, `timezone`。`start` は UTC。`24h` は UTC の時境界で、DST のフォールバックで同じローカル時刻が2回現れても別バケットになる |
+| `usage.totals` | `tokens`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens`（cached tokens を報告した呼び出しの入力合計。cache hit 率の分母）, `llm_calls`。`input_tokens` / `tokens` は Sleep を含むが、`llm_calls` は Sleep を含まない |
+| `usage.previous_tokens` | 直前の同じ長さの期間の合計トークン |
+| `usage.series` | バケットごとの `start`, `by_agent`, `by_kind` |
+| `usage.by_kind` | `kind`（`agent_loop` / `pulse` / `sleep` / `compaction`）, `tokens`, `llm_calls`（Sleep は run 数） |
+| `usage.by_model` | `provider`, `model`, `llm_calls`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_reported_input_tokens`。Sleep は含まない（Sleep の利用は `by_kind` と `totals` に含まれる） |
+| `usage.pulse_intentions` | `agent_id`, `intention_id`, `runs`, `failed_runs`, `input_tokens`, `output_tokens`。Pulse の利用は、同じ agent の run のうち `[started_at, finished_at]` に入る run へ帰属させる |
+| `usage.pulse_unattributed` | どの run にも入らない Pulse 利用 |
+| `reliability.turns` | `total`, `previous_total`, `completed`, `failed`, `cancelled`, `uncertain`, `running`, `duration_p50_ms`, `duration_p95_ms`（完了 turn の受付から完了まで） |
+| `reliability.turn_failure_kinds` / `tool_failure_kinds` | `kind`, `count` |
+| `reliability.tools` | `tool`, `calls`, `failed`（終端した呼び出しのみ） |
+| `reliability.runs` | `pulse`（`total`, `failed`）, `sleep`（`total`, `failed`, `partial_failure`。`skipped` を除く） |
+| `reliability.recent_failures` | 新しい順に最大 20 件。`at`, `source`（`turn` / `pulse` / `sleep`）, `agent_id`, `kind`（turn の `error_kind`、Pulse の intention、Sleep の status）, `summary`, `session_key`（turn）, `run_id`（run） |
+| `agents` | 全 agent の `agent_id`, `label`, `turns`, `failed_turns`, `tokens`, `last_active_at`, `pulse_runs`, `pulse_failed`, `last_sleep_status` |
+
+未知の `range` は `400 invalid_range`、未知の agent は `404 agent_not_found`。
+
+---
+
 ## 3. WebSocket
 
 ### 接続
@@ -1011,8 +1069,8 @@ Message identity は end-to-end で安定している。ユーザーメッセー
 | `invalid_params` | 400 | リクエストパラメータが不正 |
 | `surface_not_allowed` | 403 | Voice surface が allowlist 外 |
 | `turn_failed` | 500 | Voice agent turn の処理失敗 |
-| `config_conflict` | 409 | `expected_fingerprint` が現在の設定と不一致（PUT /api/config） |
-| `config_reload_forbidden` | 400 | 再起動必須フィールドの実行中変更（PUT /api/config） |
+| `config_conflict` | 409 | `expected_fingerprint` が現在の設定と不一致（PATCH /api/config/*） |
+| `config_reload_forbidden` | 400 | 再起動必須フィールドの実行中変更（PATCH /api/config/*） |
 | `webhook_receiver_not_found` | 404 | receiver が未定義 |
 | `payload_too_large` | 413 | payload が 64KB を超過 |
 | `invalid_target` | 400 | Webhook target channel 未登録・voice・agent 不在・thread 空 |

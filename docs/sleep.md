@@ -514,7 +514,7 @@ renderer は容量制御・圧縮を行わず、該当データを全件描画�
 
 | 設定 | デフォルト | 説明 |
 |---|---|---|
-| `retry.max_attempts` | 3 | 最大再試行回数 |
+| `retry.max_attempts` | 3 | 初回を含む最大試行回数（1 以上） |
 | `retry.interval_minutes` | 5 | 再試行間隔（分） |
 
 ### エージェント解決

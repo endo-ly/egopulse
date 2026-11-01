@@ -626,6 +626,49 @@ impl Config {
     pub fn load_allow_missing_api_key(config_path: Option<&Path>) -> Result<Self, ConfigError> {
         super::loader::build_config(config_path, true)
     }
+
+    /// Counts secret fields that reference `env_id` as an `env` SecretRef.
+    ///
+    /// Used to keep shared references from receiving different values in the
+    /// same `.env` key.
+    pub(crate) fn env_secret_reference_count(&self, env_id: &str) -> usize {
+        fn count(secret: Option<&ResolvedValue>, env_id: &str) -> usize {
+            usize::from(matches!(
+                secret,
+                Some(ResolvedValue::EnvRef { id, .. }) if id == env_id
+            ))
+        }
+
+        let providers = self
+            .providers
+            .values()
+            .map(|provider| count(provider.api_key.as_ref(), env_id))
+            .sum::<usize>();
+        let channels = self
+            .channels
+            .values()
+            .map(|channel| {
+                count(channel.auth_token.as_ref(), env_id)
+                    + channel.discord_bots.as_ref().map_or(0, |bots| {
+                        bots.values()
+                            .map(|bot| count(bot.token.as_ref(), env_id))
+                            .sum()
+                    })
+                    + channel.telegram_bots.as_ref().map_or(0, |bots| {
+                        bots.values()
+                            .map(|bot| count(bot.token.as_ref(), env_id))
+                            .sum()
+                    })
+            })
+            .sum::<usize>();
+        let webhooks = self
+            .webhooks
+            .receivers
+            .values()
+            .map(|receiver| count(receiver.token.as_ref(), env_id))
+            .sum::<usize>();
+        providers + channels + webhooks
+    }
 }
 
 /// Formats an optional secret value for Debug output.
@@ -678,6 +721,30 @@ mod tests {
     #[test]
     fn parse_duration_rejects_bare_number() {
         assert!(parse_duration("60").is_err());
+    }
+
+    #[test]
+    fn env_secret_reference_count_counts_shared_providers() {
+        let mut config = crate::test_util::test_config("/tmp/env-ref-count");
+        let shared = crate::config::secret_ref::env_resolved_value("SHARED_KEY", "shared-secret");
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(shared.clone());
+        config.providers.insert(
+            ProviderId::new("secondary"),
+            ProviderConfig::new(
+                "Secondary".to_string(),
+                "https://api.example.com/v1".to_string(),
+                Some(shared),
+                "model".to_string(),
+                HashMap::from([("model".to_string(), ModelConfig::default())]),
+            ),
+        );
+
+        assert_eq!(config.env_secret_reference_count("SHARED_KEY"), 2);
+        assert_eq!(config.env_secret_reference_count("OTHER_KEY"), 0);
     }
 
     #[test]

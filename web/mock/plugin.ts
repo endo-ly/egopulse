@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Plugin } from "vite";
+import { configMcp, configPayload, configYaml, editExternally, metricsReport, patchConfig, runtimeStatus } from "./metricsConfig";
 
 const AGENTS = [
   { id: "lyre", label: "Lyre", is_default: true },
@@ -1529,6 +1530,31 @@ export function mockApiPlugin(): Plugin | null {
 
         if (pathname === "/api/agents") {
           return sendJson(res, agentsPayload());
+        }
+        if (pathname === "/api/status") {
+          return sendJson(res, runtimeStatus());
+        }
+        if (pathname === "/api/metrics") {
+          return sendJson(res, metricsReport(parsed.searchParams.get("range"), parsed.searchParams.get("agent")));
+        }
+        if (pathname === "/api/config") {
+          return sendJson(res, configPayload());
+        }
+        if (pathname === "/api/config/mcp") {
+          return sendJson(res, configMcp());
+        }
+        if (pathname === "/api/config/yaml") {
+          return sendJson(res, configYaml());
+        }
+        // Dev helper: simulates an edit of the YAML file made outside the WebUI.
+        if (pathname === "/api/__mock/config-external-edit") {
+          editExternally();
+          return sendJson(res, { ok: true });
+        }
+        if (pathname.startsWith("/api/config/") && req.method === "PATCH") {
+          const result = patchConfig(pathname.slice("/api/config/".length), (await readJsonBody(req)) as Record<string, unknown>);
+          res.statusCode = result.status;
+          return sendJson(res, result.body);
         }
         if (pathname === "/api/sessions") {
           return sendJson(res, { ok: true, sessions: SESSIONS });

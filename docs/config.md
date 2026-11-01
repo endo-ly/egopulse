@@ -39,11 +39,11 @@
 - **OpenAI 互換前提**: すべてのプロバイダーは OpenAI 互換 API エンドポイントとして扱う。ベンダー固有 SDK は使わず、`base_url` の切り替えで対応する。
 - **DeepSeek thinking 履歴**: DeepSeek 系プロバイダー（`provider` または `model` に `deepseek` を含む、または `base_url` のホストが `deepseek.com` 配下の場合）は、assistant 応答の `reasoning_content` をセッション内に保持し、次回 Chat Completions 履歴へ戻す。他プロバイダーにはこの追加フィールドを送信しない。
 - **エージェント単位のモデル指定**: プロバイダー・モデルはエージェント定義（`agents.<id>`）に設定する。チャネル単位のモデル指定は廃止。
-- **エージェントファースト**: API キーなどの秘匿値は、YAML では SecretRef として保持し、実値は `~/.egopulse/.env` に保存する。外部 API レスポンスでは `has_api_key` の真偽値のみ返却し、値そのものはマスクする。
+- **エージェントファースト**: API キーなどの秘匿値は、YAML では SecretRef として保持し、実値は `~/.egopulse/.env` に保存する。外部 API レスポンスでは設定の有無と参照名のみ返却し、値そのものは返さない（§11.3）。
 
 ### 1.2 設計上の制約
 
-- **単一プロバイダー生成**: セットアップウィザードは 1 つのプロバイダーのみ生成する。複数プロバイダーの追加は手動で YAML を編集するか WebUI から行う（WebUI によるプロバイダー編集は未対応。制限事項は §9 参照）。
+- **単一プロバイダー生成**: セットアップウィザードは 1 つのプロバイダーのみ生成する。複数プロバイダーの追加は手動で YAML を編集する。既存プロバイダーの base URL・モデル・API キーは WebUI の Config 画面からも編集できる。
 - **チャネル境界**: Web / Discord / Telegram / Voice は独立した入力面として session を分離する。プロバイダーとモデルはチャネルではなく選択された Agent の設定から解決する。
 - **ホットリロード対応と非対応の分離**: 一部フィールドは設定変更後に即座に反映される。サーバーの再起動が必要なフィールドもある（§11 参照）。
 
@@ -401,7 +401,7 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 | `sleep_batch.reasoning_effort` | `string \| null` | 任意 | `null` | Sleep Batch 用の推論量。設定時は Chat Completions の `reasoning_effort`、Responses API の `reasoning.effort` へそのまま渡す |
 | `sleep_batch.schedule` | `string \| null` | 任意 | `null` | 自動実行時刻（`HH:MM` 形式、例: `04:00`）。`enabled: true` 時は必須 |
 | `sleep_batch.agents` | `list \| null` | 任意 | `null` | 実行対象 agent ID のリスト。`null` は全 agent（default_agent 優先）。空リストは実行なし |
-| `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 失敗時の最大再試行回数 |
+| `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 初回を含む最大試行回数（1 以上） |
 | `sleep_batch.retry.interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
 
 ### 3.8 Pulse 設定（`pulse`）
@@ -621,11 +621,15 @@ SecretRef 解決は以下の 2 層で構成される。
 1. **Layer 1: YAML SecretRef 解決** — `{ source: env, id: X }` をプロセス環境変数 → `.env` ファイルの順で解決
 2. **Layer 2: プロセス環境変数オーバーライド** — `WEB_AUTH_TOKEN` 等が Layer 1 の結果を上書き（§6 参照）
 
+解決元は保持される。プロセス環境変数から解決した値は Egopulse の管理外として扱い、設定保存時に `.env` へコピーしない。`.env` から解決した値、および setup / WebUI が新たに保存する値だけを `.env` に書き込む。
+
+同じ `env` の `id` を複数の SecretRef が参照する場合、それらの解決値は一致していなければならない。異なる値のまま保存しようとすると `config_secret_conflict` で拒否する。WebUI から共有参照の API key を置換した場合は、その provider 専用の参照名へ切り替える。
+
 ### 5.5 環境変数名の規約
 
 | 用途 | 環境変数名 |
 |---|---|
-| プロバイダー API キー | `{PROVIDER_ID}_API_KEY`（例: `OPENAI_API_KEY`） |
+| プロバイダー API キー | `{PROVIDER_ID}_API_KEY`（例: `OPENAI_API_KEY`）。この名前がプロセス環境変数で上書きされている場合、WebUI からの新規保存は `EGOPULSE_{PROVIDER_ID}_API_KEY` を使う |
 | Web 認証トークン | `WEB_AUTH_TOKEN` |
 | Voice 認証トークン | 任意の SecretRef ID（推奨: `EGOPULSE_VOICE_AUTH_TOKEN`） |
 | Discord Bot トークン | `DISCORD_BOT_TOKEN` |
@@ -796,14 +800,14 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 |---------|:---:|:---:|------|
 | YAML 手動編集 | 全フィールド | 全フィールド | `~/.egopulse/egopulse.config.yaml` |
 | Setup Wizard | — | Agent / Provider / Model / Web / Discord / Telegram 初期設定 | 初回セットアップ・再セットアップ |
-| WebUI (`/api/config`) | 現在の snapshot | 公開フィールド | ランタイム中の設定変更 |
+| WebUI (`/api/config`) | 現在の snapshot | General / Agent / Provider / Sleep / Pulse の再起動不要フィールド | ランタイム中の設定変更 |
 | スラッシュコマンド (`/provider`, `/model`) | 現在の snapshot | プロバイダー・モデル | ランタイム中の動的切替 |
 
 設定 YAML と同じディレクトリの `.env` を含む設定ソース全体は 250ms 間隔で監視し、2回の観測に相当する 500ms の debounce 後に安定した内容を読み込む。妥当性検証または再起動必須フィールドの検証に失敗した編集は現在の snapshot を変更しない。ファイルが一時的に存在しない場合も、復旧するまで現在の snapshot を保持する。
 
 設定を保存すると YAML と `.env` に同じ永続化世代マーカーを記録する。両ファイルのマーカーが一致しない場合は、異なる書き込み世代を混在させないため設定の読み込みを拒否する。
 
-Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返す。`PUT /api/config` はリクエストの `expected_fingerprint` が現在値と一致する場合だけ更新し、不一致なら `409 Conflict` を返す。Sleep / Pulse scheduler は設定変更通知を購読し、無効状態から有効状態へ変更された場合も同じプロセス内で動作を開始する。
+Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返す。`PATCH /api/config/*` はリクエストの `expected_fingerprint` が現在値と一致する場合だけ更新し、不一致なら `409 Conflict` を返す。Sleep / Pulse scheduler は設定変更通知を購読し、無効状態から有効状態へ変更された場合も同じプロセス内で動作を開始する。
 
 ---
 
@@ -850,15 +854,19 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 ### 11.3 秘匿フィールド
 
-以下のフィールドは API レスポンスでマスクされ、値そのものを返却しない。
+以下のフィールドは API レスポンスで値を返さない。`GET /api/config` は秘密の状態（`kind`: `env` / `exec` / `literal`、`env` の参照名と取得元、設定有無）だけを返す（[api.md §2.4](./api.md#24-設定)）。`env` の取得元はプロセス環境変数（`process`）または `.env`（`dotenv`）で、前者は WebUI から変更できない。
 
-| フィールド | API での表現 |
-|---|---|
-| `providers.<id>.api_key` | `has_api_key: boolean` |
-| `channels.web.auth_token` | `web_auth_enabled: boolean` |
-| `channels.voice.auth_token` | 返却なし |
-| `channels.discord.bots.<bot_id>.token` | 返却なし |
-| `channels.telegram.telegram_bots.<bot_id>.token` | 返却なし |
+| フィールド |
+|---|
+| `providers.<id>.api_key` |
+| `providers.<id>.headers.*`（名前のみ返す） |
+| `channels.web.auth_token` |
+| `channels.voice.auth_token` |
+| `channels.discord.bots.<bot_id>.token` |
+| `channels.telegram.telegram_bots.<bot_id>.token` |
+| `webhooks.receivers.<id>.token` |
+
+`exec` SecretRef のコマンドも返さない。
 
 ---
 
@@ -883,7 +891,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 1. `expected_fingerprint` と現在 snapshot の fingerprint を比較する。
 2. 候補を検証し、再起動必須フィールドの変更を拒否する。
 3. 設定ソースの現在 fingerprint をロック下で確認する。
-4. 設定 YAML と SecretRef（値は `.env`）を同じロック下で安全に永続化する。
+4. 設定 YAML と `.env` が管理する SecretRef の値を同じロック下で安全に永続化する。プロセス環境変数から解決した値は `.env` に複製しない。
 5. 新しい snapshot を交換し、`revision` / `fingerprint` と watch 通知を公開する。
 
 永続化または検証に失敗した場合は snapshot を交換しない。`revision` は成功した交換でのみ進み、同一 fingerprint の更新は no-op になる。

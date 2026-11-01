@@ -295,6 +295,20 @@ fn load_all_server_configs(
     Ok(all)
 }
 
+/// The effective server definitions (a later file overrides an earlier one
+/// of the same name), sorted by name.
+pub(crate) fn configured_server_definitions(
+    workspace_dir: &Path,
+) -> Result<Vec<(String, McpServerConfig)>, ConfigError> {
+    let mut servers: HashMap<String, McpServerConfig> = HashMap::new();
+    for (name, config) in load_all_server_configs(workspace_dir)? {
+        servers.insert(name, config);
+    }
+    let mut servers: Vec<_> = servers.into_iter().collect();
+    servers.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(servers)
+}
+
 fn read_mcp_config_file(path: &Path) -> Result<McpConfigFile, McpError> {
     let contents = std::fs::read_to_string(path).map_err(|source| McpError::ConfigReadFailed {
         path: path.to_path_buf(),

@@ -216,6 +216,17 @@ impl ConfigManager {
         candidate: Config,
         expected_fingerprint: Option<&str>,
     ) -> Result<Arc<ConfigSnapshot>, EgoPulseError> {
+        self.apply_candidate_with_removed_dotenv_keys(candidate, expected_fingerprint, &[])
+    }
+
+    /// Applies a candidate and deletes the named secrets from `.env` when the
+    /// resulting config no longer references them.
+    pub(crate) fn apply_candidate_with_removed_dotenv_keys(
+        &self,
+        candidate: Config,
+        expected_fingerprint: Option<&str>,
+        removed_dotenv_keys: &[String],
+    ) -> Result<Arc<ConfigSnapshot>, EgoPulseError> {
         let (current, path) = {
             let _update_guard = self
                 .update_lock
@@ -265,6 +276,7 @@ impl ConfigManager {
             &candidate,
             &path,
             &current.fingerprint,
+            removed_dotenv_keys,
         )?;
         let snapshot = Arc::new(ConfigSnapshot::with_fingerprint(
             revision,
@@ -570,6 +582,47 @@ mod tests {
         assert_eq!(changes.borrow().revision, after.revision);
         let persisted = Config::load_allow_missing_api_key(Some(&path)).expect("reload config");
         assert_eq!(persisted.timezone, "Asia/Tokyo");
+    }
+
+    #[test]
+    fn apply_candidate_removes_secrets_from_dotenv() {
+        let (dir, manager, _path) = file_manager();
+        let before = manager.current_blocking();
+        let mut with_secret = before.config.clone();
+        let old_secret = crate::config::secret_ref::env_resolved_value("REMOVE_ME", "old-secret");
+        with_secret
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(old_secret);
+        let with_secret = manager
+            .apply_candidate(with_secret, Some(&before.fingerprint))
+            .expect("save secret");
+        let env_path = dir.path().join(".env");
+        assert!(
+            std::fs::read_to_string(&env_path)
+                .expect(".env")
+                .contains("REMOVE_ME=old-secret")
+        );
+
+        let mut candidate = with_secret.config.clone();
+        let new_secret = crate::config::secret_ref::env_resolved_value("KEEP_ME", "new-secret");
+        candidate
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("provider")
+            .api_key = Some(new_secret);
+        manager
+            .apply_candidate_with_removed_dotenv_keys(
+                candidate,
+                Some(&with_secret.fingerprint),
+                &["REMOVE_ME".into()],
+            )
+            .expect("remove secret");
+
+        let dotenv = std::fs::read_to_string(&env_path).expect(".env");
+        assert!(!dotenv.contains("REMOVE_ME"));
+        assert!(dotenv.contains("KEEP_ME=new-secret"));
     }
 
     #[test]

@@ -522,27 +522,27 @@ pub(super) fn default_web_port() -> u16 {
     10961
 }
 
-pub(super) fn default_compaction_timeout_secs() -> u64 {
+pub(crate) fn default_compaction_timeout_secs() -> u64 {
     180
 }
 
-pub(super) fn default_max_history_messages() -> usize {
+pub(crate) fn default_max_history_messages() -> usize {
     50
 }
 
-pub(super) fn default_context_window_tokens() -> usize {
+pub(crate) fn default_context_window_tokens() -> usize {
     32768
 }
 
-pub(super) fn default_compaction_threshold_ratio() -> f64 {
+pub(crate) fn default_compaction_threshold_ratio() -> f64 {
     0.80
 }
 
-pub(super) fn default_compaction_target_ratio() -> f64 {
+pub(crate) fn default_compaction_target_ratio() -> f64 {
     0.40
 }
 
-pub(super) fn default_compact_keep_recent() -> usize {
+pub(crate) fn default_compact_keep_recent() -> usize {
     20
 }
 

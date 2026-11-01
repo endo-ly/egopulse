@@ -1412,6 +1412,31 @@ fn apply_web_channel_env_overrides(channels: &mut HashMap<ChannelName, ChannelCo
     }
 }
 
+/// Config fields currently overridden by an environment variable, as
+/// `(field path, variable name)`. Mirrors the overrides `build_config` applies.
+pub(crate) fn active_env_overrides() -> Vec<(&'static str, &'static str)> {
+    let mut overrides = Vec::new();
+    if env_var("LOG_LEVEL").is_some() {
+        overrides.push(("log_level", "LOG_LEVEL"));
+    }
+    if env_var("WEB_HOST").is_some() {
+        overrides.push(("channels.web.host", "WEB_HOST"));
+    }
+    if env_var("WEB_PORT").is_some_and(|value| value.parse::<u16>().is_ok()) {
+        overrides.push(("channels.web.port", "WEB_PORT"));
+    }
+    if env_var("WEB_ENABLED").is_some_and(|value| parse_bool(&value).is_some()) {
+        overrides.push(("channels.web.enabled", "WEB_ENABLED"));
+    }
+    if env_var(WEB_AUTH_TOKEN_ENV_NAME).is_some() {
+        overrides.push(("channels.web.auth_token", WEB_AUTH_TOKEN_ENV_NAME));
+    }
+    if env_var("WEB_ALLOWED_ORIGINS").is_some() {
+        overrides.push(("channels.web.allowed_origins", "WEB_ALLOWED_ORIGINS"));
+    }
+    overrides
+}
+
 fn env_var(key: &str) -> Option<String> {
     env::var(key)
         .ok()

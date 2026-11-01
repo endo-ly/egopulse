@@ -158,6 +158,11 @@ pub enum ConfigError {
         yaml: Option<String>,
         dotenv: Option<String>,
     },
+    /// Two `env` SecretRefs resolved to different values for the same
+    /// environment variable. Saving either value would make the persisted
+    /// result depend on traversal order.
+    #[error("config_secret_conflict: env={env}")]
+    ConfigSecretConflict { env: String },
     /// The candidate changes a field that requires a process restart. Restore
     /// the field and restart the process when that change is required.
     #[error("config_reload_forbidden: field={field}; restart required")]

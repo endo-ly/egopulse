@@ -83,6 +83,7 @@ pub(crate) mod backup;
 mod chat;
 mod episode;
 mod llm_usage;
+mod metrics;
 mod migration;
 mod pulse;
 mod sleep;
@@ -90,6 +91,10 @@ mod tool;
 mod turn;
 
 pub(crate) use backup::BackupSettings;
+pub(crate) use metrics::{
+    AgentActivity, FailureRecord, FailureSource, PulseIntentionUsage, SleepRunCount,
+    SleepUsageMinute, ToolCallCount, TurnFact, UsageMinute,
+};
 pub(crate) use tool::{
     ClaimOutcome, ClaimParams, ReadOnlyToolOutcome, canonical_tool_input, input_hash,
 };

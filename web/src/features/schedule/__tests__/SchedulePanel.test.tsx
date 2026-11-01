@@ -171,6 +171,7 @@ function renderPanel(authToken: string, view: ScheduleView = SCHEDULE_ACTIVITY) 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("SchedulePanel", () => {
@@ -200,6 +201,8 @@ describe("SchedulePanel", () => {
   });
 
   it("merges_both_histories_by_day_and_collapses_quiet_runs_until_asked", async () => {
+    // Keep the fixture runs inside one local day even when CI runs near midnight.
+    vi.spyOn(Date, "now").mockReturnValue(new Date(2026, 10, 1, 12, 0, 0).getTime());
     // Arrange
     stubApi({
       pulseRuns: [
