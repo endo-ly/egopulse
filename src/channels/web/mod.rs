@@ -29,6 +29,7 @@ mod agent_profile;
 mod agents;
 pub(crate) mod auth;
 mod config;
+mod metrics;
 pub(crate) mod health;
 mod pulse;
 mod sessions;
@@ -560,6 +561,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/sleep/runs/{run_id}", get(sleep::get_sleep_run_detail))
         .route("/api/pulse/runs", get(pulse::list_pulse_runs))
         .route("/api/pulse/runs/{run_id}", get(pulse::get_pulse_run_detail))
+        .route("/api/metrics", get(metrics::get_metrics))
         .route("/api/status", get(health::status))
         .route("/telemetry", get(health::telemetry_handler))
         .route_layer(middleware::from_fn_with_state(
