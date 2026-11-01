@@ -7,7 +7,13 @@ import { AgentPanel } from "../features/agent/AgentPanel";
 import { AGENT_QUERY_PREFIX } from "../features/agent/agentQuery";
 import { SchedulePanel } from "../features/schedule/SchedulePanel";
 import { SCHEDULE_QUERY_PREFIX } from "../features/schedule/scheduleQuery";
-import { EmptyState } from "../shared/ui/EmptyState";
+import { MetricsPanel, type MetricsFilters } from "../features/metrics/MetricsPanel";
+import { METRICS_QUERY_PREFIX } from "../features/metrics/metricsQuery";
+import { ConfigPanel } from "../features/config/ConfigPanel";
+import { CONFIG_QUERY_PREFIX } from "../features/config/configQuery";
+import type { ConfigSection } from "../features/config/configSections";
+import { METRICS_RANGES, type MetricsRange } from "../shared/api/metrics";
+import { confirmDiscardUnsaved } from "../shared/lib/unsaved";
 import { Toast } from "../shared/ui/Toast";
 import { useChatTransport } from "../features/chat/useChatTransport";
 import { useChatHistory } from "../features/chat/useChatHistory";
@@ -28,7 +34,7 @@ import {
   type AppRoute,
   type ScheduleView,
 } from "./router";
-import { NAV_TABS, isAgentTab, type TabId } from "./navigation";
+import { isAgentTab, type TabId } from "./navigation";
 import { resolveAutoSessionKey } from "./sessionSelection";
 
 /** Extracts the chat id from a canonical `chat:{id}` session key. */
@@ -62,18 +68,49 @@ function initialRoute(): AppRoute | null {
   return pathname === null ? null : parseRoute(pathname);
 }
 
-const COMING_SOON_ICON = (
-  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
-    <circle cx="12" cy="12" r="9" />
-    <path d="M12 7v5l3 2" strokeLinecap="round" strokeLinejoin="round" />
-  </svg>
-);
+const DEFAULT_METRICS_FILTERS: MetricsFilters = { range: "7d", agentId: null };
+
+function isMetricsRange(value: string | null): value is MetricsRange {
+  return (METRICS_RANGES as readonly (string | null)[]).includes(value);
+}
+
+/** Metrics filters live in the query string (`?range=&agent=`). */
+function readMetricsFilters(): MetricsFilters {
+  try {
+    const params = new URLSearchParams(globalThis.location.search);
+    const range = params.get("range");
+    return {
+      range: isMetricsRange(range) ? range : DEFAULT_METRICS_FILTERS.range,
+      agentId: params.get("agent") || null,
+    };
+  } catch {
+    return DEFAULT_METRICS_FILTERS;
+  }
+}
+
+/** Writes the filters while Metrics is shown and clears them elsewhere. */
+function syncMetricsFilters(filters: MetricsFilters | null): void {
+  try {
+    const url = new URL(globalThis.location.href);
+    const before = url.search;
+    url.searchParams.delete("range");
+    url.searchParams.delete("agent");
+    if (filters) {
+      if (filters.range !== DEFAULT_METRICS_FILTERS.range) url.searchParams.set("range", filters.range);
+      if (filters.agentId) url.searchParams.set("agent", filters.agentId);
+    }
+    if (url.search !== before) globalThis.history.replaceState(null, "", url.toString());
+  } catch {
+    // Non-browser environment: nothing to sync.
+  }
+}
 
 /** Per-screen selections that a route carries besides the tab and agent. */
 interface ScreenSelection {
   sessionKey: string | null;
   agentSection: AgentSection;
   scheduleView: ScheduleView;
+  configSection: ConfigSection;
 }
 
 function composeRoute(tab: TabId, agentId: string, selection: ScreenSelection): AppRoute {
@@ -85,8 +122,9 @@ function composeRoute(tab: TabId, agentId: string, selection: ScreenSelection): 
     case "schedule":
       return { tab, agentId, view: selection.scheduleView };
     case "metrics":
-    case "config":
       return { tab };
+    case "config":
+      return { tab, section: selection.configSection };
   }
 }
 
@@ -121,6 +159,10 @@ export function WebUI() {
   const [scheduleView, setScheduleView] = useState<ScheduleView>(
     bootRoute?.tab === "schedule" ? bootRoute.view : SCHEDULE_ACTIVITY,
   );
+  const [configSection, setConfigSection] = useState<ConfigSection>(
+    bootRoute?.tab === "config" ? bootRoute.section : "general",
+  );
+  const [metricsFilters, setMetricsFilters] = useState<MetricsFilters>(readMetricsFilters);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [messageJump, setMessageJump] = useState<{
     index: number;
@@ -200,13 +242,33 @@ export function WebUI() {
         sessionKey: urlSessionKey,
         agentSection,
         scheduleView,
+        configSection,
       }),
       true,
     );
-  }, [activeTab, agentSection, scheduleView, selectedAgent, urlSessionKey]);
+  }, [activeTab, agentSection, configSection, scheduleView, selectedAgent, urlSessionKey]);
+
+  useEffect(() => {
+    syncMetricsFilters(activeTab === "metrics" ? metricsFilters : null);
+  }, [activeTab, metricsFilters]);
+
+  // The address before a back/forward navigation, restored when the user
+  // keeps unsaved edits instead of leaving them.
+  const lastHrefRef = useRef<string | null>(null);
+  useEffect(() => {
+    try {
+      lastHrefRef.current = globalThis.location.href;
+    } catch {
+      lastHrefRef.current = null;
+    }
+  });
 
   useEffect(() => {
     const onPopState = () => {
+      if (!confirmDiscardUnsaved()) {
+        if (lastHrefRef.current) globalThis.history.pushState(null, "", lastHrefRef.current);
+        return;
+      }
       const pathname = currentPathname();
       const route = pathname === null ? null : parseRoute(pathname);
       if (!route) return;
@@ -214,6 +276,8 @@ export function WebUI() {
       if ("agentId" in route && route.agentId) setSelectedAgent(route.agentId);
       if (route.tab === "agent") setAgentSection(route.section);
       if (route.tab === "schedule") setScheduleView(route.view);
+      if (route.tab === "config") setConfigSection(route.section);
+      if (route.tab === "metrics") setMetricsFilters(readMetricsFilters());
       if (route.tab === "chat" && route.sessionKey) {
         setSelectedSession(route.sessionKey);
         setSessionExplicit(true);
@@ -229,6 +293,7 @@ export function WebUI() {
   // Selecting a session always shows it in Chat, from whichever screen asked.
   const handleSelectSession = useCallback(
     (key: string) => {
+      if (!confirmDiscardUnsaved()) return;
       setActiveTab("chat");
       setSelectedSession(key);
       setSessionExplicit(true);
@@ -240,6 +305,7 @@ export function WebUI() {
 
   const handleSelectAgent = useCallback(
     (id: string) => {
+      if (!confirmDiscardUnsaved()) return;
       // Global screens are agent-independent; picking an agent there opens
       // that agent's Agent screen.
       const tab = isAgentTab(activeTab) ? activeTab : "agent";
@@ -249,24 +315,49 @@ export function WebUI() {
       setDraftSessionKey(createSessionKey());
       // Runs and intentions belong to the previous agent.
       setScheduleView(SCHEDULE_ACTIVITY);
-      navigateTo(composeRoute(tab, id, { sessionKey: null, agentSection, scheduleView: SCHEDULE_ACTIVITY }));
+      navigateTo(
+        composeRoute(tab, id, { sessionKey: null, agentSection, scheduleView: SCHEDULE_ACTIVITY, configSection }),
+      );
     },
-    [activeTab, agentSection],
+    [activeTab, agentSection, configSection],
   );
 
   const handleTabChange = useCallback(
     (tab: TabId) => {
+      if (tab !== activeTab && !confirmDiscardUnsaved()) return;
       setActiveTab(tab);
       navigateTo(
         composeRoute(tab, selectedAgent, {
           sessionKey: urlSessionKey,
           agentSection,
           scheduleView,
+          configSection,
         }),
       );
     },
-    [agentSection, scheduleView, selectedAgent, urlSessionKey],
+    [activeTab, agentSection, configSection, scheduleView, selectedAgent, urlSessionKey],
   );
+
+  const handleSelectConfigSection = useCallback((section: ConfigSection) => {
+    if (!confirmDiscardUnsaved()) return;
+    setActiveTab("config");
+    setConfigSection(section);
+    navigateTo({ tab: "config", section });
+  }, []);
+
+  /** Opens a screen of a specific agent from a global screen. */
+  const openAgentScreen = useCallback((agentId: string, route: AppRoute) => {
+    setSelectedAgent(agentId);
+    setActiveTab(route.tab);
+    if (route.tab === "agent") setAgentSection(route.section);
+    if (route.tab === "schedule") setScheduleView(route.view);
+    if (route.tab === "chat" && route.sessionKey) {
+      setSelectedSession(route.sessionKey);
+      setSessionExplicit(true);
+      setDraftSessionKey(createSessionKey());
+    }
+    navigateTo(route);
+  }, []);
 
   const handleSelectAgentSection = useCallback(
     (section: AgentSection) => {
@@ -284,6 +375,25 @@ export function WebUI() {
       navigateTo({ tab: "schedule", agentId: selectedAgent, view });
     },
     [selectedAgent],
+  );
+
+  const handleOpenAgentOverview = useCallback(
+    (agentId: string) => openAgentScreen(agentId, { tab: "agent", agentId, section: "overview" }),
+    [openAgentScreen],
+  );
+  const handleOpenAgentSession = useCallback(
+    (agentId: string, sessionKey: string) => openAgentScreen(agentId, { tab: "chat", agentId, sessionKey }),
+    [openAgentScreen],
+  );
+  const handleOpenAgentRun = useCallback(
+    (agentId: string, kind: "pulse" | "sleep", runId: string) =>
+      openAgentScreen(agentId, { tab: "schedule", agentId, view: { section: "activity", run: { kind, id: runId } } }),
+    [openAgentScreen],
+  );
+  const handleOpenAgentSchedule = useCallback(
+    (agentId: string) =>
+      openAgentScreen(agentId, { tab: "schedule", agentId, view: { section: "pulse", intentionId: null } }),
+    [openAgentScreen],
   );
 
   const handleOpenSleepRun = useCallback(
@@ -412,6 +522,10 @@ export function WebUI() {
       invalidateQueries(SCHEDULE_QUERY_PREFIX);
     } else if (activeTab === "agent") {
       invalidateQueries(AGENT_QUERY_PREFIX);
+    } else if (activeTab === "metrics") {
+      invalidateQueries(METRICS_QUERY_PREFIX);
+    } else if (activeTab === "config") {
+      invalidateQueries(CONFIG_QUERY_PREFIX);
     }
   };
 
@@ -458,6 +572,9 @@ export function WebUI() {
         activeTab={activeTab}
         agentSection={agentSection}
         scheduleView={scheduleView}
+        configSection={configSection}
+        metricsFilters={metricsFilters}
+        onSelectConfigSection={handleSelectConfigSection}
         onSelectAgentSection={handleSelectAgentSection}
         onChangeScheduleView={handleChangeScheduleView}
         healthStatus={transport.connectionState === "closed" ? "degraded" : "ok"}
@@ -496,12 +613,18 @@ export function WebUI() {
               onChangeView={handleChangeScheduleView}
               onOpenSession={handleSelectSession}
             />
-          ) : activeTab === "metrics" || activeTab === "config" ? (
-            <EmptyState
-              icon={COMING_SOON_ICON}
-              title={NAV_TABS.find((tab) => tab.id === activeTab)?.label ?? activeTab}
-              description="This screen is coming soon."
+          ) : activeTab === "metrics" ? (
+            <MetricsPanel
+              authToken={authToken}
+              agents={agents}
+              filters={metricsFilters}
+              onChangeFilters={setMetricsFilters}
+              onOpenAgent={handleOpenAgentOverview}
+              onOpenSession={handleOpenAgentSession}
+              onOpenRun={handleOpenAgentRun}
             />
+          ) : activeTab === "config" ? (
+            <ConfigPanel authToken={authToken} section={configSection} onOpenSchedule={handleOpenAgentSchedule} />
           ) : null
         }
       />

@@ -1,3 +1,5 @@
+import { isConfigSection, type ConfigSection } from "../features/config/configSections";
+
 /** Agent screen sections; `overview` is the agent's root page. */
 export const AGENT_SECTIONS = ["overview", "soul", "rules", "secret", "memory", "skills"] as const;
 export type AgentSection = (typeof AGENT_SECTIONS)[number];
@@ -26,7 +28,8 @@ export type AppRoute =
   | { tab: "agent"; agentId: string; section: AgentSection }
   | { tab: "schedule"; agentId: string; view: ScheduleView }
   | { tab: "metrics" }
-  | { tab: "config" };
+  /** `general` is the config root, so it has no segment of its own. */
+  | { tab: "config"; section: ConfigSection };
 
 function isAgentSection(value: string): value is AgentSection {
   return (AGENT_SECTIONS as readonly string[]).includes(value);
@@ -108,8 +111,13 @@ export function parseRoute(pathname: string): AppRoute | null {
     const [, agentId, ...rest] = segments;
     return agentId ? parseAgentScoped(agentId, rest) : null;
   }
-  if (segments.length === 1 && (segments[0] === "metrics" || segments[0] === "config")) {
-    return { tab: segments[0] };
+  if (segments.length === 1 && segments[0] === "metrics") {
+    return { tab: "metrics" };
+  }
+  if (segments[0] === "config" && segments.length <= 2) {
+    const section = segments[1] ?? "general";
+    if (segments.length === 2 && section === "general") return null;
+    return isConfigSection(section) ? { tab: "config", section } : null;
   }
   return null;
 }
@@ -119,8 +127,9 @@ export function parseRoute(pathname: string): AppRoute | null {
  * cannot be represented (e.g. an agent-scoped route without an agent).
  */
 export function buildRoutePath(route: AppRoute): string | null {
-  if (route.tab === "metrics" || route.tab === "config") {
-    return `/${route.tab}`;
+  if (route.tab === "metrics") return "/metrics";
+  if (route.tab === "config") {
+    return route.section === "general" ? "/config" : `/config/${route.section}`;
   }
   if (!route.agentId) {
     // "/" is the boot view: chat on the default agent, no explicit session.

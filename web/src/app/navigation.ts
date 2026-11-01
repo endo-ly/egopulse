@@ -17,10 +17,10 @@ export const AGENT_TABS: NavTab<AgentTabId>[] = [
   { id: "schedule", label: "Schedule", disabled: false },
 ];
 
-/** Global screens in display order (sidebar footer). Disabled ones are placeholders. */
+/** Global screens in display order (sidebar footer). */
 export const GLOBAL_TABS: NavTab<GlobalTabId>[] = [
-  { id: "metrics", label: "Metrics", disabled: true },
-  { id: "config", label: "Config", disabled: true },
+  { id: "metrics", label: "Metrics", disabled: false },
+  { id: "config", label: "Config", disabled: false },
 ];
 
 export const NAV_TABS: NavTab[] = [...AGENT_TABS, ...GLOBAL_TABS];

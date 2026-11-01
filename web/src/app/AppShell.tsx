@@ -6,6 +6,10 @@ import { AgentsSection } from "./shell/AgentsSection";
 import { SessionsSection } from "./shell/SessionsSection";
 import { AgentSectionNav } from "../features/agent/AgentSectionNav";
 import { ScheduleSectionNav } from "../features/schedule/ScheduleSectionNav";
+import { MetricsSectionNav } from "../features/metrics/MetricsSectionNav";
+import type { MetricsFilters } from "../features/metrics/MetricsPanel";
+import { ConfigSectionNav } from "../features/config/ConfigSectionNav";
+import type { ConfigSection } from "../features/config/configSections";
 import { SCHEDULE_ACTIVITY, type AgentSection, type ScheduleView } from "./router";
 import type { HealthStatus } from "./runtimeStatus";
 import type { TabId } from "./navigation";
@@ -22,6 +26,11 @@ export interface AppProps {
   agentSection?: AgentSection;
   /** Current Schedule screen state; drives the Schedule sidebar context. */
   scheduleView?: ScheduleView;
+  /** Current Config section; drives the Config sidebar context. */
+  configSection?: ConfigSection;
+  /** Metrics range and agent; the sidebar summaries follow them. */
+  metricsFilters?: MetricsFilters;
+  onSelectConfigSection?: (section: ConfigSection) => void;
   healthStatus?: HealthStatus;
   onSelectAgent?: (id: string) => void;
   onSelectSession?: (key: string) => void;
@@ -52,6 +61,9 @@ export function App({
   activeTab = "chat",
   agentSection = "overview",
   scheduleView = SCHEDULE_ACTIVITY,
+  configSection = "general",
+  metricsFilters = { range: "7d", agentId: null },
+  onSelectConfigSection = noop,
   healthStatus = "ok",
   onSelectAgent = noop,
   onSelectSession = noop,
@@ -175,6 +187,10 @@ export function App({
     onChangeScheduleView(view);
     dismissOverlayOnMobile();
   };
+  const handleSelectConfigSection = (section: ConfigSection) => {
+    onSelectConfigSection(section);
+    dismissOverlayOnMobile();
+  };
 
   let context: ReactNode = null;
   if (activeTab === "chat") {
@@ -205,6 +221,16 @@ export function App({
         authToken={authToken ?? ""}
         section={scheduleView.section}
         onChangeView={handleChangeScheduleView}
+      />
+    );
+  } else if (activeTab === "metrics") {
+    context = <MetricsSectionNav authToken={authToken ?? ""} filters={metricsFilters} />;
+  } else if (activeTab === "config") {
+    context = (
+      <ConfigSectionNav
+        authToken={authToken ?? ""}
+        section={configSection}
+        onSelectSection={handleSelectConfigSection}
       />
     );
   }

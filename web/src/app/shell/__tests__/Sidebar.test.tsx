@@ -77,8 +77,7 @@ describe("Sidebar", () => {
     const globals = Array.from(footer.querySelectorAll("button.footer-tab"));
     expect(globals.map((button) => button.textContent)).toEqual(["Metrics", "Config"]);
     for (const button of globals) {
-      expect(button.hasAttribute("disabled")).toBe(true);
-      expect(button.getAttribute("title")).toContain("coming soon");
+      expect(button.hasAttribute("disabled")).toBe(false);
     }
   });
 

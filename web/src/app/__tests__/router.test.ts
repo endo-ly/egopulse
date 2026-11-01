@@ -16,7 +16,9 @@ describe("router", () => {
       sessionKey: "web-chat",
     });
     expect(parseRoute("/metrics")).toEqual({ tab: "metrics" });
-    expect(parseRoute("/config")).toEqual({ tab: "config" });
+    expect(parseRoute("/config")).toEqual({ tab: "config", section: "general" });
+    expect(parseRoute("/config/providers")).toEqual({ tab: "config", section: "providers" });
+    expect(parseRoute("/config/web-fetch")).toEqual({ tab: "config", section: "web-fetch" });
   });
 
   it("router_parses_agent_sections", () => {
@@ -63,6 +65,9 @@ describe("router", () => {
       "/agents/lyre/schedule/runs/pulse/r1/extra",
       "/agents/lyre/schedule/sleep/r1",
       "/metrics/extra",
+      "/config/general",
+      "/config/unknown",
+      "/config/agents/lyre",
       "/nope",
     ];
 
@@ -92,6 +97,8 @@ describe("router", () => {
       "/agents/lyre/schedule/sleep",
       "/metrics",
       "/config",
+      "/config/agents",
+      "/config/yaml",
     ];
 
     // Act / Assert

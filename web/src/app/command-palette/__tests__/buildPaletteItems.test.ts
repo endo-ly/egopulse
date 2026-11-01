@@ -32,7 +32,7 @@ const messages: ChatMessage[] = [
 ];
 
 describe("buildPaletteItems", () => {
-  it("navigation_lists_every_screen_and_disables_placeholders", () => {
+  it("navigation_lists_every_screen", () => {
     // Arrange / Act
     const items = buildPaletteItems({
       agents: [],
@@ -51,8 +51,8 @@ describe("buildPaletteItems", () => {
       ["Go to Chat", false],
       ["Go to Agent", false],
       ["Go to Schedule", false],
-      ["Go to Metrics", true],
-      ["Go to Config", true],
+      ["Go to Metrics", false],
+      ["Go to Config", false],
     ]);
   });
 

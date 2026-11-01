@@ -41,6 +41,16 @@ export function invalidateQuery(key: string) {
   notify(key);
 }
 
+/**
+ * Replaces the cached data of `key` with a known-fresh value (e.g. the body
+ * of a successful update), dropping any request still in flight for it.
+ */
+export function setQueryData<T>(key: string, data: T) {
+  startRequest(key);
+  cache.set(key, { data, loading: false, error: null, timestamp: Date.now() });
+  notify(key);
+}
+
 export function invalidateQueries(prefix: string) {
   for (const key of cache.keys()) {
     if (key.startsWith(prefix)) {
@@ -65,7 +75,14 @@ export function useServerState<T>(
   key: string,
   fetcher: () => Promise<T>,
   options?: UseServerStateOptions,
-): { data: T | undefined; loading: boolean; error: Error | null; invalidate: () => void } {
+): {
+  data: T | undefined;
+  loading: boolean;
+  error: Error | null;
+  invalidate: () => void;
+  /** Refetches while keeping the current data on screen. */
+  refresh: () => void;
+} {
   const [, forceUpdate] = useState(0);
   const rerender = useCallback(() => forceUpdate((n) => n + 1), []);
 
@@ -174,5 +191,6 @@ export function useServerState<T>(
     loading: entry?.loading ?? false,
     error: entry?.error ?? null,
     invalidate,
+    refresh: refetch,
   };
 }
