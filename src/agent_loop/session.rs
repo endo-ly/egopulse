@@ -347,26 +347,14 @@ pub(crate) async fn load_messages_for_turn_with_limit(
     snapshot_to_loaded(snapshot, Arc::clone(&state.assets)).await
 }
 
-pub(crate) async fn persist_phase_once(
-    state: &TurnDependencies,
-    scope: ConversationScope,
-    message: StoredMessage,
-    messages: &[Message],
-    session_revision: Option<i64>,
-) -> Result<PersistedTurn, EgoPulseError> {
-    store_phase_snapshot(state, scope, message, messages.to_vec(), session_revision)
-        .await
-        .map_err(EgoPulseError::Storage)
-}
-
 /// Commits the user-input message, the session snapshot, and the
 /// `accepted → input_committed` Turn transition in a single database
 /// transaction.
 ///
-/// This is the Turn-ingress counterpart to [`persist_phase_once`]: the
-/// conversation write and the Turn state advance share one SQLite
-/// transaction so a crash between them cannot leave a saved user message
-/// behind a Turn that recovery still considers unstarted.
+/// Turn phases normally persist through [`persist_phase`], which retries once
+/// after a snapshot conflict. The ingress instead shares its transaction with
+/// the Turn state advance so a crash between them cannot leave a saved user
+/// message behind a Turn that recovery still considers unstarted.
 ///
 /// # Errors
 ///

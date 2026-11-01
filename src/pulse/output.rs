@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::agent_loop::session::{
-    PersistedTurn, persist_phase, persist_phase_messages, persist_phase_once,
+    LoadedSession, PersistedTurn, persist_phase, persist_phase_messages,
 };
 use crate::agent_loop::tool_execution::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::channels::utils::text::truncate_by_chars;
@@ -242,6 +242,34 @@ async fn persist_notification_with_session(
     activation_result: &ActivationResult,
     pulse_run_id: &str,
 ) -> Result<String, EgoPulseError> {
+    let loaded = crate::agent_loop::session::load_messages_for_turn(
+        &state.turn_dependencies(),
+        ConversationScope::Normal,
+        chat_id,
+    )
+    .await?;
+
+    persist_notification_with_loaded(
+        state,
+        agent_id,
+        intention,
+        chat_id,
+        activation_result,
+        pulse_run_id,
+        loaded,
+    )
+    .await
+}
+
+async fn persist_notification_with_loaded(
+    state: &AppState,
+    agent_id: &str,
+    intention: &TemporalIntention,
+    chat_id: i64,
+    activation_result: &ActivationResult,
+    pulse_run_id: &str,
+    loaded: LoadedSession,
+) -> Result<String, EgoPulseError> {
     let output_text = &activation_result.output_text;
 
     let synthetic_input = StoredMessage {
@@ -255,23 +283,18 @@ async fn persist_notification_with_session(
         )
     };
 
-    let loaded = crate::agent_loop::session::load_messages_for_turn(
-        &state.turn_dependencies(),
-        ConversationScope::Normal,
-        chat_id,
-    )
-    .await?;
-
+    let synthetic_message = Message::text("user", &synthetic_input.content);
     let mut session_messages = (*loaded.messages).clone();
-    session_messages.push(Message::text("user", &synthetic_input.content));
+    session_messages.push(synthetic_message.clone());
 
     let PersistedTurn {
         mut revision,
         messages: mut session_messages,
-    } = persist_phase_once(
+    } = persist_phase(
         &state.turn_dependencies(),
         ConversationScope::Normal,
         synthetic_input.clone(),
+        synthetic_message,
         &session_messages,
         loaded.session_revision,
     )
@@ -334,12 +357,14 @@ async fn persist_notification_with_session(
         ..StoredMessage::assistant(chat_id, agent_id.to_string(), output_text.to_string())
     };
 
-    session_messages.push(Message::text("assistant", output_text));
+    let assistant_message = Message::text("assistant", output_text);
+    session_messages.push(assistant_message.clone());
 
-    persist_phase_once(
+    persist_phase(
         &state.turn_dependencies(),
         ConversationScope::Normal,
         assistant_msg,
+        assistant_message,
         &session_messages,
         Some(revision),
     )
@@ -681,6 +706,85 @@ mod tests {
             .expect("exists");
         assert_eq!(run.status, crate::storage::PulseRunStatus::Success);
         assert_eq!(run.chat_id, Some(chat_id));
+    }
+
+    #[tokio::test]
+    async fn notify_retries_the_synthetic_input_after_a_concurrent_session_write() {
+        // Arrange: a web notification is the delivery, so a snapshot conflict
+        // must not drop it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_test_state(&dir);
+        let agent_id = "lyre";
+        let intention = test_intention("conflict_review");
+        let pulse_run_id = "run-conflict-001";
+        let notification_text = "Retried notification.";
+
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "web:conflict:agent:lyre", "web", agent_id)
+            .expect("chat");
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
+
+        let seed = StoredMessage::user(chat_id, "user:test".to_string(), "seed".to_string());
+        state
+            .db
+            .store_message_with_session(&seed, r#"[{"role":"user","content":"seed"}]"#, None)
+            .expect("seed session");
+        let stale = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("load stale session");
+
+        // Another turn commits to the same session before Pulse persists.
+        let concurrent =
+            StoredMessage::user(chat_id, "user:test".to_string(), "concurrent".to_string());
+        state
+            .db
+            .store_message_with_session(
+                &concurrent,
+                r#"[{"role":"user","content":"seed"},{"role":"user","content":"concurrent"}]"#,
+                stale.session_revision,
+            )
+            .expect("advance session");
+
+        let activation = ActivationResult {
+            output_text: notification_text.to_string(),
+            output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
+        };
+
+        // Act
+        let result = persist_notification_with_loaded(
+            &state,
+            agent_id,
+            &intention,
+            chat_id,
+            &activation,
+            pulse_run_id,
+            stale,
+        )
+        .await;
+
+        // Assert
+        assert!(result.is_ok(), "pulse persistence must retry: {result:?}");
+        let messages = state.db.get_all_messages(chat_id).expect("messages");
+        let contents = messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(contents.len(), 4);
+        assert!(contents.contains(&"seed"));
+        assert!(contents.contains(&"concurrent"));
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.starts_with("[Pulse: conflict_review]")),
+            "synthetic input missing: {contents:?}"
+        );
+        assert!(contents.contains(&notification_text));
     }
 
     #[tokio::test]
