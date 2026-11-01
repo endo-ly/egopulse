@@ -697,7 +697,7 @@ GET /api/agents/{agent_id}/pulse
 | `id` / `enabled` / `attention` | — | PULSE.yaml の値 |
 | `schedule` | `object` | `{kind: "daily", at}` / `{kind: "weekly", day, at}` / `{kind: "interval", interval_days, at}` / `{kind: "once", date, at}` |
 | `delivery` | `object \| null` | intention 固有の配送先。`null` は `default_delivery`（それもなければ直近の会話先）を使う |
-| `target` | `object \| null` | いま発火した場合に通知が届く会話 `{channel, session_key}`。scheduler と同じ解決（`delivery` → `default_delivery` → 直近の Discord / Telegram 会話）で決まる。解決できなければ `null` で、その発火は `skipped` になる |
+| `target` | `object \| null` | いま発火した場合に通知が届く会話 `{channel, session_key}`。scheduler と同じ解決（`delivery` → `default_delivery` → 直近の Discord / Telegram / Web 会話）で決まる。解決できなければ `null` で、その発火は `skipped` になる |
 | `next` | `object \| null` | 次回発火 `{state, at}`。agent または intention が無効なら `null` |
 | `recent_runs` | `array` | 直近 10 件の run `{id, status, output_kind, started_at}`（新しい順） |
 

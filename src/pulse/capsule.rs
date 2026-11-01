@@ -72,9 +72,7 @@ pub(crate) struct HomeSurface {
     pub chat_type: String,
 }
 
-const SENDABLE_CHANNELS: &[&str] = &["discord", "telegram"];
-
-use crate::pulse::definition::DeliverySpec;
+use crate::pulse::definition::{DeliverySpec, VALID_DELIVERY_CHANNELS, parse_web_chat_id};
 
 /// Resolve the home surface for an agent.
 ///
@@ -111,6 +109,20 @@ async fn resolve_explicit(
         return Ok(None);
     }
 
+    // Web is addressed by the WebUI's canonical session ID (`chat:{id}`), not
+    // by a platform chat id. The chat id is global, so the resolved chat must
+    // belong to this channel and agent.
+    if spec.channel == "web" {
+        let Some(chat_id) = parse_web_chat_id(&spec.external_chat_id) else {
+            return Ok(None);
+        };
+        let chat =
+            crate::storage::call_blocking(db.clone(), move |db| db.get_chat_by_id(chat_id)).await?;
+        return Ok(chat
+            .filter(|info| info.channel == "web" && info.agent_id == agent_id)
+            .map(home_surface_from_chat));
+    }
+
     let channel = spec.channel.clone();
     // Users specify raw channel IDs (e.g. "1486391580586672158") but the DB
     // stores them in session-key format (e.g. "discord:1486391580586672158:agent:musa").
@@ -126,12 +138,16 @@ async fn resolve_explicit(
     })
     .await?;
 
-    Ok(chat.map(|c| HomeSurface {
-        chat_id: c.chat_id,
-        channel: c.channel,
-        external_chat_id: c.external_chat_id,
-        chat_type: c.chat_type,
-    }))
+    Ok(chat.map(home_surface_from_chat))
+}
+
+fn home_surface_from_chat(chat: crate::storage::ChatInfo) -> HomeSurface {
+    HomeSurface {
+        chat_id: chat.chat_id,
+        channel: chat.channel,
+        external_chat_id: chat.external_chat_id,
+        chat_type: chat.chat_type,
+    }
 }
 
 async fn resolve_auto(
@@ -139,7 +155,7 @@ async fn resolve_auto(
     agent_id: &str,
     available_channels: &[&str],
 ) -> Result<Option<HomeSurface>, crate::error::StorageError> {
-    let sendable_channels = SENDABLE_CHANNELS
+    let sendable_channels = VALID_DELIVERY_CHANNELS
         .iter()
         .copied()
         .filter(|channel| available_channels.contains(channel))
@@ -353,7 +369,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn home_surface_skips_web_cli_tui_and_uses_previous_sendable_chat() {
+    async fn home_surface_uses_latest_web_chat_when_available() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        let _discord_id = insert_chat(
+            &db,
+            "discord",
+            "discord:111",
+            "dm",
+            "agent-a",
+            "2024-01-01T00:00:00Z",
+        );
+
+        let web_id = insert_chat(
+            &db,
+            "web",
+            "web:session-1:agent:agent-a",
+            "web",
+            "agent-a",
+            "2024-06-01T00:00:00Z",
+        );
+
+        // Act
+        let surface = resolve_home_surface(&db, "agent-a", &["discord", "telegram", "web"], None)
+            .await
+            .expect("resolve")
+            .expect("should find surface");
+
+        // Assert
+        assert_eq!(surface.chat_id, web_id);
+        assert_eq!(surface.channel, "web");
+        assert_eq!(surface.external_chat_id, "web:session-1:agent:agent-a");
+    }
+
+    #[tokio::test]
+    async fn home_surface_skips_chats_on_unavailable_channels() {
         let (db, _dir) = test_db();
 
         let discord_id = insert_chat(
@@ -478,6 +529,117 @@ mod tests {
         assert_eq!(surface.chat_id, chat_id);
         assert_eq!(surface.channel, "discord");
         assert_eq!(surface.external_chat_id, "discord:999:agent:agent-a");
+    }
+
+    #[tokio::test]
+    async fn explicit_web_delivery_resolves_by_session_id() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        let chat_id = insert_chat(
+            &db,
+            "web",
+            "web:session-1:agent:agent-a",
+            "web",
+            "agent-a",
+            "2024-01-01T00:00:00Z",
+        );
+        let spec = DeliverySpec {
+            channel: "web".to_string(),
+            external_chat_id: format!("chat:{chat_id}"),
+        };
+
+        // Act
+        let surface = resolve_home_surface(&db, "agent-a", &["web"], Some(&spec))
+            .await
+            .expect("resolve")
+            .expect("should find surface");
+
+        // Assert
+        assert_eq!(surface.chat_id, chat_id);
+        assert_eq!(surface.channel, "web");
+        assert_eq!(surface.external_chat_id, "web:session-1:agent:agent-a");
+    }
+
+    #[tokio::test]
+    async fn explicit_web_delivery_rejects_another_agents_session() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        let chat_id = insert_chat(
+            &db,
+            "web",
+            "web:session-1:agent:agent-b",
+            "web",
+            "agent-b",
+            "2024-01-01T00:00:00Z",
+        );
+        let spec = DeliverySpec {
+            channel: "web".to_string(),
+            external_chat_id: format!("chat:{chat_id}"),
+        };
+
+        // Act
+        let surface = resolve_home_surface(&db, "agent-a", &["web"], Some(&spec))
+            .await
+            .expect("resolve");
+
+        // Assert
+        assert!(surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_web_delivery_rejects_a_non_web_session() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        let chat_id = insert_chat(
+            &db,
+            "discord",
+            "discord:999:agent:agent-a",
+            "dm",
+            "agent-a",
+            "2024-01-01T00:00:00Z",
+        );
+        let spec = DeliverySpec {
+            channel: "web".to_string(),
+            external_chat_id: format!("chat:{chat_id}"),
+        };
+
+        // Act
+        let surface = resolve_home_surface(&db, "agent-a", &["web"], Some(&spec))
+            .await
+            .expect("resolve");
+
+        // Assert
+        assert!(surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_web_delivery_rejects_an_invalid_session_address() {
+        // Arrange
+        let (db, _dir) = test_db();
+
+        let _chat_id = insert_chat(
+            &db,
+            "web",
+            "web:session-1:agent:agent-a",
+            "web",
+            "agent-a",
+            "2024-01-01T00:00:00Z",
+        );
+        let spec = DeliverySpec {
+            channel: "web".to_string(),
+            external_chat_id: "session-1".to_string(),
+        };
+
+        // Act
+        let surface = resolve_home_surface(&db, "agent-a", &["web"], Some(&spec))
+            .await
+            .expect("resolve");
+
+        // Assert
+        assert!(surface.is_none());
     }
 
     #[tokio::test]

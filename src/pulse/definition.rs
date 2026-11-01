@@ -134,8 +134,21 @@ fn default_true() -> bool {
     true
 }
 
-pub(crate) const VALID_DELIVERY_CHANNELS: &[&str] = &["discord", "telegram"];
+pub(crate) const VALID_DELIVERY_CHANNELS: &[&str] = &["discord", "telegram", "web"];
 const VALID_WEEKDAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+/// Parses a WebUI session address (`chat:{chat_id}`) used as a web delivery target.
+///
+/// The WebUI copies session IDs in this form. Only a positive decimal chat id is
+/// accepted, so a typo cannot silently address another session shape.
+pub(super) fn parse_web_chat_id(external_chat_id: &str) -> Option<i64> {
+    let raw = external_chat_id.strip_prefix("chat:")?;
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let chat_id = raw.parse::<i64>().ok()?;
+    (chat_id > 0).then_some(chat_id)
+}
 
 fn validate_delivery_raw(
     agent_id: &str,
@@ -157,6 +170,14 @@ fn validate_delivery_raw(
         return Err(PulseParseError::InvalidDelivery {
             agent_id: agent_id.to_string(),
             detail: format!("{source}: delivery external_chat_id must not be empty"),
+        });
+    }
+    if channel == "web" && parse_web_chat_id(&external_chat_id).is_none() {
+        return Err(PulseParseError::InvalidDelivery {
+            agent_id: agent_id.to_string(),
+            detail: format!(
+                "{source}: web delivery external_chat_id must be a WebUI session ID (chat:{{id}}), got: {external_chat_id}"
+            ),
         });
     }
     Ok(DeliverySpec {
@@ -1270,7 +1291,7 @@ intentions:
       at: \"09:00\"
     attention: test
     delivery:
-      channel: web
+      channel: cli
       external_chat_id: \"abc\"
 ";
         let err = parse_pulse_definition(content).unwrap_err();
@@ -1278,6 +1299,64 @@ intentions:
             matches!(err, PulseParseError::InvalidDelivery { .. }),
             "expected InvalidDelivery, got: {err}"
         );
+    }
+
+    #[test]
+    fn parse_accepts_web_session_address() {
+        // Arrange
+        let content = "\
+default_delivery:
+  channel: web
+  external_chat_id: \"chat:42\"
+intentions:
+  - id: morning_review
+    schedule:
+      kind: daily
+      at: \"09:00\"
+    attention: test
+    delivery:
+      channel: web
+      external_chat_id: \"chat:7\"
+";
+
+        // Act
+        let result = parse_pulse_definition(content).expect("should parse");
+
+        // Assert
+        assert_eq!(
+            result.default_delivery,
+            Some(DeliverySpec {
+                channel: "web".to_string(),
+                external_chat_id: "chat:42".to_string(),
+            })
+        );
+        assert_eq!(
+            result.intentions[0].delivery,
+            Some(DeliverySpec {
+                channel: "web".to_string(),
+                external_chat_id: "chat:7".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid_web_session_address() {
+        // Arrange: a raw session key and a non-numeric chat id are not WebUI
+        // session addresses.
+        for address in ["session-1", "chat:abc", "chat:-1", "chat:"] {
+            let content = format!(
+                "intentions:\n  - id: morning_review\n    schedule:\n      kind: daily\n      at: \"09:00\"\n    attention: test\n    delivery:\n      channel: web\n      external_chat_id: \"{address}\"\n"
+            );
+
+            // Act
+            let err = parse_pulse_definition(&content).unwrap_err();
+
+            // Assert
+            assert!(
+                matches!(err, PulseParseError::InvalidDelivery { .. }),
+                "expected InvalidDelivery for {address}, got: {err}"
+            );
+        }
     }
 
     #[test]

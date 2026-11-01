@@ -537,6 +537,7 @@ webhooks:
 #### Target validation
 
 - `target.channel` は Config 上の `channels` 定義ではなく、起動中 `ChannelRegistry` の登録状態で判定する
+- Web target は `channels.web.enabled` が有効で `WebAdapter` が登録されている場合のみ受け付ける
 - `target.channel == "voice"` は対象外（Voice は同期 HTTP response を正規応答経路とするため）
 - Discord / Telegram target は、`target.thread` が対応する `channels.<channel>.discord_channels` / `telegram_channels` の登録エントリに解決できる必要がある。解決できない（数値として parse 不能・未登録 thread・channel map 欠落）場合は `Normal` へ降格せず、受付時に `400 invalid_target_scope` として拒否する
 - 解決できた channel の `secret` 値から `ConversationScope` を決定する（`secret: true` なら `Secret`）。Web target は常に `Normal`

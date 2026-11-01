@@ -126,7 +126,7 @@ interface DeliveryDescription {
 
 /**
  * Describes where an intention delivers: its own destination, else the
- * agent's default, else the agent's latest Discord / Telegram conversation.
+ * agent's default, else the agent's latest conversation on a sendable channel.
  * Resolved conversations are named as in the session list.
  */
 export function describeDelivery(

@@ -46,7 +46,7 @@ export function PulseSection({ pulse, sessions, intentionId, onSelectIntention, 
                 <dd>
                   {data.default_delivery
                     ? `${channelLabel(data.default_delivery.channel)} · ${data.default_delivery.external_chat_id}`
-                    : "The latest Discord or Telegram conversation"}
+                    : "The latest conversation"}
                 </dd>
               </div>
             </dl>
@@ -125,7 +125,7 @@ function Intentions({
 const ORIGIN_NOTES = {
   intention: null,
   default: "the agent's default destination",
-  latest: "the agent's latest Discord or Telegram conversation",
+  latest: "the agent's latest conversation",
 } as const;
 
 function IntentionDetail({
@@ -182,7 +182,7 @@ function IntentionDetail({
             ) : (
               <p className="field-warning">
                 {delivery.origin === "latest"
-                  ? "There is no Discord or Telegram conversation to send to yet, so firings are skipped."
+                  ? "There is no conversation to send to yet, so firings are skipped."
                   : "No conversation matches this destination, so firings are skipped."}
               </p>
             )}
