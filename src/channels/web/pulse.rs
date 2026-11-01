@@ -370,6 +370,7 @@ mod tests {
         let config = crate::test_util::test_config(&state_root);
         let mut channels = ChannelRegistry::new();
         channels.register(Arc::new(StubAdapter("discord")));
+        channels.register(Arc::new(StubAdapter("web")));
         let app_state = crate::test_util::build_state_with_config(
             config,
             None,
@@ -506,6 +507,53 @@ intentions:
         // Assert: both intentions point at the same auto-resolved conversation
         let expected =
             serde_json::json!({"channel": "discord", "session_key": format!("chat:{chat_id}")});
+        let intentions = body["pulse"]["intentions"].as_array().expect("intentions");
+        assert_eq!(intentions.len(), 2);
+        for intention in intentions {
+            assert_eq!(intention["target"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_pulse_resolves_web_delivery_targets() {
+        // Arrange: one intention names the WebUI session ID explicitly; the
+        // other relies on the agent's latest conversation, which is the web
+        // chat below.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = web_state(&dir);
+        let chat_id = state
+            .app_state
+            .db
+            .resolve_or_create_chat_id("web", "web:session-1:agent:default", "web", "default")
+            .expect("chat");
+        write_pulse(
+            &dir,
+            &format!(
+                r#"
+enabled: true
+intentions:
+  - id: explicit_web
+    schedule: {{ kind: daily, at: "09:00" }}
+    attention: Check the calendar.
+    delivery: {{ channel: web, external_chat_id: "chat:{chat_id}" }}
+  - id: auto_web
+    schedule: {{ kind: daily, at: "21:00" }}
+    attention: Reflect.
+"#
+            ),
+        );
+
+        // Act
+        let body = get_agent_pulse(AxumState(state), Path("default".to_string()))
+            .await
+            .expect("ok")
+            .0;
+
+        // Assert
+        let expected = serde_json::json!({
+            "channel": "web",
+            "session_key": format!("chat:{chat_id}")
+        });
         let intentions = body["pulse"]["intentions"].as_array().expect("intentions");
         assert_eq!(intentions.len(), 2);
         for intention in intentions {

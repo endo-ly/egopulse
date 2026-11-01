@@ -404,15 +404,15 @@ mod tests {
     }
 
     /// A no-op channel adapter for testing that records nothing but succeeds.
-    struct MockChannelAdapter;
+    struct MockChannelAdapter(&'static str);
 
     #[async_trait::async_trait]
     impl ChannelAdapter for MockChannelAdapter {
         fn name(&self) -> &str {
-            "discord"
+            self.0
         }
         fn chat_type_routes(&self) -> Vec<(&str, ConversationKind)> {
-            vec![("discord", ConversationKind::Private)]
+            vec![(self.0, ConversationKind::Private)]
         }
         async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
             Ok(())
@@ -421,7 +421,8 @@ mod tests {
 
     fn build_test_state(dir: &tempfile::TempDir) -> AppState {
         let mut channels = ChannelRegistry::new();
-        channels.register(Arc::new(MockChannelAdapter));
+        channels.register(Arc::new(MockChannelAdapter("discord")));
+        channels.register(Arc::new(MockChannelAdapter("web")));
         build_test_state_with_channels(dir, Arc::new(channels))
     }
 
@@ -626,6 +627,60 @@ mod tests {
             session_json.contains(notification_text),
             "session snapshot should contain assistant response"
         );
+    }
+
+    #[tokio::test]
+    async fn notify_to_a_web_home_surface_persists_the_activation() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_test_state(&dir);
+        let agent_id = "lyre";
+        let intention = test_intention("web_review");
+        let pulse_run_id = "run-web-001";
+        let notification_text = "Web notification.";
+
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "web:session-1:agent:lyre", "web", agent_id)
+            .expect("chat");
+        create_pulse_run(&state.db, pulse_run_id, agent_id, &intention.id);
+        let home_surface = HomeSurface {
+            chat_id,
+            channel: "web".to_string(),
+            external_chat_id: "web:session-1:agent:lyre".to_string(),
+            chat_type: "web".to_string(),
+        };
+        let activation = ActivationResult {
+            output_text: notification_text.to_string(),
+            output_kind: PulseOutputKind::Notify,
+            tool_phases: Vec::new(),
+        };
+
+        // Act
+        let result = handle_output(
+            &state,
+            agent_id,
+            &intention,
+            &home_surface,
+            &activation,
+            pulse_run_id,
+        )
+        .await
+        .expect("handle_output");
+
+        // Assert
+        assert!(result.notified);
+        assert_eq!(result.chat_id, Some(chat_id));
+        let messages = state.db.get_all_messages(chat_id).expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, notification_text);
+        let run = state
+            .db
+            .get_pulse_run(pulse_run_id)
+            .expect("get run")
+            .expect("exists");
+        assert_eq!(run.status, crate::storage::PulseRunStatus::Success);
+        assert_eq!(run.chat_id, Some(chat_id));
     }
 
     #[tokio::test]

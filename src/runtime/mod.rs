@@ -350,7 +350,12 @@ fn build_channel_registry(
     config_manager: &Arc<ConfigManager>,
 ) -> Arc<ChannelRegistry> {
     let mut channels = ChannelRegistry::new();
-    channels.register(Arc::new(WebAdapter));
+    // Web delivery is conversation persistence, so the adapter only makes sense
+    // while the Web UI is enabled. Registering it unconditionally would let
+    // Pulse resolve web sessions on a runtime where nobody can read them.
+    if config.web_enabled() {
+        channels.register(Arc::new(WebAdapter));
+    }
     if config.voice_enabled() {
         channels.register(Arc::new(VoiceAdapter));
     }
@@ -961,6 +966,30 @@ mod tests {
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
+    }
+
+    #[test]
+    fn channel_registry_includes_web_only_when_the_web_ui_is_enabled() {
+        // Arrange
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_root = dir.path().to_string_lossy().to_string();
+        let enabled = test_config_for_runtime(state_root.clone());
+        let mut disabled = test_config_for_runtime(state_root);
+        disabled
+            .channels
+            .get_mut(&crate::config::ChannelName::new("web"))
+            .expect("web channel")
+            .enabled = Some(false);
+        let enabled_manager = Arc::new(ConfigManager::new(enabled.clone(), None));
+        let disabled_manager = Arc::new(ConfigManager::new(disabled.clone(), None));
+
+        // Act
+        let enabled_channels = build_channel_registry(&enabled, &enabled_manager);
+        let disabled_channels = build_channel_registry(&disabled, &disabled_manager);
+
+        // Assert
+        assert!(enabled_channels.get("web").is_some());
+        assert!(disabled_channels.get("web").is_none());
     }
 
     #[test]

@@ -32,8 +32,9 @@ execute. At the scheduled time you are briefly activated with the attention text
 recent conversation context; if there is nothing worth reporting you stay silent, \
 otherwise your message is delivered and the user can reply to it.
 
-Rules: `delivery` defaults to the current conversation (Discord/Telegram only; elsewhere \
-pass it explicitly). A `once` intention must be in the future, fires at the specified \
+Rules: `delivery` defaults to the current conversation (Discord, Telegram, or Web; elsewhere \
+pass it explicitly). A Web destination is the session ID copied from the Web UI (`chat:<id>`). \
+A `once` intention must be in the future, fires at the specified \
 time, and is removed automatically after a successful run. Edits take effect on the next scan; \
 changing a schedule does not re-fire an occurrence that already ran today. Check `list` \
 before adding and when investigating why a pulse did or did not fire. Do not edit \
@@ -459,16 +460,16 @@ impl Tool for PulseTool {
                     },
                     "delivery": {
                         "type": "object",
-                        "description": "Where the notification is delivered (add/update). Defaults to the current conversation when it is on Discord/Telegram",
+                        "description": "Where the notification is delivered (add/update). Defaults to the current conversation when it is on Discord, Telegram, or Web",
                         "properties": {
                             "channel": {
                                 "type": "string",
-                                "enum": ["discord", "telegram"],
+                                "enum": ["discord", "telegram", "web"],
                                 "description": "Delivery channel"
                             },
                             "external_chat_id": {
                                 "type": "string",
-                                "description": "Channel-specific chat id to deliver to"
+                                "description": "Channel-specific chat id to deliver to. For Web, the WebUI session ID (chat:<id>)"
                             }
                         }
                     }
@@ -596,17 +597,24 @@ fn default_delivery_from_context(
 ) -> Result<DeliverySpec, ToolResult> {
     let channel = context.channel.to_ascii_lowercase();
     if definition::VALID_DELIVERY_CHANNELS.contains(&channel.as_str()) {
+        // Web is addressed by the WebUI's canonical session ID so the target
+        // remains the one identifier a user can copy from the session list.
+        let external_chat_id = if channel == "web" {
+            format!("chat:{}", context.chat_id)
+        } else {
+            context.surface_thread.clone()
+        };
         return Ok(DeliverySpec {
             channel,
-            external_chat_id: context.surface_thread.clone(),
+            external_chat_id,
         });
     }
     Err(ToolResult::error_with_kind(
         ToolErrorKind::InvalidInput,
         format!(
-            "pulse: notifications can only be delivered to Discord or Telegram, but this \
+            "pulse: notifications can only be delivered to Discord, Telegram, or Web, but this \
              conversation is on '{}'. Pass an explicit delivery (channel + external_chat_id), \
-             or set the intention up from a Discord/Telegram chat.",
+             or set the intention up from a supported chat.",
             context.channel
         ),
     ))
@@ -983,10 +991,35 @@ mod tests {
     #[tokio::test]
     async fn add_on_non_sendable_channel_requires_explicit_delivery() {
         let env = build_env();
+        let mut tui_context = context();
+        tui_context.channel = "tui".to_string();
+        tui_context.surface_thread = "local".to_string();
+
+        let result = env
+            .tool
+            .execute(
+                json!({
+                    "op": "add",
+                    "schedule": {"kind": "daily", "at": "09:00"},
+                    "attention": "check"
+                }),
+                &tui_context,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Discord, Telegram, or Web"));
+    }
+
+    #[tokio::test]
+    async fn add_on_web_defaults_to_the_current_session_id() {
+        // Arrange
+        let env = build_env();
         let mut web_context = context();
+        web_context.chat_id = 42;
         web_context.channel = "web".to_string();
         web_context.surface_thread = "session-1".to_string();
 
+        // Act
         let result = env
             .tool
             .execute(
@@ -998,8 +1031,44 @@ mod tests {
                 &web_context,
             )
             .await;
-        assert!(result.is_error);
-        assert!(result.content.contains("Discord or Telegram"));
+
+        // Assert
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        let loaded =
+            definition::load_pulse_definition(std::path::Path::new(&env.state_root), "lyre")
+                .expect("load pulse definition");
+        let delivery = loaded.intentions[0].delivery.as_ref().expect("delivery");
+        assert_eq!(delivery.channel, "web");
+        assert_eq!(delivery.external_chat_id, "chat:42");
+    }
+
+    #[tokio::test]
+    async fn add_with_an_explicit_web_session_address_is_accepted() {
+        // Arrange
+        let env = build_env();
+
+        // Act
+        let result = env
+            .tool
+            .execute(
+                json!({
+                    "op": "add",
+                    "schedule": {"kind": "daily", "at": "09:00"},
+                    "attention": "check",
+                    "delivery": {"channel": "web", "external_chat_id": "chat:7"}
+                }),
+                &context(),
+            )
+            .await;
+
+        // Assert
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        let loaded =
+            definition::load_pulse_definition(std::path::Path::new(&env.state_root), "lyre")
+                .expect("load pulse definition");
+        let delivery = loaded.intentions[0].delivery.as_ref().expect("delivery");
+        assert_eq!(delivery.channel, "web");
+        assert_eq!(delivery.external_chat_id, "chat:7");
     }
 
     #[tokio::test]

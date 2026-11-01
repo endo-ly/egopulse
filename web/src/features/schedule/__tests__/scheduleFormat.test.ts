@@ -109,6 +109,26 @@ describe("scheduleFormat", () => {
     });
   });
 
+  it("names_a_resolved_web_destination_with_the_web_label", () => {
+    // Arrange
+    const sessions = [session("chat:9", "Web room")];
+    const delivery = { channel: "web", external_chat_id: "chat:9" };
+
+    // Act
+    const result = describeDelivery(
+      { delivery, target: { channel: "web", session_key: "chat:9" } },
+      null,
+      sessions,
+    );
+
+    // Assert
+    expect(result).toEqual({
+      label: "Web · Web room",
+      origin: "intention",
+      sessionKey: "chat:9",
+    });
+  });
+
   it("says_a_skipped_firing_was_not_delivered", () => {
     // Arrange / Act / Assert
     expect(pulseOutcomeLabel({ status: "success", output_kind: "notify" })).toBe("Notified");
