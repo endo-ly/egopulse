@@ -5,6 +5,8 @@ interface CacheEntry<T> {
   loading: boolean;
   error: Error | null;
   timestamp: number;
+  /** The displayed data was invalidated and must be refreshed. */
+  stale: boolean;
 }
 
 const cache = new Map<string, CacheEntry<unknown>>();
@@ -35,10 +37,35 @@ function isNewestRequest(key: string, seq: number): boolean {
   return (requestSeq.get(key) ?? 0) === seq;
 }
 
-export function invalidateQuery(key: string) {
-  cache.delete(key);
+function invalidateKey(key: string) {
   startRequest(key);
+  const entry = cache.get(key) as CacheEntry<unknown> | undefined;
+  const isMounted = (listeners.get(key)?.size ?? 0) > 0;
+  if (entry?.data !== undefined && isMounted) {
+    // Keep what the user is looking at and refresh in the background. A
+    // dropped cache would blank the screen until the refetch lands.
+    cache.set(key, {
+      ...entry,
+      loading: false,
+      error: null,
+      stale: true,
+      timestamp: Date.now(),
+    });
+  } else {
+    // Nothing is displaying it: drop it so the next mount fetches fresh data
+    // instead of retaining an unbounded set of stale pages.
+    cache.delete(key);
+  }
   notify(key);
+}
+
+/**
+ * Marks a key stale. A mounted consumer keeps its current data on screen and
+ * refetches in the background; an unmounted key is dropped so the next mount
+ * fetches it fresh.
+ */
+export function invalidateQuery(key: string) {
+  invalidateKey(key);
 }
 
 /**
@@ -47,17 +74,20 @@ export function invalidateQuery(key: string) {
  */
 export function setQueryData<T>(key: string, data: T) {
   startRequest(key);
-  cache.set(key, { data, loading: false, error: null, timestamp: Date.now() });
+  cache.set(key, {
+    data,
+    loading: false,
+    error: null,
+    timestamp: Date.now(),
+    stale: false,
+  });
   notify(key);
 }
 
+/** Applies {@link invalidateQuery} to every cached key with `prefix`. */
 export function invalidateQueries(prefix: string) {
-  for (const key of cache.keys()) {
-    if (key.startsWith(prefix)) {
-      cache.delete(key);
-      startRequest(key);
-      notify(key);
-    }
+  for (const key of [...cache.keys()]) {
+    if (key.startsWith(prefix)) invalidateKey(key);
   }
 }
 
@@ -116,12 +146,19 @@ export function useServerState<T>(
       loading: prev?.loading ?? true,
       error: null,
       timestamp: Date.now(),
+      stale: false,
     });
     notify(key);
     try {
       const data = await fetcherRef.current();
       if (!isNewestRequest(key, seq)) return;
-      cache.set(key, { data, loading: false, error: null, timestamp: Date.now() });
+      cache.set(key, {
+        data,
+        loading: false,
+        error: null,
+        timestamp: Date.now(),
+        stale: false,
+      });
     } catch (e) {
       if (!isNewestRequest(key, seq)) return;
       const latest = cache.get(key) as CacheEntry<T> | undefined;
@@ -130,6 +167,7 @@ export function useServerState<T>(
         loading: false,
         error: e instanceof Error ? e : new Error(String(e)),
         timestamp: Date.now(),
+        stale: false,
       });
     }
     notify(key);
@@ -137,6 +175,8 @@ export function useServerState<T>(
 
   useEffect(() => {
     if (!entry || (entry.data === undefined && !entry.loading && !entry.error)) {
+      refetch();
+    } else if (entry.stale) {
       refetch();
     }
   }, [entry, refetch]);

@@ -84,6 +84,108 @@ describe("ChatTab", () => {
     expect(withoutWaiting.container.querySelector(".thinking-dots")).toBeNull();
   });
 
+  it("waiting_indicator_shows_the_agent_avatar", () => {
+    // Arrange / Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        agentId="lyre"
+        agentAvatars={{ lyre: "blob:lyre-avatar" }}
+        waitingForAssistant
+      />,
+    );
+
+    // Assert
+    const row = container.querySelector(".timeline-messages > *") as HTMLElement;
+    expect(row.querySelector(".thinking-dots")).toBeTruthy();
+    expect(row.querySelector(".message-avatar img")?.getAttribute("src")).toBe(
+      "blob:lyre-avatar",
+    );
+  });
+
+  it("waiting_indicator_after_an_assistant_row_does_not_repeat_the_header", () => {
+    // Arrange / Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        entries={entries}
+        agentId="lyre"
+        agentAvatars={{ lyre: "blob:lyre-avatar" }}
+        waitingForAssistant
+      />,
+    );
+
+    // Assert: the assistant row above already carries the turn's header.
+    const rows = container.querySelectorAll(".timeline-messages > *");
+    const waitingRow = rows[rows.length - 1] as HTMLElement;
+    expect(waitingRow.querySelector(".thinking-dots")).toBeTruthy();
+    expect(waitingRow.querySelector(".message-header")).toBeNull();
+  });
+
+  it("tool_row_that_starts_a_turn_shows_the_agent_avatar", () => {
+    // Arrange
+    const tool: ChatMessage = {
+      id: "tool:call-1",
+      sender_id: "assistant",
+      sender_kind: "assistant",
+      content: JSON.stringify({ tool: "read", status: "success", result: "ok" }),
+      timestamp: "2026-07-04T00:00:02.000Z",
+      message_kind: "tool_call",
+    };
+
+    // Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        agentId="lyre"
+        agentAvatars={{ lyre: "blob:lyre-avatar" }}
+        entries={[{ message: messages[0] }, { message: tool }]}
+      />,
+    );
+
+    // Assert
+    const toolRow = container.querySelectorAll(".timeline-messages > *")[1] as HTMLElement;
+    expect(toolRow.querySelector(".tool-card")).toBeTruthy();
+    expect(toolRow.querySelector(".message-avatar img")?.getAttribute("src")).toBe(
+      "blob:lyre-avatar",
+    );
+  });
+
+  it("tool_row_under_a_narration_does_not_repeat_the_header", () => {
+    // Arrange
+    const tool: ChatMessage = {
+      id: "tool:call-1",
+      sender_id: "assistant",
+      sender_kind: "assistant",
+      content: JSON.stringify({ tool: "read", status: "success", result: "ok" }),
+      timestamp: "2026-07-04T00:00:02.000Z",
+      message_kind: "tool_call",
+    };
+
+    // Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        agentId="lyre"
+        agentAvatars={{ lyre: "blob:lyre-avatar" }}
+        entries={[
+          { message: messages[0] },
+          { message: messages[1] },
+          { message: tool },
+        ]}
+      />,
+    );
+
+    // Assert: the assistant narration already carries the turn's header.
+    const toolRow = container.querySelectorAll(".timeline-messages > *")[2] as HTMLElement;
+    expect(toolRow.querySelector(".tool-card")).toBeTruthy();
+    expect(toolRow.querySelector(".message-header")).toBeNull();
+  });
+
   it("renders_older_history_progress_and_start_marker", () => {
     const { container } = render(
       <ChatTab

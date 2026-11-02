@@ -8,6 +8,8 @@ import {
 
 export interface TimelineProps {
   children?: ReactNode;
+  /** Session identity; changing it starts the new transcript at the latest row. */
+  sessionKey?: string;
   /** Jump request: scroll to and flash the message at `index`; `seq` re-triggers repeat jumps. */
   jumpRequest?: { index: number; seq: number };
   /** Called when the user scrolls near the top of the loaded history. */
@@ -23,6 +25,7 @@ const TOP_TRIGGER_PX = 240;
 
 export function Timeline({
   children,
+  sessionKey,
   jumpRequest,
   onReachTop,
   atHistoryStart = false,
@@ -95,6 +98,21 @@ export function Timeline({
   });
 
   const lastPrependSeqRef = useRef(prependSeq);
+  const lastSessionKeyRef = useRef(sessionKey);
+  useLayoutEffect(() => {
+    if (lastSessionKeyRef.current === sessionKey) return;
+    lastSessionKeyRef.current = sessionKey;
+    // The new transcript starts with its own prepend sequence and scroll
+    // state; do not anchor it against the previous session's height.
+    lastPrependSeqRef.current = prependSeq;
+    previousScrollHeightRef.current = 0;
+    followingRef.current = true;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    setShowJumpButton(false);
+  }, [prependSeq, sessionKey]);
+
   useLayoutEffect(() => {
     if (prependSeq === lastPrependSeqRef.current) return;
     lastPrependSeqRef.current = prependSeq;
