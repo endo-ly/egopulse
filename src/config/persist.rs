@@ -226,7 +226,7 @@ struct SerializableProvider {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     models: HashMap<String, ModelConfig>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    headers: std::collections::BTreeMap<String, String>,
+    headers: std::collections::BTreeMap<String, Option<String>>,
 }
 
 #[derive(Serialize)]
@@ -1255,13 +1255,23 @@ mod tests {
             .headers
             .insert(
                 "x-opencode-session".to_string(),
-                "egopulse-session".to_string(),
+                Some("egopulse-session".to_string()),
             );
+        config
+            .providers
+            .get_mut(&ProviderId::new("openai"))
+            .expect("openai provider")
+            .headers
+            .insert("x-session-scope".to_string(), None);
 
         save_config_with_secrets(&config, &path).expect("save config");
 
         let yaml = fs::read_to_string(&path).expect("yaml");
         assert!(yaml.contains("x-opencode-session: egopulse-session"));
+        assert!(
+            yaml.contains("x-session-scope: null"),
+            "valueless headers persist as explicit null:\n{yaml}"
+        );
 
         let loaded = Config::load_allow_missing_api_key(Some(&path)).expect("load config");
         assert_eq!(
@@ -1271,8 +1281,18 @@ mod tests {
                 .expect("openai provider")
                 .headers
                 .get("x-opencode-session")
-                .map(String::as_str),
+                .and_then(|value| value.as_deref()),
             Some("egopulse-session")
+        );
+        assert!(
+            loaded
+                .providers
+                .get("openai")
+                .expect("openai provider")
+                .headers
+                .get("x-session-scope")
+                .is_some_and(Option::is_none),
+            "a valueless header survives a save/load cycle"
         );
     }
 

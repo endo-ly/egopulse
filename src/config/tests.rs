@@ -97,6 +97,7 @@ providers:
     headers:
       X-Test-Session: egopulse-test
       x-api-version: "2026-01-01"
+      x-session-scope:
   local:
     label: Local OpenAI-compatible
     base_url: http://127.0.0.1:1234/v1
@@ -154,12 +155,25 @@ fn loads_provider_based_config() {
         Some("sk-openai")
     );
     assert_eq!(
-        web_llm.headers.get("x-test-session").map(String::as_str),
+        web_llm
+            .headers
+            .get("x-test-session")
+            .and_then(|value| value.as_deref()),
         Some("egopulse-test")
     );
     assert_eq!(
-        web_llm.headers.get("x-api-version").map(String::as_str),
+        web_llm
+            .headers
+            .get("x-api-version")
+            .and_then(|value| value.as_deref()),
         Some("2026-01-01")
+    );
+    assert!(
+        web_llm
+            .headers
+            .get("x-session-scope")
+            .is_some_and(Option::is_none),
+        "a header written without a value loads as unset"
     );
 }
 

@@ -555,7 +555,12 @@ fn mask_secrets(value: &mut yaml_serde::Value) {
                     Some("headers") => {
                         if let yaml_serde::Value::Mapping(headers) = child {
                             for (_, header) in headers.iter_mut() {
-                                *header = yaml_serde::Value::String(MASK.to_string());
+                                // A header written without a value carries no
+                                // secret: it names a conversation-scoped value
+                                // that the runtime fills in per request.
+                                if matches!(header, yaml_serde::Value::String(_)) {
+                                    *header = yaml_serde::Value::String(MASK.to_string());
+                                }
                             }
                         }
                     }
@@ -1161,6 +1166,7 @@ providers:
     api_key: sk-live-literal
     headers:
       authorization: Bearer abc
+      x-opencode-session:
   local:
     api_key:
       source: env
@@ -1190,6 +1196,13 @@ webhooks:
         }
         assert!(masked.contains("LOCAL_API_KEY"));
         assert!(masked.contains("source: exec"));
+
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&masked).expect("parse masked");
+        assert_eq!(
+            parsed["providers"]["openrouter"]["headers"]["x-opencode-session"],
+            yaml_serde::Value::Null,
+            "a valueless header is not a secret and must stay unset"
+        );
     }
 
     #[test]

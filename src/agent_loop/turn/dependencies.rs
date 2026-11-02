@@ -6,7 +6,6 @@
 //! keeping scheduler, channel dispatch, and runtime observability outside the
 //! execution boundary.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +34,7 @@ pub(crate) struct TurnDependencies {
     pub(crate) config_manager: Arc<ConfigManager>,
     pub(crate) config_path: Option<PathBuf>,
     pub(crate) llm_override: Option<Arc<dyn LlmProvider>>,
-    pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn LlmProvider>>>>,
+    pub(crate) llm_cache: Arc<Mutex<crate::llm::ProviderCache>>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) skills: Arc<SkillManager>,
     pub(crate) soul_agents: Arc<crate::agent_loop::prompt::SoulAgentsLoader>,
@@ -112,20 +111,24 @@ impl TurnDependencies {
         let resolved = snapshot
             .config
             .resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        self.cached_provider(&resolved, snapshot.revision)
+        let headers = crate::llm::HeaderContext::from_surface(context);
+        self.cached_provider(&resolved, snapshot.revision, &headers)
     }
 
     pub(crate) fn cached_provider(
         &self,
         resolved: &ResolvedLlmConfig,
         config_revision: u64,
+        headers: &crate::llm::HeaderContext,
     ) -> Result<Arc<dyn LlmProvider>, EgoPulseError> {
-        let key = resolved.cache_key_with_revision(config_revision);
+        let rendered = crate::llm::rendered_config(resolved, headers);
+        let key = rendered.cache_key_with_revision(config_revision);
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
-        if let Some(provider) = cache.get(&key) {
-            return Ok(Arc::clone(provider));
+        if let Some(provider) = cache.get(key) {
+            return Ok(provider);
         }
-        let provider: Arc<dyn LlmProvider> = Arc::from(crate::llm::create_provider(resolved)?);
+        let provider: Arc<dyn LlmProvider> =
+            Arc::from(crate::llm::create_provider_rendered(&rendered)?);
         cache.insert(key, Arc::clone(&provider));
         Ok(provider)
     }

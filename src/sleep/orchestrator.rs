@@ -263,9 +263,10 @@ pub async fn run_events_extract(
                 override_provider
             } else {
                 let revision = snapshot.revision;
+                let headers = crate::llm::HeaderContext::for_agent(&resolved_agent);
                 state
                     .turn_dependencies()
-                    .cached_provider(&resolved, revision)
+                    .cached_provider(&resolved, revision, &headers)
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
@@ -602,9 +603,10 @@ async fn prepare_batch_context(
         override_provider
     } else {
         let revision = snapshot.revision;
+        let headers = crate::llm::HeaderContext::for_agent(agent_id);
         state
             .turn_dependencies()
-            .cached_provider(&resolved, revision)
+            .cached_provider(&resolved, revision, &headers)
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };
 

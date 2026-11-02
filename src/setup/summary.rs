@@ -872,7 +872,7 @@ channels:
                 .expect("ollama provider")
                 .headers
                 .get("x-opencode-session")
-                .map(String::as_str),
+                .and_then(|value| value.as_deref()),
             Some("egopulse-session")
         );
     }

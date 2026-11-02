@@ -212,7 +212,11 @@ pub(crate) struct ProviderConfig {
     pub default_model: String,
     pub models: HashMap<String, ModelConfig>,
     /// Extra HTTP headers sent with every request to this provider.
-    pub headers: BTreeMap<String, String>,
+    ///
+    /// A header mapped to `None` is sent with a value derived from the
+    /// conversation, so each conversation keeps its own upstream routing and
+    /// cache identity. `Some` values are sent verbatim.
+    pub headers: BTreeMap<String, Option<String>>,
 }
 
 impl ProviderConfig {
@@ -235,7 +239,7 @@ impl ProviderConfig {
     }
 
     /// Adds extra HTTP headers to this provider definition.
-    pub(crate) fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+    pub(crate) fn with_headers(mut self, headers: BTreeMap<String, Option<String>>) -> Self {
         self.headers = headers;
         self
     }
@@ -262,7 +266,7 @@ pub(crate) struct ResolvedLlmConfig {
     pub api_key: Option<SecretString>,
     pub model: String,
     pub reasoning_effort: Option<String>,
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, Option<String>>,
 }
 
 /// Where a resolved provider or model value came from in the resolution chain.

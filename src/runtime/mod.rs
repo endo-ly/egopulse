@@ -29,7 +29,6 @@ pub(crate) use turn::{ActiveTurnTracker, execute_observed_turn, execute_schedule
 use turn::{recover_durable_state, rehydrate_origin_tracker, spawn_turn_dispatcher};
 
 use fs2::FileExt;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -118,7 +117,7 @@ pub struct AppState {
     pub(crate) assets: Arc<AssetStore>,
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
-    pub(crate) llm_cache: Arc<Mutex<HashMap<u64, Arc<dyn crate::llm::LlmProvider>>>>,
+    pub(crate) llm_cache: Arc<Mutex<crate::llm::ProviderCache>>,
     /// Tracks in-flight conversation turns per agent for scheduler active-agent detection.
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     /// Per-session turn scheduler for concurrency control and ordered execution.
@@ -199,7 +198,9 @@ impl AppState {
             assets: parts.assets,
             soul_agents: parts.soul_agents,
             memory_loader: parts.memory_loader,
-            llm_cache: Arc::new(Mutex::new(HashMap::new())),
+            llm_cache: Arc::new(Mutex::new(crate::llm::ProviderCache::new(
+                crate::llm::PROVIDER_CACHE_CAP,
+            ))),
             active_turns: Arc::new(ActiveTurnTracker::new()),
             turn_scheduler: Arc::new(turn::TurnScheduler::new()),
             turn_tracker: Arc::new(turn::TurnTracker::new()),
@@ -643,7 +644,10 @@ fn build_app_state_dependencies(
 
 /// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
-    let llm = create_provider(&config.resolve_global_llm())?;
+    let llm = create_provider(
+        &config.resolve_global_llm(),
+        &crate::llm::HeaderContext::global(),
+    )?;
     let messages = Arc::new(vec![Message::text("user", prompt)]);
 
     tokio::select! {
@@ -1224,7 +1228,7 @@ mod tests {
         let mut different_headers = base.clone();
         different_headers
             .headers
-            .insert("x-opencode-session".to_string(), "other".to_string());
+            .insert("x-opencode-session".to_string(), Some("other".to_string()));
 
         for different in [
             resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1"),
@@ -1273,6 +1277,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn llm_cache_separates_providers_per_conversation() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let mut resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        resolved.headers.insert("x-session".to_string(), None);
+        let runtime = state.turn_dependencies();
+
+        // Act
+        let musa = runtime
+            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("musa"))
+            .expect("musa provider");
+        let musa_again = runtime
+            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("musa"))
+            .expect("musa provider");
+        let lyre = runtime
+            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("lyre"))
+            .expect("lyre provider");
+
+        // Assert
+        assert!(Arc::ptr_eq(&musa, &musa_again));
+        assert!(!Arc::ptr_eq(&musa, &lyre));
+        assert_eq!(state.llm_cache.lock().expect("cache lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn llm_cache_shares_a_provider_across_conversations_without_auto_headers() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let runtime = state.turn_dependencies();
+
+        // Act
+        let musa = runtime
+            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("musa"))
+            .expect("musa provider");
+        let lyre = runtime
+            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("lyre"))
+            .expect("lyre provider");
+
+        // Assert
+        assert!(Arc::ptr_eq(&musa, &lyre));
+        assert_eq!(state.llm_cache.lock().expect("cache lock").len(), 1);
+    }
+
+    #[tokio::test]
     async fn llm_cache_keeps_providers_for_each_config_revision() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
@@ -1280,11 +1333,12 @@ mod tests {
         let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let runtime = state.turn_dependencies();
 
+        let headers = crate::llm::HeaderContext::global();
         let newer = runtime
-            .cached_provider(&resolved, 2)
+            .cached_provider(&resolved, 2, &headers)
             .expect("newer revision provider");
         let older = runtime
-            .cached_provider(&resolved, 1)
+            .cached_provider(&resolved, 1, &headers)
             .expect("older revision provider");
 
         assert!(!Arc::ptr_eq(&newer, &older));
@@ -1300,11 +1354,10 @@ mod tests {
 
         let state = crate::test_util::build_state_with_provider(
             dir.path().to_str().expect("utf8"),
-            crate::llm::create_provider(&resolved_config(
-                expected_provider,
-                expected_model,
-                "https://example.com/v1",
-            ))
+            crate::llm::create_provider(
+                &resolved_config(expected_provider, expected_model, "https://example.com/v1"),
+                &crate::llm::HeaderContext::global(),
+            )
             .expect("provider"),
         );
         let context = crate::test_util::cli_context("override-test");
@@ -1318,7 +1371,7 @@ mod tests {
         assert_eq!(result.model_name(), expected_model);
 
         let cache = state.llm_cache.lock().expect("lock");
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
     }
 
     #[tokio::test]

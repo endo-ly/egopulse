@@ -34,7 +34,7 @@ struct FileProviderConfig {
     api_key: Option<StringOrRef>,
     default_model: Option<String>,
     models: Option<HashMap<String, Option<ModelConfig>>>,
-    headers: Option<HashMap<String, String>>,
+    headers: Option<HashMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1087,8 +1087,8 @@ fn normalize_provider_map(
 
 fn normalize_provider_headers(
     provider: &str,
-    headers: Option<HashMap<String, String>>,
-) -> Result<BTreeMap<String, String>, ConfigError> {
+    headers: Option<HashMap<String, Option<String>>>,
+) -> Result<BTreeMap<String, Option<String>>, ConfigError> {
     let mut normalized = BTreeMap::new();
 
     for (raw_name, value) in headers.unwrap_or_default() {
@@ -1100,13 +1100,15 @@ fn normalize_provider_headers(
                     reason: error.to_string(),
                 }
             })?;
-        reqwest::header::HeaderValue::from_str(&value).map_err(|error| {
-            ConfigError::InvalidProviderHeader {
-                provider: provider.to_string(),
-                header: raw_name.clone(),
-                reason: error.to_string(),
-            }
-        })?;
+        if let Some(value) = &value {
+            reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+                ConfigError::InvalidProviderHeader {
+                    provider: provider.to_string(),
+                    header: raw_name.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        }
 
         let canonical = name.as_str().to_string();
         if normalized.insert(canonical, value).is_some() {
