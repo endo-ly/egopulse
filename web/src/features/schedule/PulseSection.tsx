@@ -5,7 +5,7 @@ import { PULSE_ICON } from "../../shared/ui/icons";
 import { QueryState } from "../../shared/ui/QueryState";
 import { DocumentCard } from "../agent/DocumentCard";
 import { MetaLine, OutcomeLabel } from "./parts";
-import { describeDelivery, describeNextDue, describeSchedule } from "./scheduleFormat";
+import { describeDelivery, describeNextDue, describeNextDueInList, describeSchedule } from "./scheduleFormat";
 
 export interface PulseSectionProps {
   pulse: { data: AgentPulse | undefined; loading: boolean; error: Error | null };
@@ -81,14 +81,18 @@ function Intentions({
       />
     );
   }
-  // A selection that vanished from PULSE.yaml falls back to the first intention.
-  const active = pulse.intentions.find((intention) => intention.id === intentionId) ?? pulse.intentions[0];
+  // No selection means the first intention; a selection that vanished from
+  // PULSE.yaml is reported instead of silently showing another intention.
+  const active =
+    intentionId === null
+      ? pulse.intentions[0]
+      : pulse.intentions.find((intention) => intention.id === intentionId);
   return (
     <div className="skills-layout">
       <ul className="skills-list" aria-label="Intentions">
         {pulse.intentions.map((intention) => {
           const on = pulse.enabled === true && intention.enabled;
-          const current = intention.id === active.id;
+          const current = intention.id === active?.id;
           return (
             <li key={intention.id}>
               <button
@@ -104,20 +108,27 @@ function Intentions({
                 </span>
                 <span className="skill-row-description">
                   {describeSchedule(intention.schedule)}
-                  {on && ` · next ${describeNextDue(intention.next)}`}
+                  {on && ` · ${describeNextDueInList(intention.next)}`}
                 </span>
               </button>
             </li>
           );
         })}
       </ul>
-      <IntentionDetail
-        key={active.id}
-        intention={active}
-        pulse={pulse}
-        sessions={sessions}
-        onOpenSession={onOpenSession}
-      />
+      {active !== undefined ? (
+        <IntentionDetail
+          key={active.id}
+          intention={active}
+          pulse={pulse}
+          sessions={sessions}
+          onOpenSession={onOpenSession}
+        />
+      ) : (
+        <section className="skill-detail" aria-label="Intention not found">
+          <p className="field-warning">The selected intention is no longer in PULSE.yaml.</p>
+          <p className="field-note">Choose an intention from the list.</p>
+        </section>
+      )}
     </div>
   );
 }
@@ -179,12 +190,14 @@ function IntentionDetail({
                   Open in Chat
                 </button>
               </>
-            ) : (
+            ) : on ? (
               <p className="field-warning">
                 {delivery.origin === "latest"
                   ? "There is no conversation to send to yet, so firings are skipped."
                   : "No conversation matches this destination, so firings are skipped."}
               </p>
+            ) : (
+              <p className="field-note">This destination will be resolved when it is active again.</p>
             )}
           </dd>
         </div>

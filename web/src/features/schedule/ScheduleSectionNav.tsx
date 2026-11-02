@@ -28,6 +28,7 @@ const ITEMS: SectionItem[] = [
 ];
 
 function activitySummary(pulse: AgentPulse, outlook: SleepOutlook, problems: number): string {
+  if (pulse.error !== null) return "PULSE.yaml error";
   if (problems > 0) return `${problems} need${problems === 1 ? "s" : ""} attention`;
   const next = upcomingItems(pulse, outlook)[0];
   if (next === undefined) return "Nothing scheduled";

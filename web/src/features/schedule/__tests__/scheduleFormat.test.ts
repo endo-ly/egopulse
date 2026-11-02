@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   describeDelivery,
   describeNextDue,
+  describeNextDueInList,
   describeSchedule,
   formatDay,
   formatUpcomingTime,
@@ -164,6 +165,21 @@ describe("scheduleFormat", () => {
     expect(describeNextDue({ state: "attempted_this_period", at: null })).toBe("Done for this period");
     expect(describeNextDue({ state: "attempted_once", at: null })).toBe("Already fired");
     expect(describeNextDue({ state: "no_upcoming", at: null })).toBe("No upcoming");
+  });
+
+  it("prefixes_only_a_scheduled_firing_with_next_in_a_row", () => {
+    // Arrange
+    const now = new Date(2026, 9, 31, 8, 0).getTime();
+
+    // Act / Assert
+    expect(describeNextDueInList(null, now)).toBe("off");
+    expect(describeNextDueInList({ state: "due_now", at: null }, now)).toBe("due now");
+    expect(describeNextDueInList({ state: "scheduled", at: new Date(2026, 9, 31, 21, 0).toISOString() }, now)).toBe(
+      "next Today 21:00",
+    );
+    expect(describeNextDueInList({ state: "attempted_this_period", at: null }, now)).toBe("done for this period");
+    expect(describeNextDueInList({ state: "attempted_once", at: null }, now)).toBe("already fired");
+    expect(describeNextDueInList({ state: "no_upcoming", at: null }, now)).toBe("no upcoming");
   });
 
   it("previews_the_first_markdown_line_as_plain_text", () => {

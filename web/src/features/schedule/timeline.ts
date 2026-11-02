@@ -91,21 +91,26 @@ export interface Problem {
 }
 
 /**
- * Routines whose latest run failed or could not deliver: each Pulse
+ * Routines whose latest run failed or could not deliver: each enabled Pulse
  * intention's latest firing, and the latest sleep run that did work. A later
- * successful run clears the problem.
+ * successful run clears the problem. Disabled Pulse intentions are excluded
+ * because they will not retry and would leave a permanent, unactionable
+ * warning.
  */
 export function latestProblems(pulse: AgentPulse | undefined, lastSleep: SleepRun | undefined): Problem[] {
   const problems: Problem[] = [];
-  for (const intention of pulse?.intentions ?? []) {
-    const latest = intention.recent_runs[0];
-    if (latest && (latest.status === "failed" || latest.status === "skipped")) {
-      problems.push({
-        intentionId: intention.id,
-        run: { kind: "pulse", id: latest.id },
-        status: latest.status,
-        startedAt: latest.started_at,
-      });
+  if (pulse?.enabled === true) {
+    for (const intention of pulse.intentions) {
+      if (!intention.enabled) continue;
+      const latest = intention.recent_runs[0];
+      if (latest && (latest.status === "failed" || latest.status === "skipped")) {
+        problems.push({
+          intentionId: intention.id,
+          run: { kind: "pulse", id: latest.id },
+          status: latest.status,
+          startedAt: latest.started_at,
+        });
+      }
     }
   }
   if (lastSleep && (lastSleep.status === "failed" || lastSleep.status === "partial_failure")) {

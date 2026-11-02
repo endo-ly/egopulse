@@ -156,4 +156,28 @@ describe("latestProblems", () => {
     // Arrange / Act / Assert
     expect(latestProblems(undefined, sleepRun("ok", at(31, 3)))).toEqual([]);
   });
+
+  it("ignores_problems_of_disabled_intentions_and_a_disabled_pulse", () => {
+    // Arrange
+    const failed = (id: string): PulseIntention["recent_runs"] => [
+      { id, status: "failed", output_kind: null, started_at: at(31, 8) },
+    ];
+    const disabledIntention = { ...intention("disabled", failed("disabled-fail")), enabled: false };
+    const activeIntention = intention("active", failed("active-fail"));
+    const pulse: AgentPulse = {
+      enabled: true,
+      error: null,
+      timezone: "UTC",
+      default_delivery: null,
+      intentions: [disabledIntention, activeIntention],
+    };
+
+    // Act
+    const enabledProblems = latestProblems(pulse, undefined);
+    const disabledPulseProblems = latestProblems({ ...pulse, enabled: false }, undefined);
+
+    // Assert
+    expect(enabledProblems.map((problem) => problem.intentionId)).toEqual(["active"]);
+    expect(disabledPulseProblems).toEqual([]);
+  });
 });

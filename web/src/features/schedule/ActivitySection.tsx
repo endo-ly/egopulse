@@ -1,5 +1,5 @@
 import type { ScheduleRun } from "../../app/router";
-import type { AgentPulse, SessionEntry, SleepOutlook, SleepRun } from "../../shared/api/types";
+import type { AgentPulse, PulseIntention, SessionEntry, SleepOutlook, SleepRun } from "../../shared/api/types";
 import { StatusDot } from "../../shared/ui/StatusDot";
 import { LaneGlyph } from "./parts";
 import { PulseRunBody } from "./PulseRunBody";
@@ -69,6 +69,7 @@ export function ActivitySection({
           run={run}
           authToken={authToken}
           sessions={sessions}
+          intentions={pulse?.intentions}
           onClose={() => onOpenRun(null)}
           onOpenSession={onOpenSession}
           onOpenIntention={onOpenIntention}
@@ -134,6 +135,7 @@ function RunDetail({
   run,
   authToken,
   sessions,
+  intentions,
   onClose,
   onOpenSession,
   onOpenIntention,
@@ -141,6 +143,7 @@ function RunDetail({
   run: ScheduleRun;
   authToken: string;
   sessions: readonly SessionEntry[];
+  intentions: readonly PulseIntention[] | undefined;
   onClose: () => void;
   onOpenSession: (sessionKey: string) => void;
   onOpenIntention: (intentionId: string) => void;
@@ -163,6 +166,7 @@ function RunDetail({
             runId={run.id}
             authToken={authToken}
             sessions={sessions}
+            intentions={intentions}
             onOpenSession={onOpenSession}
             onOpenIntention={onOpenIntention}
           />

@@ -108,6 +108,8 @@ const SESSIONS: SessionEntry[] = [
 ];
 
 interface Api {
+  pulse?: AgentPulse;
+  outlook?: SleepOutlook;
   pulseRuns?: PulseRun[];
   sleepRuns?: SleepRun[];
   pulseDetails?: Record<string, PulseRunDetail>;
@@ -131,7 +133,13 @@ function pageOf<T extends { id: string; status: string; started_at: string }>(ru
 }
 
 /** Serves the Schedule APIs from fixtures and records requested URLs. */
-function stubApi({ pulseRuns = [], sleepRuns = [], pulseDetails = {} }: Api) {
+function stubApi({
+  pulse = PULSE,
+  outlook = OUTLOOK,
+  pulseRuns = [],
+  sleepRuns = [],
+  pulseDetails = {},
+}: Api) {
   const requested: URL[] = [];
   vi.stubGlobal(
     "fetch",
@@ -139,8 +147,8 @@ function stubApi({ pulseRuns = [], sleepRuns = [], pulseDetails = {} }: Api) {
       const url = new URL(String(input), "http://localhost");
       requested.push(url);
       let body: unknown;
-      if (url.pathname.endsWith("/pulse")) body = { ok: true, pulse: PULSE };
-      else if (url.pathname.endsWith("/sleep/next")) body = { ok: true, outlook: OUTLOOK };
+      if (url.pathname.endsWith("/pulse")) body = { ok: true, pulse };
+      else if (url.pathname.endsWith("/sleep/next")) body = { ok: true, outlook };
       else if (url.pathname === "/api/pulse/runs") body = { ok: true, ...pageOf(pulseRuns, url) };
       else if (url.pathname === "/api/sleep/runs") body = { ok: true, ...pageOf(sleepRuns, url) };
       else if (url.pathname.startsWith("/api/pulse/runs/")) {
@@ -366,6 +374,27 @@ describe("SchedulePanel", () => {
     expect(onChangeView).toHaveBeenCalledWith({ section: "pulse", intentionId: "morning" });
   });
 
+  it("does_not_open_an_intention_that_was_removed", async () => {
+    // Arrange
+    const run = pulseRun("removed-run", "removed", 0.2);
+    const detail: PulseRunDetail = { ...run, attention_snapshot: "Old attention.", delivery: null };
+    stubApi({ pulseRuns: [run], pulseDetails: { "removed-run": detail } });
+    const view: ScheduleView = { section: "activity", run: { kind: "pulse", id: "removed-run" } };
+    const { getByRole } = renderPanel("t-removed-intention", view);
+    const pane = getByRole("complementary", { name: "Pulse run" });
+    await waitFor(() => {
+      expect(pane.querySelector(".run-detail-line")).toBeTruthy();
+    });
+
+    // Act
+    const line = pane.querySelector(".run-detail-line");
+
+    // Assert
+    expect(pane.querySelector(".title-link")).toBeNull();
+    expect(within(pane).queryByRole("button", { name: "Open intention" })).toBeNull();
+    expect(line?.textContent).toContain("This intention is no longer in PULSE.yaml.");
+  });
+
   it("shows_each_intention_definition_in_the_pulse_section", async () => {
     // Arrange
     stubApi({});
@@ -395,6 +424,64 @@ describe("SchedulePanel", () => {
     expect(detail.querySelector(".doc-card")!.textContent).toContain("Wrap up the day.");
     expect(container.textContent).not.toContain("History");
     expect(onChangeView).toHaveBeenCalledWith({ section: "pulse", intentionId: "morning" });
+  });
+
+  it("reports_a_selection_that_is_no_longer_in_the_pulse_definition", async () => {
+    // Arrange
+    stubApi({});
+
+    // Act
+    const { findByText, queryByRole } = renderPanel("t-missing-intention", {
+      section: "pulse",
+      intentionId: "removed",
+    });
+
+    // Assert
+    expect(await findByText("The selected intention is no longer in PULSE.yaml.")).toBeTruthy();
+    expect(queryByRole("region", { name: "morning" })).toBeNull();
+    expect(queryByRole("region", { name: "evening" })).toBeNull();
+  });
+
+  it("does_not_prefix_an_already_fired_intention_with_next", async () => {
+    // Arrange
+    stubApi({
+      pulse: {
+        ...PULSE,
+        intentions: [
+          intention({
+            id: "once",
+            schedule: { kind: "once", date: "2026-10-01", at: "10:00" },
+            next: { state: "attempted_once", at: null },
+          }),
+        ],
+      },
+    });
+
+    // Act
+    const { findByRole, container } = renderPanel("t-once", { section: "pulse", intentionId: "once" });
+    await findByRole("region", { name: "once" });
+
+    // Assert
+    const description = container.querySelector(".skill-row-description");
+    expect(description?.textContent).toBe("Once on 2026-10-01 10:00 · already fired");
+  });
+
+  it("does_not_warn_about_delivery_for_an_off_intention", async () => {
+    // Arrange
+    stubApi({
+      pulse: {
+        ...PULSE,
+        intentions: [PULSE.intentions[0], { ...PULSE.intentions[1], enabled: false }],
+      },
+    });
+
+    // Act
+    const { findByRole } = renderPanel("t-off-delivery", { section: "pulse", intentionId: "evening" });
+    const detail = await findByRole("region", { name: "evening" });
+
+    // Assert
+    expect(detail.querySelector(".field-warning")).toBeNull();
+    expect(detail.textContent).toContain("This destination will be resolved when it is active again.");
   });
 
   it("shows_only_the_destination_in_sends_to", async () => {
@@ -467,6 +554,56 @@ describe("SchedulePanel", () => {
     expect(container.textContent).toContain("Likely to skip");
     expect(container.textContent).toContain("it runs when there are more than 64");
   });
+
+  it("describes_the_sleep_outlook_as_manual_when_scheduled_sleep_is_off", async () => {
+    // Arrange
+    stubApi({
+      outlook: { ...OUTLOOK, scheduler_enabled: false, next_check_at: null, pending_messages: 100 },
+    });
+
+    // Act
+    const { findByRole, container } = render(
+      <SchedulePanel
+        agentId="lyre"
+        authToken="t-sleep-manual"
+        view={{ section: "sleep" }}
+        sessions={SESSIONS}
+        onChangeView={vi.fn()}
+        onOpenSession={vi.fn()}
+      />,
+    );
+
+    // Assert
+    await findByRole("meter", { name: "New messages" });
+    expect(container.textContent).toContain("Manual run would proceed");
+    expect(container.textContent).not.toContain("Expected to run");
+    expect(container.textContent).toContain("a manual run proceeds when there are more than 64");
+  });
+
+  it("describes_the_sleep_outlook_as_manual_when_the_agent_is_not_targeted", async () => {
+    // Arrange
+    stubApi({
+      outlook: { ...OUTLOOK, targeted: false, next_check_at: null, pending_messages: 0 },
+    });
+
+    // Act
+    const { findByRole, container } = render(
+      <SchedulePanel
+        agentId="lyre"
+        authToken="t-sleep-untargeted"
+        view={{ section: "sleep" }}
+        sessions={SESSIONS}
+        onChangeView={vi.fn()}
+        onOpenSession={vi.fn()}
+      />,
+    );
+
+    // Assert
+    await findByRole("meter", { name: "New messages" });
+    expect(container.textContent).toContain("This agent is not included in scheduled sleep.");
+    expect(container.textContent).toContain("Manual run would skip");
+    expect(container.textContent).not.toContain("Likely to skip");
+  });
 });
 
 describe("ScheduleSectionNav", () => {
@@ -488,5 +625,24 @@ describe("ScheduleSectionNav", () => {
     expect(rows[0].querySelector(".context-sub")!.textContent).toBe("1 needs attention");
     expect(rows[1].getAttribute("aria-current")).toBe("page");
     expect(onChangeView).toHaveBeenCalledWith({ section: "sleep" });
+  });
+
+  it("reports_a_pulse_parse_error_in_the_activity_summary", async () => {
+    // Arrange
+    stubApi({
+      pulse: { ...PULSE, enabled: null, error: "bad yaml", default_delivery: null, intentions: [] },
+    });
+
+    // Act
+    const { container } = render(
+      <ScheduleSectionNav agentId="lyre" authToken="t-nav-error" section="activity" onChangeView={vi.fn()} />,
+    );
+
+    // Assert
+    await waitFor(() => {
+      expect(container.querySelectorAll(".context-row")[0].querySelector(".context-sub")!.textContent).toBe(
+        "PULSE.yaml error",
+      );
+    });
   });
 });

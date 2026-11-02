@@ -20,6 +20,14 @@ export function SleepSection({ outlook }: SleepSectionProps) {
     <QueryState state={outlook}>
       {(data) => {
         const willRun = sleepWillRun(data);
+        const scheduled = data.scheduler_enabled && data.targeted && data.next_check_at !== null;
+        const decision = scheduled
+          ? willRun
+            ? "Expected to run"
+            : "Likely to skip"
+          : willRun
+            ? "Manual run would proceed"
+            : "Manual run would skip";
         return (
           <div className="agent-page" data-lane="sleep">
             <dl className="agent-kv">
@@ -28,11 +36,9 @@ export function SleepSection({ outlook }: SleepSectionProps) {
                 <dd>{nextCheck(data)}</dd>
               </div>
               <div className="agent-kv-row">
-                <dt>Decision</dt>
+                <dt>{scheduled ? "Decision" : "Manual run"}</dt>
                 <dd>
-                  <OutcomeLabel tone={willRun ? "success" : "idle"}>
-                    {willRun ? "Expected to run" : "Likely to skip"}
-                  </OutcomeLabel>
+                  <OutcomeLabel tone={willRun ? "success" : "idle"}>{decision}</OutcomeLabel>
                   <div
                     className="meter"
                     role="meter"
@@ -47,7 +53,8 @@ export function SleepSection({ outlook }: SleepSectionProps) {
                     />
                   </div>
                   <p className="field-note">
-                    {data.pending_messages} new messages so far; it runs when there are more than {data.threshold}.
+                    {data.pending_messages} new messages so far; {scheduled ? "it runs" : "a manual run proceeds"} when
+                    there are more than {data.threshold}.
                   </p>
                 </dd>
               </div>

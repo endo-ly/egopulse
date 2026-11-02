@@ -93,6 +93,27 @@ export function describeNextDue(next: PulseNextDue | null, now: number = Date.no
 }
 
 /**
+ * The next firing for a one-line row. Only a scheduled firing reads as
+ * "next ..."; a state such as "already fired" must not be prefixed with
+ * "next".
+ */
+export function describeNextDueInList(next: PulseNextDue | null, now: number = Date.now()): string {
+  if (next === null) return "off";
+  switch (next.state) {
+    case "due_now":
+      return "due now";
+    case "scheduled":
+      return next.at ? `next ${formatUpcomingTime(next.at, now)}` : "next scheduled";
+    case "attempted_this_period":
+      return "done for this period";
+    case "attempted_once":
+      return "already fired";
+    case "no_upcoming":
+      return "no upcoming";
+  }
+}
+
+/**
  * A Pulse run's outcome: "Notified" / "Silent" for successes, "Not delivered"
  * for a firing skipped because its destination did not resolve, else the status.
  */

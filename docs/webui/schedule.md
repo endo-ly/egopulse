@@ -27,7 +27,7 @@ Sidebar の文脈領域（[layout.md §2.5](./layout.md#25-context-section)）�
 
 | 行 | 2 行目の要約 |
 |---|---|
-| Activity | 問題があれば `{n} needs attention`、なければ直近の予定（`Next: Today 09:00`）。何もなければ `Nothing scheduled` |
+| Activity | 問題があれば `{n} needs attention`、PULSE.yaml がパースできなければ `PULSE.yaml error`、なければ直近の予定（`Next: Today 09:00`）。何もなければ `Nothing scheduled` |
 | Pulse | `{有効数} of {総数} active`。agent の Pulse が無効なら `Off`、PULSE.yaml がパースできなければ `PULSE.yaml error` |
 | Sleep | 次回チェックの時刻。スケジューラが無効なら `Manual only`、agent が対象外なら `Not scheduled` |
 
@@ -48,12 +48,13 @@ Timeline の上に、直近の run に問題がある intention / Sleep を新�
 
 | 対象 | 問題とみなす条件 | 表示 |
 |---|---|---|
-| Pulse intention | 最新の run が `failed` | `{intention id} failed on its last firing` |
-| Pulse intention | 最新の run が `skipped`（配送先の会話が解決できず通知できなかった） | `{intention id} could not deliver its last notification` |
+| Pulse intention | agent の Pulse と intention が有効で、最新の run が `failed` | `{intention id} failed on its last firing` |
+| Pulse intention | agent の Pulse と intention が有効で、最新の run が `skipped`（配送先の会話が解決できず通知できなかった） | `{intention id} could not deliver its last notification` |
 | Sleep | 実際に処理した最新の run（`skipped` を除く）が `failed` / `partial_failure` | `Sleep failed on its last run` / `Sleep partly failed on its last run` |
 
 - 各行は status dot・タイトル・時刻と `View`（その run を右に開く）
 - その後に成功した run があれば問題は解消したとみなし、表示しない
+- Pulse が無効、または intention が無効なものは対象外。無効な routine は再試行されないため、解消しない警告を残さない
 - PULSE.yaml がパースできない場合は、その旨（scheduler はその agent の intention を発火しない）とパースエラーを同じ枠に表示する
 
 ### 2.2 Upcoming
@@ -94,17 +95,17 @@ Skills と同じく、intention の一覧と選んだ intention の定義を左�
 | 要素 | 内容 |
 |---|---|
 | agent 単位の設定 | Status（`On` / `Off`）・Timezone・Default destination（`default_delivery`。なければ直近の Discord / Telegram / Web 会話） |
-| 一覧 | PULSE.yaml の定義順。各行は id と `{schedule} · next {次回発火}`。無効な intention（または agent の Pulse が無効）は薄くして `Off` を添える |
+| 一覧 | PULSE.yaml の定義順。各行は id と `{schedule} · next {次回発火}`。`due_now` は `· due now`、`attempted_this_period` / `attempted_once` / `no_upcoming` は `· done for this period` / `· already fired` / `· no upcoming` と、`next` を付けずに状態を示す。無効な intention（または agent の Pulse が無効）は薄くして `Off` を添える |
 | 定義 | 見出しは intention の id、状態（`Active` / `Off` / `Off (Pulse is off)`）、When（schedule と timezone）、Next（無効なら `Does not fire while off`）、Sends to（§3.1）、Attention（DocumentCard で全文）。タイトルに attention を出さない（同じ文が二度並ぶため） |
 
-- 選択は URL に持つ。指定がない、または PULSE.yaml から消えた intention を指す場合は先頭の intention を選ぶ
+- 選択は URL に持つ。指定がなければ先頭の intention を選ぶ。指定した intention が PULSE.yaml から消えている場合は、先頭に置き換えず、その旨を表示する
 - PULSE.yaml がパースできない場合は、agent 単位の設定と一覧の代わりにその旨とパースエラーを表示する
 - intention がない場合は、会話の中で agent に頼めば作られることを示す
 - 実行の結果はここに出さない（Activity で見る）
 
 ### 3.1 配送先の表示
 
-配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram / Web 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI は、ユーザーが表示名を付けた会話を `Discord · Team chat` のように示し、表示名のない会話は設定された配送先（`Discord · 123456789`）またはチャンネル名（`Discord`）で示す。会話の最終メッセージは発火のたびに変わり、別の intention の通知も含むため、配送先の表示には使わない。どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。Web の配送先はセッション ID（`chat:{id}`）で指定し、`target.session_key` も同じ形式になる。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示し、発火が skip されることを warning 色で伝える。
+配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram / Web 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI は、ユーザーが表示名を付けた会話を `Discord · Team chat` のように示し、表示名のない会話は設定された配送先（`Discord · 123456789`）またはチャンネル名（`Discord`）で示す。会話の最終メッセージは発火のたびに変わり、別の intention の通知も含むため、配送先の表示には使わない。どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。Web の配送先はセッション ID（`chat:{id}`）で指定し、`target.session_key` も同じ形式になる。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示す。有効な intention では発火が skip されることを warning 色で伝え、無効な intention では有効化後に解決する旨を note で伝える。
 
 ---
 
@@ -113,7 +114,7 @@ Skills と同じく、intention の一覧と選んだ intention の定義を左�
 | 項目 | 内容 |
 |---|---|
 | Next check | 次にスケジューラが Sleep を試みる時刻。スケジューラが無効なら `Scheduled sleep is off; it runs only when started by hand.`、agent が対象外なら `This agent is not included in scheduled sleep.` |
-| Decision | 現時点の見込み（`Expected to run` / `Likely to skip`）、閾値に対する新しいメッセージ数のメーター（閾値を超えると Sleep の色）、`41 new messages so far; it runs when there are more than 64.` |
+| Decision | scheduled のときは現時点の見込み（`Expected to run` / `Likely to skip`）。スケジューラ無効・agent 対象外のときは `Manual run would proceed` / `Manual run would skip` とし、手動実行の見込みであることを示す。閾値に対する新しいメッセージ数のメーター（閾値を超えると Sleep の色）と `41 new messages so far; it runs when there are more than 64.`（手動のときは `a manual run proceeds`）を添える |
 
 Sleep は決まった時刻に起動するが、実行するかはその時点の状態で決まる（新しいメッセージが閾値以下ならスキップ、agent が会話中なら見送り）。このため結論を先に示しつつ、「予定」と断定しない言い方にする。
 
@@ -127,9 +128,9 @@ Sleep は決まった時刻に起動するが、実行するかはその時点�
 
 | 要素 | 内容 |
 |---|---|
-| 見出し | intention の id。押すと Pulse 区画のその intention へ移る（`↗` を添える）。メタ行に結果・開始時刻・所要時間（開始時刻の直後に括弧で添える） |
+| 見出し | intention の id。PULSE.yaml に残っていれば押すと Pulse 区画のその intention へ移る（`↗` を添える）。消えている場合はリンクにしない。メタ行に結果・開始時刻・所要時間（開始時刻の直後に括弧で添える） |
 | Outcome | `notify` は通知本文をカードで Markdown 表示。`silent` は報告することがなく送信しなかった旨。`failed` はエラー、`skipped` は通知できなかった旨と理由（warning 色） |
-| 配送先 | 会話に表示名があれば `Sent to Discord · Team chat`、なければチャンネル名（`Sent to Discord`）で示す。`Open in Chat` で通知を保存した会話を Chat タブで開く。通知がなくても `Open intention` を出し、意図の定義へ移れる |
+| 配送先 | 会話に表示名があれば `Sent to Discord · Team chat`、なければチャンネル名（`Sent to Discord`）で示す。`Open in Chat` で通知を保存した会話を Chat タブで開く。通知がなくても、intention が PULSE.yaml に残っていれば `Open intention` を出し、意図の定義へ移れる。消えている場合は `Open intention` の代わりにその旨を示す |
 | Attention | run 開始時点の attention。PULSE.yaml がその後編集されても当時の内容を表示する。記録のない run は `Not recorded for this run.` |
 
 Activation 中のツール実行は、通知を保存した会話の Pulse trace として Chat タブで確認する（[chat.md](./chat.md)）。Pulse Capsule の内部（注入されたコンテキスト等）は表示しない。
