@@ -343,6 +343,7 @@ mod tests {
     use super::*;
     use axum::extract::State as AxumState;
     use axum::http::StatusCode;
+    use chrono::{Datelike, Duration};
 
     use async_trait::async_trait;
 
@@ -403,26 +404,29 @@ mod tests {
 
     #[tokio::test]
     async fn agent_pulse_lists_intentions_with_next_firing_target_and_recent_runs() {
-        // Arrange
+        // Arrange: target tomorrow's weekday at noon so the schedule is never
+        // due at test time. A fixed weekday would only be future on other days.
+        let tomorrow = Utc::now() + Duration::days(1);
+        let target_day = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+            [tomorrow.weekday().num_days_from_monday() as usize];
         let dir = tempfile::tempdir().expect("tempdir");
-        write_pulse(
-            &dir,
-            r#"
+        let yaml = r#"
 enabled: true
 default_delivery:
   channel: discord
   external_chat_id: "123"
 intentions:
   - id: morning
-    schedule: { kind: weekly, day: mon, at: "09:00" }
+    schedule: { kind: weekly, day: __DAY__, at: "12:00" }
     attention: Check the calendar.
   - id: paused
     enabled: false
     schedule: { kind: daily, at: "21:00" }
     attention: Reflect.
     delivery: { channel: telegram, external_chat_id: "456" }
-"#,
-        );
+"#
+        .replace("__DAY__", target_day);
+        write_pulse(&dir, &yaml);
         let state = web_state(&dir);
         let chat_id = state
             .app_state
@@ -455,7 +459,7 @@ intentions:
         let morning = &pulse["intentions"][0];
         assert_eq!(
             morning["schedule"],
-            serde_json::json!({"kind": "weekly", "day": "mon", "at": "09:00"})
+            serde_json::json!({"kind": "weekly", "day": target_day, "at": "12:00"})
         );
         assert_eq!(morning["delivery"], serde_json::Value::Null);
         assert_eq!(
