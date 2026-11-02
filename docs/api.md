@@ -180,7 +180,7 @@ args、env と header の値、endpoint のパス・query・認証情報は返�
 GET /api/config/yaml
 ```
 
-`{ "path", "revision", "fingerprint", "content" }`。`content` はディスク上の YAML を正規化して再シリアライズしたもので、`api_key` / `auth_token` / `token` のリテラル値、SecretRef の `command`、provider `headers` の全値を `********` に置換する。`env` SecretRef の `id` は残す。
+`{ "path", "revision", "fingerprint", "content" }`。`content` はディスク上の YAML を正規化して再シリアライズしたもので、`api_key` / `auth_token` / `token` のリテラル値、SecretRef の `command`、provider `headers` の文字列値を `********` に置換する。値を持たないヘッダ（会話単位で自動付与されるもの）は `null` のまま返す。`env` SecretRef の `id` は残す。
 
 #### 更新
 

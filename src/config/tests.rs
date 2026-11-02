@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use secrecy::ExposeSecret;
 use serial_test::serial;
 
-use super::{Config, default_state_root};
+use super::{Config, ProviderHeaderValue, default_state_root};
 use crate::error::ConfigError;
 use crate::test_env::EnvVarGuard;
 
@@ -97,6 +97,7 @@ providers:
     headers:
       X-Test-Session: egopulse-test
       x-api-version: "2026-01-01"
+      x-session-scope:
   local:
     label: Local OpenAI-compatible
     base_url: http://127.0.0.1:1234/v1
@@ -154,12 +155,17 @@ fn loads_provider_based_config() {
         Some("sk-openai")
     );
     assert_eq!(
-        web_llm.headers.get("x-test-session").map(String::as_str),
-        Some("egopulse-test")
+        web_llm.headers.get("x-test-session"),
+        Some(&ProviderHeaderValue::Literal("egopulse-test".to_string()))
     );
     assert_eq!(
-        web_llm.headers.get("x-api-version").map(String::as_str),
-        Some("2026-01-01")
+        web_llm.headers.get("x-api-version"),
+        Some(&ProviderHeaderValue::Literal("2026-01-01".to_string()))
+    );
+    assert_eq!(
+        web_llm.headers.get("x-session-scope"),
+        Some(&ProviderHeaderValue::Generated),
+        "a header written without a value is generated per request scope"
     );
 }
 

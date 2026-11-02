@@ -139,6 +139,8 @@ src/
 │
 ├── llm/                 # LLM プロバイダー抽象化
 │   ├── mod.rs           # LlmProvider trait
+│   ├── cache.rs         # Provider キャッシュ（上限付き・会話単位）
+│   ├── headers.rs       # 会話単位ヘッダ値の導出
 │   ├── openai.rs        # OpenAI 互換クライアント
 │   ├── responses.rs     # Responses API 呼び出し
 │   ├── messages.rs      # Messages API 呼び出し
@@ -237,7 +239,7 @@ pub struct AppState {
     pub(crate) assets: Arc<AssetStore>,
     pub(crate) soul_agents: Arc<SoulAgentsLoader>,
     pub(crate) memory_loader: Arc<MemoryLoader>,
-    pub(crate) llm_cache: Mutex<HashMap<u64, Arc<dyn LlmProvider>>>,
+    pub(crate) llm_cache: Mutex<ProviderCache>,
     pub(crate) active_turns: Arc<ActiveTurnTracker>,
     pub(crate) turn_scheduler: Arc<TurnScheduler>,
     pub(crate) turn_tracker: Arc<TurnTracker>,
@@ -273,7 +275,7 @@ TurnDependencies
 │   ├── chat.rs            — chats / messages / sessions の原子的更新（revision CAS）
 │   ├── turn.rs            — turn_runs / turn_origins の作成・重複受付防止・状態遷移
 │   └── tool.rs            — tool_calls の claim・状態更新・結果再利用
-├── llm_cache              — Config snapshot 対応の Provider 解決と cache（resolve_llm_for_agent_channel）
+├── llm_cache              — Config snapshot と会話に対応する Provider 解決と cache（resolve_llm_for_agent_channel）
 └── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
 ```
 

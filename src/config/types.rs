@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use secrecy::SecretString;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::ConfigError;
 
@@ -204,6 +205,36 @@ pub(crate) struct ModelConfig {
     pub model_instructions_file: Option<String>,
 }
 
+/// Value of one extra provider header.
+///
+/// YAML represents a literal value as a string and a generated value as a
+/// valueless key (`null`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ProviderHeaderValue {
+    /// Sent verbatim.
+    Literal(String),
+    /// Filled at request time with the identifier of the request scope.
+    Generated,
+}
+
+impl Serialize for ProviderHeaderValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Literal(value) => serializer.serialize_str(value),
+            Self::Generated => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderHeaderValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match Option::<String>::deserialize(deserializer)? {
+            Some(value) => Ok(Self::Literal(value)),
+            None => Ok(Self::Generated),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ProviderConfig {
     pub label: String,
@@ -212,7 +243,11 @@ pub(crate) struct ProviderConfig {
     pub default_model: String,
     pub models: HashMap<String, ModelConfig>,
     /// Extra HTTP headers sent with every request to this provider.
-    pub headers: BTreeMap<String, String>,
+    ///
+    /// A [`ProviderHeaderValue::Generated`] header is filled with a value
+    /// derived from the request scope, so each conversation keeps its own
+    /// upstream routing and cache identity.
+    pub headers: BTreeMap<String, ProviderHeaderValue>,
 }
 
 impl ProviderConfig {
@@ -235,7 +270,7 @@ impl ProviderConfig {
     }
 
     /// Adds extra HTTP headers to this provider definition.
-    pub(crate) fn with_headers(mut self, headers: BTreeMap<String, String>) -> Self {
+    pub(crate) fn with_headers(mut self, headers: BTreeMap<String, ProviderHeaderValue>) -> Self {
         self.headers = headers;
         self
     }
@@ -262,7 +297,7 @@ pub(crate) struct ResolvedLlmConfig {
     pub api_key: Option<SecretString>,
     pub model: String,
     pub reasoning_effort: Option<String>,
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, ProviderHeaderValue>,
 }
 
 /// Where a resolved provider or model value came from in the resolution chain.
@@ -332,6 +367,16 @@ impl ResolvedLlmConfig {
             reasoning_effort,
             headers: provider.headers.clone(),
         }
+    }
+
+    /// Returns `true` when any header requires a request-scope value.
+    ///
+    /// Such a configuration needs the durable installation identity; every
+    /// other configuration keeps the provider cache independent of it.
+    pub(crate) fn has_generated_headers(&self) -> bool {
+        self.headers
+            .values()
+            .any(|value| matches!(value, ProviderHeaderValue::Generated))
     }
 
     /// Cache key that mixes in the `ConfigSnapshot` revision.

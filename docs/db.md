@@ -671,16 +671,24 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 
 ### db_meta
 
-スキーマバージョンの key-value ストア。現在は `schema_version` のみ格納。
+スキーマバージョンとインストール識別子の key-value ストア。
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
-| key | TEXT | PK | 設定キー（`schema_version`） |
-| value | TEXT | NOT NULL | 設定値（バージョン番号の文字列表現） |
+| key | TEXT | PK | 設定キー（`schema_version` / `installation_id`） |
+| value | TEXT | NOT NULL | 設定値 |
+
+**キー**:
+
+| キー | 説明 |
+|------|------|
+| `schema_version` | スキーマバージョン番号の文字列表現 |
+| `installation_id` | この DB を作成したインストールを表す UUID。初回参照時に生成し、以後は同じ値を返す。値なし provider ヘッダの識別子導出に使い、そのヘッダを設定していない構成では参照も生成もされない |
 
 **操作**:
 - `schema_version(conn)` — `db_meta.schema_version` を読み取り。未設定時は `0` を返す
 - `set_schema_version(conn, version, note)` — Upsert（`ON CONFLICT DO UPDATE`）+ `schema_migrations` への履歴記録
+- `installation_id()` — `db_meta.installation_id` を読み取り、未設定なら UUID を生成して保存する。値はプロセス内でキャッシュされる
 
 ---
 

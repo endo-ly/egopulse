@@ -3,8 +3,10 @@
 //! OpenAI 互換 Chat Completions API および Responses API へのリクエスト構築・送信・
 //! レスポンス解析を行う。ツールコールに対応する。
 
+mod cache;
 pub(crate) mod calibration;
 pub(crate) mod codex_auth;
+mod headers;
 mod messages;
 mod openai;
 mod responses;
@@ -17,9 +19,11 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
-use crate::config::ResolvedLlmConfig;
+use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
 use crate::error::LlmError;
 
+pub(crate) use cache::{PROVIDER_CACHE_CAP, ProviderCache};
+pub(crate) use headers::{HeaderContext, rendered_config};
 #[allow(unused_imports)]
 pub(crate) use messages::*;
 pub(crate) use openai::*;
@@ -205,8 +209,18 @@ pub(crate) trait LlmProvider: Send + Sync {
     ) -> Result<MessagesResponse, LlmError>;
 }
 
-/// Create the default LLM provider based on the resolved request-time configuration.
+/// Creates the LLM provider for `config` and the given conversation.
+///
+/// Headers configured without a value are filled in from `context`.
 pub(crate) fn create_provider(
+    config: &ResolvedLlmConfig,
+    context: &HeaderContext,
+) -> Result<Box<dyn LlmProvider>, LlmError> {
+    create_provider_rendered(&rendered_config(config, context))
+}
+
+/// Creates the LLM provider for a configuration whose header values are final.
+pub(crate) fn create_provider_rendered(
     config: &ResolvedLlmConfig,
 ) -> Result<Box<dyn LlmProvider>, LlmError> {
     Ok(Box::new(OpenAiProvider::new(config)?))
@@ -219,11 +233,11 @@ mod tests {
     use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::config::ResolvedLlmConfig;
+    use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
 
     use super::{
-        LlmError, LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse,
-        ToolCall, ToolDefinition, create_provider, extract_raw_tool_use_blocks,
+        HeaderContext, LlmError, LlmProvider, Message, MessageContent, MessageContentPart,
+        MessagesResponse, ToolCall, ToolDefinition, create_provider, extract_raw_tool_use_blocks,
     };
 
     fn message(content: &str) -> Arc<Vec<Message>> {
@@ -312,7 +326,8 @@ mod tests {
             Some("sk-test"),
         );
         llm_config.reasoning_effort = Some("high".to_string());
-        let provider = create_provider(&llm_config).expect("provider");
+        let provider =
+            create_provider(&llm_config, &HeaderContext::process_global()).expect("provider");
 
         let response = provider
             .send_message("", message("hello"), None)
@@ -346,9 +361,10 @@ mod tests {
         );
         llm_config.headers.insert(
             "x-opencode-session".to_string(),
-            "egopulse-musa".to_string(),
+            ProviderHeaderValue::Literal("egopulse-musa".to_string()),
         );
-        let provider = create_provider(&llm_config).expect("provider");
+        let provider =
+            create_provider(&llm_config, &HeaderContext::process_global()).expect("provider");
 
         let response = provider
             .send_message("", message("hello"), None)
@@ -356,6 +372,67 @@ mod tests {
             .expect("response");
 
         assert_eq!(response.content, "hello back");
+    }
+
+    #[tokio::test]
+    async fn valueless_header_is_rendered_per_conversation() {
+        // Arrange
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "content": "hello back"
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let mut llm_config = config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        );
+        llm_config
+            .headers
+            .insert("x-session".to_string(), ProviderHeaderValue::Generated);
+
+        // Act
+        for agent in ["musa", "lyre"] {
+            create_provider(
+                &llm_config,
+                &HeaderContext::for_agent("installation", agent),
+            )
+            .expect("provider")
+            .send_message("", message("hello"), None)
+            .await
+            .expect("response");
+        }
+
+        // Assert
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 2);
+        let values: Vec<String> = requests
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("x-session")
+                    .expect("header")
+                    .to_str()
+                    .expect("utf8")
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            values.iter().all(|value| value.len() == 36
+                && value.split('-').count() == 5
+                && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')),
+            "{values:?}"
+        );
+        assert_ne!(values[0], values[1]);
     }
 
     #[test]
@@ -403,11 +480,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = create_provider(&config(
-            "openai/gpt-4o-mini",
-            format!("{}/api/v1", server.uri()),
-            Some("sk-openrouter"),
-        ))
+        let provider = create_provider(
+            &config(
+                "openai/gpt-4o-mini",
+                format!("{}/api/v1", server.uri()),
+                Some("sk-openrouter"),
+            ),
+            &HeaderContext::process_global(),
+        )
         .expect("provider");
 
         let response = provider
@@ -433,9 +513,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider =
-            create_provider(&config("local-model", format!("{}/v1", server.uri()), None))
-                .expect("provider");
+        let provider = create_provider(
+            &config("local-model", format!("{}/v1", server.uri()), None),
+            &HeaderContext::process_global(),
+        )
+        .expect("provider");
 
         let response = provider
             .send_message("", message("hello"), None)
@@ -475,11 +557,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = create_provider(&config(
-            "gpt-4o-mini",
-            format!("{}/v1", server.uri()),
-            Some("sk-test"),
-        ))
+        let provider = create_provider(
+            &config(
+                "gpt-4o-mini",
+                format!("{}/v1", server.uri()),
+                Some("sk-test"),
+            ),
+            &HeaderContext::process_global(),
+        )
         .expect("provider");
 
         let response = provider
@@ -524,11 +609,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let provider = create_provider(&config(
-            "gpt-4o-mini",
-            format!("{}/v1", server.uri()),
-            Some("sk-test"),
-        ))
+        let provider = create_provider(
+            &config(
+                "gpt-4o-mini",
+                format!("{}/v1", server.uri()),
+                Some("sk-test"),
+            ),
+            &HeaderContext::process_global(),
+        )
         .expect("provider");
 
         let response = provider
@@ -833,11 +921,14 @@ mod tests {
     #[tokio::test]
     async fn llm_provider_metadata_returns_config() {
         let server = wiremock::MockServer::start().await;
-        let provider = create_provider(&config(
-            "gpt-4o-mini",
-            format!("{}/v1", server.uri()),
-            Some("sk-test"),
-        ))
+        let provider = create_provider(
+            &config(
+                "gpt-4o-mini",
+                format!("{}/v1", server.uri()),
+                Some("sk-test"),
+            ),
+            &HeaderContext::process_global(),
+        )
         .expect("provider");
 
         assert_eq!(provider.provider_name(), "test");

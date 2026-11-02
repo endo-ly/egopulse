@@ -4,9 +4,30 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+/// HTTP client shared by every provider.
+///
+/// Providers are created per conversation, so each one must not build its own
+/// connection pool.
+static SHARED_HTTP: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
+fn shared_http_client() -> Result<reqwest::Client, LlmError> {
+    SHARED_HTTP
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(LlmError::InitFailed)
+}
 
 /// OpenAI-compatible LLM provider using Chat Completions and Responses APIs.
 pub(crate) struct OpenAiProvider {
@@ -29,12 +50,7 @@ impl OpenAiProvider {
     /// Returns `LlmError::InitFailed` if the HTTP client cannot be built, or if the
     /// `openai-codex` provider is selected but no Codex auth token is available.
     pub(crate) fn new(config: &ResolvedLlmConfig) -> Result<Self, LlmError> {
-        let http = reqwest::Client::builder()
-            .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .build()
-            .map_err(|error| LlmError::InitFailed(error.to_string()))?;
+        let http = shared_http_client()?;
 
         let is_codex = crate::llm::codex_auth::is_codex_provider(&config.provider);
         let (api_key, account_id) = if is_codex {
@@ -56,6 +72,11 @@ impl OpenAiProvider {
             let parsed_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                 LlmError::InitFailed(format!("invalid header name '{name}': {error}"))
             })?;
+            let ProviderHeaderValue::Literal(value) = value else {
+                return Err(LlmError::InitFailed(format!(
+                    "header '{name}' was not resolved for the request scope"
+                )));
+            };
             let parsed_value = HeaderValue::from_str(value).map_err(|error| {
                 LlmError::InitFailed(format!("invalid value for header '{name}': {error}"))
             })?;
