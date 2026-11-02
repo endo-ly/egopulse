@@ -109,6 +109,8 @@ Command Palette（`Cmd/Ctrl+K`）の Messages セクションから行う。
 - `assistant`：agent アイコン（設定済みなら `/api/agents/{agent_id}/avatar` の画像。bearer auth のため `useAgentAvatars` フックが authorized fetch → object URL に変換して `<img>` に渡す）。未設定なら sender_id の頭文字
 - `system` / `tool`：頭文字
 
+応答待機行とツールカード行は assistant のターンに属するため、そのターンの最初の行では agent の avatar と sender label を表示する。ナレーション済みの assistant 行が直前に出ている場合、続くツールカードは同じヘッダーを繰り返さない。ターンがツールから始まる場合も、最初のツールカードが avatar を伴う。
+
 ### 4.3 Sender Label
 
 - 小テキスト・強調
@@ -154,11 +156,17 @@ LLM 応答がストリーミング中のメッセージ（ドラフト状態）�
 - bubble 右下に小 spinner または streaming 用ステータスアイコン
 - ストリーミング完了（done 受信）後、カーソルを消して確定状態へ移行
 
+### 4.8 応答待機
+
+run が受諾されてから最初の delta または `tool_start` が届くまでの間、timeline 末尾に assistant の行を表示する。この行は agent の avatar・sender label・thinking dots を持ち、応答が始まると最初の delta 行またはツールカード行に置き換わる。
+
 ---
 
 ## 5. Tool 実行カード
 
 LLM がツールを呼び出したとき、応答メッセージの下（同一の assistant 発言ツリー内）に折りたたみカードを表示する。
+
+ツールカード行は assistant と同じ幅に置き、そのターンの最初の行では avatar 付きヘッダーを表示する。ナレーション済みの assistant 行に続く場合はヘッダーを省略し、カードだけを左揃えで表示する。
 
 ### 5.1 States
 

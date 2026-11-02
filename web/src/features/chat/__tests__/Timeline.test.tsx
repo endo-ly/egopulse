@@ -45,6 +45,31 @@ describe("Timeline", () => {
     expect(tl.scrollTop).toBe(2000);
   });
 
+  it("timeline_returns_to_the_latest_row_when_the_session_changes", () => {
+    // Arrange: the user scrolled up in the previous session.
+    const { container, rerender } = render(
+      <Timeline sessionKey="chat:1">
+        <div>old session</div>
+      </Timeline>,
+    );
+    const tl = container.querySelector(".timeline") as HTMLElement;
+    setScrollProps(tl, 2000, 200, 0);
+    fireEvent.scroll(tl);
+    expect(container.querySelector(".jump-to-latest")).toBeTruthy();
+
+    // Act
+    setScrollProps(tl, 3000, 200, 0);
+    rerender(
+      <Timeline sessionKey="chat:2">
+        <div>new session</div>
+      </Timeline>,
+    );
+
+    // Assert
+    expect(tl.scrollTop).toBe(3000);
+    expect(container.querySelector(".jump-to-latest")).toBeNull();
+  });
+
   it("timeline_highlights_requested_jump_target", () => {
     const { container } = render(
       <Timeline jumpRequest={{ index: 1, seq: 1 }}>

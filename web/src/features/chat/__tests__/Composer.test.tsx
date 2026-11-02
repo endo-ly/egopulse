@@ -145,6 +145,26 @@ describe("Composer", () => {
     expect((items ?? []).length).toBeGreaterThan(0);
   });
 
+  it("composer_session_switch_resets_slash_suggestion_state", () => {
+    // Arrange: the previous session dismissed its suggestion popup.
+    globalThis.localStorage?.setItem("egopulse.draft.s2", "/re");
+    const { container, rerender } = render(
+      <Composer onSubmit={vi.fn()} storageKey="s1" />,
+    );
+    const ta = container.querySelector(".composer-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "/" } });
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(container.querySelector(".command-suggest")).toBeNull();
+
+    // Act
+    rerender(<Composer onSubmit={vi.fn()} storageKey="s2" />);
+
+    // Assert: the new session's slash draft shows its own suggestions.
+    expect(ta.value).toBe("/re");
+    expect(container.querySelector(".command-suggest")).toBeTruthy();
+    globalThis.localStorage?.clear();
+  });
+
   it("composer_escape_clears_suggest", () => {
     const onSubmit = vi.fn();
     const { container } = render(<Composer onSubmit={onSubmit} />);

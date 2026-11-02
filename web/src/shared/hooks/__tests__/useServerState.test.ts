@@ -136,6 +136,53 @@ describe("useServerState", () => {
     await waitFor(() => expect(result.current.data).toBe("fresh"));
   });
 
+  it("keeps mounted data visible while an invalidated query refetches", async () => {
+    // Arrange: the first fetch landed and the refresh is still on its way.
+    let resolveRefresh: ((value: string) => void) | null = null;
+    const fetcher = vi
+      .fn()
+      .mockResolvedValueOnce("old")
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveRefresh = resolve;
+          }),
+      );
+    const { result } = renderHook(() =>
+      useServerState("test-stale-mount", fetcher),
+    );
+    await waitFor(() => expect(result.current.data).toBe("old"));
+
+    // Act
+    act(() => invalidateQuery("test-stale-mount"));
+    await waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+
+    // Assert: the visible value survives until the fresh response lands.
+    expect(result.current.data).toBe("old");
+    await act(async () => resolveRefresh?.("new"));
+    await waitFor(() => expect(result.current.data).toBe("new"));
+  });
+
+  it("drops invalidated data that no component is showing", async () => {
+    // Arrange: a mounted screen fills the cache, then unmounts.
+    const first = renderHook(() =>
+      useServerState("test-stale-unmounted", () => Promise.resolve("old")),
+    );
+    await waitFor(() => expect(first.result.current.data).toBe("old"));
+    first.unmount();
+    act(() => invalidateQuery("test-stale-unmounted"));
+
+    // Act
+    const fetcher = vi.fn().mockResolvedValue("new");
+    const { result } = renderHook(() =>
+      useServerState("test-stale-unmounted", fetcher),
+    );
+
+    // Assert: the next mount does not reuse the stale page.
+    expect(result.current.data).toBeUndefined();
+    await waitFor(() => expect(result.current.data).toBe("new"));
+  });
+
   it("revalidates cached data on mount while keeping it visible", async () => {
     // Arrange: a first mount fills the cache
     const first = renderHook(() => useServerState("test-revalidate", () => Promise.resolve("old")));

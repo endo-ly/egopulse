@@ -480,6 +480,7 @@ export function WebUI() {
     (session) => session.session_key === selectedSession,
   );
   const channel = selectedSessionData?.channel ?? "web";
+  const sessionAgentId = selectedSessionData?.agent_id ?? selectedAgent;
   const isReadOnly = channel !== "web";
 
   const timelineEntries = useMemo(
@@ -557,7 +558,8 @@ export function WebUI() {
 
   const chatMain = (
     <ChatTab
-      key={selectedSession}
+      sessionKey={selectedSession}
+      agentId={sessionAgentId}
       channel={channel}
       readOnly={isReadOnly}
       entries={timelineEntries}

@@ -1,5 +1,6 @@
 import { Timeline } from "./Timeline";
 import { MessageBubble } from "./MessageBubble";
+import { MessageHeader } from "./MessageHeader";
 import { ToolCard } from "./ToolCard";
 import { Composer } from "./Composer";
 import { ReadOnlyBanner } from "./ReadOnlyBanner";
@@ -10,6 +11,10 @@ import type { TimelineEntry } from "./timelineEntries";
 export interface ChatTabProps {
   channel: string;
   readOnly: boolean;
+  /** Session the timeline belongs to; changing it resets scroll position. */
+  sessionKey?: string;
+  /** The agent that owns the session, used by progress and tool rows. */
+  agentId?: string;
   /** Top-level timeline rows, with Pulse traces folded under their outputs. */
   entries?: TimelineEntry[];
   onSend?: (text: string, draftId: string) => Promise<boolean>;
@@ -32,9 +37,21 @@ export interface ChatTabProps {
   olderLoadSeq?: number;
 }
 
+/**
+ * A tool row belongs to the assistant's turn. When the preceding row is
+ * already assistant-side, that row carries the turn's header.
+ */
+function startsAssistantTurn(entries: TimelineEntry[], index: number): boolean {
+  if (index === 0) return true;
+  const previous = entries[index - 1].message;
+  return previous.sender_kind !== "assistant" && previous.sender_kind !== "tool";
+}
+
 export function ChatTab({
   channel,
   readOnly,
+  sessionKey,
+  agentId,
   entries = [],
   onSend,
   storageKey,
@@ -51,16 +68,25 @@ export function ChatTab({
   return (
     <div className="chat-tab">
       <Timeline
+        sessionKey={sessionKey}
         jumpRequest={jumpRequest}
         onReachTop={onLoadOlder}
         atHistoryStart={atHistoryStart}
         prependSeq={olderLoadSeq}
       >
-        {entries.map(({ message: m, pulseTrace }) => {
+        {entries.map(({ message: m, pulseTrace }, index) => {
           const toolEvent = parseToolEvent(m);
           if (toolEvent) {
             return (
               <div key={m.id} className="message-row bubble-tool">
+                {agentId && startsAssistantTurn(entries, index) && (
+                  <MessageHeader
+                    senderId={agentId}
+                    senderKind="assistant"
+                    timestamp={m.timestamp}
+                    agentAvatars={agentAvatars}
+                  />
+                )}
                 <ToolCard event={toolEvent} />
               </div>
             );
@@ -76,6 +102,13 @@ export function ChatTab({
         })}
         {waitingForAssistant && (
           <div className="message-row bubble-assistant">
+            {agentId && (
+              <MessageHeader
+                senderId={agentId}
+                senderKind="assistant"
+                agentAvatars={agentAvatars}
+              />
+            )}
             <div className="message-body">
               <span className="thinking-dots" aria-label="assistant is responding">
                 <span />

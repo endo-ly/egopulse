@@ -1,4 +1,10 @@
-import { useState, useRef, useEffect, type KeyboardEvent } from "react";
+import {
+  useState,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  type KeyboardEvent,
+} from "react";
 import { loadDraft, saveDraft } from "./draftStorage";
 import { matchSlashCommands } from "./slashCommands";
 import { randomId } from "../../shared/lib/random";
@@ -18,6 +24,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const submittingRef = useRef(false);
   const storageKeyRef = useRef(storageKey);
+  const loadedStorageKeyRef = useRef(storageKey);
   const draftVersionRef = useRef(0);
   const draftIdRef = useRef(randomId());
 
@@ -31,9 +38,14 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
   const showSuggestPopup =
     text.startsWith("/") && matches.length > 0 && !suggestHidden;
 
-  useEffect(() => {
+  // Load the new session's draft before paint so the previous session's text
+  // and slash suggestions never flash in the composer.
+  useLayoutEffect(() => {
+    if (loadedStorageKeyRef.current === storageKey) return;
+    loadedStorageKeyRef.current = storageKey;
     setText(loadDraft(storageKey));
-    draftIdRef.current = randomId();
+    setSuggestIndex(-1);
+    setSuggestHidden(false);
     submittingRef.current = false;
     setSubmitting(false);
   }, [storageKey]);
