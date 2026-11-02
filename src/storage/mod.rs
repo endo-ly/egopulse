@@ -83,6 +83,7 @@ pub(crate) mod backup;
 mod chat;
 mod episode;
 mod llm_usage;
+mod meta;
 mod metrics;
 mod migration;
 mod pulse;
@@ -200,6 +201,8 @@ fn initialize_database_file(db_path: &Path) -> Result<(), StorageError> {
 /// `busy_timeout = 5 s`.
 pub struct Database {
     pool: Pool,
+    /// Cached `db_meta.installation_id`; loaded on first use.
+    installation_id: std::sync::OnceLock<String>,
     /// Test-only transient fault injection. Stays at its default (no faults) in
     /// production; tests force a flaky DB via [`Database::fault_inject_next_get_conn`]
     /// to exercise abnormal recovery paths.
@@ -805,6 +808,7 @@ impl Database {
         let pool = build_pool_and_migrate(db_path)?;
         Ok(Self {
             pool,
+            installation_id: std::sync::OnceLock::new(),
             fault: std::sync::Mutex::new(FaultConfig::default()),
         })
     }
@@ -839,6 +843,7 @@ impl Database {
         let pool = build_pool_and_migrate(db_path)?;
         Ok(Self {
             pool,
+            installation_id: std::sync::OnceLock::new(),
             fault: std::sync::Mutex::new(FaultConfig::default()),
         })
     }
@@ -856,6 +861,7 @@ impl Database {
         let pool = build_secret_pool_and_migrate(db_path)?;
         Ok(Self {
             pool,
+            installation_id: std::sync::OnceLock::new(),
             fault: std::sync::Mutex::new(FaultConfig::default()),
         })
     }
@@ -884,6 +890,7 @@ impl Database {
         let pool = build_secret_pool_and_migrate(db_path)?;
         Ok(Self {
             pool,
+            installation_id: std::sync::OnceLock::new(),
             fault: std::sync::Mutex::new(FaultConfig::default()),
         })
     }
@@ -931,6 +938,7 @@ impl Database {
             .map_err(|e| StorageError::InitFailed(e.to_string()))?;
         Ok(Self {
             pool,
+            installation_id: std::sync::OnceLock::new(),
             fault: std::sync::Mutex::new(FaultConfig::default()),
         })
     }

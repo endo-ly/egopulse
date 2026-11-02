@@ -111,8 +111,40 @@ impl TurnDependencies {
         let resolved = snapshot
             .config
             .resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        let headers = crate::llm::HeaderContext::from_surface(context);
+        let headers = self.header_context_for_surface(context)?;
         self.cached_provider(&resolved, snapshot.revision, &headers)
+    }
+
+    /// Builds the request scope of a conversation on this installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgoPulseError`] when the installation identity cannot be read.
+    pub(crate) fn header_context_for_surface(
+        &self,
+        context: &crate::conversation::SurfaceContext,
+    ) -> Result<crate::llm::HeaderContext, EgoPulseError> {
+        let installation_id = self.db.installation_id()?;
+        Ok(crate::llm::HeaderContext::for_surface(
+            installation_id,
+            context,
+        ))
+    }
+
+    /// Builds the request scope of an agent for work without a conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EgoPulseError`] when the installation identity cannot be read.
+    pub(crate) fn header_context_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<crate::llm::HeaderContext, EgoPulseError> {
+        let installation_id = self.db.installation_id()?;
+        Ok(crate::llm::HeaderContext::for_agent(
+            installation_id,
+            agent_id,
+        ))
     }
 
     pub(crate) fn cached_provider(

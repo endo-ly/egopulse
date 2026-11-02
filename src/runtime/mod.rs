@@ -646,7 +646,7 @@ fn build_app_state_dependencies(
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
     let llm = create_provider(
         &config.resolve_global_llm(),
-        &crate::llm::HeaderContext::global(),
+        &crate::llm::HeaderContext::process_global(),
     )?;
     let messages = Arc::new(vec![Message::text("user", prompt)]);
 
@@ -1292,13 +1292,25 @@ mod tests {
 
         // Act
         let musa = runtime
-            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("musa"))
+            .cached_provider(
+                &resolved,
+                1,
+                &crate::llm::HeaderContext::for_agent("installation", "musa"),
+            )
             .expect("musa provider");
         let musa_again = runtime
-            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("musa"))
+            .cached_provider(
+                &resolved,
+                1,
+                &crate::llm::HeaderContext::for_agent("installation", "musa"),
+            )
             .expect("musa provider");
         let lyre = runtime
-            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("lyre"))
+            .cached_provider(
+                &resolved,
+                1,
+                &crate::llm::HeaderContext::for_agent("installation", "lyre"),
+            )
             .expect("lyre provider");
 
         // Assert
@@ -1318,15 +1330,47 @@ mod tests {
 
         // Act
         let musa = runtime
-            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("musa"))
+            .cached_provider(
+                &resolved,
+                1,
+                &crate::llm::HeaderContext::for_agent("installation", "musa"),
+            )
             .expect("musa provider");
         let lyre = runtime
-            .cached_provider(&resolved, 1, &crate::llm::HeaderContext::for_agent("lyre"))
+            .cached_provider(
+                &resolved,
+                1,
+                &crate::llm::HeaderContext::for_agent("installation", "lyre"),
+            )
             .expect("lyre provider");
 
         // Assert
         assert!(Arc::ptr_eq(&musa, &lyre));
         assert_eq!(state.llm_cache.lock().expect("cache lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn header_context_separates_storage_scopes() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let runtime = state.turn_dependencies();
+        let mut normal = crate::test_util::cli_context("scope-test");
+        normal.scope = crate::conversation::ConversationScope::Normal;
+        let mut secret = normal.clone();
+        secret.scope = crate::conversation::ConversationScope::Secret;
+
+        // Act
+        let normal = runtime
+            .header_context_for_surface(&normal)
+            .expect("normal context");
+        let secret = runtime
+            .header_context_for_surface(&secret)
+            .expect("secret context");
+
+        // Assert
+        assert_ne!(normal, secret);
     }
 
     #[tokio::test]
@@ -1337,7 +1381,7 @@ mod tests {
         let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
         let runtime = state.turn_dependencies();
 
-        let headers = crate::llm::HeaderContext::global();
+        let headers = crate::llm::HeaderContext::process_global();
         let newer = runtime
             .cached_provider(&resolved, 2, &headers)
             .expect("newer revision provider");
@@ -1360,7 +1404,7 @@ mod tests {
             dir.path().to_str().expect("utf8"),
             crate::llm::create_provider(
                 &resolved_config(expected_provider, expected_model, "https://example.com/v1"),
-                &crate::llm::HeaderContext::global(),
+                &crate::llm::HeaderContext::process_global(),
             )
             .expect("provider"),
         );

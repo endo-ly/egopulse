@@ -326,7 +326,8 @@ mod tests {
             Some("sk-test"),
         );
         llm_config.reasoning_effort = Some("high".to_string());
-        let provider = create_provider(&llm_config, &HeaderContext::global()).expect("provider");
+        let provider =
+            create_provider(&llm_config, &HeaderContext::process_global()).expect("provider");
 
         let response = provider
             .send_message("", message("hello"), None)
@@ -362,7 +363,8 @@ mod tests {
             "x-opencode-session".to_string(),
             ProviderHeaderValue::Literal("egopulse-musa".to_string()),
         );
-        let provider = create_provider(&llm_config, &HeaderContext::global()).expect("provider");
+        let provider =
+            create_provider(&llm_config, &HeaderContext::process_global()).expect("provider");
 
         let response = provider
             .send_message("", message("hello"), None)
@@ -399,11 +401,14 @@ mod tests {
 
         // Act
         for agent in ["musa", "lyre"] {
-            create_provider(&llm_config, &HeaderContext::for_agent(agent))
-                .expect("provider")
-                .send_message("", message("hello"), None)
-                .await
-                .expect("response");
+            create_provider(
+                &llm_config,
+                &HeaderContext::for_agent("installation", agent),
+            )
+            .expect("provider")
+            .send_message("", message("hello"), None)
+            .await
+            .expect("response");
         }
 
         // Assert
@@ -422,8 +427,9 @@ mod tests {
             })
             .collect();
         assert!(
-            values.iter().all(|value| value.len() == 16
-                && value.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))),
+            values.iter().all(|value| value.len() == 36
+                && value.split('-').count() == 5
+                && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')),
             "{values:?}"
         );
         assert_ne!(values[0], values[1]);
@@ -480,7 +486,7 @@ mod tests {
                 format!("{}/api/v1", server.uri()),
                 Some("sk-openrouter"),
             ),
-            &HeaderContext::global(),
+            &HeaderContext::process_global(),
         )
         .expect("provider");
 
@@ -509,7 +515,7 @@ mod tests {
 
         let provider = create_provider(
             &config("local-model", format!("{}/v1", server.uri()), None),
-            &HeaderContext::global(),
+            &HeaderContext::process_global(),
         )
         .expect("provider");
 
@@ -557,7 +563,7 @@ mod tests {
                 format!("{}/v1", server.uri()),
                 Some("sk-test"),
             ),
-            &HeaderContext::global(),
+            &HeaderContext::process_global(),
         )
         .expect("provider");
 
@@ -609,7 +615,7 @@ mod tests {
                 format!("{}/v1", server.uri()),
                 Some("sk-test"),
             ),
-            &HeaderContext::global(),
+            &HeaderContext::process_global(),
         )
         .expect("provider");
 
@@ -921,7 +927,7 @@ mod tests {
                 format!("{}/v1", server.uri()),
                 Some("sk-test"),
             ),
-            &HeaderContext::global(),
+            &HeaderContext::process_global(),
         )
         .expect("provider");
 
