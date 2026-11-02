@@ -152,7 +152,11 @@ function stubApi({ pulseRuns = [], sleepRuns = [], pulseDetails = {} }: Api) {
   return requested;
 }
 
-function renderPanel(authToken: string, view: ScheduleView = SCHEDULE_ACTIVITY) {
+function renderPanel(
+  authToken: string,
+  view: ScheduleView = SCHEDULE_ACTIVITY,
+  sessions: readonly SessionEntry[] = SESSIONS,
+) {
   const onChangeView = vi.fn();
   const onOpenSession = vi.fn();
   const utils = render(
@@ -160,7 +164,7 @@ function renderPanel(authToken: string, view: ScheduleView = SCHEDULE_ACTIVITY) 
       agentId="lyre"
       authToken={authToken}
       view={view}
-      sessions={SESSIONS}
+      sessions={sessions}
       onChangeView={onChangeView}
       onOpenSession={onOpenSession}
     />,
@@ -391,6 +395,54 @@ describe("SchedulePanel", () => {
     expect(detail.querySelector(".doc-card")!.textContent).toContain("Wrap up the day.");
     expect(container.textContent).not.toContain("History");
     expect(onChangeView).toHaveBeenCalledWith({ section: "pulse", intentionId: "morning" });
+  });
+
+  it("shows_only_the_destination_in_sends_to", async () => {
+    // Arrange
+    stubApi({});
+    const sessions: SessionEntry[] = [
+      { ...SESSIONS[0], name: null, last_message_preview: "Another intention's notification." },
+    ];
+    const { findByRole } = renderPanel("t-sends-to", { section: "pulse", intentionId: "morning" }, sessions);
+
+    // Act
+    const detail = await findByRole("region", { name: "morning" });
+    const row = Array.from(detail.querySelectorAll(".agent-kv-row")).find(
+      (candidate) => candidate.querySelector("dt")?.textContent === "Sends to",
+    );
+
+    // Assert
+    expect(row?.querySelector("dd")?.textContent).toContain("Discord · 123");
+    expect(detail.textContent).not.toContain("Another intention's notification.");
+  });
+
+  it("does_not_repeat_the_delivered_message_as_a_run_destination", async () => {
+    // Arrange
+    const output = "Two meetings today.";
+    const run = pulseRun("notify", "morning", 0.2, { output_text: output });
+    const detail: PulseRunDetail = {
+      ...run,
+      attention_snapshot: "Check the calendar.",
+      delivery: { channel: "discord", external_chat_id: "discord:1:agent:lyre", session_key: "chat:7" },
+    };
+    stubApi({ pulseRuns: [run], pulseDetails: { notify: detail } });
+    const sessions: SessionEntry[] = [{ ...SESSIONS[0], name: null, last_message_preview: output }];
+    const { getByRole } = renderPanel(
+      "t-run-destination",
+      { section: "activity", run: { kind: "pulse", id: "notify" } },
+      sessions,
+    );
+    const pane = getByRole("complementary", { name: "Pulse run" });
+    await waitFor(() => {
+      expect(pane.querySelector(".message-card")?.textContent).toBe(output);
+    });
+
+    // Act
+    const line = pane.querySelector(".run-detail-line");
+
+    // Assert
+    expect(line?.textContent).toContain("Sent to Discord");
+    expect(line?.textContent).not.toContain(output);
   });
 
   it("shows_the_sleep_outlook_in_the_sleep_section", async () => {

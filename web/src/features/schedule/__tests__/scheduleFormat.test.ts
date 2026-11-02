@@ -76,9 +76,12 @@ describe("scheduleFormat", () => {
     expect(formatDay(new Date(2026, 9, 28, 9, 0).toISOString(), now)).toMatch(/Oct.*28/);
   });
 
-  it("names_the_resolved_conversation_as_the_session_list_does", () => {
+  it("names_a_resolved_conversation_without_using_its_last_message", () => {
     // Arrange
-    const sessions = [session("chat:7", "Team chat"), session("chat:8", null, "hello there")];
+    const sessions = [
+      session("chat:7", "Team chat"),
+      session("chat:8", null, "another intention's notification"),
+    ];
     const fallback = { channel: "discord", external_chat_id: "123" };
     const own = { channel: "telegram", external_chat_id: "987" };
 
@@ -93,10 +96,27 @@ describe("scheduleFormat", () => {
       null,
       sessions,
     );
+    const unnamedConfigured = describeDelivery(
+      { delivery: null, target: { channel: "discord", session_key: "chat:8" } },
+      fallback,
+      sessions,
+    );
 
     // Assert
     expect(named).toEqual({ label: "Discord · Team chat", origin: "default", sessionKey: "chat:7" });
-    expect(unnamed).toEqual({ label: "Discord · hello there", origin: "latest", sessionKey: "chat:8" });
+    expect(unnamed).toEqual({ label: "Discord", origin: "latest", sessionKey: "chat:8" });
+    expect(unnamedConfigured).toEqual({
+      label: "Discord · 123",
+      origin: "default",
+      sessionKey: "chat:8",
+    });
+    expect(
+      describeDelivery({ delivery: own, target: { channel: "telegram", session_key: "chat:99" } }, null, sessions),
+    ).toEqual({
+      label: "Telegram · 987",
+      origin: "intention",
+      sessionKey: "chat:99",
+    });
     expect(describeDelivery({ delivery: own, target: null }, fallback, sessions)).toEqual({
       label: "Telegram · 987",
       origin: "intention",

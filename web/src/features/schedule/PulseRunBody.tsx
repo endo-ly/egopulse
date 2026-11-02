@@ -1,12 +1,11 @@
 import { fetchPulseRunDetail } from "../../shared/api/pulse";
 import type { PulseRunDetail, SessionEntry } from "../../shared/api/types";
-import { channelLabel, formatDuration } from "../../shared/lib/format";
-import { sessionTitle } from "../../shared/lib/session";
+import { formatDuration } from "../../shared/lib/format";
 import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
 import { QueryState } from "../../shared/ui/QueryState";
 import { MetaLine, OutcomeLabel } from "./parts";
 import { pulseTone } from "./runStatus";
-import { formatRunTime, pulseOutcomeLabel } from "./scheduleFormat";
+import { deliveryLabel, formatRunTime, pulseOutcomeLabel } from "./scheduleFormat";
 import { useScheduleQuery } from "./scheduleQuery";
 
 export interface PulseRunBodyProps {
@@ -53,7 +52,9 @@ function PulseRunContent({
   onOpenIntention: (intentionId: string) => void;
 }) {
   const { delivery } = run;
-  const session = delivery && sessions.find((candidate) => candidate.session_key === delivery.session_key);
+  const session = delivery
+    ? sessions.find((candidate) => candidate.session_key === delivery.session_key)
+    : undefined;
   const took = run.finished_at
     ? formatDuration(Date.parse(run.finished_at) - Date.parse(run.started_at))
     : null;
@@ -91,8 +92,7 @@ function PulseRunContent({
       <p className="run-detail-line">
         {delivery && (
           <>
-            Sent to {channelLabel(delivery.channel)}
-            {session && ` · ${sessionTitle(session)}`}{" "}
+            Sent to {deliveryLabel(delivery.channel, session, null)}{" "}
             <button type="button" className="text-link" onClick={() => onOpenSession(delivery.session_key)}>
               Open in Chat
             </button>{" "}

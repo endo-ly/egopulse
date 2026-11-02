@@ -104,7 +104,7 @@ Skills と同じく、intention の一覧と選んだ intention の定義を左�
 
 ### 3.1 配送先の表示
 
-配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram / Web 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI はその会話を Sessions と同じ名前（[layout.md §2.6](./layout.md#26-sessions)）で `Discord · Team chat` のように示し、どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。Web の配送先はセッション ID（`chat:{id}`）で指定し、`target.session_key` も同じ形式になる。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示し、発火が skip されることを warning 色で伝える。
+配送先は intention 固有 → `default_delivery` → 直近の Discord / Telegram / Web 会話の順に決まる。サーバーが scheduler と同じ解決を行い、届く会話（`target`）を返す。WebUI は、ユーザーが表示名を付けた会話を `Discord · Team chat` のように示し、表示名のない会話は設定された配送先（`Discord · 123456789`）またはチャンネル名（`Discord`）で示す。会話の最終メッセージは発火のたびに変わり、別の intention の通知も含むため、配送先の表示には使わない。どう決まったか（intention 固有 / agent の既定 / 直近の会話）と `Open in Chat` を添える。Web の配送先はセッション ID（`chat:{id}`）で指定し、`target.session_key` も同じ形式になる。解決できない場合は設定された配送先（`Telegram · 987654321`）または `Latest conversation` を示し、発火が skip されることを warning 色で伝える。
 
 ---
 
@@ -129,7 +129,7 @@ Sleep は決まった時刻に起動するが、実行するかはその時点�
 |---|---|
 | 見出し | intention の id。押すと Pulse 区画のその intention へ移る（`↗` を添える）。メタ行に結果・開始時刻・所要時間（開始時刻の直後に括弧で添える） |
 | Outcome | `notify` は通知本文をカードで Markdown 表示。`silent` は報告することがなく送信しなかった旨。`failed` はエラー、`skipped` は通知できなかった旨と理由（warning 色） |
-| 配送先 | `Sent to Discord · Team chat` と `Open in Chat`（通知を保存した会話を Chat タブで開く）。通知がなくても `Open intention` を出し、意図の定義へ移れる |
+| 配送先 | 会話に表示名があれば `Sent to Discord · Team chat`、なければチャンネル名（`Sent to Discord`）で示す。`Open in Chat` で通知を保存した会話を Chat タブで開く。通知がなくても `Open intention` を出し、意図の定義へ移れる |
 | Attention | run 開始時点の attention。PULSE.yaml がその後編集されても当時の内容を表示する。記録のない run は `Not recorded for this run.` |
 
 Activation 中のツール実行は、通知を保存した会話の Pulse trace として Chat タブで確認する（[chat.md](./chat.md)）。Pulse Capsule の内部（注入されたコンテキスト等）は表示しない。

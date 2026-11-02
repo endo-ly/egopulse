@@ -7,7 +7,6 @@ import type {
   SessionEntry,
 } from "../../shared/api/types";
 import { channelLabel } from "../../shared/lib/format";
-import { sessionTitle } from "../../shared/lib/session";
 import { statusLabel, triggerLabel } from "./runStatus";
 
 const DAY_NAMES: Record<string, string> = {
@@ -116,7 +115,7 @@ export function markdownPreview(markdown: string | null): string | null {
 
 /** Where an intention's firings go, as shown to people. */
 interface DeliveryDescription {
-  /** "Discord · Team chat", or the configured destination when it does not resolve. */
+  /** "Discord · Team chat" when named, else the configured address or just the channel. */
   label: string;
   /** How the destination was chosen. */
   origin: "intention" | "default" | "latest";
@@ -125,9 +124,26 @@ interface DeliveryDescription {
 }
 
 /**
+ * Names a delivery destination. A named conversation is identified by its
+ * name; an unnamed one by its configured address when there is one, else by
+ * its channel alone. The conversation's latest message is never part of the
+ * label: it changes with every firing and does not identify the conversation.
+ */
+export function deliveryLabel(
+  channel: string,
+  session: SessionEntry | undefined,
+  configured: PulseDelivery | null,
+): string {
+  const channelText = channelLabel(channel);
+  const name = session?.name?.trim();
+  if (name) return `${channelText} · ${name}`;
+  if (configured) return `${channelText} · ${configured.external_chat_id}`;
+  return channelText;
+}
+
+/**
  * Describes where an intention delivers: its own destination, else the
  * agent's default, else the agent's latest conversation on a sendable channel.
- * Resolved conversations are named as in the session list.
  */
 export function describeDelivery(
   intention: Pick<PulseIntention, "delivery" | "target">,
@@ -139,9 +155,8 @@ export function describeDelivery(
   const { target } = intention;
   if (target !== null) {
     const session = sessions.find((candidate) => candidate.session_key === target.session_key);
-    const channel = channelLabel(target.channel);
     return {
-      label: session ? `${channel} · ${sessionTitle(session)}` : channel,
+      label: deliveryLabel(target.channel, session, configured),
       origin,
       sessionKey: target.session_key,
     };
