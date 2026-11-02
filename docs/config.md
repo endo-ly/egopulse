@@ -274,7 +274,7 @@ web_fetch:
 | `api_key` | `string \| SecretRef \| null` | 条件付き | API 認証キー。`localhost` 系および `openai-codex` プリセットでは不要（OAuth セッショントークンを自動利用）。SecretRef 使用可能（§5）。秘匿フィールド |
 | `default_model` | `string` | **必須** | このプロバイダーのデフォルトモデル |
 | `models` | `map<string, ModelConfig>` | 任意 | 利用可能なモデル一覧。各モデルにメタデータを設定可能 |
-| `headers` | `map<string, string>` | 任意 | 全リクエストに付与する追加 HTTP ヘッダ。ヘッダ名は小文字に正規化される。同じ名前の既定ヘッダ（`Authorization` 等）がある場合はここでの指定が優先される |
+| `headers` | `map<string, string \| null>` | 任意 | 全リクエストに付与する追加 HTTP ヘッダ。ヘッダ名は小文字に正規化される。同じ名前の既定ヘッダ（`Authorization` 等）がある場合はここでの指定が優先される。値を書かない（`null`）場合は会話ごとの識別子を自動付与する |
 
 #### `ModelConfig` のフィールド
 
@@ -284,7 +284,9 @@ web_fetch:
 | `model_instructions` | `string` | 任意 | なし | モデル固有の追加指示（インライン）。system prompt の `<soul>` セクションと Core Instructions の間に `<model-instructions>` タグで注入される。`model_instructions_file` と排他（両立時は起動エラー） |
 | `model_instructions_file` | `string` | 任意 | なし | モデル固有の追加指示を記述したファイルパス。相対パスは設定ファイルのディレクトリ基点で解決（絶対パスも可）。`model_instructions` と排他 |
 
-`headers` は静的なリクエストヘッダをプロバイダー単位で付与する。値は固定文字列で、SecretRef は使用できない。例えば OpenCode Go は、会話ごとに安定したセッション ID を `x-opencode-session` で要求するため、次のように設定する。
+`headers` はリクエストヘッダをプロバイダー単位で付与する。値は文字列で、SecretRef は使用できない。
+
+値を書かないヘッダは、**会話ごとに安定した識別子**が送信される。値の書式は実装が決めるため、利用側で生成・管理する必要はない。会話の単位は EgoPulse の会話（`chat`）と同じで、チャネル・スレッド・エージェントの組み合わせごとに1つである。
 
 ```yaml
 providers:
@@ -295,10 +297,17 @@ providers:
       id: OPENCODE_GO_API_KEY
     default_model: glm-5.3
     headers:
-      x-opencode-session: UUID
+      # 値は EgoPulse が会話ごとに自動生成する
+      x-opencode-session:
+      # 固定値を送る場合は従来どおり文字列で書く
+      x-client-name: egopulse
 ```
 
-セッション ID は認証情報ではない。固定値でも動作するが、ルーティングとプロンプトキャッシュの最適化は会話ごとに異なる値の方が効率的に働く。
+このヘッダは認証情報ではない。ゲートウェイは会話単位の値を使ってルーティングとプロンプトキャッシュの割り当てを決めるため、全プロセスで1つの固定値を共有すると、上流の割り当てが変わったときにその値へ固定されたままになる。会話単位に分散させることで、影響は該当の会話だけに閉じる。
+
+会話を持たない処理には別の単位を使う。Sleep バッチはエージェント単位、CLI の単発実行はプロセス全体で1つである。
+
+EgoPulse が設定を書き出すと、値なしヘッダは `null` として保存される。YAML 上の意味は空欄と同じである。
 
 ### 3.3 Web チャネル（`channels.web`）
 
