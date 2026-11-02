@@ -184,14 +184,43 @@ mod tests {
     }
 
     #[test]
-    fn different_conversations_render_different_values() {
-        // Arrange
-        let first = HeaderContext::for_agent(INSTALLATION, "musa");
-        let second = HeaderContext::for_agent(INSTALLATION, "lyre");
+    fn different_conversations_of_one_agent_render_different_values() {
+        // Arrange: same agent, different threads.
+        let first = crate::test_util::cli_context("thread-a");
+        let second = crate::test_util::cli_context("thread-b");
+        assert_eq!(first.agent_id, second.agent_id);
 
         // Act
-        let first = render_headers(&headers(&[("x-session", None)]), &first);
-        let second = render_headers(&headers(&[("x-session", None)]), &second);
+        let first = render_headers(
+            &headers(&[("x-session", None)]),
+            &HeaderContext::for_surface(INSTALLATION, &first),
+        );
+        let second = render_headers(
+            &headers(&[("x-session", None)]),
+            &HeaderContext::for_surface(INSTALLATION, &second),
+        );
+
+        // Assert
+        assert_ne!(first["x-session"], second["x-session"]);
+    }
+
+    #[test]
+    fn different_agents_of_one_thread_render_different_values() {
+        // Arrange: same thread, different agents.
+        let mut first = crate::test_util::cli_context("thread");
+        let mut second = first.clone();
+        first.agent_id = "musa".to_string();
+        second.agent_id = "lyre".to_string();
+
+        // Act
+        let first = render_headers(
+            &headers(&[("x-session", None)]),
+            &HeaderContext::for_surface(INSTALLATION, &first),
+        );
+        let second = render_headers(
+            &headers(&[("x-session", None)]),
+            &HeaderContext::for_surface(INSTALLATION, &second),
+        );
 
         // Assert
         assert_ne!(first["x-session"], second["x-session"]);

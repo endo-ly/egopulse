@@ -111,56 +111,77 @@ impl TurnDependencies {
         let resolved = snapshot
             .config
             .resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
-        let headers = self.header_context_for_surface(context)?;
-        self.cached_provider(&resolved, snapshot.revision, &headers)
+        let headers = self.header_context_for_surface(&resolved, context)?;
+        self.cached_provider(&resolved, snapshot.revision, headers.as_ref())
     }
 
     /// Builds the request scope of a conversation on this installation.
+    ///
+    /// Returns `None` when `resolved` has no generated header, so a
+    /// configuration that does not use this feature never reads the
+    /// installation identity.
     ///
     /// # Errors
     ///
     /// Returns [`EgoPulseError`] when the installation identity cannot be read.
     pub(crate) fn header_context_for_surface(
         &self,
+        resolved: &ResolvedLlmConfig,
         context: &crate::conversation::SurfaceContext,
-    ) -> Result<crate::llm::HeaderContext, EgoPulseError> {
+    ) -> Result<Option<crate::llm::HeaderContext>, EgoPulseError> {
+        if !resolved.has_generated_headers() {
+            return Ok(None);
+        }
         let installation_id = self.db.installation_id()?;
-        Ok(crate::llm::HeaderContext::for_surface(
+        Ok(Some(crate::llm::HeaderContext::for_surface(
             installation_id,
             context,
-        ))
+        )))
     }
 
     /// Builds the request scope of an agent for work without a conversation.
+    ///
+    /// Returns `None` when `resolved` has no generated header.
     ///
     /// # Errors
     ///
     /// Returns [`EgoPulseError`] when the installation identity cannot be read.
     pub(crate) fn header_context_for_agent(
         &self,
+        resolved: &ResolvedLlmConfig,
         agent_id: &str,
-    ) -> Result<crate::llm::HeaderContext, EgoPulseError> {
+    ) -> Result<Option<crate::llm::HeaderContext>, EgoPulseError> {
+        if !resolved.has_generated_headers() {
+            return Ok(None);
+        }
         let installation_id = self.db.installation_id()?;
-        Ok(crate::llm::HeaderContext::for_agent(
+        Ok(Some(crate::llm::HeaderContext::for_agent(
             installation_id,
             agent_id,
-        ))
+        )))
     }
 
     pub(crate) fn cached_provider(
         &self,
         resolved: &ResolvedLlmConfig,
         config_revision: u64,
-        headers: &crate::llm::HeaderContext,
+        headers: Option<&crate::llm::HeaderContext>,
     ) -> Result<Arc<dyn LlmProvider>, EgoPulseError> {
-        let rendered = crate::llm::rendered_config(resolved, headers);
-        let key = rendered.cache_key_with_revision(config_revision);
+        let rendered;
+        let provider_config = match headers {
+            Some(headers) => {
+                rendered = crate::llm::rendered_config(resolved, headers);
+                &rendered
+            }
+            None => resolved,
+        };
+        let key = provider_config.cache_key_with_revision(config_revision);
         let mut cache = self.llm_cache.lock().expect("llm_cache lock");
         if let Some(provider) = cache.get(key) {
             return Ok(provider);
         }
         let provider: Arc<dyn LlmProvider> =
-            Arc::from(crate::llm::create_provider_rendered(&rendered)?);
+            Arc::from(crate::llm::create_provider_rendered(provider_config)?);
         cache.insert(key, Arc::clone(&provider));
         Ok(provider)
     }

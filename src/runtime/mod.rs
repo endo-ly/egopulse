@@ -964,6 +964,8 @@ pub async fn start_channels(state: Arc<AppState>) -> Result<(), EgoPulseError> {
 mod tests {
     use std::sync::Arc;
 
+    use rusqlite::OptionalExtension;
+
     use super::*;
     use crate::config::ResolvedLlmConfig;
     use crate::conversation::ConversationScope;
@@ -1290,32 +1292,23 @@ mod tests {
         );
         let runtime = state.turn_dependencies();
 
+        let musa = crate::llm::HeaderContext::for_agent("installation", "musa");
+        let lyre = crate::llm::HeaderContext::for_agent("installation", "lyre");
+
         // Act
-        let musa = runtime
-            .cached_provider(
-                &resolved,
-                1,
-                &crate::llm::HeaderContext::for_agent("installation", "musa"),
-            )
+        let musa_provider = runtime
+            .cached_provider(&resolved, 1, Some(&musa))
             .expect("musa provider");
-        let musa_again = runtime
-            .cached_provider(
-                &resolved,
-                1,
-                &crate::llm::HeaderContext::for_agent("installation", "musa"),
-            )
+        let musa_provider_again = runtime
+            .cached_provider(&resolved, 1, Some(&musa))
             .expect("musa provider");
-        let lyre = runtime
-            .cached_provider(
-                &resolved,
-                1,
-                &crate::llm::HeaderContext::for_agent("installation", "lyre"),
-            )
+        let lyre_provider = runtime
+            .cached_provider(&resolved, 1, Some(&lyre))
             .expect("lyre provider");
 
         // Assert
-        assert!(Arc::ptr_eq(&musa, &musa_again));
-        assert!(!Arc::ptr_eq(&musa, &lyre));
+        assert!(Arc::ptr_eq(&musa_provider, &musa_provider_again));
+        assert!(!Arc::ptr_eq(&musa_provider, &lyre_provider));
         assert_eq!(state.llm_cache.lock().expect("cache lock").len(), 2);
     }
 
@@ -1330,18 +1323,10 @@ mod tests {
 
         // Act
         let musa = runtime
-            .cached_provider(
-                &resolved,
-                1,
-                &crate::llm::HeaderContext::for_agent("installation", "musa"),
-            )
+            .cached_provider(&resolved, 1, None)
             .expect("musa provider");
         let lyre = runtime
-            .cached_provider(
-                &resolved,
-                1,
-                &crate::llm::HeaderContext::for_agent("installation", "lyre"),
-            )
+            .cached_provider(&resolved, 1, None)
             .expect("lyre provider");
 
         // Assert
@@ -1356,6 +1341,11 @@ mod tests {
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");
         let runtime = state.turn_dependencies();
+        let mut resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        resolved.headers.insert(
+            "x-session".to_string(),
+            crate::config::ProviderHeaderValue::Generated,
+        );
         let mut normal = crate::test_util::cli_context("scope-test");
         normal.scope = crate::conversation::ConversationScope::Normal;
         let mut secret = normal.clone();
@@ -1363,14 +1353,47 @@ mod tests {
 
         // Act
         let normal = runtime
-            .header_context_for_surface(&normal)
+            .header_context_for_surface(&resolved, &normal)
             .expect("normal context");
         let secret = runtime
-            .header_context_for_surface(&secret)
+            .header_context_for_surface(&resolved, &secret)
             .expect("secret context");
 
         // Assert
+        assert!(normal.is_some());
         assert_ne!(normal, secret);
+    }
+
+    #[tokio::test]
+    async fn header_context_skips_the_installation_identity_when_unused() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let runtime = state.turn_dependencies();
+        let resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        let context = crate::test_util::cli_context("no-generated");
+
+        // Act
+        let headers = runtime
+            .header_context_for_surface(&resolved, &context)
+            .expect("context");
+
+        // Assert
+        assert!(headers.is_none(), "no generated header needs no scope");
+        let conn = state.db.get_conn().expect("conn");
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM db_meta WHERE key = 'installation_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query");
+        assert!(
+            stored.is_none(),
+            "an unused installation identity must not be written"
+        );
     }
 
     #[tokio::test]
@@ -1383,10 +1406,10 @@ mod tests {
 
         let headers = crate::llm::HeaderContext::process_global();
         let newer = runtime
-            .cached_provider(&resolved, 2, &headers)
+            .cached_provider(&resolved, 2, Some(&headers))
             .expect("newer revision provider");
         let older = runtime
-            .cached_provider(&resolved, 1, &headers)
+            .cached_provider(&resolved, 1, Some(&headers))
             .expect("older revision provider");
 
         assert!(!Arc::ptr_eq(&newer, &older));

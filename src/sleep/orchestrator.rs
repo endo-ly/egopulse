@@ -265,11 +265,11 @@ pub async fn run_events_extract(
                 let revision = snapshot.revision;
                 let headers = state
                     .turn_dependencies()
-                    .header_context_for_agent(&resolved_agent)
+                    .header_context_for_agent(&resolved, &resolved_agent)
                     .map_err(|error| SleepBatchError::Internal(error.to_string()))?;
                 state
                     .turn_dependencies()
-                    .cached_provider(&resolved, revision, &headers)
+                    .cached_provider(&resolved, revision, headers.as_ref())
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
@@ -608,11 +608,11 @@ async fn prepare_batch_context(
         let revision = snapshot.revision;
         let headers = state
             .turn_dependencies()
-            .header_context_for_agent(agent_id)
+            .header_context_for_agent(&resolved, agent_id)
             .map_err(|error| SleepBatchError::Internal(error.to_string()))?;
         state
             .turn_dependencies()
-            .cached_provider(&resolved, revision, &headers)
+            .cached_provider(&resolved, revision, headers.as_ref())
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };
 

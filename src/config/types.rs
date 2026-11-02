@@ -369,6 +369,16 @@ impl ResolvedLlmConfig {
         }
     }
 
+    /// Returns `true` when any header requires a request-scope value.
+    ///
+    /// Such a configuration needs the durable installation identity; every
+    /// other configuration keeps the provider cache independent of it.
+    pub(crate) fn has_generated_headers(&self) -> bool {
+        self.headers
+            .values()
+            .any(|value| matches!(value, ProviderHeaderValue::Generated))
+    }
+
     /// Cache key that mixes in the `ConfigSnapshot` revision.
     ///
     /// When `revision` is `0` this produces the same value as the old
