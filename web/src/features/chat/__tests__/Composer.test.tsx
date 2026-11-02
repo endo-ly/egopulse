@@ -84,6 +84,47 @@ describe("Composer", () => {
     globalThis.localStorage?.clear();
   });
 
+  it("composer_previous_session_ack_does_not_clear_the_new_session_submit", async () => {
+    // Arrange: session A's send is waiting for its ack.
+    let resolveA!: (value: boolean) => void;
+    let resolveB!: (value: boolean) => void;
+    const onSubmit = vi
+      .fn()
+      .mockImplementationOnce(
+        () => new Promise<boolean>((resolve) => (resolveA = resolve)),
+      )
+      .mockImplementationOnce(
+        () => new Promise<boolean>((resolve) => (resolveB = resolve)),
+      );
+    globalThis.localStorage?.setItem("egopulse.draft.s2", "B");
+    const { container, rerender } = render(
+      <Composer onSubmit={onSubmit} storageKey="s1" />,
+    );
+    const ta = container.querySelector(".composer-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "A" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledWith("A", expect.any(String));
+    expect(ta.disabled).toBe(true);
+
+    // Act: switch to session B and send while A is still in flight.
+    rerender(<Composer onSubmit={onSubmit} storageKey="s2" />);
+    expect(ta.value).toBe("B");
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(ta.disabled).toBe(true);
+    await act(async () => {
+      resolveA(true);
+    });
+
+    // Assert: A's completion must not release B's submit lock.
+    expect(ta.disabled).toBe(true);
+    await act(async () => {
+      resolveB(true);
+    });
+    expect(ta.disabled).toBe(false);
+    globalThis.localStorage?.clear();
+  });
+
   it("composer_shift_enter_inserts_newline", () => {
     const onSubmit = vi.fn();
     const { container } = render(<Composer onSubmit={onSubmit} />);
@@ -143,6 +184,26 @@ describe("Composer", () => {
     expect(suggest).toBeTruthy();
     const items = suggest?.querySelectorAll(".suggest-item");
     expect((items ?? []).length).toBeGreaterThan(0);
+  });
+
+  it("composer_session_switch_resets_slash_suggestion_state", () => {
+    // Arrange: the previous session dismissed its suggestion popup.
+    globalThis.localStorage?.setItem("egopulse.draft.s2", "/re");
+    const { container, rerender } = render(
+      <Composer onSubmit={vi.fn()} storageKey="s1" />,
+    );
+    const ta = container.querySelector(".composer-textarea") as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "/" } });
+    fireEvent.keyDown(ta, { key: "Escape" });
+    expect(container.querySelector(".command-suggest")).toBeNull();
+
+    // Act
+    rerender(<Composer onSubmit={vi.fn()} storageKey="s2" />);
+
+    // Assert: the new session's slash draft shows its own suggestions.
+    expect(ta.value).toBe("/re");
+    expect(container.querySelector(".command-suggest")).toBeTruthy();
+    globalThis.localStorage?.clear();
   });
 
   it("composer_escape_clears_suggest", () => {
