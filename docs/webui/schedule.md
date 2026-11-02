@@ -128,9 +128,9 @@ Sleep は決まった時刻に起動するが、実行するかはその時点�
 
 | 要素 | 内容 |
 |---|---|
-| 見出し | intention の id。PULSE.yaml に残っていれば押すと Pulse 区画のその intention へ移る（`↗` を添える）。消えている場合はリンクにしない。メタ行に結果・開始時刻・所要時間（開始時刻の直後に括弧で添える） |
+| 見出し | intention の id。PULSE.yaml に残っていれば押すと Pulse 区画のその intention へ移る（`↗` を添える）。消えている場合や PULSE.yaml が読めない場合はリンクにしない。メタ行に結果・開始時刻・所要時間（開始時刻の直後に括弧で添える） |
 | Outcome | `notify` は通知本文をカードで Markdown 表示。`silent` は報告することがなく送信しなかった旨。`failed` はエラー、`skipped` は通知できなかった旨と理由（warning 色） |
-| 配送先 | 会話に表示名があれば `Sent to Discord · Team chat`、なければチャンネル名（`Sent to Discord`）で示す。`Open in Chat` で通知を保存した会話を Chat タブで開く。通知がなくても、intention が PULSE.yaml に残っていれば `Open intention` を出し、意図の定義へ移れる。消えている場合は `Open intention` の代わりにその旨を示す |
+| 配送先 | 会話に表示名があれば `Sent to Discord · Team chat`、なければチャンネル名（`Sent to Discord`）で示す。`Open in Chat` で通知を保存した会話を Chat タブで開く。通知がなくても、intention が PULSE.yaml に残っていれば `Open intention` を出し、意図の定義へ移れる。消えている場合は `Open intention` の代わりにその旨を、PULSE.yaml が読めない場合は読めない旨を示す |
 | Attention | run 開始時点の attention。PULSE.yaml がその後編集されても当時の内容を表示する。記録のない run は `Not recorded for this run.` |
 
 Activation 中のツール実行は、通知を保存した会話の Pulse trace として Chat タブで確認する（[chat.md](./chat.md)）。Pulse Capsule の内部（注入されたコンテキスト等）は表示しない。

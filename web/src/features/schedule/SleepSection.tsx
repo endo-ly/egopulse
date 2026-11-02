@@ -36,7 +36,7 @@ export function SleepSection({ outlook }: SleepSectionProps) {
                 <dd>{nextCheck(data)}</dd>
               </div>
               <div className="agent-kv-row">
-                <dt>{scheduled ? "Decision" : "Manual run"}</dt>
+                <dt>Decision</dt>
                 <dd>
                   <OutcomeLabel tone={willRun ? "success" : "idle"}>{decision}</OutcomeLabel>
                   <div

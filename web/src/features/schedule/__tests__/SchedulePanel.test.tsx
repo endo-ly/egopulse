@@ -395,6 +395,32 @@ describe("SchedulePanel", () => {
     expect(line?.textContent).toContain("This intention is no longer in PULSE.yaml.");
   });
 
+  it("does_not_open_an_intention_when_pulse_yaml_cannot_be_read", async () => {
+    // Arrange
+    const run = pulseRun("unreadable-run", "morning", 0.2);
+    const detail: PulseRunDetail = { ...run, attention_snapshot: "Check the calendar.", delivery: null };
+    stubApi({
+      pulse: { ...PULSE, enabled: null, error: "bad yaml", default_delivery: null, intentions: [] },
+      pulseRuns: [run],
+      pulseDetails: { "unreadable-run": detail },
+    });
+    const view: ScheduleView = { section: "activity", run: { kind: "pulse", id: "unreadable-run" } };
+    const { getByRole } = renderPanel("t-unreadable-intention", view);
+    const pane = getByRole("complementary", { name: "Pulse run" });
+    await waitFor(() => {
+      expect(pane.querySelector(".run-detail-line")).toBeTruthy();
+    });
+
+    // Act
+    const line = pane.querySelector(".run-detail-line");
+
+    // Assert
+    expect(pane.querySelector(".title-link")).toBeNull();
+    expect(within(pane).queryByRole("button", { name: "Open intention" })).toBeNull();
+    expect(line?.textContent).toContain("PULSE.yaml could not be read, so this intention cannot be opened.");
+    expect(line?.textContent).not.toContain("no longer in PULSE.yaml");
+  });
+
   it("shows_each_intention_definition_in_the_pulse_section", async () => {
     // Arrange
     stubApi({});

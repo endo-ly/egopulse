@@ -175,9 +175,14 @@ describe("latestProblems", () => {
     // Act
     const enabledProblems = latestProblems(pulse, undefined);
     const disabledPulseProblems = latestProblems({ ...pulse, enabled: false }, undefined);
+    const unreadablePulseProblems = latestProblems(
+      { ...pulse, enabled: null, error: "bad yaml" },
+      undefined,
+    );
 
     // Assert
     expect(enabledProblems.map((problem) => problem.intentionId)).toEqual(["active"]);
     expect(disabledPulseProblems).toEqual([]);
+    expect(unreadablePulseProblems).toEqual([]);
   });
 });

@@ -1,5 +1,5 @@
 import { fetchPulseRunDetail } from "../../shared/api/pulse";
-import type { PulseIntention, PulseRunDetail, SessionEntry } from "../../shared/api/types";
+import type { AgentPulse, PulseRunDetail, SessionEntry } from "../../shared/api/types";
 import { formatDuration } from "../../shared/lib/format";
 import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
 import { QueryState } from "../../shared/ui/QueryState";
@@ -12,8 +12,8 @@ export interface PulseRunBodyProps {
   runId: string;
   authToken: string;
   sessions: readonly SessionEntry[];
-  /** The agent's current intentions; undefined while they are still loading. */
-  intentions: readonly PulseIntention[] | undefined;
+  /** The agent's Pulse definition; undefined while it is loading or unavailable. */
+  pulse: AgentPulse | undefined;
   onOpenSession: (sessionKey: string) => void;
   /** Opens the intention that fired, where it is set up. */
   onOpenIntention: (intentionId: string) => void;
@@ -24,7 +24,7 @@ export function PulseRunBody({
   runId,
   authToken,
   sessions,
-  intentions,
+  pulse,
   onOpenSession,
   onOpenIntention,
 }: PulseRunBodyProps) {
@@ -35,7 +35,7 @@ export function PulseRunBody({
         <PulseRunContent
           run={run}
           sessions={sessions}
-          intentions={intentions}
+          pulse={pulse}
           onOpenSession={onOpenSession}
           onOpenIntention={onOpenIntention}
         />
@@ -47,19 +47,23 @@ export function PulseRunBody({
 function PulseRunContent({
   run,
   sessions,
-  intentions,
+  pulse,
   onOpenSession,
   onOpenIntention,
 }: {
   run: PulseRunDetail;
   sessions: readonly SessionEntry[];
-  intentions: readonly PulseIntention[] | undefined;
+  pulse: AgentPulse | undefined;
   onOpenSession: (sessionKey: string) => void;
   onOpenIntention: (intentionId: string) => void;
 }) {
   const { delivery } = run;
-  const intentionExists =
-    intentions === undefined || intentions.some((intention) => intention.id === run.intention_id);
+  // Undefined means the definition is unknown (loading or unavailable), so the
+  // intention may still exist.
+  const definitionUnavailable = pulse !== undefined && pulse.error !== null;
+  const canOpen =
+    pulse === undefined ||
+    (!definitionUnavailable && pulse.intentions.some((intention) => intention.id === run.intention_id));
   const session = delivery
     ? sessions.find((candidate) => candidate.session_key === delivery.session_key)
     : undefined;
@@ -70,7 +74,7 @@ function PulseRunContent({
     <>
       <header className="run-detail-head">
         <h2 className="run-detail-title">
-          {intentionExists ? (
+          {canOpen ? (
             <button
               type="button"
               className="title-link"
@@ -110,12 +114,16 @@ function PulseRunContent({
             </button>{" "}
           </>
         )}
-        {intentionExists ? (
+        {canOpen ? (
           <button type="button" className="text-link" onClick={() => onOpenIntention(run.intention_id)}>
             Open intention
           </button>
         ) : (
-          <span className="field-note">This intention is no longer in PULSE.yaml.</span>
+          <span className="field-note">
+            {definitionUnavailable
+              ? "PULSE.yaml could not be read, so this intention cannot be opened."
+              : "This intention is no longer in PULSE.yaml."}
+          </span>
         )}
       </p>
 
