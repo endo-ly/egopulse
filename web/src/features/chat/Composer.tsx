@@ -23,6 +23,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
   const [submitting, setSubmitting] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const submittingRef = useRef(false);
+  const submitVersionRef = useRef(0);
   const storageKeyRef = useRef(storageKey);
   const loadedStorageKeyRef = useRef(storageKey);
   const draftVersionRef = useRef(0);
@@ -46,6 +47,9 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
     setText(loadDraft(storageKey));
     setSuggestIndex(-1);
     setSuggestHidden(false);
+    // The previous session's ack may still arrive; it must not clear this
+    // session's submit state when it does.
+    submitVersionRef.current += 1;
     submittingRef.current = false;
     setSubmitting(false);
   }, [storageKey]);
@@ -69,6 +73,7 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
     const keyAtSubmit = storageKey;
     const draftVersionAtSubmit = draftVersionRef.current;
     const draftIdAtSubmit = draftIdRef.current;
+    const submitVersion = ++submitVersionRef.current;
     submittingRef.current = true;
     setSubmitting(true);
     void (async () => {
@@ -89,8 +94,10 @@ export function Composer({ onSubmit, disabled, storageKey }: ComposerProps) {
         setSuggestIndex(-1);
         setSuggestHidden(false);
       } finally {
-        submittingRef.current = false;
-        setSubmitting(false);
+        if (submitVersionRef.current === submitVersion) {
+          submittingRef.current = false;
+          setSubmitting(false);
+        }
       }
     })();
   };
