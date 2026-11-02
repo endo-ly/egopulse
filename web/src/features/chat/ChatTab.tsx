@@ -38,8 +38,8 @@ export interface ChatTabProps {
 }
 
 /**
- * A tool row belongs to the assistant's turn. When the preceding row is
- * already assistant-side, that row carries the turn's header.
+ * A progress or tool row belongs to the assistant's turn. When the preceding
+ * row is already assistant-side, that row carries the turn's header.
  */
 function startsAssistantTurn(entries: TimelineEntry[], index: number): boolean {
   if (index === 0) return true;
@@ -65,6 +65,8 @@ export function ChatTab({
   atHistoryStart = false,
   olderLoadSeq = 0,
 }: ChatTabProps) {
+  const waitingStartsTurn = startsAssistantTurn(entries, entries.length);
+
   return (
     <div className="chat-tab">
       <Timeline
@@ -102,7 +104,7 @@ export function ChatTab({
         })}
         {waitingForAssistant && (
           <div className="message-row bubble-assistant">
-            {agentId && (
+            {agentId && waitingStartsTurn && (
               <MessageHeader
                 senderId={agentId}
                 senderKind="assistant"

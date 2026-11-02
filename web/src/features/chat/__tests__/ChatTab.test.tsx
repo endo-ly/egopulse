@@ -104,6 +104,26 @@ describe("ChatTab", () => {
     );
   });
 
+  it("waiting_indicator_after_an_assistant_row_does_not_repeat_the_header", () => {
+    // Arrange / Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        entries={entries}
+        agentId="lyre"
+        agentAvatars={{ lyre: "blob:lyre-avatar" }}
+        waitingForAssistant
+      />,
+    );
+
+    // Assert: the assistant row above already carries the turn's header.
+    const rows = container.querySelectorAll(".timeline-messages > *");
+    const waitingRow = rows[rows.length - 1] as HTMLElement;
+    expect(waitingRow.querySelector(".thinking-dots")).toBeTruthy();
+    expect(waitingRow.querySelector(".message-header")).toBeNull();
+  });
+
   it("tool_row_that_starts_a_turn_shows_the_agent_avatar", () => {
     // Arrange
     const tool: ChatMessage = {

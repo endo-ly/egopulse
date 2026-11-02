@@ -158,7 +158,7 @@ LLM 応答がストリーミング中のメッセージ（ドラフト状態）�
 
 ### 4.8 応答待機
 
-run が受諾されてから最初の delta または `tool_start` が届くまでの間、timeline 末尾に assistant の行を表示する。この行は agent の avatar・sender label・thinking dots を持ち、応答が始まると最初の delta 行またはツールカード行に置き換わる。
+run が受諾されてから最初の delta または `tool_start` が届くまでの間、timeline 末尾に assistant の行を表示する。この行は thinking dots を持ち、そのターンの最初の assistant 行になる場合だけ agent の avatar と sender label も表示する。応答が始まると最初の delta 行またはツールカード行に置き換わる。
 
 ---
 
