@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::Config;
 use super::ModelConfig;
+use super::ProviderHeaderValue;
 use super::secret_ref::{
     CONFIG_SOURCE_GENERATION_PREFIX, DotenvFile, EnvOrigin, ResolvedValue, save_dotenv,
 };
@@ -226,7 +227,7 @@ struct SerializableProvider {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     models: HashMap<String, ModelConfig>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    headers: std::collections::BTreeMap<String, Option<String>>,
+    headers: std::collections::BTreeMap<String, ProviderHeaderValue>,
 }
 
 #[derive(Serialize)]
@@ -1255,14 +1256,17 @@ mod tests {
             .headers
             .insert(
                 "x-opencode-session".to_string(),
-                Some("egopulse-session".to_string()),
+                ProviderHeaderValue::Literal("egopulse-session".to_string()),
             );
         config
             .providers
             .get_mut(&ProviderId::new("openai"))
             .expect("openai provider")
             .headers
-            .insert("x-session-scope".to_string(), None);
+            .insert(
+                "x-session-scope".to_string(),
+                ProviderHeaderValue::Generated,
+            );
 
         save_config_with_secrets(&config, &path).expect("save config");
 
@@ -1280,18 +1284,19 @@ mod tests {
                 .get("openai")
                 .expect("openai provider")
                 .headers
-                .get("x-opencode-session")
-                .and_then(|value| value.as_deref()),
-            Some("egopulse-session")
+                .get("x-opencode-session"),
+            Some(&ProviderHeaderValue::Literal(
+                "egopulse-session".to_string()
+            ))
         );
-        assert!(
+        assert_eq!(
             loaded
                 .providers
                 .get("openai")
                 .expect("openai provider")
                 .headers
-                .get("x-session-scope")
-                .is_some_and(Option::is_none),
+                .get("x-session-scope"),
+            Some(&ProviderHeaderValue::Generated),
             "a valueless header survives a save/load cycle"
         );
     }

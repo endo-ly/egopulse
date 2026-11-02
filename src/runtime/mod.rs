@@ -1226,9 +1226,10 @@ mod tests {
             "sk-other".to_string().into_boxed_str(),
         ));
         let mut different_headers = base.clone();
-        different_headers
-            .headers
-            .insert("x-opencode-session".to_string(), Some("other".to_string()));
+        different_headers.headers.insert(
+            "x-opencode-session".to_string(),
+            crate::config::ProviderHeaderValue::Literal("other".to_string()),
+        );
 
         for different in [
             resolved_config("anthropic", "gpt-4o", "https://api.openai.com/v1"),
@@ -1283,7 +1284,10 @@ mod tests {
         let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
         let state = build_app_state(config).await.expect("build state");
         let mut resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
-        resolved.headers.insert("x-session".to_string(), None);
+        resolved.headers.insert(
+            "x-session".to_string(),
+            crate::config::ProviderHeaderValue::Generated,
+        );
         let runtime = state.turn_dependencies();
 
         // Act

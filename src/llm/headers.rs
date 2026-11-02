@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
 
-use crate::config::ResolvedLlmConfig;
+use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
 use crate::conversation::SurfaceContext;
 
 /// Digest bytes rendered as hex. Eight bytes keep the value short while
@@ -57,7 +57,7 @@ fn derive_session_value(session_key: &str) -> String {
 
 /// Returns `headers` with every valueless entry filled in for `context`.
 pub(crate) fn render_headers(
-    headers: &BTreeMap<String, Option<String>>,
+    headers: &BTreeMap<String, ProviderHeaderValue>,
     context: &HeaderContext,
 ) -> BTreeMap<String, String> {
     let mut derived: Option<String> = None;
@@ -65,8 +65,8 @@ pub(crate) fn render_headers(
         .iter()
         .map(|(name, value)| {
             let value = match value {
-                Some(value) => value.clone(),
-                None => derived
+                ProviderHeaderValue::Literal(value) => value.clone(),
+                ProviderHeaderValue::Generated => derived
                     .get_or_insert_with(|| derive_session_value(&context.session_key))
                     .clone(),
             };
@@ -86,7 +86,7 @@ pub(crate) fn rendered_config(
     let mut rendered = config.clone();
     rendered.headers = render_headers(&config.headers, context)
         .into_iter()
-        .map(|(name, value)| (name, Some(value)))
+        .map(|(name, value)| (name, ProviderHeaderValue::Literal(value)))
         .collect();
     rendered
 }
@@ -94,17 +94,23 @@ pub(crate) fn rendered_config(
 #[cfg(test)]
 mod tests {
     use super::{HeaderContext, render_headers, rendered_config};
-    use crate::config::ResolvedLlmConfig;
+    use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
     use std::collections::BTreeMap;
 
-    fn headers(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+    fn headers(entries: &[(&str, Option<&str>)]) -> BTreeMap<String, ProviderHeaderValue> {
         entries
             .iter()
-            .map(|(name, value)| ((*name).to_string(), value.map(String::from)))
+            .map(|(name, value)| {
+                let value = match value {
+                    Some(value) => ProviderHeaderValue::Literal((*value).to_string()),
+                    None => ProviderHeaderValue::Generated,
+                };
+                ((*name).to_string(), value)
+            })
             .collect()
     }
 
-    fn config(headers: BTreeMap<String, Option<String>>) -> ResolvedLlmConfig {
+    fn config(headers: BTreeMap<String, ProviderHeaderValue>) -> ResolvedLlmConfig {
         ResolvedLlmConfig {
             provider: "provider".to_string(),
             label: "Provider".to_string(),
@@ -193,8 +199,16 @@ mod tests {
 
         // Assert
         assert_eq!(rendered.headers.len(), 2);
-        assert!(rendered.headers.values().all(Option::is_some));
-        assert_eq!(rendered.headers["x-fixed"].as_deref(), Some("fixed"));
+        assert!(
+            rendered
+                .headers
+                .values()
+                .all(|value| matches!(value, ProviderHeaderValue::Literal(_)))
+        );
+        assert_eq!(
+            rendered.headers["x-fixed"],
+            ProviderHeaderValue::Literal("fixed".to_string())
+        );
     }
 
     #[test]

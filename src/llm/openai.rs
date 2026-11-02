@@ -72,9 +72,11 @@ impl OpenAiProvider {
             let parsed_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                 LlmError::InitFailed(format!("invalid header name '{name}': {error}"))
             })?;
-            let value = value.as_deref().ok_or_else(|| {
-                LlmError::InitFailed(format!("header '{name}' has no resolved value"))
-            })?;
+            let ProviderHeaderValue::Literal(value) = value else {
+                return Err(LlmError::InitFailed(format!(
+                    "header '{name}' was not resolved for the request scope"
+                )));
+            };
             let parsed_value = HeaderValue::from_str(value).map_err(|error| {
                 LlmError::InitFailed(format!("invalid value for header '{name}': {error}"))
             })?;

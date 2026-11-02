@@ -19,7 +19,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
-use crate::config::ResolvedLlmConfig;
+use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
 use crate::error::LlmError;
 
 pub(crate) use cache::{PROVIDER_CACHE_CAP, ProviderCache};
@@ -233,7 +233,7 @@ mod tests {
     use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::config::ResolvedLlmConfig;
+    use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
 
     use super::{
         HeaderContext, LlmError, LlmProvider, Message, MessageContent, MessageContentPart,
@@ -360,7 +360,7 @@ mod tests {
         );
         llm_config.headers.insert(
             "x-opencode-session".to_string(),
-            Some("egopulse-musa".to_string()),
+            ProviderHeaderValue::Literal("egopulse-musa".to_string()),
         );
         let provider = create_provider(&llm_config, &HeaderContext::global()).expect("provider");
 
@@ -393,7 +393,9 @@ mod tests {
             format!("{}/v1", server.uri()),
             Some("sk-test"),
         );
-        llm_config.headers.insert("x-session".to_string(), None);
+        llm_config
+            .headers
+            .insert("x-session".to_string(), ProviderHeaderValue::Generated);
 
         // Act
         for agent in ["musa", "lyre"] {

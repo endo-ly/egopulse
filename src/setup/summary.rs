@@ -871,9 +871,10 @@ channels:
                 .get(&ProviderId::new("ollama"))
                 .expect("ollama provider")
                 .headers
-                .get("x-opencode-session")
-                .and_then(|value| value.as_deref()),
-            Some("egopulse-session")
+                .get("x-opencode-session"),
+            Some(&crate::config::ProviderHeaderValue::Literal(
+                "egopulse-session".to_string()
+            ))
         );
     }
 
