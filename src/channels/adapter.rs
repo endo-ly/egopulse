@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::attachment::AttachmentInfo;
+
 /// Keeps a channel-specific turn activity indicator alive until dropped.
 pub(crate) trait TurnActivity: Send {}
 
@@ -122,6 +124,9 @@ pub(crate) trait ChannelAdapter: Send + Sync {
     /// rejects longer text. Telegram truncates at 1024 UTF-8 bytes on a
     /// character boundary and discards the remainder.
     ///
+    /// Returns the stored attachment metadata when the channel makes the file
+    /// available to a client that renders it later (currently Web only).
+    ///
     /// Returns an error if the channel does not support file attachments.
     ///
     /// # Errors
@@ -133,7 +138,7 @@ pub(crate) trait ChannelAdapter: Send + Sync {
         external_chat_id: &str,
         text: Option<&str>,
         attachment: &PreparedAttachment,
-    ) -> Result<(), String> {
+    ) -> Result<Option<AttachmentInfo>, String> {
         let _ = (external_chat_id, text, attachment);
         Err("file attachments not supported on this channel".to_string())
     }
@@ -186,7 +191,9 @@ mod tests {
     #[test]
     fn registry_registers_and_resolves() {
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(WebAdapter::new(
+            std::env::temp_dir().join("egopulse-test-attachments"),
+        )));
 
         assert!(registry.get("web").is_some());
     }

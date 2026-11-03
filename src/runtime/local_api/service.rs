@@ -393,6 +393,7 @@ fn map_agent_event(event: AgentEvent) -> TurnEvent {
             preview,
             duration_ms,
             call_id,
+            ..
         } => TurnEvent::ToolResult {
             name,
             is_error,

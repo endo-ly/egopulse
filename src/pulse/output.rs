@@ -660,7 +660,9 @@ mod tests {
         // the WebUI session ID, so the whole delivery path is exercised.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut channels = ChannelRegistry::new();
-        channels.register(Arc::new(crate::channels::web::WebAdapter));
+        channels.register(Arc::new(crate::channels::web::WebAdapter::new(
+            dir.path().join("attachments"),
+        )));
         let state = build_test_state_with_channels(&dir, Arc::new(channels));
         let agent_id = "lyre";
         let intention = test_intention("web_review");

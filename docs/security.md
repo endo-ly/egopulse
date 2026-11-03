@@ -209,6 +209,7 @@ prefix を持たない値や Config に登録されていない値も、周囲�
 | Compaction Archive | 会話アーカイブにシークレットが含まれる | 三層 redaction（値・prefix・文脈）適用 + ファイルパーミッション `0600` |
 | 値ベースリダクションの対象外 | Config・MCP・`.env` に存在しない秘密（他プロセスの環境変数など）はマスクされない | prefix ベース・文脈ベースで補完 |
 | bash の隔離 | `.env` と `<state_root>/runtime/`（DB・バックアップ・会話アーカイブ・Local API のソケット）を bash から読めない | 方針メッセージが表示される。必要な値は skill の `required_env` で注入し、それ以外はユーザーに依頼する |
+| Web 添付配信 | `runtime/attachments/` は workspace 外かつ bash sandbox の対象。配信は Bearer 認証必須で、ID は canonical UUID + 許可拡張子のみ | 音声以外は `application/octet-stream` + `Content-Disposition: attachment` で返し、アプリ origin で能動コンテンツを実行させない |
 | MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。Runtime が解決した値を自前のエンドポイントへ送らせる意図的な迂回は防げない | §7 の対象外（意図的な迂回） |
 
 ---

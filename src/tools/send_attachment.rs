@@ -19,6 +19,12 @@ use super::path_guard;
 use super::search::resolve_workspace_path;
 use super::{Tool, ToolErrorKind, ToolExecutionContext, ToolResult, schema_object};
 
+/// Upper bound for reading one attachment into memory.
+///
+/// The bytes are shared by every channel adapter, so this is the global safety
+/// valve; the Web adapter applies its own delivery policy on top.
+const MAX_PREPARED_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
+
 async fn prepare_attachment(
     workspace_dir: &Path,
     requested_path: &str,
@@ -50,19 +56,30 @@ async fn prepare_attachment(
         }
         Err(error) => return Err(format!("Failed to read attachment: {error}")),
     };
-    if !file
+    let metadata = file
         .metadata()
         .await
-        .map_err(|e| format!("Failed to read attachment: {e}"))?
-        .is_file()
-    {
+        .map_err(|e| format!("Failed to read attachment: {e}"))?;
+    if !metadata.is_file() {
         return Err(format!("File not found: {requested_path}"));
+    }
+    if metadata.len() > MAX_PREPARED_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Attachment exceeds the {} MiB limit",
+            MAX_PREPARED_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
     }
 
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .await
         .map_err(|e| format!("Failed to read attachment: {e}"))?;
+    if bytes.len() as u64 > MAX_PREPARED_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Attachment exceeds the {} MiB limit",
+            MAX_PREPARED_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
+    }
 
     Ok(PreparedAttachment::new(resolved, bytes))
 }
@@ -206,7 +223,9 @@ impl Tool for SendAttachmentTool {
             .send_attachment(&chat_info.external_chat_id, text.as_deref(), &attachment)
             .await
         {
-            Ok(()) => ToolResult::success("Attachment sent successfully".to_string()),
+            Ok(Some(info)) => ToolResult::success("Attachment sent successfully".to_string())
+                .with_attachments(vec![info]),
+            Ok(None) => ToolResult::success("Attachment sent successfully".to_string()),
             Err(e) => ToolResult::error_with_kind(
                 ToolErrorKind::Upstream,
                 format!("Failed to send attachment: {e}"),
@@ -222,7 +241,9 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    use crate::attachment::AttachmentInfo;
     use crate::channels::adapter::{ChannelAdapter, ConversationKind};
+    use crate::channels::web::WebAdapter;
 
     #[derive(Clone)]
     struct ReceivedAttachment {
@@ -232,6 +253,7 @@ mod tests {
 
     struct RecordingAdapter {
         received: Arc<Mutex<Option<ReceivedAttachment>>>,
+        receipt: Option<AttachmentInfo>,
     }
 
     #[async_trait]
@@ -253,12 +275,12 @@ mod tests {
             _: &str,
             text: Option<&str>,
             attachment: &PreparedAttachment,
-        ) -> Result<(), String> {
+        ) -> Result<Option<AttachmentInfo>, String> {
             *self.received.lock().expect("recording adapter lock") = Some(ReceivedAttachment {
                 text: text.map(str::to_string),
                 path: attachment.path().to_path_buf(),
             });
-            Ok(())
+            Ok(self.receipt.clone())
         }
     }
 
@@ -332,6 +354,7 @@ mod tests {
         let received = Arc::new(Mutex::new(None));
         let adapter = Arc::new(RecordingAdapter {
             received: Arc::clone(&received),
+            receipt: None,
         });
         let mut channels = ChannelRegistry::new();
         channels.register(adapter);
@@ -367,6 +390,112 @@ mod tests {
             observed.path,
             std::fs::canonicalize(attachment_path).expect("canonical path")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_surfaces_web_attachment_metadata() {
+        // Arrange: a web adapter that snapshots the file and returns its id.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attachment_path = dir.path().join("reply.mp3");
+        std::fs::write(&attachment_path, "audio").expect("attachment");
+
+        let receipt = AttachmentInfo {
+            id: "00000000-0000-4000-8000-000000000000.mp3".to_string(),
+            filename: "reply.mp3".to_string(),
+            content_type: "audio/mpeg".to_string(),
+            size_bytes: 5,
+        };
+        let adapter = Arc::new(RecordingAdapter {
+            received: Arc::new(Mutex::new(None)),
+            receipt: Some(receipt.clone()),
+        });
+        let mut channels = ChannelRegistry::new();
+        channels.register(adapter);
+
+        let db = Arc::new(Database::new(&dir.path().join("egopulse.db")).expect("database"));
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:attachment", "cli", "default")
+            .expect("chat id");
+        let tool = SendAttachmentTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(channels),
+            Arc::clone(&db),
+            None,
+        );
+        let mut context = crate::test_util::test_tool_context();
+        context.chat_id = chat_id;
+
+        // Act
+        let result = tool
+            .execute(json!({"attachment_path": "reply.mp3"}), &context)
+            .await;
+
+        // Assert
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.attachments, vec![receipt]);
+    }
+
+    #[tokio::test]
+    async fn execute_stores_a_web_attachment_through_the_real_adapter() {
+        // Arrange: a Web chat, the real Web adapter, and an audio file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attachment_path = dir.path().join("reply.mp3");
+        std::fs::write(&attachment_path, "audio").expect("attachment");
+
+        let attachments_dir = dir.path().join("attachments");
+        let mut channels = ChannelRegistry::new();
+        channels.register(Arc::new(WebAdapter::new(attachments_dir.clone())));
+
+        let db = Arc::new(Database::new(&dir.path().join("egopulse.db")).expect("database"));
+        let chat_id = db
+            .resolve_or_create_chat_id("web", "web:test:agent:default", "web", "default")
+            .expect("chat id");
+        let tool = SendAttachmentTool::new(
+            dir.path().to_path_buf(),
+            Arc::new(channels),
+            Arc::clone(&db),
+            None,
+        );
+        let mut context = crate::test_util::test_tool_context();
+        context.chat_id = chat_id;
+        context.channel = "web".to_string();
+        context.tool_call_id = "call-audio".to_string();
+
+        // Act
+        let result = tool
+            .execute(json!({"attachment_path": "reply.mp3"}), &context)
+            .await;
+
+        // Assert
+        assert!(!result.is_error, "{result:?}");
+        let info = result.attachments.first().expect("attachment metadata");
+        assert!(info.id.ends_with(".mp3"), "{info:?}");
+        assert_eq!(info.filename, "reply.mp3");
+        assert_eq!(info.content_type, "audio/mpeg");
+        assert_eq!(
+            std::fs::read(attachments_dir.join(&info.id)).expect("stored attachment"),
+            b"audio"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_attachment_rejects_oversized_files_before_reading() {
+        // Arrange: a sparse file larger than the read cap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("huge.wav");
+        let file = std::fs::File::create(&path).expect("create");
+        file.set_len(MAX_PREPARED_ATTACHMENT_BYTES + 1)
+            .expect("set length");
+
+        // Act
+        let result = prepare_attachment(dir.path(), "huge.wav").await;
+
+        // Assert
+        let error = match result {
+            Ok(_) => panic!("oversized attachment must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("50 MiB limit"), "{error}");
     }
 
     #[tokio::test]

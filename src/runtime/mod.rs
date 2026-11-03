@@ -355,7 +355,7 @@ fn build_channel_registry(
     // while the Web UI is enabled. Registering it unconditionally would let
     // Pulse resolve web sessions on a runtime where nobody can read them.
     if config.web_enabled() {
-        channels.register(Arc::new(WebAdapter));
+        channels.register(Arc::new(WebAdapter::new(config.attachments_dir())));
     }
     if config.voice_enabled() {
         channels.register(Arc::new(VoiceAdapter));

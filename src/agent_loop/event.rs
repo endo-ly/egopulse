@@ -7,6 +7,8 @@
 use serde::Serialize;
 use std::sync::Arc;
 
+use crate::attachment::AttachmentInfo;
+
 /// Represents internal events emitted while the agent processes a turn.
 ///
 /// Message identity is stable end to end: the user message keeps the
@@ -39,6 +41,8 @@ pub(crate) enum AgentEvent {
         duration_ms: u128,
         /// LLM-issued tool call id. Disambiguates concurrent same-name tools.
         call_id: String,
+        /// Files delivered to a channel that renders them later (Web).
+        attachments: Vec<AttachmentInfo>,
     },
     /// A human message accepted during the Tool phase and committed after its
     /// Tool Results. The event is emitted only after the database commit.

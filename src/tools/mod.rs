@@ -35,6 +35,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::json;
 
+use crate::attachment::AttachmentInfo;
 use crate::config::Config;
 use crate::config::secret_ref::DotenvFile;
 use crate::conversation::ConversationScope;
@@ -116,6 +117,11 @@ pub(crate) struct ToolResult {
     pub content: String,
     pub is_error: bool,
     pub details: Option<serde_json::Value>,
+    /// Attachments delivered to a channel that renders them later (Web).
+    ///
+    /// Kept separate from [`Self::details`] so channel metadata never exposes
+    /// unrelated tool details (for example an edit diff) to the Web timeline.
+    pub attachments: Vec<AttachmentInfo>,
     pub llm_content: crate::llm::MessageContent,
     /// Failure classification recorded in the `tool_calls.error_kind` ledger
     /// column. `None` falls back to the generic `tool_error` kind.
@@ -161,6 +167,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: None,
+            attachments: Vec::new(),
             error_kind: None,
         }
     }
@@ -172,6 +179,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: Some(details),
+            attachments: Vec::new(),
             error_kind: None,
         }
     }
@@ -185,6 +193,7 @@ impl ToolResult {
             content,
             is_error: false,
             details: None,
+            attachments: Vec::new(),
             llm_content,
             error_kind: None,
         }
@@ -197,6 +206,7 @@ impl ToolResult {
             content,
             is_error: true,
             details: None,
+            attachments: Vec::new(),
             error_kind: None,
         }
     }
@@ -208,6 +218,7 @@ impl ToolResult {
             content,
             is_error: true,
             details: None,
+            attachments: Vec::new(),
             error_kind: Some(kind),
         }
     }
@@ -218,6 +229,12 @@ impl ToolResult {
         self
     }
 
+    /// Attach channel-delivered files to this result.
+    pub(crate) fn with_attachments(mut self, attachments: Vec<AttachmentInfo>) -> Self {
+        self.attachments = attachments;
+        self
+    }
+
     /// Create an error result with structured details.
     pub(crate) fn error_with_details(content: String, details: serde_json::Value) -> Self {
         Self {
@@ -225,6 +242,7 @@ impl ToolResult {
             content,
             is_error: true,
             details: Some(details),
+            attachments: Vec::new(),
             error_kind: None,
         }
     }

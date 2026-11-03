@@ -36,7 +36,7 @@ Authorization: Bearer <token>
 
 ### Web API 認証
 
-`/api/config*`、`/api/metrics`、`/api/status`、`/api/sessions`、`/api/history`、`/api/send_stream`、`/api/stream`、`/api/agents`、`/api/sleep/*`、`/telemetry` は `channels.web.auth_token` で認証する。
+`/api/config*`、`/api/metrics`、`/api/status`、`/api/sessions`、`/api/history`、`/api/attachments/*`、`/api/send_stream`、`/api/stream`、`/api/agents`、`/api/sleep/*`、`/telemetry` は `channels.web.auth_token` で認証する。
 
 ### Voice API 認証
 
@@ -289,7 +289,9 @@ GET /api/history?session_key=main&limit=300&before_seq=6524
 
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 
-メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。
+メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input, attachments}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。
+
+`attachments` は `send_attachment` が Web へ配信したファイルの配列で、各要素は `{id, filename, content_type, size_bytes}` を持つ。通常のツールでは空配列。WebUI は成功した `send_attachment` に `attachments` がある場合、ツールカードの代わりに添付カード（音声プレイヤーまたはダウンロード）を描画する。
 
 `pulse` は、そのエントリが属する Pulse 通知の Activation を示す。Activation 外のエントリでは `null`、属する場合は `{run_id, role, intention_id}` を持つ。`run_id` は `pulse_runs.id`、`intention_id` は同 run の intention（run の記録がない場合は `null`）。`role` は `input`（intention を注入する合成入力）、`step`（途中発話・ツール結果要約・それらに紐づくツール呼び出し）、`output`（配送先チャネルへ届けた最終応答）のいずれか。Pulse の行は `pulse:{run_id}:{role}` 形式のメッセージ ID で保存され（`src/pulse/message_id.rs`）、ツール呼び出しは親メッセージ ID から判定する。WebUI はこれを使い、`input` / `step` を同じ `run_id` の `output` の下に折りたたむ。
 
@@ -340,7 +342,7 @@ GET /api/stream?run_id=550e8400-e29b-41d4-a716-446655440000&last_event_id=0
 | `status` | 実行状態の変化（`started`, `completed`, `error`） |
 | `iteration` | エージェントループのイテレーション番号 |
 | `tool_start` | ツール実行開始。ツール名と入力パラメータを含む |
-| `tool_result` | ツール実行完了。出力と成否を含む |
+| `tool_result` | ツール実行完了。出力と成否、配信した添付ファイルのメタデータを含む |
 | `delta` | LLM からのストリーミングテキスト差分（安定メッセージIDつき） |
 | `user_input` | staged follow-up のcommit（canonicalメッセージIDつき） |
 | `assistant_discarded` | retryで置換されたstream済み応答の破棄（メッセージIDつき） |
@@ -361,6 +363,25 @@ data: {"response": "今日の東京の天気は晴れです。...", "messageId":
 
 切断時に `last_event_id` を指定して再接続すると、途中から再開できる。
 RunHub は最大 512 イベント、5 分間の TTL でイベントを保持する。
+
+#### 添付ファイル配信
+
+```text
+GET /api/attachments/{id}
+```
+
+`send_attachment` が Web セッションへ配信したファイルを返す。`id` はツール結果の `attachments[].id`（`{uuid}.{ext}`）。
+
+| 項目 | 内容 |
+|---|---|
+| 認証 | `Authorization: Bearer <web token>` |
+| 成功 | `200`。ボディはファイルバイト列 |
+| 音声 | `Content-Type: audio/*`、`Content-Disposition: inline`。WebUI は `<audio>` で再生する |
+| その他 | `Content-Type: application/octet-stream`、`Content-Disposition: attachment` |
+| キャッシュ | `Cache-Control: private, max-age=31536000, immutable` |
+| 不正・不存在 | `404` (`attachment_not_found`) |
+
+ID は canonical な UUID と許可された拡張子（`mp3` / `wav` / `ogg` / `oga` / `opus` / `m4a` / `aac` / `flac` / `webm` / `bin`）だけを受け付ける。ファイルは `state_root/runtime/attachments/` 直下からのみ返し、任意のパスを読むことはできない。Range リクエストには対応せず、常にファイル全体を返す。
 
 ---
 
@@ -1080,7 +1101,8 @@ Message identity は end-to-end で安定している。ユーザーメッセー
     "name": "read",
     "isError": false,
     "preview": "ファイル内容の先頭...",
-    "durationMs": 87
+    "durationMs": 87,
+    "attachments": []
   }
 }
 ```
@@ -1088,7 +1110,7 @@ Message identity は end-to-end で安定している。ユーザーメッセー
 | イベント | 説明 |
 |---------|------|
 | `tool_start` | ツール実行開始。`callId`, `name`, `input` を含む。narrationはstreamした安定IDのまま残り、名前変更は行わない |
-| `tool_result` | ツール実行完了。`callId`, `name`, `isError`, `preview`, `durationMs` を含む。同じ `callId` の `tool_start` を更新する |
+| `tool_result` | ツール実行完了。`callId`, `name`, `isError`, `preview`, `durationMs`, `attachments` を含む。同じ `callId` の `tool_start` を更新する。`attachments` は `send_attachment` が Web へ配信したファイルのメタデータで、通常は空配列 |
 | `assistant_discarded` | stream済み応答の破棄（retryによる置換）。`messageId` のメッセージを削除する |
 
 `preview` はツール出力の先頭（最大 200 文字）。完全な出力は履歴取得時に `tool_calls` テーブルから復元される。

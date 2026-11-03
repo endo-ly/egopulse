@@ -81,6 +81,64 @@ pub(crate) fn format_attachment_text(paths: &[PathBuf], user_text: &str) -> Stri
     parts.join("\n")
 }
 
+/// 配信添付として保存できる音声形式と、その Content-Type。
+///
+/// Web UI は `audio/` で始まる Content-Type だけを再生可能な添付として扱う。
+/// ここにない拡張子は `bin` / `application/octet-stream` としてダウンロードさせる。
+const OUTBOUND_MEDIA_TYPES: &[(&str, &str)] = &[
+    ("mp3", "audio/mpeg"),
+    ("wav", "audio/wav"),
+    ("ogg", "audio/ogg"),
+    ("oga", "audio/ogg"),
+    ("opus", "audio/ogg"),
+    ("m4a", "audio/mp4"),
+    ("aac", "audio/aac"),
+    ("flac", "audio/flac"),
+    ("webm", "audio/webm"),
+];
+
+/// 未知の拡張子を保存するときの拡張子。
+const FALLBACK_MEDIA_EXTENSION: &str = "bin";
+/// 未知の拡張子を配信するときの Content-Type。
+const FALLBACK_MEDIA_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// 元ファイル名から、保存用拡張子と Content-Type を決める。
+///
+/// 大文字小文字は正規化し、英数字以外を含む拡張子や長すぎる拡張子は
+/// `bin` として扱う。返す拡張子は必ず [`OUTBOUND_MEDIA_TYPES`] または
+/// [`FALLBACK_MEDIA_EXTENSION`] のいずれかになる。
+pub(crate) fn outbound_media_kind(filename: &str) -> (&'static str, &'static str) {
+    let Some(extension) = Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+    else {
+        return (FALLBACK_MEDIA_EXTENSION, FALLBACK_MEDIA_CONTENT_TYPE);
+    };
+    let normalized = extension.to_ascii_lowercase();
+    if normalized.len() > 8 || !normalized.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return (FALLBACK_MEDIA_EXTENSION, FALLBACK_MEDIA_CONTENT_TYPE);
+    }
+    OUTBOUND_MEDIA_TYPES
+        .iter()
+        .copied()
+        .find(|(known, _)| known.eq_ignore_ascii_case(&normalized))
+        .unwrap_or((FALLBACK_MEDIA_EXTENSION, FALLBACK_MEDIA_CONTENT_TYPE))
+}
+
+/// 保存済み添付の拡張子から Content-Type を返す。
+///
+/// `bin` はダウンロード用の `application/octet-stream`、それ以外は
+/// [`OUTBOUND_MEDIA_TYPES`] に登録済みの形式だけを受け付ける。
+pub(crate) fn attachment_content_type(extension: &str) -> Option<&'static str> {
+    if extension.eq_ignore_ascii_case(FALLBACK_MEDIA_EXTENSION) {
+        return Some(FALLBACK_MEDIA_CONTENT_TYPE);
+    }
+    OUTBOUND_MEDIA_TYPES
+        .iter()
+        .find(|(known, _)| known.eq_ignore_ascii_case(extension))
+        .map(|(_, content_type)| *content_type)
+}
+
 /// ファイル名を検証・サニタイズする。
 ///
 /// - 空文字列を拒否
@@ -246,5 +304,48 @@ mod tests {
              [attachment: /workspace/media/inbound/b.pdf]\n\
              see attached"
         );
+    }
+}
+
+#[cfg(test)]
+mod media_kind_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_media_kind_maps_supported_audio() {
+        // Arrange / Act / Assert
+        assert_eq!(outbound_media_kind("reply.mp3"), ("mp3", "audio/mpeg"));
+        assert_eq!(outbound_media_kind("REPLY.MP3"), ("mp3", "audio/mpeg"));
+        assert_eq!(outbound_media_kind("voice.wav"), ("wav", "audio/wav"));
+        assert_eq!(outbound_media_kind("voice.opus"), ("opus", "audio/ogg"));
+    }
+
+    #[test]
+    fn outbound_media_kind_falls_back_to_bin() {
+        // Arrange / Act / Assert
+        assert_eq!(
+            outbound_media_kind("notes.pdf"),
+            (FALLBACK_MEDIA_EXTENSION, FALLBACK_MEDIA_CONTENT_TYPE)
+        );
+        assert_eq!(
+            outbound_media_kind("no-extension"),
+            (FALLBACK_MEDIA_EXTENSION, FALLBACK_MEDIA_CONTENT_TYPE)
+        );
+        assert_eq!(
+            outbound_media_kind("weird.!!!!"),
+            (FALLBACK_MEDIA_EXTENSION, FALLBACK_MEDIA_CONTENT_TYPE)
+        );
+    }
+
+    #[test]
+    fn attachment_content_type_rejects_unknown_extensions() {
+        // Arrange / Act / Assert
+        assert_eq!(attachment_content_type("mp3"), Some("audio/mpeg"));
+        assert_eq!(
+            attachment_content_type("bin"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(attachment_content_type("html"), None);
+        assert_eq!(attachment_content_type(""), None);
     }
 }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::agent_loop::resolve_chat_id;
+use crate::attachment::AttachmentInfo;
 use crate::config::AgentId;
 use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
@@ -47,6 +48,8 @@ struct ToolResultPayload {
     is_error: bool,
     preview: String,
     duration_ms: u128,
+    /// Files the Web UI can render as attachments. Empty for other tools.
+    attachments: Vec<AttachmentInfo>,
 }
 
 /// Terminal assistant content. `message_id` is the stable id the response
@@ -406,6 +409,7 @@ pub(super) async fn publish_agent_event(run_hub: &RunHub, run_id: &str, event: A
             is_error,
             preview,
             duration_ms,
+            attachments,
         } => {
             run_hub
                 .publish(
@@ -417,6 +421,7 @@ pub(super) async fn publish_agent_event(run_hub: &RunHub, run_id: &str, event: A
                         is_error,
                         preview,
                         duration_ms,
+                        attachments,
                     })
                     .unwrap_or_default(),
                 )
@@ -1083,6 +1088,7 @@ mod tests {
             is_error: false,
             preview: "done".to_string(),
             duration_ms: 123,
+            attachments: Vec::new(),
         })
         .unwrap();
         let tool_result_parsed: serde_json::Value =
@@ -2102,5 +2108,44 @@ mod tests {
         let data: serde_json::Value = serde_json::from_str(&done_event.data).expect("json");
         let expected = format!("web:slash:{}", accepted.started.run_id);
         assert_eq!(data["messageId"], serde_json::json!(expected));
+    }
+
+    #[tokio::test]
+    async fn publish_agent_event_forwards_attachment_metadata() {
+        // Arrange: a Web tool result that delivered an audio attachment.
+        let hub = RunHub::default();
+        hub.create("run-audio", WEB_ACTOR.to_string(), "chat:1".to_string())
+            .await;
+        let (mut rx, _, _, _, _, _) = hub
+            .subscribe_with_replay("run-audio", None, WEB_ACTOR, false)
+            .await
+            .expect("subscribe");
+
+        // Act
+        publish_agent_event(
+            &hub,
+            "run-audio",
+            AgentEvent::ToolResult {
+                call_id: "call-audio".to_string(),
+                name: "send_attachment".to_string(),
+                is_error: false,
+                preview: "Attachment sent successfully".to_string(),
+                duration_ms: 5,
+                attachments: vec![AttachmentInfo {
+                    id: "00000000-0000-4000-8000-000000000000.mp3".to_string(),
+                    filename: "reply.mp3".to_string(),
+                    content_type: "audio/mpeg".to_string(),
+                    size_bytes: 1234,
+                }],
+            },
+        )
+        .await;
+
+        // Assert
+        let event = rx.recv().await.expect("event");
+        assert_eq!(event.event, "tool_result");
+        let data: serde_json::Value = serde_json::from_str(&event.data).expect("json");
+        assert_eq!(data["attachments"][0]["filename"], "reply.mp3");
+        assert_eq!(data["attachments"][0]["content_type"], "audio/mpeg");
     }
 }

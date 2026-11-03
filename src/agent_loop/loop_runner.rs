@@ -366,6 +366,7 @@ impl<'a> AgentLoop<'a> {
                     is_error: outcome.result.is_error,
                     preview: truncate_by_chars(&outcome.payload, MAX_TOOL_RESULT_TEXT_CHARS),
                     duration_ms: outcome.duration_ms,
+                    attachments: outcome.result.attachments.clone(),
                 });
             })),
         };
