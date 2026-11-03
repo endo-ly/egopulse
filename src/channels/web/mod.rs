@@ -550,7 +550,7 @@ fn build_router(web_state: WebState) -> Router {
         )
         .route(
             "/api/agents/{agent_id}/files/{kind}",
-            get(agent_profile::get_agent_prompt_file),
+            get(agent_profile::get_agent_prompt_file).put(agent_profile::put_agent_prompt_file),
         )
         .route(
             "/api/agents/{agent_id}/memory/history",

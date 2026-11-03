@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
 
@@ -20,6 +20,10 @@ export interface DocumentCardProps {
   markdown?: boolean;
   /** Long content starts folded with a control to show all of it. */
   collapsible?: boolean;
+  /** Header controls rendered before the Raw toggle. */
+  actions?: ReactNode;
+  /** Replaces the default body; used by the inline editor. */
+  children?: ReactNode;
 }
 
 /** A file shown as a card: path header, then rendered Markdown or raw text. */
@@ -31,6 +35,8 @@ export function DocumentCard({
   content,
   markdown = true,
   collapsible = false,
+  actions,
+  children,
 }: DocumentCardProps) {
   const [raw, setRaw] = useState(false);
   const foldable = collapsible && content !== null && content.split("\n").length > FOLD_LINES;
@@ -43,6 +49,7 @@ export function DocumentCard({
         {eyebrow && <span className="doc-card-eyebrow">{eyebrow}</span>}
         <code className="doc-card-path">{path}</code>
         {status && <span className="doc-card-status">{status}</span>}
+        {actions}
         {content && markdown && (
           <button
             type="button"
@@ -54,25 +61,31 @@ export function DocumentCard({
           </button>
         )}
       </header>
-      {content === "" && <p className="doc-card-empty">This file is empty.</p>}
-      {content && (
-        <div className={`doc-card-content ${folded ? "folded" : ""}`}>
-          {markdown && !raw ? (
-            <MarkdownRenderer content={content} />
-          ) : (
-            <pre className="doc-card-raw">{content}</pre>
+      {children != null ? (
+        children
+      ) : (
+        <>
+          {content === "" && <p className="doc-card-empty">This file is empty.</p>}
+          {content && (
+            <div className={`doc-card-content ${folded ? "folded" : ""}`}>
+              {markdown && !raw ? (
+                <MarkdownRenderer content={content} />
+              ) : (
+                <pre className="doc-card-raw">{content}</pre>
+              )}
+            </div>
           )}
-        </div>
-      )}
-      {foldable && (
-        <button
-          type="button"
-          className="doc-card-fold"
-          aria-expanded={expanded}
-          onClick={() => setExpanded((value) => !value)}
-        >
-          {expanded ? "Show less" : "Show all"}
-        </button>
+          {foldable && (
+            <button
+              type="button"
+              className="doc-card-fold"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? "Show less" : "Show all"}
+            </button>
+          )}
+        </>
       )}
     </article>
   );

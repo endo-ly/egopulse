@@ -631,8 +631,22 @@ GET /api/agents/{agent_id}/files/{kind}
 {
   "ok": true,
   "layers": [
-    { "scope": "agent", "path": "agents/lyre/SOUL.md", "content": null, "applied": false },
-    { "scope": "global", "path": "SOUL.md", "content": "…", "applied": true }
+    {
+      "scope": "agent",
+      "path": "agents/lyre/SOUL.md",
+      "content": null,
+      "applied": false,
+      "exists": false,
+      "hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "scope": "global",
+      "path": "SOUL.md",
+      "content": "…",
+      "applied": true,
+      "exists": true,
+      "hash": "…"
+    }
   ]
 }
 ```
@@ -643,7 +657,40 @@ GET /api/agents/{agent_id}/files/{kind}
 | `rules` | global → agent（注入順） | 内容のある層すべて（累積） |
 | `secret` | agent のみ | 内容があれば `true`（Secret スコープの turn でのみ注入） |
 
-`content` は trim 済みの本文で、ファイルがない・空の場合は `null`。
+`content` は trim 済みの本文で、ファイルがない・空の場合は `null`。`exists` はファイルの有無で、空ファイルと未作成を区別する。`hash` は trim 済み本文の SHA-256（欠損・空は空文字のハッシュ）で、更新時の `expected_hash` に使う。
+
+#### prompt ファイルの更新
+
+```text
+PUT /api/agents/{agent_id}/files/{kind}
+```
+
+```json
+{
+  "scope": "agent",
+  "content": "# Soul\n\n本文",
+  "expected_hash": "…"
+}
+```
+
+`kind` は `soul` / `rules` / `secret`、`scope` は `global` / `agent`。`secret` に `global` は存在しない。
+
+- 内容は trim して保存し、本文が空でない場合は末尾に改行を付ける
+- `expected_hash` は取得時の `hash` と一致する必要がある。一致しない場合は `409` で、ファイルを変更しない
+- 保存後は GET と同じ形の `layers` を返す。SOUL のフォールバックや AGENTS の累積で他の層の `applied` が変わるため
+- 空の `content` は空ファイルとして保存する（`content: null` / `exists: true` / `applied: false`）
+- 既存ファイルまたはその親ディレクトリ（state root 配下）がシンボリックリンク、または既存ファイルが読み取り不能な場合は上書きしない
+
+| ステータス | エラーコード | 条件 |
+|---|---|---|
+| `400` | `invalid_prompt_file_kind` | 未知の `kind` |
+| `400` | `invalid_prompt_file_scope` | 未知の `scope`、またはその kind に存在しない層 |
+| `400` | `invalid_expected_hash` | `expected_hash` が空 |
+| `400` | `prompt_file_not_writable` | 保存先またはその親ディレクトリがシンボリックリンク |
+| `404` | `agent_not_found` | 未知の agent |
+| `409` | `prompt_file_conflict` | `expected_hash` が現在内容と不一致 |
+| `413` | `prompt_file_too_large` | 256 KiB 超 |
+| `500` | `internal_error` | 読み取り・書き込みの I/O エラー |
 
 #### 記憶の変更履歴
 

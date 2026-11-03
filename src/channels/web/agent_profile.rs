@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use super::agents::resolved_agent_id;
 use super::{ApiError, ApiResult, WebState, api_error, bad_request, internal_error, not_found};
-use crate::agent_loop::prompt::{PromptFileKind, PromptFileLayer, PromptFileScope};
+use crate::agent_loop::prompt::{
+    PromptFileKind, PromptFileLayer, PromptFileScope, PromptFileWriteError, prompt_content_hash,
+};
 use crate::config::{AgentId, Config, LlmSettingSource};
 use crate::skills::{
     SkillFileError, SkillManager, SkillMetadata, list_skill_files, read_skill_file,
@@ -43,6 +45,11 @@ struct LayerBody {
     path: String,
     content: Option<String>,
     applied: bool,
+    /// Whether the file exists, so an empty file is distinguishable from a
+    /// missing one.
+    exists: bool,
+    /// SHA-256 of the canonical content; the optimistic-lock token for writes.
+    hash: String,
 }
 
 #[derive(Serialize)]
@@ -74,6 +81,13 @@ struct SkillFileEntry {
 #[derive(Deserialize)]
 pub(super) struct HistoryQuery {
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PromptFileUpdate {
+    scope: String,
+    content: String,
+    expected_hash: String,
 }
 
 /// Returns the agent's effective LLM settings, bindings, and prompt sources.
@@ -191,6 +205,52 @@ pub(super) async fn get_agent_prompt_file(
     })
     .await?
     .ok_or_else(|| not_found("agent_not_found"))?;
+
+    Ok(Json(serde_json::json!({ "ok": true, "layers": layers })))
+}
+
+/// Writes one layer of an agent prompt file.
+///
+/// Returns the updated layers in the same shape as the GET endpoint, because a
+/// write can change `applied` on the other layers (SOUL falls back, AGENTS
+/// accumulates).
+///
+/// # Errors
+///
+/// `404` for an unknown agent, `400` for an invalid kind, scope, or empty
+/// expected hash, `409` when the file changed since it was read, `413` for
+/// oversized content, and `500` for I/O failure.
+pub(super) async fn put_agent_prompt_file(
+    State(state): State<WebState>,
+    UrlPath((agent_id, kind)): UrlPath<(String, String)>,
+    Json(update): Json<PromptFileUpdate>,
+) -> ApiResult {
+    let agent_id =
+        resolved_agent_id(&state, &agent_id).ok_or_else(|| not_found("agent_not_found"))?;
+    let kind =
+        parse_prompt_file_kind(&kind).ok_or_else(|| bad_request("invalid_prompt_file_kind"))?;
+    let scope = parse_prompt_file_scope(&update.scope)
+        .ok_or_else(|| bad_request("invalid_prompt_file_scope"))?;
+    if update.expected_hash.trim().is_empty() {
+        return Err(bad_request("invalid_expected_hash"));
+    }
+
+    let app_state = Arc::clone(&state.app_state);
+    let id = agent_id.as_str().to_string();
+    let content = update.content;
+    let expected_hash = update.expected_hash;
+    let layers = blocking(move || -> Result<Vec<LayerBody>, ApiError> {
+        let layers = app_state
+            .soul_agents
+            .write_prompt_file(&id, kind, scope, &content, &expected_hash)
+            .map_err(prompt_file_write_error)?;
+        let state_root = Path::new(&app_state.config.state_root);
+        Ok(layers
+            .into_iter()
+            .map(|layer| layer_body(state_root, layer))
+            .collect())
+    })
+    .await??;
 
     Ok(Json(serde_json::json!({ "ok": true, "layers": layers })))
 }
@@ -347,11 +407,34 @@ fn skill_summary(skills: &SkillManager, meta: &SkillMetadata) -> SkillSummary {
 }
 
 fn layer_body(state_root: &Path, layer: PromptFileLayer) -> LayerBody {
+    let exists = layer.path.is_file();
     LayerBody {
+        hash: prompt_content_hash(layer.content.as_deref()),
         scope: scope_name(layer.scope),
         path: display_path(state_root, &layer.path),
         content: layer.content,
         applied: layer.applied,
+        exists,
+    }
+}
+
+fn prompt_file_write_error(error: PromptFileWriteError) -> ApiError {
+    match error {
+        PromptFileWriteError::UnsafeAgentId => not_found("agent_not_found"),
+        PromptFileWriteError::UnsupportedScope => bad_request("invalid_prompt_file_scope"),
+        PromptFileWriteError::Conflict => api_error(StatusCode::CONFLICT, "prompt_file_conflict"),
+        PromptFileWriteError::TooLarge => {
+            api_error(StatusCode::PAYLOAD_TOO_LARGE, "prompt_file_too_large")
+        }
+        PromptFileWriteError::Symlink => bad_request("prompt_file_not_writable"),
+        PromptFileWriteError::UnsafePath => {
+            tracing::warn!("prompt file path escapes the state root");
+            internal_error()
+        }
+        PromptFileWriteError::Io(error) => {
+            tracing::warn!(%error, "failed to write prompt file");
+            internal_error()
+        }
     }
 }
 
@@ -360,6 +443,14 @@ fn parse_prompt_file_kind(kind: &str) -> Option<PromptFileKind> {
         "soul" => Some(PromptFileKind::Soul),
         "rules" => Some(PromptFileKind::Rules),
         "secret" => Some(PromptFileKind::Secret),
+        _ => None,
+    }
+}
+
+fn parse_prompt_file_scope(scope: &str) -> Option<PromptFileScope> {
+    match scope {
+        "global" => Some(PromptFileScope::Global),
+        "agent" => Some(PromptFileScope::Agent),
         _ => None,
     }
 }
@@ -554,8 +645,22 @@ mod tests {
         assert_eq!(
             body["layers"],
             serde_json::json!([
-                {"scope": "agent", "path": "agents/lyre/SOUL.md", "content": "Lyre soul", "applied": true},
-                {"scope": "global", "path": "SOUL.md", "content": "Global soul", "applied": false},
+                {
+                    "scope": "agent",
+                    "path": "agents/lyre/SOUL.md",
+                    "content": "Lyre soul",
+                    "applied": true,
+                    "exists": true,
+                    "hash": prompt_content_hash(Some("Lyre soul")),
+                },
+                {
+                    "scope": "global",
+                    "path": "SOUL.md",
+                    "content": "Global soul",
+                    "applied": false,
+                    "exists": true,
+                    "hash": prompt_content_hash(Some("Global soul")),
+                },
             ])
         );
     }
@@ -581,6 +686,220 @@ mod tests {
         // Assert
         assert_eq!(status_of(bad_kind), StatusCode::BAD_REQUEST);
         assert_eq!(status_of(bad_agent), StatusCode::NOT_FOUND);
+    }
+
+    fn update(scope: &str, content: &str, expected_hash: &str) -> PromptFileUpdate {
+        PromptFileUpdate {
+            scope: scope.to_string(),
+            content: content.to_string(),
+            expected_hash: expected_hash.to_string(),
+        }
+    }
+
+    fn code_of(result: ApiResult) -> (StatusCode, String) {
+        let (status, Json(body)) = result.expect_err("expected error");
+        (
+            status,
+            body["error"].as_str().expect("error code").to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn put_prompt_file_saves_content_and_returns_layers() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = web_state(&dir);
+        write(&dir, "SOUL.md", "Global soul\n");
+
+        // Act
+        let body = put_agent_prompt_file(
+            State(state.clone()),
+            UrlPath(("lyre".to_string(), "soul".to_string())),
+            Json(update("agent", "  Lyre soul  ", &prompt_content_hash(None))),
+        )
+        .await
+        .expect("saved")
+        .0;
+
+        // Assert
+        assert_eq!(body["ok"], serde_json::json!(true));
+        let layers = &body["layers"];
+        assert_eq!(layers[0]["scope"], "agent");
+        assert_eq!(layers[0]["content"], "Lyre soul");
+        assert_eq!(layers[0]["applied"], true);
+        assert_eq!(layers[0]["exists"], true);
+        assert_eq!(
+            layers[0]["hash"],
+            serde_json::json!(prompt_content_hash(Some("Lyre soul")))
+        );
+        assert_eq!(layers[1]["applied"], false);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agents/lyre/SOUL.md")).unwrap(),
+            "Lyre soul\n"
+        );
+
+        let get = get_agent_prompt_file(
+            State(state),
+            UrlPath(("lyre".to_string(), "soul".to_string())),
+        )
+        .await
+        .expect("get")
+        .0;
+        assert_eq!(get["layers"], *layers);
+    }
+
+    #[tokio::test]
+    async fn put_prompt_file_maps_errors_to_status_codes() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = web_state(&dir);
+        write(&dir, "agents/lyre/SOUL.md", "old");
+
+        // Act / Assert: unknown agent
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("ghost".to_string(), "soul".to_string())),
+                Json(update("agent", "new", &prompt_content_hash(Some("old")))),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::NOT_FOUND, "agent_not_found")
+        );
+
+        // Act / Assert: unknown kind
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "pulse".to_string())),
+                Json(update("agent", "new", &prompt_content_hash(Some("old")))),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_prompt_file_kind")
+        );
+
+        // Act / Assert: unknown scope
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "soul".to_string())),
+                Json(update("channel", "new", &prompt_content_hash(Some("old")))),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_prompt_file_scope")
+        );
+
+        // Act / Assert: empty expected hash
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "soul".to_string())),
+                Json(update("agent", "new", "  ")),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_expected_hash")
+        );
+
+        // Act / Assert: stale hash
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "soul".to_string())),
+                Json(update("agent", "new", &prompt_content_hash(Some("other")))),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::CONFLICT, "prompt_file_conflict")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agents/lyre/SOUL.md")).unwrap(),
+            "old"
+        );
+
+        // Act / Assert: unsupported layer for the kind
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "secret".to_string())),
+                Json(update("global", "new", &prompt_content_hash(None))),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::BAD_REQUEST, "invalid_prompt_file_scope")
+        );
+
+        // Act / Assert: oversized content
+        let oversized = "a".repeat(crate::agent_loop::prompt::MAX_PROMPT_FILE_BYTES + 1);
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "soul".to_string())),
+                Json(update(
+                    "agent",
+                    &oversized,
+                    &prompt_content_hash(Some("old")),
+                )),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::PAYLOAD_TOO_LARGE, "prompt_file_too_large")
+        );
+
+        // Act / Assert: unreadable existing file
+        std::fs::write(dir.path().join("agents/lyre/SOUL.md"), [0xff, 0xfe]).unwrap();
+        let (status, code) = code_of(
+            put_agent_prompt_file(
+                State(state.clone()),
+                UrlPath(("lyre".to_string(), "soul".to_string())),
+                Json(update("agent", "new", &prompt_content_hash(None))),
+            )
+            .await,
+        );
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let target = dir.path().join("target.md");
+            std::fs::write(&target, "target").unwrap();
+            let path = dir.path().join("agents/lyre/SOUL.md");
+            let _ = std::fs::remove_file(&path);
+            symlink(&target, &path).unwrap();
+
+            let (status, code) = code_of(
+                put_agent_prompt_file(
+                    State(state),
+                    UrlPath(("lyre".to_string(), "soul".to_string())),
+                    Json(update("agent", "new", &prompt_content_hash(Some("target")))),
+                )
+                .await,
+            );
+            assert_eq!(
+                (status, code.as_str()),
+                (StatusCode::BAD_REQUEST, "prompt_file_not_writable")
+            );
+        }
     }
 
     #[tokio::test]
