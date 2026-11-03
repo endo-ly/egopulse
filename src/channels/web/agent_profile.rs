@@ -427,6 +427,10 @@ fn prompt_file_write_error(error: PromptFileWriteError) -> ApiError {
             api_error(StatusCode::PAYLOAD_TOO_LARGE, "prompt_file_too_large")
         }
         PromptFileWriteError::Symlink => bad_request("prompt_file_not_writable"),
+        PromptFileWriteError::UnsafePath => {
+            tracing::warn!("prompt file path escapes the state root");
+            internal_error()
+        }
         PromptFileWriteError::Io(error) => {
             tracing::warn!(%error, "failed to write prompt file");
             internal_error()

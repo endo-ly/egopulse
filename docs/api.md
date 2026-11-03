@@ -679,14 +679,14 @@ PUT /api/agents/{agent_id}/files/{kind}
 - `expected_hash` は取得時の `hash` と一致する必要がある。一致しない場合は `409` で、ファイルを変更しない
 - 保存後は GET と同じ形の `layers` を返す。SOUL のフォールバックや AGENTS の累積で他の層の `applied` が変わるため
 - 空の `content` は空ファイルとして保存する（`content: null` / `exists: true` / `applied: false`）
-- 既存ファイルがシンボリックリンク、または読み取り不能な場合は上書きしない
+- 既存ファイルまたはその親ディレクトリ（state root 配下）がシンボリックリンク、または既存ファイルが読み取り不能な場合は上書きしない
 
 | ステータス | エラーコード | 条件 |
 |---|---|---|
 | `400` | `invalid_prompt_file_kind` | 未知の `kind` |
 | `400` | `invalid_prompt_file_scope` | 未知の `scope`、またはその kind に存在しない層 |
 | `400` | `invalid_expected_hash` | `expected_hash` が空 |
-| `400` | `prompt_file_not_writable` | 既存ファイルがシンボリックリンク |
+| `400` | `prompt_file_not_writable` | 保存先またはその親ディレクトリがシンボリックリンク |
 | `404` | `agent_not_found` | 未知の agent |
 | `409` | `prompt_file_conflict` | `expected_hash` が現在内容と不一致 |
 | `413` | `prompt_file_too_large` | 256 KiB 超 |

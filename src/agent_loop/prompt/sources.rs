@@ -53,8 +53,12 @@ pub(crate) enum PromptFileWriteError {
     Conflict,
     #[error("prompt file exceeds {MAX_PROMPT_FILE_BYTES} bytes")]
     TooLarge,
-    /// The path is a symlink; rename would replace the link rather than the
-    /// file it points to.
+    /// A parent directory under the state root is a symlink, so the resolved
+    /// write target would escape the directory tree the UI manages.
+    #[error("prompt file path is outside the state root")]
+    UnsafePath,
+    /// The file or a parent directory under the state root is a symlink. A
+    /// rename would replace a linked file, or write through a linked directory.
     #[error("prompt file is a symlink")]
     Symlink,
     #[error("failed to access prompt file: {0}")]
@@ -62,6 +66,7 @@ pub(crate) enum PromptFileWriteError {
 }
 
 pub(crate) struct SoulAgentsLoader {
+    state_root: PathBuf,
     soul_path: PathBuf,
     agents_path: PathBuf,
     agents_dir: PathBuf,
@@ -75,6 +80,7 @@ pub(crate) struct SoulAgentsLoader {
 impl SoulAgentsLoader {
     pub(crate) fn new(config: &crate::config::Config) -> Self {
         Self {
+            state_root: PathBuf::from(&config.state_root),
             soul_path: config.soul_path(),
             agents_path: config.agents_path(),
             agents_dir: PathBuf::from(&config.state_root).join("agents"),
@@ -207,8 +213,8 @@ impl SoulAgentsLoader {
     /// # Errors
     ///
     /// Returns [`PromptFileWriteError`] for an unsafe agent id, a scope the
-    /// kind does not have, a stale hash, oversized content, a symlink, or I/O
-    /// failure.
+    /// kind does not have, a stale hash, oversized content, a symlink (the file
+    /// or a parent directory), or I/O failure.
     pub(crate) fn write_prompt_file(
         &self,
         agent_id: &str,
@@ -230,6 +236,7 @@ impl SoulAgentsLoader {
             .find(|layer| layer.scope == scope)
             .ok_or(PromptFileWriteError::UnsupportedScope)?;
 
+        self.ensure_no_symlink_ancestors(&target.path)?;
         match std::fs::symlink_metadata(&target.path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(PromptFileWriteError::Symlink);
@@ -266,6 +273,33 @@ impl SoulAgentsLoader {
 
         self.prompt_file_layers(agent_id, kind)
             .ok_or(PromptFileWriteError::UnsafeAgentId)
+    }
+
+    /// Rejects parent directories below the state root that are symlinks.
+    ///
+    /// Checking only the final component is insufficient: if
+    /// `agents/<agent_id>` is a symlink, a regular `SOUL.md` inside it is still
+    /// written through the link to a directory the UI does not manage.
+    fn ensure_no_symlink_ancestors(&self, path: &Path) -> Result<(), PromptFileWriteError> {
+        let mut current = path.parent();
+        while let Some(directory) = current {
+            if directory == self.state_root {
+                return Ok(());
+            }
+            if !directory.starts_with(&self.state_root) {
+                return Err(PromptFileWriteError::UnsafePath);
+            }
+            match std::fs::symlink_metadata(directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(PromptFileWriteError::Symlink);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            current = directory.parent();
+        }
+        Err(PromptFileWriteError::UnsafePath)
     }
 
     pub(crate) fn provision_default_soul(&self) -> io::Result<bool> {
@@ -325,52 +359,37 @@ pub(crate) fn prompt_content_hash(content: Option<&str>) -> String {
 /// Writes `content` through a temp file in the same directory, fsyncs it, and
 /// renames it over `path`. Readers therefore never see a partial file.
 fn write_prompt_file_atomically(path: &Path, content: &str) -> io::Result<()> {
+    use std::io::Write;
+
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "prompt file has no parent"))?;
     std::fs::create_dir_all(parent)?;
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("prompt.md");
-    let suffix = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let temp_path = parent.join(format!(".{file_name}.{}.{suffix}.tmp", std::process::id()));
     // Keep the mode of an existing file: a SECRET.md created as 0600 must not
     // become world-readable just because it was edited from the WebUI.
     let existing_permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
-
-    let result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Never expose the temp file more widely than a private file, even
-            // before an existing mode is applied below.
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temp_path)?;
-        std::io::Write::write_all(&mut file, content.as_bytes())?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".egopulse-prompt-")
+        .tempfile_in(parent)?;
+    {
+        let file = temp.as_file_mut();
+        file.write_all(content.as_bytes())?;
         if !content.is_empty() {
-            std::io::Write::write_all(&mut file, b"\n")?;
+            file.write_all(b"\n")?;
         }
-        file.sync_all()?;
-        if let Some(permissions) = existing_permissions {
-            std::fs::set_permissions(&temp_path, permissions)?;
-        }
-        std::fs::rename(&temp_path, path)
-    })();
+    }
+    if let Some(permissions) = existing_permissions {
+        temp.as_file().set_permissions(permissions)?;
+    }
+    temp.as_file().sync_all()?;
+    temp.persist(path).map_err(|error| error.error)?;
 
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    } else if let Ok(directory) = std::fs::File::open(parent) {
+    if let Ok(directory) = std::fs::File::open(parent) {
         // Best effort: the file itself is already synced.
         let _ = directory.sync_all();
     }
-    result
+    Ok(())
 }
 
 #[cfg(test)]
@@ -380,6 +399,7 @@ mod tests {
 
     fn make_loader(dir: &Path) -> SoulAgentsLoader {
         SoulAgentsLoader {
+            state_root: dir.to_path_buf(),
             soul_path: dir.join("SOUL.md"),
             agents_path: dir.join("AGENTS.md"),
             agents_dir: dir.join("agents"),
@@ -870,6 +890,40 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_prompt_file_rejects_symlinked_agent_directory() {
+        // Arrange
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        fs::create_dir_all(dir.path().join("agents")).unwrap();
+        write_file(&external.path().join("alice/SOUL.md"), "external soul");
+        symlink(
+            external.path().join("alice"),
+            dir.path().join("agents/alice"),
+        )
+        .unwrap();
+
+        // Act
+        let result = loader.write_prompt_file(
+            "alice",
+            PromptFileKind::Soul,
+            PromptFileScope::Agent,
+            "new soul",
+            &prompt_content_hash(Some("external soul")),
+        );
+
+        // Assert
+        assert!(matches!(result, Err(PromptFileWriteError::Symlink)));
+        assert_eq!(
+            fs::read_to_string(external.path().join("alice/SOUL.md")).unwrap(),
+            "external soul"
+        );
     }
 
     #[test]
