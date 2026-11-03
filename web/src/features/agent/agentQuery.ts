@@ -3,6 +3,11 @@ import { useServerState } from "../../shared/hooks/useServerState";
 /** Prefix shared by every Agent screen query, so one refresh reloads them all. */
 export const AGENT_QUERY_PREFIX = "agent-screen:";
 
+/** The cache key of one Agent screen query. */
+export function agentQueryKey(authToken: string, parts: string[]): string {
+  return `${AGENT_QUERY_PREFIX}${parts.join(":")}:${authToken}`;
+}
+
 /**
  * Fetches Agent screen data. Prompt files and memory change outside the UI
  * (Sleep, manual edits), so cached data is shown at once and revalidated on
@@ -10,7 +15,7 @@ export const AGENT_QUERY_PREFIX = "agent-screen:";
  * across auth identities.
  */
 export function useAgentQuery<T>(authToken: string, parts: string[], fetcher: () => Promise<T>) {
-  return useServerState(`${AGENT_QUERY_PREFIX}${parts.join(":")}:${authToken}`, fetcher, {
+  return useServerState(agentQueryKey(authToken, parts), fetcher, {
     revalidateOnMount: true,
   });
 }

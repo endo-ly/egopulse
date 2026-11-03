@@ -1363,26 +1363,86 @@ const GLOBAL_RULES = [
   "- 破壊的な操作の前には必ず確認する。",
 ].join("\n");
 
-// Mirrors GET /api/agents/:id/files/:kind: soul falls back to the global
+// Mirrors GET / PUT /api/agents/:id/files/:kind: soul falls back to the global
 // file, rules accumulate, secret is agent-only.
+type MockPromptScope = "agent" | "global";
+interface MockPromptLayer {
+  scope: MockPromptScope;
+  path: string;
+  content: string | null;
+  applied: boolean;
+  exists: boolean;
+  hash: string;
+}
+
+/** `${agentId}:${kind}:${scope}` → canonical content ("" when cleared). */
+const PROMPT_FILE_OVERRIDES = new Map<string, string>();
+
+/** Deterministic 64-hex stand-in for the server's SHA-256. */
+function promptHash(content: string | null): string {
+  const text = (content ?? "").trim();
+  let a = 0x811c9dc5;
+  let b = 0x9e3779b9;
+  let c = 0x85ebca6b;
+  let d = 0xc2b2ae35;
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    a = Math.imul(a ^ code, 0x01000193);
+    b = Math.imul(b + code, 0x85ebca9b);
+    c = Math.imul(c ^ code, 0xc2b2ae3d);
+    d = Math.imul(d + code, 0x27d4eb2f);
+  }
+  return [a, b, c, d]
+    .map((value) => (value >>> 0).toString(16).padStart(8, "0"))
+    .join("");
+}
+
+function promptLayer(
+  agentId: string,
+  kind: string,
+  scope: MockPromptScope,
+  path: string,
+  seeded: string | null,
+): MockPromptLayer {
+  const key = `${agentId}:${kind}:${scope}`;
+  const overridden = PROMPT_FILE_OVERRIDES.get(key);
+  const content = overridden === undefined ? seeded : overridden.trim() || null;
+  return {
+    scope,
+    path,
+    content,
+    applied: content !== null,
+    exists: overridden !== undefined || content !== null,
+    hash: promptHash(content),
+  };
+}
+
 function PROMPT_FILES(agentId: string) {
-  const agentSoul =
+  const agentSoulSeed =
     agentId === "lyre"
       ? ["# Lyre", "", "観測者として振る舞い、記憶を丁寧に扱う。", "", "## 口調", "- です・ます調"].join("\n")
       : null;
-  const agentRules = agentId === "lyre" ? "# Lyre rules\n\n- 設計判断は理由とセットで残す。" : null;
-  const secret = agentId === "lyre" ? "秘密モードでは、より親密なトーンで話す。" : null;
+  const agentRulesSeed = agentId === "lyre" ? "# Lyre rules\n\n- 設計判断は理由とセットで残す。" : null;
+  const secretSeed = agentId === "lyre" ? "秘密モードでは、より親密なトーンで話す。" : null;
+
+  const soul = [
+    promptLayer(agentId, "soul", "agent", `agents/${agentId}/SOUL.md`, agentSoulSeed),
+    promptLayer(agentId, "soul", "global", "SOUL.md", GLOBAL_SOUL),
+  ];
+  soul[0].applied = soul[0].content !== null;
+  soul[1].applied = soul[0].content === null && soul[1].content !== null;
+
+  const rules = [
+    promptLayer(agentId, "rules", "global", "AGENTS.md", GLOBAL_RULES),
+    promptLayer(agentId, "rules", "agent", `agents/${agentId}/AGENTS.md`, agentRulesSeed),
+  ];
+  for (const layer of rules) layer.applied = layer.content !== null;
+
   return {
-    soul: [
-      { scope: "agent", path: `agents/${agentId}/SOUL.md`, content: agentSoul, applied: agentSoul !== null },
-      { scope: "global", path: "SOUL.md", content: GLOBAL_SOUL, applied: agentSoul === null },
-    ],
-    rules: [
-      { scope: "global", path: "AGENTS.md", content: GLOBAL_RULES, applied: true },
-      { scope: "agent", path: `agents/${agentId}/AGENTS.md`, content: agentRules, applied: agentRules !== null },
-    ],
+    soul,
+    rules,
     secret: [
-      { scope: "agent", path: `agents/${agentId}/SECRET.md`, content: secret, applied: secret !== null },
+      promptLayer(agentId, "secret", "agent", `agents/${agentId}/SECRET.md`, secretSeed),
     ],
   };
 }
@@ -1751,11 +1811,52 @@ export function mockApiPlugin(): Plugin | null {
         }
         const fileMatch = pathname.match(/^\/api\/agents\/([^/]+)\/files\/([^/]+)$/);
         if (fileMatch) {
-          const files = PROMPT_FILES(decodeURIComponent(fileMatch[1]));
+          const agentId = decodeURIComponent(fileMatch[1]);
+          if (!AGENTS.some((agent) => agent.id === agentId)) {
+            res.statusCode = 404;
+            return sendJson(res, { ok: false, error: "agent_not_found" });
+          }
+          const files = PROMPT_FILES(agentId);
           const kind = fileMatch[2] as keyof typeof files;
           if (!(kind in files)) {
             res.statusCode = 400;
             return sendJson(res, { ok: false, error: "invalid_prompt_file_kind" });
+          }
+          if (req.method === "PUT") {
+            let body: { scope?: unknown; content?: unknown; expected_hash?: unknown };
+            try {
+              body = (await readJsonBody(req)) as typeof body;
+            } catch {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid_json" });
+            }
+            if (body.scope !== "agent" && body.scope !== "global") {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid_prompt_file_scope" });
+            }
+            if (typeof body.content !== "string") {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid_content" });
+            }
+            if (typeof body.expected_hash !== "string" || body.expected_hash.trim() === "") {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid_expected_hash" });
+            }
+            const layer = files[kind].find((candidate) => candidate.scope === body.scope);
+            if (!layer) {
+              res.statusCode = 400;
+              return sendJson(res, { ok: false, error: "invalid_prompt_file_scope" });
+            }
+            if (layer.hash !== body.expected_hash) {
+              res.statusCode = 409;
+              return sendJson(res, { ok: false, error: "prompt_file_conflict" });
+            }
+            if (Buffer.byteLength(body.content.trim(), "utf8") > 256 * 1024) {
+              res.statusCode = 413;
+              return sendJson(res, { ok: false, error: "prompt_file_too_large" });
+            }
+            PROMPT_FILE_OVERRIDES.set(`${agentId}:${kind}:${body.scope}`, body.content);
+            return sendJson(res, { ok: true, layers: PROMPT_FILES(agentId)[kind] });
           }
           return sendJson(res, { ok: true, layers: files[kind] });
         }

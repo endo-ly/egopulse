@@ -374,11 +374,12 @@ export function WebUI() {
 
   const handleSelectAgentSection = useCallback(
     (section: AgentSection) => {
+      if (section !== agentSection && !confirmDiscardUnsaved()) return;
       setActiveTab("agent");
       setAgentSection(section);
       navigateTo({ tab: "agent", agentId: selectedAgent, section });
     },
-    [selectedAgent],
+    [agentSection, selectedAgent],
   );
 
   const handleChangeScheduleView = useCallback(

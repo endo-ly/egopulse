@@ -8,7 +8,14 @@ import { WebUI } from "../WebUI";
 // shell wires navigation, so each screen renders as a marker.
 vi.mock("../../features/chat/ChatTab", () => ({ ChatTab: () => <div>chat screen</div> }));
 vi.mock("../../features/agent/AgentPanel", () => ({
-  AgentPanel: () => <div>agent screen</div>,
+  AgentPanel: ({ onSelectSection }: { onSelectSection: (section: string) => void }) => (
+    <div>
+      agent screen
+      <button type="button" onClick={() => onSelectSection("rules")}>
+        open rules
+      </button>
+    </div>
+  ),
 }));
 vi.mock("../../features/schedule/SchedulePanel", () => ({
   SchedulePanel: () => <div>schedule screen</div>,
@@ -82,6 +89,7 @@ describe("WebUI", () => {
   afterEach(() => {
     cleanup();
     setUnsavedChanges("config-form", false);
+    setUnsavedChanges("agent-file", false);
   });
 
   it("opens the chat screen when a session is picked from the command palette", async () => {
@@ -122,6 +130,30 @@ describe("WebUI", () => {
     // Assert: the navigation now goes through.
     expect(await screen.findByText("schedule screen")).toBeTruthy();
     expect(globalThis.location.pathname.startsWith("/agents/lyre/schedule")).toBe(true);
+    confirm.mockRestore();
+  });
+
+  it("asks_before_switching_agent_sections_with_unsaved_prompt_edit", async () => {
+    // Arrange: the Agent screen shows a section with an unsaved edit.
+    globalThis.history.replaceState({}, "", "/agents/lyre/soul");
+    setUnsavedChanges("agent-file", true);
+    const confirm = vi.spyOn(globalThis, "confirm").mockReturnValue(false);
+    render(<WebUI />);
+    await screen.findByText("agent screen");
+
+    // Act: switch to another section and refuse the discard.
+    fireEvent.click(screen.getByRole("button", { name: "open rules" }));
+
+    // Assert: the draft and the URL stay put.
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(globalThis.location.pathname).toBe("/agents/lyre/soul");
+
+    // Act: accept the discard.
+    confirm.mockReturnValue(true);
+    fireEvent.click(screen.getByRole("button", { name: "open rules" }));
+
+    // Assert: the section changes.
+    await waitFor(() => expect(globalThis.location.pathname).toBe("/agents/lyre/rules"));
     confirm.mockRestore();
   });
 

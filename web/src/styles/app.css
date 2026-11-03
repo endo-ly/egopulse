@@ -2930,6 +2930,77 @@
     font-size: var(--text-sm);
   }
 
+  .doc-card-editor {
+    display: grid;
+    gap: var(--space-sm);
+  }
+
+  .doc-card-editor-note {
+    margin: 0;
+    padding: var(--space-sm) var(--space-md);
+    border-radius: var(--radius-sm);
+    background: var(--color-accent-10);
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+  }
+
+  .doc-card-editor-tabs {
+    display: flex;
+    gap: var(--space-xs);
+  }
+
+  .doc-card-editor-textarea {
+    width: 100%;
+    min-height: 16rem;
+    box-sizing: border-box;
+    padding: var(--space-md);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+    background: var(--color-code-block-bg);
+    color: var(--color-text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: var(--text-sm);
+    line-height: 1.6;
+    resize: vertical;
+  }
+
+  .doc-card-editor-textarea:focus {
+    outline: none;
+    border-color: var(--color-border-strong);
+  }
+
+  .doc-card-editor-preview {
+    min-height: 4rem;
+    padding: var(--space-sm) var(--space-md);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-sm);
+  }
+
+  .doc-card-editor-diff summary {
+    cursor: pointer;
+    color: var(--color-muted);
+    font-size: var(--text-xs);
+  }
+
+  .doc-card-editor-diff .diff-container {
+    margin-top: var(--space-sm);
+    max-height: 32rem;
+    overflow: auto;
+  }
+
+  .doc-card-editor-error {
+    margin: 0;
+    color: var(--color-danger);
+    font-size: var(--text-sm);
+  }
+
+  .doc-card-editor-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: var(--space-sm);
+  }
+
   .memory-changes {
     display: grid;
     margin: 0;

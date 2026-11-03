@@ -19,7 +19,7 @@ export function setUnsavedChanges(formId: string, dirty: boolean): void {
 /** Asks before leaving unsaved edits; true when it is fine to navigate. */
 export function confirmDiscardUnsaved(): boolean {
   if (dirtyForms.size === 0) return true;
-  const ok = globalThis.confirm?.("You have unsaved config changes. Discard them?") ?? true;
+  const ok = globalThis.confirm?.("You have unsaved changes. Discard them?") ?? true;
   if (ok) {
     dirtyForms.clear();
     globalThis.removeEventListener?.("beforeunload", onBeforeUnload);

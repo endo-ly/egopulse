@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
 import { AgentPanel } from "../AgentPanel";
 import type { AgentSection } from "../../../app/router";
 import type {
@@ -43,10 +43,21 @@ const PROFILE: AgentProfile = {
 
 type Routes = Record<string, unknown>;
 
+type PutResult = { status: number; body: unknown };
+
 /** Stubs fetch so each API path returns its own JSON body. */
-function stubApi(routes: Routes) {
-  const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+function stubApi(routes: Routes, onPut?: (path: string, body: unknown) => PutResult) {
+  const fetchMock = vi.fn().mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
     const path = new URL(String(input), "http://localhost").pathname;
+    if (init?.method === "PUT" && onPut) {
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      const result = onPut(path, body);
+      return Promise.resolve({
+        ok: result.status < 400,
+        status: result.status,
+        json: () => Promise.resolve(result.body),
+      });
+    }
     const body = routes[path];
     if (body === undefined) {
       return Promise.resolve({ ok: false, status: 404, json: () => Promise.resolve({}) });
@@ -61,6 +72,11 @@ function requestedPaths(fetchMock: ReturnType<typeof vi.fn>): string[] {
   return fetchMock.mock.calls.map(
     ([input]) => new URL(String(input), "http://localhost").pathname,
   );
+}
+
+/** Stable stand-in for the server hash; only equality matters in the UI. */
+function promptHash(content: string): string {
+  return `hash:${content}`;
 }
 
 let tokenSeq = 0;
@@ -193,8 +209,22 @@ describe("AgentPanel", () => {
   it("soul_marks_the_applied_layer_and_the_fallback", async () => {
     // Arrange
     const layers: PromptFileLayer[] = [
-      { scope: "agent", path: "agents/lyre/SOUL.md", content: null, applied: false },
-      { scope: "global", path: "SOUL.md", content: "Global soul", applied: true },
+      {
+        scope: "agent",
+        path: "agents/lyre/SOUL.md",
+        content: null,
+        applied: false,
+        exists: false,
+        hash: promptHash(""),
+      },
+      {
+        scope: "global",
+        path: "SOUL.md",
+        content: "Global soul",
+        applied: true,
+        exists: true,
+        hash: promptHash("Global soul"),
+      },
     ];
     stubApi({ "/api/agents/lyre/files/soul": { layers } });
 
@@ -215,7 +245,14 @@ describe("AgentPanel", () => {
     const fetchMock = stubApi({
       "/api/agents/lyre/files/secret": {
         layers: [
-          { scope: "agent", path: "agents/lyre/SECRET.md", content: "intimate", applied: true },
+          {
+            scope: "agent",
+            path: "agents/lyre/SECRET.md",
+            content: "intimate",
+            applied: true,
+            exists: true,
+            hash: promptHash("intimate"),
+          },
         ],
       },
     });
@@ -232,6 +269,212 @@ describe("AgentPanel", () => {
 
     // Assert
     await waitFor(() => expect(screen.getByText("intimate")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
+  });
+
+  it("distinguishes_empty_files_from_missing_layers", async () => {
+    // Arrange
+    const layers: PromptFileLayer[] = [
+      {
+        scope: "global",
+        path: "AGENTS.md",
+        content: null,
+        applied: false,
+        exists: true,
+        hash: "empty-hash",
+      },
+      {
+        scope: "agent",
+        path: "agents/lyre/AGENTS.md",
+        content: null,
+        applied: false,
+        exists: false,
+        hash: "empty-hash",
+      },
+    ];
+    stubApi({ "/api/agents/lyre/files/rules": { layers } });
+
+    // Act
+    renderPanel("rules");
+
+    // Assert
+    await waitFor(() => expect(screen.getAllByRole("article")).toHaveLength(2));
+    const cards = screen.getAllByRole("article");
+    expect(cards[0].textContent).toContain("Empty");
+    expect(cards[1].textContent).toContain("Not created");
+  });
+
+  it("prompt_file_edit_saves_content_with_expected_hash", async () => {
+    // Arrange
+    const before: PromptFileLayer[] = [
+      {
+        scope: "agent",
+        path: "agents/lyre/SOUL.md",
+        content: "old soul",
+        applied: true,
+        exists: true,
+        hash: "hash-old",
+      },
+      {
+        scope: "global",
+        path: "SOUL.md",
+        content: "global soul",
+        applied: false,
+        exists: true,
+        hash: "hash-global",
+      },
+    ];
+    const after: PromptFileLayer[] = [
+      { ...before[0], content: "new soul", hash: "hash-new" },
+      before[1],
+    ];
+    const put = vi
+      .fn()
+      .mockReturnValue({ status: 200, body: { ok: true, layers: after } });
+    stubApi({ "/api/agents/lyre/files/soul": { layers: before } }, put);
+
+    // Act
+    renderPanel("soul");
+    await waitFor(() => expect(screen.getByText("old soul")).toBeTruthy());
+    fireEvent.click(screen.getAllByRole("button", { name: "Edit" })[0]);
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "new soul" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    // Assert
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put).toHaveBeenCalledWith("/api/agents/lyre/files/soul", {
+      scope: "agent",
+      content: "new soul",
+      expected_hash: "hash-old",
+    });
+    await waitFor(() => expect(screen.getByText("new soul")).toBeTruthy());
+    expect(screen.queryByLabelText("Content")).toBeNull();
+  });
+
+  it("missing_layer_can_be_edited_and_global_layers_warn", async () => {
+    // Arrange
+    const layers: PromptFileLayer[] = [
+      {
+        scope: "agent",
+        path: "agents/lyre/SOUL.md",
+        content: null,
+        applied: false,
+        exists: false,
+        hash: "empty-hash",
+      },
+      {
+        scope: "global",
+        path: "SOUL.md",
+        content: "Global soul",
+        applied: true,
+        exists: true,
+        hash: "global-hash",
+      },
+    ];
+    stubApi({ "/api/agents/lyre/files/soul": { layers } });
+
+    // Act
+    renderPanel("soul");
+    await waitFor(() => expect(screen.getByText("Global soul")).toBeTruthy());
+    const cards = screen.getAllByRole("article");
+    fireEvent.click(within(cards[0]).getByRole("button", { name: "Edit" }));
+
+    // Assert: a missing layer opens an empty editor
+    expect((screen.getByLabelText("Content") as HTMLTextAreaElement).value).toBe("");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // Act
+    fireEvent.click(within(cards[1]).getByRole("button", { name: "Edit" }));
+
+    // Assert: the shared scope is called out before editing
+    await waitFor(() => expect(screen.getByText(/shared global file/i)).toBeTruthy());
+  });
+
+  it("prompt_file_editor_previews_markdown_and_guards_unsaved_edits", async () => {
+    // Arrange
+    const layers: PromptFileLayer[] = [
+      {
+        scope: "agent",
+        path: "agents/lyre/SOUL.md",
+        content: "old soul",
+        applied: true,
+        exists: true,
+        hash: "hash-old",
+      },
+    ];
+    stubApi({ "/api/agents/lyre/files/soul": { layers } });
+    renderPanel("soul");
+    await waitFor(() => expect(screen.getByText("old soul")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    // Act: edit and preview
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "**bold**" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+
+    // Assert: Markdown is rendered from the draft
+    await waitFor(() => expect(screen.getByText("bold").tagName).toBe("STRONG"));
+    expect(document.querySelector(".doc-card-editor-diff")?.textContent).toContain("+1");
+    expect(document.querySelector(".doc-card-editor-diff")?.textContent).toContain("−1");
+
+    // Assert: the draft guards unload until discarded
+    const unload = new Event("beforeunload", { cancelable: true });
+    globalThis.dispatchEvent(unload);
+    expect(unload.defaultPrevented).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    const afterCancel = new Event("beforeunload", { cancelable: true });
+    globalThis.dispatchEvent(afterCancel);
+    expect(afterCancel.defaultPrevented).toBe(false);
+  });
+
+  it("prompt_file_conflict_keeps_draft_and_reloads_latest", async () => {
+    // Arrange
+    const routes: Routes = {
+      "/api/agents/lyre/files/soul": {
+        layers: [
+          {
+            scope: "agent",
+            path: "agents/lyre/SOUL.md",
+            content: "old soul",
+            applied: true,
+            exists: true,
+            hash: "hash-old",
+          },
+        ],
+      },
+    };
+    stubApi(routes, () => ({
+      status: 409,
+      body: { ok: false, error: "prompt_file_conflict" },
+    }));
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    renderPanel("soul");
+    await waitFor(() => expect(screen.getByText("old soul")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "my draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    // Assert: the draft survives the conflict
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("changed elsewhere"));
+    expect((screen.getByLabelText("Content") as HTMLTextAreaElement).value).toBe("my draft");
+
+    // Act: the remote content is reloaded
+    routes["/api/agents/lyre/files/soul"] = {
+      layers: [
+        {
+          scope: "agent",
+          path: "agents/lyre/SOUL.md",
+          content: "remote soul",
+          applied: true,
+          exists: true,
+          hash: "hash-remote",
+        },
+      ],
+    };
+    fireEvent.click(screen.getByRole("button", { name: "Reload" }));
+
+    // Assert
+    await waitFor(() => expect(screen.getByText("remote soul")).toBeTruthy());
+    expect(screen.queryByLabelText("Content")).toBeNull();
   });
 
   it("memory_shows_all_layers_and_their_changes_on_one_page", async () => {

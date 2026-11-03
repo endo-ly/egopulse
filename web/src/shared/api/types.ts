@@ -249,6 +249,10 @@ export interface PromptFileLayer {
   content: string | null;
   /** Whether the content is injected into the system prompt. */
   applied: boolean;
+  /** Whether the file exists, so an empty file is not shown as missing. */
+  exists: boolean;
+  /** SHA-256 of the canonical content; sent back as `expected_hash`. */
+  hash: string;
 }
 
 export interface MemoryChange {

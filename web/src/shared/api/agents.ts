@@ -5,6 +5,7 @@ import type {
   MemoryChange,
   PromptFileKind,
   PromptFileLayer,
+  PromptFileScope,
   SkillDetail,
   SkillSummary,
 } from "./types";
@@ -60,6 +61,40 @@ export async function fetchPromptFile(
     authToken,
   );
   return data.layers;
+}
+
+/** Sent when the file changed after it was read. */
+export class PromptFileConflictError extends Error {
+  constructor() {
+    super("The file changed elsewhere.");
+  }
+}
+
+/** Writes one layer and returns every layer of the kind after the write. */
+export async function savePromptFile(
+  agentId: string,
+  kind: PromptFileKind,
+  scope: PromptFileScope,
+  content: string,
+  expectedHash: string,
+  authToken: string,
+): Promise<PromptFileLayer[]> {
+  try {
+    const data = await apiFetch<{ ok: boolean; layers: PromptFileLayer[] }>(
+      agentPath(agentId, `/files/${kind}`),
+      authToken,
+      {
+        method: "PUT",
+        body: JSON.stringify({ scope, content, expected_hash: expectedHash }),
+      },
+    );
+    return data.layers;
+  } catch (error) {
+    if (error instanceof Error && error.message === "prompt_file_conflict") {
+      throw new PromptFileConflictError();
+    }
+    throw error;
+  }
 }
 
 export async function fetchAgentMemory(agentId: string, authToken: string): Promise<AgentMemory> {
