@@ -353,12 +353,16 @@ pub(super) async fn get_history(
 fn tool_call_entry(tool_call: &ToolCall, pulse_intentions: &PulseIntentions) -> serde_json::Value {
     let input = serde_json::from_str::<serde_json::Value>(&tool_call.tool_input)
         .unwrap_or(serde_json::Value::Null);
+    let mut attachments = serde_json::json!([]);
     let (status, result) = match (&tool_call.state, tool_call.tool_output.as_ref()) {
         // The ledger state is the source of truth for the card status; the
         // output only carries the result body.
         (ToolState::Succeeded, Some(output)) => {
             let parsed = serde_json::from_str::<serde_json::Value>(output)
                 .unwrap_or(serde_json::Value::Null);
+            if let Some(value) = parsed.get("attachments").filter(|value| value.is_array()) {
+                attachments = value.clone();
+            }
             let result = parsed
                 .get("result")
                 .and_then(|r| r.as_str())
@@ -391,6 +395,7 @@ fn tool_call_entry(tool_call: &ToolCall, pulse_intentions: &PulseIntentions) -> 
             "status": status,
             "result": result,
             "input": input,
+            "attachments": attachments,
         }))
         .unwrap_or_default(),
         "timestamp": tool_call.timestamp,
@@ -1029,6 +1034,63 @@ mod tests {
         assert_eq!(content["status"], "success");
         assert_eq!(content["result"], "file contents");
         assert_eq!(content["input"]["path"], "a.txt");
+        assert_eq!(content["attachments"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn api_history_exposes_send_attachment_metadata() {
+        // Arrange: a successful send_attachment result carries the stored
+        // attachment metadata that the Web timeline renders as an audio card.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:session-attachment:agent:lyre", "lyre");
+
+        let assistant_msg =
+            StoredMessage::assistant(chat_id, "lyre".to_string(), "sending audio".to_string());
+        db.store_message_only(&assistant_msg)
+            .expect("store assistant message");
+        db.insert_tool_call_for_test(
+            "call-audio",
+            chat_id,
+            &assistant_msg.id,
+            "send_attachment",
+            r#"{"attachment_path":"media/reply.mp3"}"#,
+            Some(
+                r#"{"result":"Attachment sent successfully","status":"success","attachments":[{"id":"00000000-0000-4000-8000-000000000000.mp3","filename":"reply.mp3","content_type":"audio/mpeg","size_bytes":1234}]}"#,
+            ),
+            "2024-01-01T00:00:01Z",
+        )
+        .expect("store tool call");
+
+        // Act
+        let query = Query(super::HistoryQuery {
+            session_key: Some(format!("chat:{chat_id}")),
+            limit: None,
+            before_seq: None,
+        });
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+
+        // Assert
+        let body = result.0;
+        let messages = body["messages"].as_array().expect("messages array");
+        let tool_message = messages
+            .iter()
+            .find(|m| m["message_kind"] == "tool_call")
+            .expect("tool message present");
+        let content = serde_json::from_str::<serde_json::Value>(
+            tool_message["content"].as_str().expect("content string"),
+        )
+        .expect("content json");
+        let attachments = content["attachments"].as_array().expect("attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(
+            attachments[0]["id"],
+            "00000000-0000-4000-8000-000000000000.mp3"
+        );
+        assert_eq!(attachments[0]["filename"], "reply.mp3");
+        assert_eq!(attachments[0]["content_type"], "audio/mpeg");
+        assert_eq!(attachments[0]["size_bytes"], 1234);
     }
 
     #[tokio::test]

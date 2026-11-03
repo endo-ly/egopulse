@@ -469,6 +469,7 @@ mod tests {
             preview: String::new(),
             duration_ms,
             call_id: call_id.to_string(),
+            attachments: Vec::new(),
         }
     }
 
@@ -667,6 +668,7 @@ mod tests {
             preview: secret_preview.to_string(),
             duration_ms: 300,
             call_id: "bash".to_string(),
+            attachments: Vec::new(),
         })
         .unwrap();
         drop(tx);

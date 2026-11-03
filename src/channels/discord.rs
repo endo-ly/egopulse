@@ -339,7 +339,7 @@ impl ChannelAdapter for DiscordAdapter {
         external_chat_id: &str,
         text: Option<&str>,
         attachment: &PreparedAttachment,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::attachment::AttachmentInfo>, String> {
         let discord_chat_id = parse_discord_chat_id(external_chat_id)?;
         let token = self.select_token(external_chat_id)?;
         let url = format!("https://discord.com/api/v10/channels/{discord_chat_id}/messages");
@@ -380,7 +380,9 @@ impl ChannelAdapter for DiscordAdapter {
                 .header(reqwest::header::AUTHORIZATION, format!("Bot {token}"))
                 .multipart(form)
         })
-        .await
+        .await?;
+
+        Ok(None)
     }
 }
 

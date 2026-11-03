@@ -314,6 +314,14 @@ impl Config {
         self.runtime_dir().join("assets")
     }
 
+    /// Web 配信用の添付ファイル保存ディレクトリ: `state_root/runtime/attachments`。
+    ///
+    /// workspace の外に置くことで、エージェントが配信済みコピーを書き換えたり
+    /// 削除したりできないようにする。
+    pub(crate) fn attachments_dir(&self) -> PathBuf {
+        self.runtime_dir().join("attachments")
+    }
+
     /// アーカイブディレクトリ: `state_root/runtime/groups`。
     pub(crate) fn groups_dir(&self) -> PathBuf {
         self.runtime_dir().join("groups")

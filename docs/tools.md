@@ -413,8 +413,16 @@ Environment variables:
 - `text` のチャネル別契約:
   - Discord: `content` として最大 2000 Unicode スカラー値まで完全に送信する。上限超過時は切り詰めずエラーにする
   - Telegram: `caption` として最大 1024 UTF-8 バイトまで送信する。超過時は UTF-8 文字境界で切り詰めて残りを破棄し、エラーにはしない
+  - Web: 送信はせず、添付カードのキャプションとして表示する
+- Web の配信:
+  - `state_root/runtime/attachments/` に `{uuid}.{ext}` でスナップショットを保存する。元ファイルが後で削除・変更されても配信内容は変わらない
+  - ツール結果に `attachments`（`id` / `filename` / `content_type` / `size_bytes`）を付与する。Web UI は音声を再生カード、それ以外をダウンロードカードとして描画する
+  - 1 ファイルあたりの読み込み上限は 50 MiB、Web 配信上限も 50 MiB
+  - 保存先は workspace 外かつ bash sandbox から隠されるため、エージェントは配信済みコピーを変更できない
+  - 保存期間は無期限（自動削除なし）。DB バックアップには含まれないため、必要なら `runtime/attachments/` を別途バックアップする
 - 成功時:
   - `"Attachment sent successfully"`
+  - Web では `attachments` に保存済みファイルのメタデータが入る
 - 主な失敗:
   - `"Missing required parameter: attachment_path"`
   - `"Attachment path must stay within workspace: <path>"`
@@ -422,7 +430,9 @@ Environment variables:
   - `"no chat found for chat_id <id>"`
   - `"no adapter for channel '<name>'"`
   - `"File not found: <path>"`
-  - `"Failed to send attachment: <reason>"`
+  - `"Attachment exceeds the 50 MiB limit"`
+  - `"Failed to send attachment: <reason>"`（Web の上限超過・書き込み失敗を含む）
+    - 例: `"Failed to send attachment: attachment exceeds the 50 MiB Web limit"`
 
 実装: [egopulse/src/tools/send_attachment.rs](../../egopulse/src/tools/send_attachment.rs)
 

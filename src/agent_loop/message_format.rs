@@ -50,6 +50,9 @@ pub(crate) fn format_tool_result(
     if let Some(details) = &result.details {
         payload["details"] = details.clone();
     }
+    if !result.attachments.is_empty() {
+        payload["attachments"] = serde_json::json!(&result.attachments);
+    }
     payload.to_string()
 }
 
@@ -335,6 +338,32 @@ mod tests {
             formatted,
             "<direct-input>\n[Current time: 2026-08-28 (Fri) 21:34:56 Asia/Tokyo]\nfollow-up\n</direct-input>"
         );
+    }
+
+    #[test]
+    fn format_tool_result_includes_delivered_attachments() {
+        // Arrange
+        let call = ToolCall {
+            id: "call-audio".to_string(),
+            name: "send_attachment".to_string(),
+            arguments: serde_json::json!({"attachment_path": "reply.mp3"}),
+            invalid_arguments: None,
+        };
+        let result = crate::tools::ToolResult::success("Attachment sent successfully".to_string())
+            .with_attachments(vec![crate::attachment::AttachmentInfo {
+                id: "00000000-0000-4000-8000-000000000000.mp3".to_string(),
+                filename: "reply.mp3".to_string(),
+                content_type: "audio/mpeg".to_string(),
+                size_bytes: 1234,
+            }]);
+
+        // Act
+        let payload = format_tool_result(&call, &result);
+
+        // Assert
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload");
+        assert_eq!(parsed["attachments"][0]["filename"], "reply.mp3");
+        assert_eq!(parsed["attachments"][0]["content_type"], "audio/mpeg");
     }
 
     #[test]

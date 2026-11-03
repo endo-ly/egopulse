@@ -6,6 +6,7 @@ use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::message_format::{
     format_tool_result, message_to_text, tool_message_content,
 };
+use crate::attachment::AttachmentInfo;
 use crate::channels::utils::text::truncate_by_chars;
 use crate::error::EgoPulseError;
 use crate::llm::{Message, ToolCall};
@@ -386,8 +387,10 @@ impl<'a> ToolExecutor<'a> {
             }
             ClaimOutcome::Reused { tool_output } => {
                 // A prior execution already succeeded; return the stored output
-                // without re-running the Tool.
-                let result = ToolResult::success(tool_output.clone());
+                // without re-running the Tool. Recover attachment metadata so a
+                // replayed tool_result still renders the Web attachment card.
+                let attachments = attachments_from_stored_payload(&tool_output);
+                let result = ToolResult::success(tool_output.clone()).with_attachments(attachments);
                 (result, tool_output, false)
             }
             ClaimOutcome::Blocked { state: tool_state } => {
@@ -499,6 +502,19 @@ fn invalid_arguments_message(tool_name: &str, parse_error: &str) -> String {
     )
 }
 
+/// Recovers attachment metadata from a stored tool-result payload.
+///
+/// The payload is `format_tool_result` JSON; a reused ledger entry bypasses
+/// the tool execution that produced it, so the event path needs the same
+/// metadata the history projection reads.
+fn attachments_from_stored_payload(payload: &str) -> Vec<AttachmentInfo> {
+    serde_json::from_str::<serde_json::Value>(payload)
+        .ok()
+        .and_then(|value| value.get("attachments").cloned())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
 pub(crate) fn build_tool_result_phase(outcomes: Vec<ExecutedToolCall>) -> ToolResultPhase {
     let tool_messages = outcomes
         .into_iter()
@@ -532,6 +548,34 @@ mod tests {
             arguments,
             invalid_arguments: None,
         }
+    }
+
+    #[test]
+    fn stored_payload_attachments_are_recovered_for_replays() {
+        // Arrange
+        let payload = json!({
+            "tool": "send_attachment",
+            "status": "success",
+            "result": "Attachment sent successfully",
+            "attachments": [{
+                "id": "00000000-0000-4000-8000-000000000000.mp3",
+                "filename": "reply.mp3",
+                "content_type": "audio/mpeg",
+                "size_bytes": 1234
+            }]
+        })
+        .to_string();
+
+        // Act
+        let attachments = attachments_from_stored_payload(&payload);
+
+        // Assert
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "reply.mp3");
+        assert_eq!(
+            attachments[0].id,
+            "00000000-0000-4000-8000-000000000000.mp3"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 pub mod agent_loop;
 pub(crate) mod assets;
+pub(crate) mod attachment;
 pub(crate) mod builtin_skills;
 pub mod channels;
 pub mod config;

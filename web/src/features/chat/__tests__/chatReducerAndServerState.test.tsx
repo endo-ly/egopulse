@@ -291,6 +291,40 @@ describe("chatReducer assistant identity", () => {
     });
     expect(card?.runId).toBe("run-1");
   });
+
+  it("tool_result_preserves_attachment_metadata", () => {
+    // Arrange
+    let state = initialChatState();
+    state = reduceToolStart(state, {
+      runId: "run-1",
+      callId: "call-audio",
+      name: "send_attachment",
+      input: { attachment_path: "media/reply.mp3" },
+    });
+    const attachments = [
+      {
+        id: "00000000-0000-4000-8000-000000000000.mp3",
+        filename: "reply.mp3",
+        content_type: "audio/mpeg",
+        size_bytes: 1234,
+      },
+    ];
+
+    // Act
+    state = reduceToolResult(state, {
+      runId: "run-1",
+      callId: "call-audio",
+      name: "send_attachment",
+      isError: false,
+      preview: "Attachment sent successfully",
+      durationMs: 120,
+      attachments,
+    });
+
+    // Assert
+    const card = state.messages.find((m) => m.id === "tool:call-audio");
+    expect(JSON.parse(card?.content ?? "{}").attachments).toEqual(attachments);
+  });
 });
 
 describe("chatReducer retry and error", () => {

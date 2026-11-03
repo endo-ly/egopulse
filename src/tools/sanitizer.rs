@@ -210,6 +210,9 @@ pub(crate) fn sanitize_tool_result(
         .details
         .take()
         .map(|details| sanitize_json_value(details, secrets));
+    for attachment in &mut result.attachments {
+        attachment.filename = sanitize_output_string(&attachment.filename, secrets);
+    }
     result
 }
 
@@ -480,6 +483,12 @@ mod tests {
             content: "contains leaked-key here".to_string(),
             is_error: false,
             details: Some(json!({"trace": "leaked-key in trace"})),
+            attachments: vec![crate::attachment::AttachmentInfo {
+                id: "00000000-0000-4000-8000-000000000000.mp3".to_string(),
+                filename: "leaked-key.mp3".to_string(),
+                content_type: "audio/mpeg".to_string(),
+                size_bytes: 1,
+            }],
             llm_content: MessageContent::text("leaked-key in llm".to_string()),
             error_kind: None,
         };
@@ -490,6 +499,7 @@ mod tests {
         // Assert
         assert!(sanitized.content.contains("[REDACTED:key]"));
         assert!(!sanitized.content.contains("leaked-key"));
+        assert!(sanitized.attachments[0].filename.contains("[REDACTED:key]"));
         match &sanitized.llm_content {
             MessageContent::Text(text) => {
                 assert!(text.contains("[REDACTED:key]"));

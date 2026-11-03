@@ -1,19 +1,22 @@
 import { useId, useState } from "react";
 import type { ChatMessage } from "../../shared/api/types";
 import { MarkdownRenderer } from "../../shared/ui/MarkdownRenderer";
+import { AttachmentCard } from "./AttachmentCard";
 import { ToolCard } from "./ToolCard";
-import { parseToolEvent } from "./toolEvent";
+import { parseToolEvent, toolAttachments, toolCaption } from "./toolEvent";
 import type { PulseTraceData } from "./timelineEntries";
 
 export interface PulseTraceProps {
   trace: PulseTraceData;
+  /** Bearer token used to fetch attachment blobs. */
+  authToken?: string;
 }
 
 /**
  * One quiet line naming the Pulse intention behind a delivered output. It
  * expands in place to the activation trace for auditing.
  */
-export function PulseTrace({ trace }: PulseTraceProps) {
+export function PulseTrace({ trace, authToken }: PulseTraceProps) {
   const [expanded, setExpanded] = useState(false);
   const bodyId = useId();
   const name = trace.intentionId ?? "Pulse";
@@ -46,7 +49,11 @@ export function PulseTrace({ trace }: PulseTraceProps) {
       {expandable && expanded && (
         <div id={bodyId} className="pulse-trace-body">
           {trace.entries.map((entry) => (
-            <PulseTraceEntry key={entry.id} message={entry} />
+            <PulseTraceEntry
+              key={entry.id}
+              message={entry}
+              authToken={authToken}
+            />
           ))}
         </div>
       )}
@@ -54,9 +61,33 @@ export function PulseTrace({ trace }: PulseTraceProps) {
   );
 }
 
-function PulseTraceEntry({ message }: { message: ChatMessage }) {
+function PulseTraceEntry({
+  message,
+  authToken,
+}: {
+  message: ChatMessage;
+  authToken?: string;
+}) {
   const toolEvent = parseToolEvent(message);
-  if (toolEvent) return <ToolCard event={toolEvent} />;
+  if (toolEvent) {
+    const attachments = toolAttachments(toolEvent);
+    if (attachments.length > 0) {
+      const caption = toolCaption(toolEvent);
+      return (
+        <>
+          {attachments.map((attachment) => (
+            <AttachmentCard
+              key={attachment.id}
+              attachment={attachment}
+              caption={caption}
+              authToken={authToken ?? ""}
+            />
+          ))}
+        </>
+      );
+    }
+    return <ToolCard event={toolEvent} />;
+  }
   if (message.pulse?.role === "input") {
     return <p className="pulse-trace-input">{message.content}</p>;
   }

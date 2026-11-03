@@ -516,7 +516,7 @@ impl ChannelAdapter for TelegramAdapter {
         external_chat_id: &str,
         text: Option<&str>,
         attachment: &PreparedAttachment,
-    ) -> Result<(), String> {
+    ) -> Result<Option<crate::attachment::AttachmentInfo>, String> {
         let chat_id = parse_telegram_chat_id(external_chat_id)?;
         let token = self.select_token(external_chat_id)?;
 
@@ -562,7 +562,7 @@ impl ChannelAdapter for TelegramAdapter {
         )
         .await?;
 
-        Ok(())
+        Ok(None)
     }
 }
 

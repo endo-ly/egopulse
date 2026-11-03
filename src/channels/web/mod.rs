@@ -19,14 +19,15 @@ use axum::routing::{get, patch, post};
 use axum::{Router, body::Body};
 use tokio::sync::{Mutex, broadcast};
 
-use crate::channels::adapter::ChannelAdapter;
-use crate::channels::adapter::ConversationKind;
+use crate::attachment::AttachmentInfo;
+use crate::channels::adapter::{ChannelAdapter, ConversationKind, PreparedAttachment};
 use crate::error::EgoPulseError;
 use crate::runtime::AppState;
 use crate::storage::RunCursor;
 
 mod agent_profile;
 mod agents;
+mod attachments;
 pub(crate) mod auth;
 mod config;
 pub(crate) mod health;
@@ -115,7 +116,17 @@ pub(super) fn parse_statuses<T: FromStr>(raw: Option<&str>) -> Result<Vec<T>, Ap
 }
 
 /// Adapts the local web surface to the shared channel interface.
-pub(crate) struct WebAdapter;
+pub(crate) struct WebAdapter {
+    attachments_dir: PathBuf,
+}
+
+impl WebAdapter {
+    /// Creates a Web adapter that snapshots delivered files under
+    /// `attachments_dir`.
+    pub(crate) fn new(attachments_dir: PathBuf) -> Self {
+        Self { attachments_dir }
+    }
+}
 
 #[async_trait]
 impl ChannelAdapter for WebAdapter {
@@ -129,6 +140,22 @@ impl ChannelAdapter for WebAdapter {
 
     async fn send_text(&self, _external_chat_id: &str, _text: &str) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Snapshots the attachment so the Web UI can fetch it after a reload.
+    ///
+    /// The returned id is a UUID plus the normalized extension. The original
+    /// file name is kept only as display metadata; the stored file is named by
+    /// the opaque id so it cannot escape `attachments_dir`.
+    async fn send_attachment(
+        &self,
+        _external_chat_id: &str,
+        _text: Option<&str>,
+        attachment: &PreparedAttachment,
+    ) -> Result<Option<AttachmentInfo>, String> {
+        attachments::store_attachment(&self.attachments_dir, attachment)
+            .await
+            .map(Some)
     }
 }
 
@@ -531,6 +558,7 @@ fn build_router(web_state: WebState) -> Router {
         .route("/api/sessions", get(sessions::list_sessions))
         .route("/api/sessions/{chat_id}", patch(sessions::update_session))
         .route("/api/history", get(sessions::get_history))
+        .route("/api/attachments/{id}", get(attachments::get_attachment))
         .route("/api/send_stream", post(stream::api_send_stream))
         .route("/api/stream", get(stream::api_stream))
         .route("/api/agents", get(agents::list_agents))
@@ -673,7 +701,7 @@ mod tests {
 
     #[test]
     fn web_adapter_properties() {
-        let adapter = WebAdapter;
+        let adapter = test_web_adapter();
 
         assert_eq!(adapter.name(), "web");
         assert_eq!(
@@ -840,6 +868,12 @@ mod tests {
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
         });
         (router, app_state)
+    }
+
+    /// Builds a Web adapter whose attachment directory is never exercised by
+    /// the router tests that only need the channel registered.
+    fn test_web_adapter() -> WebAdapter {
+        WebAdapter::new(std::env::temp_dir().join("egopulse-test-attachments"))
     }
 
     fn web_only_test_router(dir: &tempfile::TempDir) -> Router {
@@ -1251,7 +1285,7 @@ mod tests {
         add_telegram_channel(&mut config, -100);
         config.webhooks = WebhooksConfig { receivers };
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(test_web_adapter()));
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         registry.register(Arc::new(NoopChannelAdapter("telegram")));
         let state = build_state_with_config(config, None, None, None, Some(Arc::new(registry)));
@@ -1528,7 +1562,7 @@ mod tests {
             )]),
         };
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(test_web_adapter()));
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let provider = FakeProvider {
             responses: std::sync::Mutex::new(vec![MessagesResponse {
@@ -1634,7 +1668,7 @@ mod tests {
             )]),
         };
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(test_web_adapter()));
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let provider = FakeProvider {
             responses: std::sync::Mutex::new(vec![MessagesResponse {
@@ -1732,7 +1766,7 @@ mod tests {
             )]),
         };
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(test_web_adapter()));
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let app_state = Arc::new(build_state_with_config(
             config,
@@ -1844,7 +1878,7 @@ mod tests {
             )]),
         };
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(test_web_adapter()));
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let app_state = Arc::new(build_state_with_config(
             config,
@@ -1936,7 +1970,7 @@ mod tests {
             )]),
         };
         let mut registry = ChannelRegistry::new();
-        registry.register(Arc::new(WebAdapter));
+        registry.register(Arc::new(test_web_adapter()));
         registry.register(Arc::new(NoopChannelAdapter("discord")));
         let app_state = Arc::new(build_state_with_config(
             config,
@@ -1989,5 +2023,171 @@ mod tests {
         // No agent turn was started: the rejection happened before the
         // scheduler was ever touched.
         assert_eq!(app_state.turn_scheduler.global_queued(), 0);
+    }
+}
+
+#[cfg(test)]
+mod web_adapter_attachment_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn web_adapter_delegates_attachment_storage() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attachments_dir = dir.path().join("attachments");
+        let adapter = WebAdapter::new(attachments_dir.clone());
+        let source = dir.path().join("reply.mp3");
+        std::fs::write(&source, b"audio").expect("source");
+        let attachment = PreparedAttachment::new(source, b"audio".to_vec());
+
+        // Act
+        let info = adapter
+            .send_attachment("web:test", Some("caption"), &attachment)
+            .await
+            .expect("send")
+            .expect("receipt");
+
+        // Assert
+        assert!(info.id.ends_with(".mp3"), "{info:?}");
+        assert_eq!(info.filename, "reply.mp3");
+        assert!(attachments_dir.join(&info.id).exists());
+    }
+}
+
+#[cfg(test)]
+mod attachment_api_tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::config::secret_ref::ResolvedValue;
+    use crate::test_util::{build_state_with_config, test_config};
+
+    const ATTACHMENT_ID: &str = "00000000-0000-4000-8000-000000000000.mp3";
+
+    fn test_router(dir: &tempfile::TempDir) -> (Router, Arc<AppState>) {
+        let mut config = test_config(dir.path().to_str().expect("state root"));
+        config
+            .channels
+            .get_mut("web")
+            .expect("web config")
+            .auth_token = Some(ResolvedValue::Literal("web-secret".to_string()));
+        let app_state = Arc::new(build_state_with_config(config, None, None, None, None));
+        let router = build_router(WebState {
+            config_path: None,
+            app_state: Arc::clone(&app_state),
+            run_hub: RunHub::default(),
+            active_ws_connections: Arc::new(AtomicUsize::new(0)),
+        });
+        (router, app_state)
+    }
+
+    fn write_attachment(state: &AppState, id: &str, bytes: &[u8]) {
+        let dir = state.config.attachments_dir();
+        std::fs::create_dir_all(&dir).expect("attachments dir");
+        std::fs::write(dir.join(id), bytes).expect("attachment file");
+    }
+
+    async fn get(router: Router, id: &str, authorized: bool) -> axum::response::Response {
+        let mut request = Request::get(format!("/api/attachments/{id}"));
+        if authorized {
+            request = request.header(header::AUTHORIZATION, "Bearer web-secret");
+        }
+        router
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response")
+    }
+
+    #[tokio::test]
+    async fn attachment_endpoint_serves_audio_inline() {
+        // Arrange: store through the real Web storage path so the id and
+        // extension the endpoint receives are the ones production produces.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (router, state) = test_router(&dir);
+        let source = dir.path().join("reply.mp3");
+        std::fs::write(&source, b"audio-bytes").expect("source");
+        let attachment = PreparedAttachment::new(source, b"audio-bytes".to_vec());
+        let info =
+            super::attachments::store_attachment(&state.config.attachments_dir(), &attachment)
+                .await
+                .expect("store attachment");
+
+        // Act
+        let response = get(router, &info.id, true).await;
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers[header::CONTENT_TYPE], "audio/mpeg");
+        assert_eq!(
+            headers[header::CONTENT_DISPOSITION],
+            format!("inline; filename=\"{}\"", info.id)
+        );
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        assert_eq!(headers[header::CONTENT_LENGTH], "11");
+        assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"audio-bytes");
+    }
+
+    #[tokio::test]
+    async fn attachment_endpoint_downloads_non_audio() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (router, state) = test_router(&dir);
+        let id = "00000000-0000-4000-8000-000000000001.bin";
+        write_attachment(&state, id, b"opaque");
+
+        // Act
+        let response = get(router, id, true).await;
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response.headers()[header::CONTENT_DISPOSITION],
+            format!("attachment; filename=\"{id}\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_endpoint_returns_404_for_invalid_or_missing_ids() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (router, _state) = test_router(&dir);
+
+        // Act
+        let missing = get(
+            router.clone(),
+            "00000000-0000-4000-8000-000000000002.mp3",
+            true,
+        )
+        .await;
+        let malformed = get(router, "not-an-id.mp3", true).await;
+
+        // Assert
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(malformed.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attachment_endpoint_requires_authentication() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (router, state) = test_router(&dir);
+        write_attachment(&state, ATTACHMENT_ID, b"audio-bytes");
+
+        // Act
+        let response = get(router, ATTACHMENT_ID, false).await;
+
+        // Assert
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
