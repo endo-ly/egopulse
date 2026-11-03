@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
+use super::MAX_PROMPT_FILE_BYTES;
+
 const DEFAULT_SOUL_MD: &str = include_str!("../../default_soul.md");
 
 struct CachedContent {
@@ -38,12 +40,36 @@ pub(crate) struct PromptFileLayer {
     pub applied: bool,
 }
 
+/// Failure to write one prompt file layer.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PromptFileWriteError {
+    #[error("unsafe agent id")]
+    UnsafeAgentId,
+    /// The requested scope does not exist for this kind (e.g. global SECRET).
+    #[error("prompt file scope is not valid for this kind")]
+    UnsupportedScope,
+    /// The content on disk no longer matches the caller's `expected_hash`.
+    #[error("prompt file changed on disk")]
+    Conflict,
+    #[error("prompt file exceeds {MAX_PROMPT_FILE_BYTES} bytes")]
+    TooLarge,
+    /// The path is a symlink; rename would replace the link rather than the
+    /// file it points to.
+    #[error("prompt file is a symlink")]
+    Symlink,
+    #[error("failed to access prompt file: {0}")]
+    Io(#[from] io::Error),
+}
+
 pub(crate) struct SoulAgentsLoader {
     soul_path: PathBuf,
     agents_path: PathBuf,
     agents_dir: PathBuf,
     soul_cache: Mutex<Option<CachedContent>>,
     agents_cache: Mutex<Option<CachedContent>>,
+    /// Serializes "compare hash, then write" so two WebUI saves cannot both
+    /// pass the check and overwrite each other's result.
+    write_lock: Mutex<()>,
 }
 
 impl SoulAgentsLoader {
@@ -54,6 +80,7 @@ impl SoulAgentsLoader {
             agents_dir: PathBuf::from(&config.state_root).join("agents"),
             soul_cache: Mutex::new(None),
             agents_cache: Mutex::new(None),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -168,6 +195,79 @@ impl SoulAgentsLoader {
         Some(layers)
     }
 
+    /// Writes one prompt file layer and returns every layer of `kind` after the
+    /// write, so callers see recomputed `applied` flags.
+    ///
+    /// `expected_hash` must equal [`prompt_content_hash`] of the current
+    /// content. The check and the write are serialized, so concurrent saves
+    /// cannot both succeed from the same base. A read failure other than
+    /// "not found" is reported instead of being treated as empty content,
+    /// because overwriting an unreadable file would lose data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PromptFileWriteError`] for an unsafe agent id, a scope the
+    /// kind does not have, a stale hash, oversized content, a symlink, or I/O
+    /// failure.
+    pub(crate) fn write_prompt_file(
+        &self,
+        agent_id: &str,
+        kind: PromptFileKind,
+        scope: PromptFileScope,
+        content: &str,
+        expected_hash: &str,
+    ) -> Result<Vec<PromptFileLayer>, PromptFileWriteError> {
+        if !safe_agent_id(agent_id) {
+            return Err(PromptFileWriteError::UnsafeAgentId);
+        }
+        let _guard = self.write_lock.lock().expect("prompt file write lock");
+
+        let layers = self
+            .prompt_file_layers(agent_id, kind)
+            .ok_or(PromptFileWriteError::UnsafeAgentId)?;
+        let target = layers
+            .iter()
+            .find(|layer| layer.scope == scope)
+            .ok_or(PromptFileWriteError::UnsupportedScope)?;
+
+        match std::fs::symlink_metadata(&target.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(PromptFileWriteError::Symlink);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+
+        let current = read_trimmed_strict(&target.path)?;
+        if prompt_content_hash(current.as_deref()) != expected_hash {
+            return Err(PromptFileWriteError::Conflict);
+        }
+
+        let canonical = content.trim();
+        if canonical.len() > MAX_PROMPT_FILE_BYTES {
+            return Err(PromptFileWriteError::TooLarge);
+        }
+
+        write_prompt_file_atomically(&target.path, canonical)?;
+
+        // The mtime-keyed caches would normally notice the new file, but two
+        // writes within one filesystem timestamp tick could look unchanged.
+        // Clearing explicitly makes a save visible to the very next prompt.
+        match (kind, scope) {
+            (PromptFileKind::Soul, PromptFileScope::Global) => {
+                *self.soul_cache.lock().expect("soul_agents cache lock") = None;
+            }
+            (PromptFileKind::Rules, PromptFileScope::Global) => {
+                *self.agents_cache.lock().expect("soul_agents cache lock") = None;
+            }
+            _ => {}
+        }
+
+        self.prompt_file_layers(agent_id, kind)
+            .ok_or(PromptFileWriteError::UnsafeAgentId)
+    }
+
     pub(crate) fn provision_default_soul(&self) -> io::Result<bool> {
         if self.soul_path.exists() {
             return Ok(false);
@@ -198,6 +298,81 @@ fn read_trimmed(path: &Path) -> Option<String> {
     }
 }
 
+/// Reads the canonical content used for the optimistic-lock hash.
+///
+/// Unlike [`read_trimmed`], anything except "not found" is an error. Treating
+/// an unreadable file as empty would let a save overwrite content that could
+/// not be read.
+fn read_trimmed_strict(path: &Path) -> io::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = content.trim();
+            Ok((!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Hash of the canonical (trimmed) content. `None` and an empty file share the
+/// hash of the empty string, which is what the UI receives as `hash`.
+pub(crate) fn prompt_content_hash(content: Option<&str>) -> String {
+    use sha2::{Digest, Sha256};
+    let canonical = content.unwrap_or_default().trim();
+    format!("{:x}", Sha256::digest(canonical.as_bytes()))
+}
+
+/// Writes `content` through a temp file in the same directory, fsyncs it, and
+/// renames it over `path`. Readers therefore never see a partial file.
+fn write_prompt_file_atomically(path: &Path, content: &str) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "prompt file has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("prompt.md");
+    let suffix = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let temp_path = parent.join(format!(".{file_name}.{}.{suffix}.tmp", std::process::id()));
+    // Keep the mode of an existing file: a SECRET.md created as 0600 must not
+    // become world-readable just because it was edited from the WebUI.
+    let existing_permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Never expose the temp file more widely than a private file, even
+            // before an existing mode is applied below.
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path)?;
+        std::io::Write::write_all(&mut file, content.as_bytes())?;
+        if !content.is_empty() {
+            std::io::Write::write_all(&mut file, b"\n")?;
+        }
+        file.sync_all()?;
+        if let Some(permissions) = existing_permissions {
+            std::fs::set_permissions(&temp_path, permissions)?;
+        }
+        std::fs::rename(&temp_path, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    } else if let Ok(directory) = std::fs::File::open(parent) {
+        // Best effort: the file itself is already synced.
+        let _ = directory.sync_all();
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +385,7 @@ mod tests {
             agents_dir: dir.join("agents"),
             soul_cache: Mutex::new(None),
             agents_cache: Mutex::new(None),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -567,5 +743,316 @@ mod tests {
 
         // Assert
         assert_eq!(layers, None);
+    }
+
+    // --- prompt file writes ---
+
+    #[test]
+    fn prompt_content_hash_uses_trimmed_content() {
+        // Arrange
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        // Act / Assert
+        assert_eq!(prompt_content_hash(Some("abc")), abc);
+        assert_eq!(prompt_content_hash(None), empty);
+        assert_eq!(prompt_content_hash(Some("  \n")), empty);
+    }
+
+    #[test]
+    fn write_prompt_file_creates_missing_agent_layer_with_canonical_content() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("SOUL.md"), "Global soul\n");
+        let expected = prompt_content_hash(None);
+
+        // Act
+        let layers = loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Soul,
+                PromptFileScope::Agent,
+                "  # Alice\n\nBody  ",
+                &expected,
+            )
+            .expect("write");
+
+        // Assert
+        let path = dir.path().join("agents/alice/SOUL.md");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Alice\n\nBody\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("SOUL.md")).unwrap(),
+            "Global soul\n"
+        );
+        let agent = layers
+            .iter()
+            .find(|layer| layer.scope == PromptFileScope::Agent)
+            .expect("agent layer");
+        assert_eq!(agent.content.as_deref(), Some("# Alice\n\nBody"));
+        assert!(agent.applied);
+    }
+
+    #[test]
+    fn write_prompt_file_rejects_stale_hash_without_touching_disk() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        let path = dir.path().join("agents/alice/SOUL.md");
+        write_file(&path, "old");
+
+        // Act
+        let result = loader.write_prompt_file(
+            "alice",
+            PromptFileKind::Soul,
+            PromptFileScope::Agent,
+            "new",
+            &prompt_content_hash(Some("different")),
+        );
+
+        // Assert
+        assert!(matches!(result, Err(PromptFileWriteError::Conflict)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+    }
+
+    #[test]
+    fn write_prompt_file_rejects_unreadable_existing_file() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        let path = dir.path().join("agents/alice/SOUL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        // Act
+        let result = loader.write_prompt_file(
+            "alice",
+            PromptFileKind::Soul,
+            PromptFileScope::Agent,
+            "new",
+            &prompt_content_hash(None),
+        );
+
+        // Assert
+        assert!(matches!(result, Err(PromptFileWriteError::Io(_))));
+        assert_eq!(fs::read(&path).unwrap(), vec![0xff, 0xfe]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_prompt_file_rejects_symlink_path() {
+        // Arrange
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        let target = dir.path().join("target.md");
+        fs::write(&target, "target").unwrap();
+        let path = dir.path().join("agents/alice/SOUL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        symlink(&target, &path).unwrap();
+
+        // Act
+        let result = loader.write_prompt_file(
+            "alice",
+            PromptFileKind::Soul,
+            PromptFileScope::Agent,
+            "new",
+            &prompt_content_hash(Some("target")),
+        );
+
+        // Assert
+        assert!(matches!(result, Err(PromptFileWriteError::Symlink)));
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "target");
+    }
+
+    #[test]
+    fn write_prompt_file_rejects_scope_the_kind_never_has() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+
+        // Act
+        let result = loader.write_prompt_file(
+            "alice",
+            PromptFileKind::Secret,
+            PromptFileScope::Global,
+            "new",
+            &prompt_content_hash(None),
+        );
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(PromptFileWriteError::UnsupportedScope)
+        ));
+        assert!(!dir.path().join("agents/alice/SECRET.md").exists());
+    }
+
+    #[test]
+    fn write_prompt_file_rejects_content_over_limit() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        let content = "a".repeat(MAX_PROMPT_FILE_BYTES + 1);
+
+        // Act
+        let result = loader.write_prompt_file(
+            "alice",
+            PromptFileKind::Soul,
+            PromptFileScope::Agent,
+            &content,
+            &prompt_content_hash(None),
+        );
+
+        // Assert
+        assert!(matches!(result, Err(PromptFileWriteError::TooLarge)));
+        assert!(!dir.path().join("agents/alice/SOUL.md").exists());
+    }
+
+    #[test]
+    fn write_prompt_file_clears_layer_with_blank_content() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        let path = dir.path().join("agents/alice/SOUL.md");
+        write_file(&path, "old");
+
+        // Act
+        let layers = loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Soul,
+                PromptFileScope::Agent,
+                "  \n",
+                &prompt_content_hash(Some("old")),
+            )
+            .expect("clear");
+
+        // Assert
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        let agent = layers
+            .iter()
+            .find(|layer| layer.scope == PromptFileScope::Agent)
+            .expect("agent layer");
+        assert_eq!(agent.content, None);
+        assert!(!agent.applied);
+    }
+
+    #[test]
+    fn write_prompt_file_refreshes_cached_global_soul_and_rules() {
+        // Arrange: warm both global caches before writing.
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("SOUL.md"), "old soul");
+        write_file(&dir.path().join("AGENTS.md"), "old rules");
+        assert_eq!(loader.load_soul(None).as_deref(), Some("old soul"));
+        assert_eq!(loader.load_global_agents().as_deref(), Some("old rules"));
+
+        // Act
+        loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Soul,
+                PromptFileScope::Global,
+                "new soul",
+                &prompt_content_hash(Some("old soul")),
+            )
+            .expect("soul write");
+        loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Rules,
+                PromptFileScope::Global,
+                "new rules",
+                &prompt_content_hash(Some("old rules")),
+            )
+            .expect("rules write");
+
+        // Assert: the next prompt build sees the new content
+        assert_eq!(loader.load_soul(None).as_deref(), Some("new soul"));
+        assert_eq!(loader.load_global_agents().as_deref(), Some("new rules"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_prompt_file_preserves_existing_permissions_and_restricts_new_files() {
+        // Arrange
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        let existing = dir.path().join("agents/alice/SOUL.md");
+        write_file(&existing, "old");
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o640)).unwrap();
+        let created = dir.path().join("agents/alice/AGENTS.md");
+
+        // Act
+        loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Soul,
+                PromptFileScope::Agent,
+                "new",
+                &prompt_content_hash(Some("old")),
+            )
+            .expect("update");
+        loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Rules,
+                PromptFileScope::Agent,
+                "rules",
+                &prompt_content_hash(None),
+            )
+            .expect("create");
+
+        // Assert
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::metadata(&created).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn write_prompt_file_returns_recomputed_applied_flags() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let loader = make_loader(dir.path());
+        write_file(&dir.path().join("SOUL.md"), "Global soul");
+
+        // Act
+        let layers = loader
+            .write_prompt_file(
+                "alice",
+                PromptFileKind::Soul,
+                PromptFileScope::Agent,
+                "Alice soul",
+                &prompt_content_hash(None),
+            )
+            .expect("write");
+
+        // Assert
+        let applied: Vec<_> = layers
+            .iter()
+            .map(|layer| (layer.scope, layer.applied))
+            .collect();
+        assert_eq!(
+            applied,
+            vec![
+                (PromptFileScope::Agent, true),
+                (PromptFileScope::Global, false)
+            ]
+        );
     }
 }
