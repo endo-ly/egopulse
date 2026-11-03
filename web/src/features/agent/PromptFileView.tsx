@@ -43,13 +43,20 @@ function PromptFileLayers({ agentId, authToken, kind }: PromptFileViewProps) {
   const layersState = useAgentQuery(authToken, ["file", agentId, kind], () =>
     fetchPromptFile(agentId, kind, authToken),
   );
-  const [editing, setEditing] = useState<PromptFileScope | null>(null);
+  const [editing, setEditing] = useState<EditingPromptFile | null>(null);
   const [saving, setSaving] = useState(false);
   const [conflict, setConflict] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const startEditing = (scope: PromptFileScope) => {
-    setEditing(scope);
+  const startEditing = (layer: PromptFileLayer) => {
+    // Capture the base of the edit once. A background refetch while the editor
+    // is open must not replace the hash that Save compares against, or a remote
+    // change would be silently overwritten.
+    setEditing({
+      scope: layer.scope,
+      original: layer.content ?? "",
+      expectedHash: layer.hash,
+    });
     setConflict(false);
     setError(null);
   };
@@ -60,10 +67,8 @@ function PromptFileLayers({ agentId, authToken, kind }: PromptFileViewProps) {
     setError(null);
   };
 
-  const handleSave = async (layers: PromptFileLayer[], content: string) => {
+  const handleSave = async (content: string) => {
     if (saving || editing === null) return;
-    const layer = layers.find((candidate) => candidate.scope === editing);
-    if (!layer) return;
 
     setSaving(true);
     setConflict(false);
@@ -72,9 +77,9 @@ function PromptFileLayers({ agentId, authToken, kind }: PromptFileViewProps) {
       const next = await savePromptFile(
         agentId,
         kind,
-        editing,
+        editing.scope,
         content,
-        layer.hash,
+        editing.expectedHash,
         authToken,
       );
       setQueryData(agentQueryKey(authToken, ["file", agentId, kind]), next);
@@ -105,37 +110,37 @@ function PromptFileLayers({ agentId, authToken, kind }: PromptFileViewProps) {
       {(layers) => (
         <div className="doc-card-stack">
           {layers.map((layer) => {
-            const isEditing = editing === layer.scope;
+            const editingState = editing?.scope === layer.scope ? editing : null;
             return (
               <DocumentCard
                 key={layer.path}
                 eyebrow={layer.scope}
                 path={layer.path}
-                status={isEditing ? "Editing" : layerStatus(layer)}
+                status={editingState ? "Editing" : layerStatus(layer)}
                 tone={layer.applied ? "applied" : "inactive"}
-                content={isEditing ? null : layer.content}
+                content={editingState ? null : layer.content}
                 actions={
                   editing === null ? (
                     <button
                       type="button"
                       className="doc-card-action"
-                      onClick={() => startEditing(layer.scope)}
+                      onClick={() => startEditing(layer)}
                     >
                       Edit
                     </button>
                   ) : undefined
                 }
               >
-                {isEditing ? (
+                {editingState ? (
                   <PromptFileEditor
                     key={layer.path}
                     formId={`agent-file:${agentId}:${kind}:${layer.scope}`}
-                    original={layer.content ?? ""}
+                    original={editingState.original}
                     scope={layer.scope}
                     saving={saving}
                     conflict={conflict}
                     error={error}
-                    onSave={(content) => void handleSave(layers, content)}
+                    onSave={(content) => void handleSave(content)}
                     onCancel={cancelEditing}
                     onReload={handleReload}
                   />
@@ -147,6 +152,13 @@ function PromptFileLayers({ agentId, authToken, kind }: PromptFileViewProps) {
       )}
     </QueryState>
   );
+}
+
+interface EditingPromptFile {
+  scope: PromptFileScope;
+  /** Trimmed content and hash captured when Edit was pressed. */
+  original: string;
+  expectedHash: string;
 }
 
 function layerStatus(layer: PromptFileLayer): string {

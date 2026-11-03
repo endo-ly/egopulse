@@ -2976,9 +2976,16 @@
     border-radius: var(--radius-sm);
   }
 
-  .doc-card-editor-diff summary {
+  .doc-card-editor-diff-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-xs);
+    padding: 0;
+    border: 0;
+    background: none;
     cursor: pointer;
     color: var(--color-muted);
+    font: inherit;
     font-size: var(--text-xs);
   }
 

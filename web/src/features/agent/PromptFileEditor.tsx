@@ -36,9 +36,14 @@ export function PromptFileEditor({
 }: PromptFileEditorProps) {
   const [draft, setDraft] = useState(original);
   const [mode, setMode] = useState<"write" | "preview">("write");
-  const [diffOpen, setDiffOpen] = useState(true);
+  // The diff is expensive for large files, so it is computed only while the
+  // user has the Changes panel open.
+  const [diffOpen, setDiffOpen] = useState(false);
   const dirty = draft !== original;
-  const counts = useMemo(() => countLineChanges(original, draft), [original, draft]);
+  const counts = useMemo(
+    () => (diffOpen ? countLineChanges(original, draft) : null),
+    [diffOpen, original, draft],
+  );
 
   useEffect(() => {
     setUnsavedChanges(formId, dirty);
@@ -91,20 +96,23 @@ export function PromptFileEditor({
       )}
 
       {dirty && (
-        <details
-          className="doc-card-editor-diff"
-          open={diffOpen}
-          onToggle={(event) => setDiffOpen(event.currentTarget.open)}
-        >
-          <summary>
-            Changes{" "}
-            <span className="tab-switch-count">
-              <span className="count-add">+{counts.add}</span>{" "}
-              <span className="count-remove">−{counts.remove}</span>
-            </span>
-          </summary>
-          <DiffViewer before={original} after={draft} fileName="this file" />
-        </details>
+        <div className="doc-card-editor-diff">
+          <button
+            type="button"
+            className="doc-card-editor-diff-toggle"
+            aria-expanded={diffOpen}
+            onClick={() => setDiffOpen((open) => !open)}
+          >
+            Changes
+            {counts && (
+              <span className="tab-switch-count">
+                <span className="count-add">+{counts.add}</span>{" "}
+                <span className="count-remove">−{counts.remove}</span>
+              </span>
+            )}
+          </button>
+          {diffOpen && <DiffViewer before={original} after={draft} fileName="this file" />}
+        </div>
       )}
 
       {conflict && (

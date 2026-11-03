@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { invalidateQuery } from "../../../shared/hooks/useServerState";
+import { agentQueryKey } from "../agentQuery";
 import { AgentPanel } from "../AgentPanel";
 import type { AgentSection } from "../../../app/router";
 import type {
@@ -351,6 +353,78 @@ describe("AgentPanel", () => {
     expect(screen.queryByLabelText("Content")).toBeNull();
   });
 
+  it("prompt_file_edit_keeps_the_starting_hash_when_the_layer_refetches", async () => {
+    // Arrange
+    const routes: Routes = {
+      "/api/agents/lyre/files/soul": {
+        layers: [
+          {
+            scope: "agent",
+            path: "agents/lyre/SOUL.md",
+            content: "old soul",
+            applied: true,
+            exists: true,
+            hash: "hash-old",
+          },
+        ],
+      },
+    };
+    const put = vi.fn().mockReturnValue({
+      status: 200,
+      body: {
+        ok: true,
+        layers: [
+          {
+            scope: "agent",
+            path: "agents/lyre/SOUL.md",
+            content: "my draft",
+            applied: true,
+            exists: true,
+            hash: "hash-my-draft",
+          },
+        ],
+      },
+    });
+    const fetchMock = stubApi(routes, put);
+    const props = renderPanel("soul");
+    await waitFor(() => expect(screen.getByText("old soul")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    fireEvent.change(screen.getByLabelText("Content"), { target: { value: "my draft" } });
+
+    // Act: a background invalidation replaces the layer while the editor is open.
+    routes["/api/agents/lyre/files/soul"] = {
+      layers: [
+        {
+          scope: "agent",
+          path: "agents/lyre/SOUL.md",
+          content: "remote soul",
+          applied: true,
+          exists: true,
+          hash: "hash-remote",
+        },
+      ],
+    };
+    await act(async () => {
+      invalidateQuery(agentQueryKey(props.authToken, ["file", "lyre", "soul"]));
+    });
+    await waitFor(() =>
+      expect(
+        requestedPaths(fetchMock).filter((path) => path === "/api/agents/lyre/files/soul"),
+      ).toHaveLength(2),
+    );
+
+    // Act: saving must still use the hash captured when editing started.
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    // Assert
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+    expect(put).toHaveBeenCalledWith("/api/agents/lyre/files/soul", {
+      scope: "agent",
+      content: "my draft",
+      expected_hash: "hash-old",
+    });
+  });
+
   it("missing_layer_can_be_edited_and_global_layers_warn", async () => {
     // Arrange
     const layers: PromptFileLayer[] = [
@@ -413,8 +487,18 @@ describe("AgentPanel", () => {
 
     // Assert: Markdown is rendered from the draft
     await waitFor(() => expect(screen.getByText("bold").tagName).toBe("STRONG"));
-    expect(document.querySelector(".doc-card-editor-diff")?.textContent).toContain("+1");
-    expect(document.querySelector(".doc-card-editor-diff")?.textContent).toContain("−1");
+    const changes = screen.getByRole("button", { name: "Changes" });
+    expect(changes.getAttribute("aria-expanded")).toBe("false");
+    expect(document.querySelector(".diff-container")).toBeNull();
+
+    // Act: open the diff on demand
+    fireEvent.click(changes);
+
+    // Assert: the counts and the diff are computed once opened
+    await waitFor(() => expect(changes.textContent).toContain("+1"));
+    expect(changes.textContent).toContain("−1");
+    expect(changes.getAttribute("aria-expanded")).toBe("true");
+    expect(document.querySelector(".diff-container")).toBeTruthy();
 
     // Assert: the draft guards unload until discarded
     const unload = new Event("beforeunload", { cancelable: true });

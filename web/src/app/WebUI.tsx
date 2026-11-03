@@ -444,6 +444,7 @@ export function WebUI() {
   );
 
   const handleNewSession = (name?: string) => {
+    if (!confirmDiscardUnsaved()) return;
     const key = createSessionKey();
     const trimmedName = name?.trim();
     setDraftSessionKey(key);

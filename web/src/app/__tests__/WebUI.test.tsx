@@ -157,6 +157,38 @@ describe("WebUI", () => {
     confirm.mockRestore();
   });
 
+  it("asks_before_starting_a_new_session_with_unsaved_prompt_edit", async () => {
+    // Arrange: the Agent screen shows a section with an unsaved edit.
+    globalThis.history.replaceState({}, "", "/agents/lyre/soul");
+    setUnsavedChanges("agent-file", true);
+    const confirm = vi.spyOn(globalThis, "confirm").mockReturnValue(false);
+    render(<WebUI />);
+    await screen.findByText("agent screen");
+
+    const startNewSession = async () => {
+      fireEvent.click(screen.getByRole("button", { name: /open command palette/i }));
+      // The palette can show the same action under Recent after the first use.
+      fireEvent.click((await screen.findAllByText("New Session"))[0]);
+    };
+
+    // Act: refuse to discard the draft.
+    await startNewSession();
+
+    // Assert: the editor stays mounted.
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(globalThis.location.pathname).toBe("/agents/lyre/soul");
+    expect(screen.getByText("agent screen")).toBeTruthy();
+
+    // Act: accept the discard.
+    confirm.mockReturnValue(true);
+    await startNewSession();
+
+    // Assert: the new session replaces the screen.
+    expect(await screen.findByText("chat screen")).toBeTruthy();
+    expect(globalThis.location.pathname).toBe("/agents/lyre/chat/s/draft:1");
+    confirm.mockRestore();
+  });
+
   it("keeps_a_config_edit_when_history_moves_between_sections", async () => {
     // Arrange: Config is showing with an unsaved form open.
     globalThis.history.replaceState({}, "", "/config");
