@@ -14,8 +14,10 @@ use crate::channels::utils::media;
 
 use super::{ApiError, WebState, internal_error, not_found};
 
-/// Cache policy for immutable attachment ids.
-const ATTACHMENT_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
+/// Attachments are private conversation content. Keep them out of persistent
+/// browser caches; the Web UI already holds the fetched Blob for the mounted
+/// card and fetches again when the file is needed later.
+const ATTACHMENT_CACHE_CONTROL: &str = "private, no-store";
 
 /// Upper bound for one Web attachment snapshot.
 ///

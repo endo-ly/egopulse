@@ -35,6 +35,10 @@ function formatAttachmentBytes(bytes: number): string {
  * auth, which media elements cannot send, so the blob is fetched on demand and
  * exposed through an object URL. Loading on demand keeps a long history with
  * many audio messages from downloading everything at once.
+ *
+ * `Load audio` only fetches the file. Playback starts from the standard player
+ * control because browsers may block programmatic autoplay after an async
+ * fetch. The object URL is released when playback ends or the card unmounts.
  */
 export function AttachmentCard({
   attachment,
@@ -42,7 +46,6 @@ export function AttachmentCard({
   authToken,
 }: AttachmentCardProps) {
   const [state, setState] = useState<LoadState>({ status: "idle" });
-  const [playRequested, setPlayRequested] = useState(false);
   const objectUrlRef = useRef<string | null>(null);
   const loadingRef = useRef(false);
   const mountedRef = useRef(true);
@@ -87,13 +90,19 @@ export function AttachmentCard({
     }
   };
 
-  const play = () => {
-    setPlayRequested(true);
-    void load();
+  const releaseObjectUrl = () => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = null;
+    }
+  };
+
+  const releaseAfterPlayback = () => {
+    releaseObjectUrl();
+    setState({ status: "idle" });
   };
 
   const download = async () => {
-    setPlayRequested(false);
     const url = await load();
     if (!url) return;
     const anchor = document.createElement("a");
@@ -125,8 +134,8 @@ export function AttachmentCard({
         <audio
           className="attachment-audio"
           controls
-          autoPlay={playRequested}
           aria-label={attachment.filename}
+          onEnded={releaseAfterPlayback}
           src={state.url}
         />
       ) : null}
@@ -135,7 +144,7 @@ export function AttachmentCard({
           <button
             type="button"
             className="attachment-card-action"
-            onClick={play}
+            onClick={() => void load()}
             disabled={state.status === "loading"}
           >
             {state.status === "loading" ? (
@@ -143,7 +152,7 @@ export function AttachmentCard({
                 <Spinner size="sm" /> Loading…
               </>
             ) : (
-              "Play audio"
+              "Load audio"
             )}
           </button>
         ) : null}

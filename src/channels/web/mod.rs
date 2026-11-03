@@ -2127,12 +2127,7 @@ mod attachment_api_tests {
         );
         assert_eq!(headers["x-content-type-options"], "nosniff");
         assert_eq!(headers[header::CONTENT_LENGTH], "11");
-        assert!(
-            headers[header::CACHE_CONTROL]
-                .to_str()
-                .expect("cache-control")
-                .contains("immutable")
-        );
+        assert_eq!(headers[header::CACHE_CONTROL], "private, no-store");
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");

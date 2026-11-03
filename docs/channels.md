@@ -76,7 +76,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 - **検索範囲**: コマンドパレットのメッセージ検索は読み込み済みの履歴のみを対象とする。対象はタイムラインの最上位の行で、折りたたまれた Pulse の経過は含まない。全履歴検索は `GET /api/history` のページングとは別の機能である
 - **再接続**: SSEは `last_event_id`、WebSocketは `run.subscribe` によるイベントリプレイ対応（最大 512 イベント、5 分 TTL）。run が保持期間切れの場合は `run_not_found` を返し、クライアントは永続化済み履歴から再構築する
 - **応答**: WebAdapter の `send_text` は no-op。通常の返答は SSE/WS のストリーミングで届け、Pulse など他起点の通知は通常セッションへの永続化で届ける。永続化後は WebSocket `session_updated` と履歴ポーリングで Web UI に反映される
-- **添付ファイル配信**: `send_attachment` は WebAdapter が `state_root/runtime/attachments/` にスナップショットを保存し、ツール結果に `attachments` メタデータを返す。Web UI は成功した `send_attachment` を添付カードとして描画し、再生・ダウンロード時に `GET /api/attachments/{id}` を Bearer 認証で取得する。音声はインライン再生、それ以外はダウンロードになる。保存先は workspace 外で、エージェントからは変更できない。1 ファイル 50 MiB 上限。自動削除は行わない
+- **添付ファイル配信**: `send_attachment` は WebAdapter が `state_root/runtime/attachments/` にスナップショットを保存し、ツール結果に `attachments` メタデータを返す。Web UI は成功した `send_attachment` を添付カードとして描画し、再生・ダウンロード時に `GET /api/attachments/{id}` を Bearer 認証で取得する。音声は標準プレイヤーで再生し、それ以外はダウンロードになる。保存先は workspace 外で、エージェントからは変更できない。1 ファイル 50 MiB 上限。保存期間は無期限（自動削除なし）で、DB バックアップには含まれないため、必要なら `runtime/attachments/` を別途バックアップする
 - **既存チャットのagent**: `chat:{id}` を指定した再開時は、`chats.agent_id` を使用する。新規Webセッションだけが `default_agent` を使用する。
 
 ### セッション管理

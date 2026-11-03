@@ -378,7 +378,7 @@ GET /api/attachments/{id}
 | 成功 | `200`。ボディはファイルバイト列 |
 | 音声 | `Content-Type: audio/*`、`Content-Disposition: inline`。WebUI は `<audio>` で再生する |
 | その他 | `Content-Type: application/octet-stream`、`Content-Disposition: attachment` |
-| キャッシュ | `Cache-Control: private, max-age=31536000, immutable` |
+| キャッシュ | `Cache-Control: private, no-store`（私的な会話内容のためブラウザに永続キャッシュさせない） |
 | 不正・不存在 | `404` (`attachment_not_found`) |
 
 ID は canonical な UUID と許可された拡張子（`mp3` / `wav` / `ogg` / `oga` / `opus` / `m4a` / `aac` / `flac` / `webm` / `bin`）だけを受け付ける。ファイルは `state_root/runtime/attachments/` 直下からのみ返し、任意のパスを読むことはできない。Range リクエストには対応せず、常にファイル全体を返す。

@@ -56,19 +56,22 @@ describe("AttachmentCard", () => {
     expect(fetchBlob).not.toHaveBeenCalled();
   });
 
-  it("loads_audio_on_play_and_revokes_its_object_url", async () => {
+  it("loads_audio_on_click_without_autoplay_and_revokes_on_unmount", async () => {
     // Arrange
     fetchBlob.mockResolvedValue(audioBlob());
     const { container, unmount } = render(
       <AttachmentCard attachment={AUDIO} authToken="token" />,
     );
+    const loadButton = container.querySelector(
+      ".attachment-card-action",
+    ) as HTMLButtonElement;
+    expect(loadButton.textContent).toBe("Load audio");
 
     // Act
-    fireEvent.click(
-      container.querySelector(".attachment-card-action") as HTMLButtonElement,
-    );
+    fireEvent.click(loadButton);
 
-    // Assert
+    // Assert: the standard player is shown, but playback is not started
+    // programmatically after the async fetch.
     await waitFor(() => expect(container.querySelector("audio")).toBeTruthy());
     expect(fetchBlob).toHaveBeenCalledWith(
       "/api/attachments/00000000-0000-4000-8000-000000000000.mp3",
@@ -77,13 +80,13 @@ describe("AttachmentCard", () => {
     expect(container.querySelector("audio")?.getAttribute("src")).toBe(
       "blob:attachment",
     );
-    expect(container.querySelector("audio")?.hasAttribute("autoplay")).toBe(true);
+    expect(container.querySelector("audio")?.hasAttribute("autoplay")).toBe(false);
 
     unmount();
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:attachment");
   });
 
-  it("download_does_not_autoplay_audio", async () => {
+  it("download_loads_the_player_without_starting_playback", async () => {
     // Arrange
     fetchBlob.mockResolvedValue(audioBlob());
     const { container } = render(
@@ -98,6 +101,30 @@ describe("AttachmentCard", () => {
     // Assert: the player appears for later use but does not start.
     await waitFor(() => expect(container.querySelector("audio")).toBeTruthy());
     expect(container.querySelector("audio")?.hasAttribute("autoplay")).toBe(false);
+    expect(anchorClick).toHaveBeenCalled();
+  });
+
+  it("releases_the_object_url_when_playback_ends", async () => {
+    // Arrange
+    fetchBlob.mockResolvedValue(audioBlob());
+    const { container } = render(
+      <AttachmentCard attachment={AUDIO} authToken="token" />,
+    );
+    fireEvent.click(
+      container.querySelector(".attachment-card-action") as HTMLButtonElement,
+    );
+    await waitFor(() => expect(container.querySelector("audio")).toBeTruthy());
+    const audio = container.querySelector("audio") as HTMLAudioElement;
+
+    // Act
+    fireEvent(audio, new Event("ended"));
+
+    // Assert
+    await waitFor(() => expect(container.querySelector("audio")).toBeNull());
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:attachment");
+    expect(
+      container.querySelector(".attachment-card-action")?.textContent,
+    ).toBe("Load audio");
   });
 
   it("shows_an_error_and_retries", async () => {

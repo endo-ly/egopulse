@@ -419,6 +419,7 @@ Environment variables:
   - ツール結果に `attachments`（`id` / `filename` / `content_type` / `size_bytes`）を付与する。Web UI は音声を再生カード、それ以外をダウンロードカードとして描画する
   - 1 ファイルあたりの読み込み上限は 50 MiB、Web 配信上限も 50 MiB
   - 保存先は workspace 外かつ bash sandbox から隠されるため、エージェントは配信済みコピーを変更できない
+  - 保存期間は無期限（自動削除なし）。DB バックアップには含まれないため、必要なら `runtime/attachments/` を別途バックアップする
 - 成功時:
   - `"Attachment sent successfully"`
   - Web では `attachments` に保存済みファイルのメタデータが入る

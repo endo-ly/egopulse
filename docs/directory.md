@@ -147,7 +147,7 @@ skills/
 |---|---|
 | `egopulse.db` | SQLite。会話履歴、セッション、ツール呼び出し記録 |
 | `assets/` | 会話中に生成・参照される画像等のバイナリアセット |
-| `attachments/` | `send_attachment` が Web へ配信したファイルのスナップショット。`{uuid}.{ext}` で保存し、元の workspace ファイルから独立する。DB バックアップ（`runtime/backups/`）には含まれない |
+| `attachments/` | `send_attachment` が Web へ配信したファイルのスナップショット。`{uuid}.{ext}` で保存し、元の workspace ファイルから独立する。保存期間は無期限（自動削除なし）。DB バックアップ（`runtime/backups/`）には含まれないため、必要ならこのディレクトリを別途バックアップする |
 | `groups/` | チャット別永続データのルート |
 
 ### 2.5 runtime/groups/ — チャット別アーカイブ
