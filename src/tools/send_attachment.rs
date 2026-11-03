@@ -70,8 +70,11 @@ async fn prepare_attachment(
         ));
     }
 
+    // Bound the read even if the file grows after the metadata check.
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    (&mut file)
+        .take(MAX_PREPARED_ATTACHMENT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .await
         .map_err(|e| format!("Failed to read attachment: {e}"))?;
     if bytes.len() as u64 > MAX_PREPARED_ATTACHMENT_BYTES {
