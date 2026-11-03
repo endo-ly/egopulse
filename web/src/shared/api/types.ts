@@ -50,6 +50,17 @@ export interface HistoryPage {
   newestSeq: number | null;
 }
 
+/** A file delivered by the Web channel and fetched on demand. */
+export interface AttachmentInfo {
+  /** Opaque `{uuid}.{ext}` token used by `GET /api/attachments/{id}`. */
+  id: string;
+  /** Original file name for display and download. */
+  filename: string;
+  /** MIME type; `audio/*` files render a player instead of a download only. */
+  content_type: string;
+  size_bytes: number;
+}
+
 export interface ToolEventData {
   name: string;
   state: "pending" | "success" | "error";
@@ -57,6 +68,8 @@ export interface ToolEventData {
   output?: string;
   is_error?: boolean;
   duration_ms?: number;
+  /** Files delivered by this tool call (currently only `send_attachment`). */
+  attachments?: AttachmentInfo[];
 }
 
 /** One page of a run listing, as the API returns it. */

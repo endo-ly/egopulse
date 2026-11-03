@@ -11,12 +11,15 @@ export interface MessageBubbleProps {
   agentAvatars?: Record<string, string>;
   /** Folded activation trace when this message is a delivered Pulse output. */
   pulseTrace?: PulseTraceData;
+  /** Bearer token used to fetch attachment blobs in a folded trace. */
+  authToken?: string;
 }
 
 export const MessageBubble = memo(function MessageBubble({
   message,
   agentAvatars,
   pulseTrace,
+  authToken,
 }: MessageBubbleProps) {
   const cls = `message-row bubble-${message.sender_kind}`;
 
@@ -28,7 +31,7 @@ export const MessageBubble = memo(function MessageBubble({
         timestamp={message.timestamp}
         agentAvatars={agentAvatars}
       />
-      {pulseTrace && <PulseTrace trace={pulseTrace} />}
+      {pulseTrace && <PulseTrace trace={pulseTrace} authToken={authToken} />}
       <div className="message-body">
         {message.sender_kind === "assistant" ? (
           <MarkdownRenderer content={message.content} />

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render } from "@testing-library/react";
+import { fireEvent, render } from "@testing-library/react";
 import { ChatTab } from "../ChatTab";
 import type { ChatMessage } from "../../../shared/api/types";
 
@@ -225,6 +225,134 @@ describe("ChatTab", () => {
 
     // Assert
     expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  it("send_attachment_success_renders_an_audio_attachment_card", () => {
+    // Arrange
+    const tool: ChatMessage = {
+      id: "tool:call-audio",
+      sender_id: "assistant",
+      sender_kind: "assistant",
+      content: JSON.stringify({
+        tool: "send_attachment",
+        status: "success",
+        result: "Attachment sent successfully",
+        input: { attachment_path: "media/reply.mp3", text: "hear this" },
+        attachments: [
+          {
+            id: "00000000-0000-4000-8000-000000000000.mp3",
+            filename: "reply.mp3",
+            content_type: "audio/mpeg",
+            size_bytes: 1234,
+          },
+        ],
+      }),
+      timestamp: "2026-07-04T00:00:02.000Z",
+      message_kind: "tool_call",
+    };
+
+    // Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        entries={[{ message: tool }]}
+        authToken="token"
+      />,
+    );
+
+    // Assert
+    expect(container.querySelector(".tool-card")).toBeNull();
+    expect(container.querySelector(".attachment-card")).toBeTruthy();
+    expect(container.querySelector(".attachment-card-title")?.textContent).toBe(
+      "reply.mp3",
+    );
+    expect(container.querySelector(".attachment-card-caption")?.textContent).toBe(
+      "hear this",
+    );
+  });
+
+  it("send_attachment_without_metadata_stays_a_tool_card", () => {
+    // Arrange
+    const tool: ChatMessage = {
+      id: "tool:call-audio",
+      sender_id: "assistant",
+      sender_kind: "assistant",
+      content: JSON.stringify({
+        tool: "send_attachment",
+        status: "success",
+        result: "Attachment sent successfully",
+        input: { attachment_path: "media/reply.mp3" },
+      }),
+      timestamp: "2026-07-04T00:00:02.000Z",
+      message_kind: "tool_call",
+    };
+
+    // Act
+    const { container } = render(
+      <ChatTab channel="web" readOnly={false} entries={[{ message: tool }]} />,
+    );
+
+    // Assert
+    expect(container.querySelector(".attachment-card")).toBeNull();
+    expect(container.querySelector(".tool-card")).toBeTruthy();
+  });
+
+  it("pulse_trace_send_attachment_renders_an_attachment_card", () => {
+    // Arrange: an attachment delivered inside a Pulse activation trace.
+    const tool: ChatMessage = {
+      id: "tool:call-audio",
+      sender_id: "assistant",
+      sender_kind: "assistant",
+      content: JSON.stringify({
+        tool: "send_attachment",
+        status: "success",
+        result: "Attachment sent successfully",
+        input: { attachment_path: "media/reply.mp3" },
+        attachments: [
+          {
+            id: "00000000-0000-4000-8000-000000000000.mp3",
+            filename: "reply.mp3",
+            content_type: "audio/mpeg",
+            size_bytes: 1234,
+          },
+        ],
+      }),
+      timestamp: "2026-07-04T00:00:02.000Z",
+      message_kind: "tool_call",
+      pulse: { run_id: "run-1", role: "step", intention_id: "morning_review" },
+    };
+    const output: ChatMessage = {
+      ...messages[1],
+      id: "pulse:run-1:output",
+      pulse: { run_id: "run-1", role: "output", intention_id: "morning_review" },
+    };
+
+    // Act
+    const { container } = render(
+      <ChatTab
+        channel="web"
+        readOnly={false}
+        authToken="token"
+        entries={[
+          {
+            message: output,
+            pulseTrace: { intentionId: "morning_review", entries: [tool] },
+          },
+        ]}
+      />,
+    );
+    fireEvent.click(
+      container.querySelector(".pulse-trace-summary") as HTMLButtonElement,
+    );
+
+    // Assert
+    expect(
+      container.querySelector(".pulse-trace-body .attachment-card"),
+    ).toBeTruthy();
+    expect(
+      container.querySelector(".pulse-trace-body .tool-card"),
+    ).toBeNull();
   });
 
   it("pulse_output_row_carries_its_folded_trace_line", () => {

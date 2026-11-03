@@ -2,10 +2,11 @@ import { Timeline } from "./Timeline";
 import { MessageBubble } from "./MessageBubble";
 import { MessageHeader } from "./MessageHeader";
 import { ToolCard } from "./ToolCard";
+import { AttachmentCard } from "./AttachmentCard";
 import { Composer } from "./Composer";
 import { ReadOnlyBanner } from "./ReadOnlyBanner";
 import { Spinner } from "../../shared/ui/Spinner";
-import { parseToolEvent } from "./toolEvent";
+import { parseToolEvent, toolAttachments, toolCaption } from "./toolEvent";
 import type { TimelineEntry } from "./timelineEntries";
 
 export interface ChatTabProps {
@@ -35,6 +36,8 @@ export interface ChatTabProps {
   atHistoryStart?: boolean;
   /** Bumped after older messages are prepended. */
   olderLoadSeq?: number;
+  /** Bearer token used to fetch attachment blobs. */
+  authToken?: string;
 }
 
 /**
@@ -64,6 +67,7 @@ export function ChatTab({
   olderError = null,
   atHistoryStart = false,
   olderLoadSeq = 0,
+  authToken = "",
 }: ChatTabProps) {
   const waitingStartsTurn = startsAssistantTurn(entries, entries.length);
 
@@ -79,6 +83,30 @@ export function ChatTab({
         {entries.map(({ message: m, pulseTrace }, index) => {
           const toolEvent = parseToolEvent(m);
           if (toolEvent) {
+            const attachments = toolAttachments(toolEvent);
+            if (attachments.length > 0) {
+              const caption = toolCaption(toolEvent);
+              return (
+                <div key={m.id} className="message-row bubble-tool">
+                  {agentId && startsAssistantTurn(entries, index) && (
+                    <MessageHeader
+                      senderId={agentId}
+                      senderKind="assistant"
+                      timestamp={m.timestamp}
+                      agentAvatars={agentAvatars}
+                    />
+                  )}
+                  {attachments.map((attachment) => (
+                    <AttachmentCard
+                      key={`${m.id}:${attachment.id}`}
+                      attachment={attachment}
+                      caption={caption}
+                      authToken={authToken}
+                    />
+                  ))}
+                </div>
+              );
+            }
             return (
               <div key={m.id} className="message-row bubble-tool">
                 {agentId && startsAssistantTurn(entries, index) && (
@@ -99,6 +127,7 @@ export function ChatTab({
               message={m}
               agentAvatars={agentAvatars}
               pulseTrace={pulseTrace}
+              authToken={authToken}
             />
           );
         })}

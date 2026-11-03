@@ -576,6 +576,7 @@ export function WebUI() {
       olderError={history.olderError}
       atHistoryStart={history.atHistoryStart}
       olderLoadSeq={history.loadSeq}
+      authToken={authToken}
     />
   );
 

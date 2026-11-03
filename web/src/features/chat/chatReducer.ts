@@ -1,4 +1,4 @@
-import type { ChatMessage } from "../../shared/api/types";
+import type { AttachmentInfo, ChatMessage } from "../../shared/api/types";
 
 export interface ChatEventMessage {
   id: string;
@@ -277,6 +277,7 @@ export interface ToolResultPayload {
   isError: boolean;
   preview: string;
   durationMs: number;
+  attachments?: AttachmentInfo[];
 }
 
 export interface UserInputPayload {
@@ -329,6 +330,7 @@ interface ToolContent {
   input?: unknown;
   result?: string;
   durationMs?: number;
+  attachments?: AttachmentInfo[];
 }
 
 function toolMessageId(callId: string): string {
@@ -342,6 +344,7 @@ function encodeToolContent(fields: ToolContent): string {
     input: fields.input ?? null,
     result: fields.result,
     duration_ms: fields.durationMs,
+    attachments: fields.attachments ?? [],
   });
 }
 
@@ -378,6 +381,7 @@ export function reduceToolStart(
       tool: payload.name,
       status: "pending",
       input: payload.input,
+      attachments: [],
     }),
     timestamp: new Date().toISOString(),
     message_kind: "tool_call",
@@ -406,6 +410,7 @@ export function reduceToolResult(
       input: existing ? decodeToolInput(existing.content) : undefined,
       result: payload.preview,
       durationMs: payload.durationMs,
+      attachments: payload.attachments,
     }),
     timestamp: new Date().toISOString(),
     message_kind: "tool_call",
