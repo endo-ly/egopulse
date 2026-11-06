@@ -252,7 +252,7 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 | `agent_send` | エージェント間通信。`sender_kind` は `tool`、`recipient_agent_id` に宛先エージェント ID が設定される |
 | `system_event` | システムイベント。停止条件によるターン拒否や LLM 失敗を記録。`sender_id` は `"system"`、`sender_kind` は `system`。`content` は JSON 形式（`{"reason": "ChainDepthExceeded"}` 等） |
 | `tool_call` | ツール実行結果。`sender_kind` は `assistant`、`content` は JSON 文字列（`{tool, status, result, input}`） |
-| `turn_failure` | Turn が応答を返さず終了した記録。`sender_id` は `"system"`、`sender_kind` は `system`、`content` はユーザー向けサマリ、`turn_id` に失敗した Turn を持つ。Web UI は履歴から描画するためリロード後も残る。`load_session_snapshot` はこの種別を LLM 文脈から除外する |
+| `turn_failure` | Turn が応答を返さず終了した記録。`sender_id` は `"system"`、`sender_kind` は `system`、`content` はユーザー向けサマリ。LLM の文脈には含めない |
 
 ---
 

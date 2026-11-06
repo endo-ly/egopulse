@@ -232,17 +232,9 @@ AgentLoop は final response と最新の session snapshot を `AgentLoopResult`
 
 ### 待ち時間の上限
 
-1 回の model iteration は `MODEL_ITERATION_DEADLINE`（300 秒）で打ち切る。各 attempt は残り時間で `tokio::time::timeout` されるため、試行の**開始**だけを制限するのでは上限にならない。1 回目の attempt は全量を使えるので、正常な長い生成は従来どおり許容し、リトライは残り時間しか使えない。
+1 回の model iteration は全体で 300 秒、1 リクエストは 90 秒の無応答で打ち切る。1 回目の試行は全量を使えるため、正常に進行する長い生成は従来どおり許容し、リトライは残り時間しか使えない。無応答の期限は read のたびにリセットされるので、進行中の生成を落とさず、接続後に何も返らない状態だけを早く検出できる。
 
-| 層 | 値 | 役割 |
-|---|---|---|
-| `REQUEST_TIMEOUT_SECS` | 300 秒 | 1 リクエストの総 deadline（HTTP client） |
-| `READ_TIMEOUT_SECS` | 90 秒 | read 間の無応答 deadline。毎 read でリセットされるため、進行中の長い生成は落とさず、接続後に1バイトも返らない prefill 停滞だけを検出する |
-| `MODEL_ITERATION_DEADLINE` | 300 秒 | 1 model iteration の総 deadline（全 attempt 合計） |
-
-指数バックオフには full jitter を掛ける。`Retry-After` がある場合はサーバー指示をそのまま使う。複数の会話が同時に同じレート制限へ当たったとき、固定 delay では同時リトライになるため。
-
-リトライ可否の判定だけでなく、試行回数の記録とバックオフ待機も `tokio::time::timeout_at(deadline, ...)` の内側で実行する。待機は provider から見えない処理であり、期限の外に置くと DB 待ちが長い場合に iteration window を超える。期限に到達した場合は、その時点までの実際のエラーをそのまま返す（合成の timeout に置き換えない）。
+試行回数の記録とバックオフ待機も同じ期限の内側で行う。これらは provider から見えない処理であり、外に置くと DB 待ちが長い場合に上限を超える。期限に到達した場合は、その時点までの実際のエラーをそのまま返す。
 
 turn 中の保存は phase ごとに進む。
 
@@ -458,32 +450,13 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 
 ### 10.2.1 失敗の可視化
 
-`failed` / `uncertain` への遷移は、会話にも `message_kind = turn_failure` のメッセージとして記録する。Web UI は `GET /api/history` だけを情報源とするため、失敗が `turn_runs` にしか無いとリロード後に消える。
+`failed` / `uncertain` への遷移は、会話にも `message_kind = turn_failure` のメッセージとして記録する。Web UI は履歴だけを情報源とするため、失敗が `turn_runs` にしか無いとリロード後に消える。
 
-| 項目 | 内容 |
-|---|---|
-| 書き込み単位 | `turn_runs` の状態遷移・origin の terminal reason・会話エントリを**同一 transaction**で確定する。分けると「Turn は端末なのに履歴が無い」状態が恒久化する（以後の `fail()` は端末判定で早期 return し、起動時 recovery も端末 Turn を対象にしないため補完されない） |
-| メッセージ ID | `turn-failure:<turn_id>`（決定的。`INSERT OR IGNORE` により再実行しても増えない） |
-| 対象経路 | `fail_turn` / `fail_turn_and_terminate_origin` / `fail_invalid_durable_turn` / `recover_interrupted_turns` |
-| LLM 文脈 | `load_session_snapshot` と `get_recent_context_messages` が `turn_failure` を除外する。エージェントが自分のエラーを文脈として読まない |
-| チャネル配送 | Discord / Telegram は従来どおりチャネルへも送信する。Web は履歴が唯一の配信経路 |
-
-#### 内部診断と公開文言の分離
-
-`turn_runs` に残す診断情報と、会話に書く文言は読者が違う。`TurnFailure { kind, diagnostic, public }` が両者を明示的に運び、`diagnostic` は `turn_runs.error_message` に、`public` は `messages.content` に入る。会話に書く以上、`public` は利用者が読んで意味の通る文でなければならない。
-
-| 経路 | `diagnostic`（`turn_runs`） | `public`（会話） |
-|---|---|---|
-| LLM / Tool 実行の失敗（`failed`） | `user_facing_summary()` | 同じ文言（`TurnFailure::shared`） |
-| LLM / Tool 実行の失敗（`uncertain`） | `user_facing_summary()` | `UNCERTAIN_FAILURE_PUBLIC_MESSAGE` |
-| resume 検証の失敗 | `config fingerprint mismatch on resume` 等の内部診断 | `RESUME_FAILED_PUBLIC_MESSAGE` |
-| dispatcher による破棄（`uncertain`） | stop reason と内部 note | `TURN_REJECTED_UNCERTAIN_PUBLIC_MESSAGE` |
-| 保存済み payload の解読失敗 | `DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE` | `DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE` |
-| 起動時 recovery | `recovered on startup: ...` | 出力未公開なら `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら `RECOVERED_UNCERTAIN_MESSAGE` |
-
-`uncertain` は外部出力や Tool 副作用が既に発生している可能性がある状態であり、同じ依頼を再送すると操作が重複し得る。そのため `failed` の「再度送ってください」という案内を流用せず、結果の確認を促す文言にする。
-
-会話エントリの文言は push チャネルにもそのまま使う。`TurnDispatcher` は失敗時に `turn-failure:<turn_id>` の保存済み本文を読み、observer への通知と Discord / Telegram への送信に同じ文字列を使う。文言を2箇所で組み立てると、片方だけが再実行を促す状態になり得るため。
+- 状態遷移と会話エントリは同一 transaction で確定する。分けると「Turn は端末なのに履歴が無い」状態が残り、起動時 recovery も端末 Turn を対象にしないため二度と補完されない
+- `turn_runs` に残す内部診断と、会話に書く文言は分ける。会話に出る以上、利用者が読んで意味の通る文でなければならない
+- `uncertain` は出力や Tool 副作用が既に発生している可能性がある。再送すると操作が重複し得るため、再実行を促さず結果の確認を促す
+- 会話エントリの文言は push チャネルにもそのまま使う。2箇所で組み立てると、片方だけが再実行を促す状態になり得る
+- LLM に渡す文脈からは除外する。エージェントが自分のエラーを会話として読まない
 
 ### 10.3 crash recovery
 
