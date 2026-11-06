@@ -473,7 +473,7 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 | `model_pending` / `model_completed` / `tools_pending` / `tools_completed`（`scheduled_request_json` なし） | `uncertain`（外部出力や Tool 副作用が及んでいる可能性があり、再開の安全性を証明できない） |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
-起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` / `tools_completed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため `failed` とする。`tools_completed` の resume は未commitの staged follow-upを先にsession snapshotへ反映し、元の input を再保存せず、完了済み Tool を再実行しない。
+起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` / `tools_completed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため終了する。`input_committed` は `failed`、`tools_completed` は Tool の副作用が既に発生している可能性があるため `uncertain` とする。`tools_completed` の resume は未commitの staged follow-upを先にsession snapshotへ反映し、元の input を再保存せず、完了済み Tool を再実行しない。
 
 同時に `Database::recover_running_tools()` が `running` の Tool をすべて `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
 

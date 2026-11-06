@@ -745,20 +745,48 @@ mod tests {
         )
         .with_streaming_delta("unpublished partial output");
         let observer = provider.clone();
+        let (state, llm) = state_with_provider(&dir, provider, "transient-retry-limit");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
+
+        // Act
+        let result = runner
+            .run_with_transient_retry(Duration::from_secs(60))
+            .await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
+    }
+
+    /// Builds a state whose provider answers from `provider`, plus the LLM the
+    /// deadline tests drive.
+    fn state_with_provider(
+        dir: &tempfile::TempDir,
+        provider: RecordingProvider,
+        session: &str,
+    ) -> (crate::runtime::AppState, Arc<dyn LlmProvider>) {
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider),
         );
-        let context = cli_context("transient-retry-limit");
+        let context = cli_context(session);
         let snapshot = state.config_manager.current_blocking();
         let llm = state
             .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
-        let dependencies = state.turn_dependencies();
-        let runner = ModelRunner::new(ModelStepRequest {
-            state: &dependencies,
-            llm: llm.as_ref(),
+        (state, llm)
+    }
+
+    /// The model-step request the deadline tests share.
+    fn deadline_test_request<'a>(
+        state: &'a TurnDependencies,
+        llm: &'a dyn LlmProvider,
+    ) -> ModelStepRequest<'a> {
+        ModelStepRequest {
+            state,
+            llm,
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
             tools: None,
@@ -771,16 +799,7 @@ mod tests {
             iteration: 1,
             scope: ConversationScope::Normal,
             on_delta: &ignore_delta,
-        });
-
-        // Act
-        let result = runner
-            .run_with_transient_retry(Duration::from_secs(60))
-            .await;
-
-        // Assert
-        assert!(result.is_err());
-        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
+        }
     }
 
     #[test]
@@ -831,33 +850,9 @@ mod tests {
             vec![MODEL_ITERATION_DEADLINE.as_millis() as u64 * 2; MAX_LLM_RETRIES],
         );
         let observer = provider.clone();
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let context = cli_context("iteration-deadline-hang");
-        let snapshot = state.config_manager.current_blocking();
-        let llm = state
-            .turn_dependencies()
-            .llm_for_context_with_snapshot(&context, &snapshot)
-            .expect("llm");
+        let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-hang");
         let dependencies = state.turn_dependencies();
-        let runner = ModelRunner::new(ModelStepRequest {
-            state: &dependencies,
-            llm: llm.as_ref(),
-            system_prompt: "system prompt",
-            messages: Arc::new(vec![Message::text("user", "hello")]),
-            tools: None,
-            chat_id: 1,
-            caller_channel: "cli",
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration: 1,
-            scope: ConversationScope::Normal,
-            on_delta: &ignore_delta,
-        });
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
 
         // Act
         let started = tokio::time::Instant::now();
@@ -905,33 +900,9 @@ mod tests {
             vec![0; MAX_LLM_RETRIES],
         );
         let observer = provider.clone();
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let context = cli_context("iteration-deadline-wait");
-        let snapshot = state.config_manager.current_blocking();
-        let llm = state
-            .turn_dependencies()
-            .llm_for_context_with_snapshot(&context, &snapshot)
-            .expect("llm");
+        let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-wait");
         let dependencies = state.turn_dependencies();
-        let runner = ModelRunner::new(ModelStepRequest {
-            state: &dependencies,
-            llm: llm.as_ref(),
-            system_prompt: "system prompt",
-            messages: Arc::new(vec![Message::text("user", "hello")]),
-            tools: None,
-            chat_id: 1,
-            caller_channel: "cli",
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration: 1,
-            scope: ConversationScope::Normal,
-            on_delta: &ignore_delta,
-        });
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
 
         // Act
         let started = tokio::time::Instant::now();
@@ -981,33 +952,9 @@ mod tests {
             vec![200_000; MAX_LLM_RETRIES],
         );
         let observer = provider.clone();
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let context = cli_context("iteration-deadline-backoff");
-        let snapshot = state.config_manager.current_blocking();
-        let llm = state
-            .turn_dependencies()
-            .llm_for_context_with_snapshot(&context, &snapshot)
-            .expect("llm");
+        let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-backoff");
         let dependencies = state.turn_dependencies();
-        let runner = ModelRunner::new(ModelStepRequest {
-            state: &dependencies,
-            llm: llm.as_ref(),
-            system_prompt: "system prompt",
-            messages: Arc::new(vec![Message::text("user", "hello")]),
-            tools: None,
-            chat_id: 1,
-            caller_channel: "cli",
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration: 1,
-            scope: ConversationScope::Normal,
-            on_delta: &ignore_delta,
-        });
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
 
         // Act
         let result = runner

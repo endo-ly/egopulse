@@ -198,14 +198,6 @@ pub(crate) fn turn_failure_message_id(turn_id: &str) -> String {
 /// Conversation text for a Turn whose saved request could not be read back.
 const DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE: &str = "Turn could not be resumed because its saved request was unreadable. Please send your message again.";
 
-/// Conversation text for a Turn a restart stopped before it produced output.
-const RECOVERED_FAILED_MESSAGE: &str =
-    "Turn ended without a response because the runtime restarted. Please send your message again.";
-
-/// Conversation text for a Turn a restart stopped after it may have produced
-/// output or Tool side effects.
-const RECOVERED_UNCERTAIN_MESSAGE: &str = "Turn ended without a final response because the runtime restarted. Check the result before sending your message again.";
-
 fn require_state_locked(
     tx: &rusqlite::Transaction<'_>,
     turn_id: &str,
@@ -1187,8 +1179,8 @@ impl Database {
                     &tx,
                     &row.turn_id,
                     match to {
-                        TurnRunState::Uncertain => RECOVERED_UNCERTAIN_MESSAGE,
-                        _ => RECOVERED_FAILED_MESSAGE,
+                        TurnRunState::Uncertain => crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE,
+                        _ => crate::error::TURN_INTERRUPTED_PUBLIC_MESSAGE,
                     },
                 )?;
                 recovered.push(RecoveredTurnRun {
@@ -2277,7 +2269,10 @@ mod tests {
             .collect();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].id, format!("turn-failure:{turn_id}"));
-        assert_eq!(failures[0].content, RECOVERED_FAILED_MESSAGE);
+        assert_eq!(
+            failures[0].content,
+            crate::error::TURN_INTERRUPTED_PUBLIC_MESSAGE
+        );
     }
 
     #[test]

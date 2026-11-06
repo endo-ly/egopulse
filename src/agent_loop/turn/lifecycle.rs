@@ -234,7 +234,11 @@ impl<'a> TurnLifecycle<'a> {
         let error_kind = error.error_kind();
         let error_message = sanitize_error_message(error);
         let failure = if target == TurnRunState::Uncertain {
-            TurnFailure::with_public(error_kind, &error_message, UNCERTAIN_FAILURE_PUBLIC_MESSAGE)
+            TurnFailure::with_public(
+                error_kind,
+                &error_message,
+                crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE,
+            )
         } else {
             TurnFailure::shared(error_kind, &error_message)
         };
@@ -273,12 +277,28 @@ impl<'a> TurnLifecycle<'a> {
 }
 
 /// Marks an unrecoverable resume target as failed.
+///
+/// `resume_target` decides the outcome. A `tools_completed` Turn has already run
+/// its Tools, so failing the resume cannot rule out side effects; recording it
+/// as `failed` would invite a retry that repeats them.
 pub(crate) async fn fail_resume_permanently(
     runtime: &TurnDependencies,
     scope: ConversationScope,
     turn_id: &str,
+    resume_target: TurnRunState,
     reason: &str,
 ) {
+    let (target, public) = if resume_target == TurnRunState::ToolsCompleted {
+        (
+            TurnRunState::Uncertain,
+            crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE,
+        )
+    } else {
+        (
+            TurnRunState::Failed,
+            crate::error::TURN_INTERRUPTED_PUBLIC_MESSAGE,
+        )
+    };
     let turn_id_owned = turn_id.to_string();
     let reason = reason.to_string();
     let turn_id_for_db = turn_id_owned.clone();
@@ -286,12 +306,8 @@ pub(crate) async fn fail_resume_permanently(
     if let Err(error) = call_blocking(runtime.db_for(scope), move |db| {
         db.fail_turn(
             &turn_id_for_db,
-            TurnRunState::Failed,
-            TurnFailure {
-                kind: "validation".to_string(),
-                diagnostic: reason_for_db,
-                public: RESUME_FAILED_PUBLIC_MESSAGE.to_string(),
-            },
+            target,
+            TurnFailure::with_public("validation", &reason_for_db, public),
         )
     })
     .await
@@ -299,20 +315,6 @@ pub(crate) async fn fail_resume_permanently(
         warn!(error = %error, %turn_id_owned, "failed to mark unrecoverable resume turn as failed");
     }
 }
-
-/// Conversation text for a Turn that may already have produced output or Tool
-/// side effects.
-///
-/// Retrying such a Turn can duplicate an operation the user already paid for,
-/// so it must not carry the "please try again" advice a clean failure does.
-pub(crate) const UNCERTAIN_FAILURE_PUBLIC_MESSAGE: &str = "Turn ended without a final response after it may have changed something outside EgoPulse. Check the result before sending your message again.";
-
-/// Conversation text for a Turn that could not be resumed after a restart.
-///
-/// The resume validation reasons name config fingerprints, payload decoding,
-/// and missing input rows; none of that belongs in the conversation.
-const RESUME_FAILED_PUBLIC_MESSAGE: &str =
-    "Turn could not be resumed after a restart. Please send your message again.";
 
 /// Validates and decodes a durable `input_committed` resume target.
 pub(crate) async fn validate_resume(
@@ -379,6 +381,7 @@ async fn validate_resume_target(
                 runtime,
                 scope,
                 turn_id,
+                expected_state,
                 "resume target has no scheduled request",
             )
             .await;
@@ -392,6 +395,7 @@ async fn validate_resume_target(
             runtime,
             scope,
             turn_id,
+            expected_state,
             "resume target already published output",
         )
         .await;
@@ -407,6 +411,7 @@ async fn validate_resume_target(
                 runtime,
                 scope,
                 turn_id,
+                expected_state,
                 "failed to decode scheduled request",
             )
             .await;
@@ -422,6 +427,7 @@ async fn validate_resume_target(
                 runtime,
                 scope,
                 turn_id,
+                expected_state,
                 "config fingerprint mismatch on resume",
             )
             .await;
@@ -436,6 +442,7 @@ async fn validate_resume_target(
             runtime,
             scope,
             turn_id,
+            expected_state,
             "resume target input message missing",
         )
         .await;
@@ -455,6 +462,7 @@ async fn validate_resume_target(
             runtime,
             scope,
             turn_id,
+            expected_state,
             "resume target input message missing",
         )
         .await;
@@ -472,13 +480,13 @@ fn sanitize_error_message(error: &EgoPulseError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_resume;
+    use super::{validate_resume, validate_tools_completed_resume};
     use crate::agent_loop::event::AgentEvent;
     use crate::agent_loop::test_support::{
         RecordingProvider, build_state_with_provider, cli_context,
     };
     use crate::agent_loop::{process_turn, process_turn_with_events, resolve_chat_id};
-    use crate::conversation::SurfaceContext;
+    use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::llm::MessagesResponse;
     use crate::runtime::AppState;
     use crate::runtime::turn::{ScheduledTurn, serialize_scheduled_turn};
@@ -612,6 +620,17 @@ mod tests {
     fn assert_failed(run: &TurnRun) {
         assert_eq!(run.state, TurnRunState::Failed);
         assert_eq!(run.error_kind.as_deref(), Some("validation"));
+    }
+
+    /// Returns the conversation text recorded for the seeded Turn's failure.
+    async fn failure_entry(state: &AppState, turn_id: &str) -> String {
+        let message_id = crate::storage::turn_failure_message_id(turn_id);
+        call_blocking(state.db_for(ConversationScope::Normal), move |db| {
+            db.get_message_content(&message_id)
+        })
+        .await
+        .expect("read failure entry")
+        .expect("failure entry must exist")
     }
 
     #[tokio::test]
@@ -988,13 +1007,79 @@ mod tests {
         .await
         .expect_err("fingerprint mismatch must be rejected");
 
-        // Assert
+        // Assert: nothing ran, so the user can send the message again.
         assert!(error.to_string().contains("config fingerprint mismatch"));
         assert_failed(
             &state
                 .db
                 .get_turn_run(&run.turn_id)
                 .expect("failed resume turn"),
+        );
+        assert_eq!(
+            failure_entry(&state, &run.turn_id).await,
+            crate::error::TURN_INTERRUPTED_PUBLIC_MESSAGE
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn tools_completed_resume_failure_is_uncertain_and_warns_about_side_effects() {
+        // Arrange: the Tools already ran, so the resume cannot rule out that
+        // their side effects happened.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(RecordingProvider::new(Vec::new(), Vec::new())),
+        );
+        let context = context_with_request_key("resume-tools", "resume:tools");
+        let snapshot = state.config_manager.current_blocking();
+        let payload = resume_payload(&context, "resume input");
+        let run = seed_input_committed_turn(
+            &state,
+            &context,
+            Some(&payload),
+            Some("stale-fingerprint"),
+            false,
+            true,
+        )
+        .await;
+        for transition in [
+            |db: &crate::storage::Database, turn_id: &str| {
+                db.begin_turn_model_iteration(turn_id, 1, "hash")
+                    .map(|_| ())
+            },
+            |db: &crate::storage::Database, turn_id: &str| db.complete_turn_model(turn_id),
+            |db: &crate::storage::Database, turn_id: &str| db.begin_turn_tools(turn_id).map(|_| ()),
+            |db: &crate::storage::Database, turn_id: &str| db.complete_turn_tools(turn_id),
+        ] {
+            let turn_id = run.turn_id.clone();
+            call_blocking(state.db_for(context.scope), move |db| {
+                transition(db, &turn_id)
+            })
+            .await
+            .expect("advance turn");
+        }
+
+        // Act
+        let error = validate_tools_completed_resume(
+            &state.turn_dependencies(),
+            context.scope,
+            &run.turn_id,
+            &state.db.get_turn_run(&run.turn_id).expect("reload"),
+            &snapshot,
+        )
+        .await
+        .expect_err("fingerprint mismatch must be rejected");
+
+        // Assert: the Turn may have changed something, so the text asks about
+        // the result instead of inviting a retry.
+        assert!(error.to_string().contains("config fingerprint mismatch"));
+        let failed = state.db.get_turn_run(&run.turn_id).expect("failed resume");
+        assert_eq!(failed.state, TurnRunState::Uncertain);
+        assert_eq!(failed.error_kind.as_deref(), Some("validation"));
+        assert_eq!(
+            failure_entry(&state, &run.turn_id).await,
+            crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE
         );
     }
 

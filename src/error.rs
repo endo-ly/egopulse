@@ -7,6 +7,17 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Conversation text for a Turn that may already have produced output or Tool
+/// side effects.
+///
+/// Retrying such a Turn can duplicate an operation the user already paid for,
+/// so the text asks about the result instead of inviting a retry.
+pub(crate) const TURN_UNCERTAIN_PUBLIC_MESSAGE: &str = "Turn ended without a final response after it may have changed something outside EgoPulse. Check the result before sending your message again.";
+
+/// Conversation text for a Turn a restart stopped before it produced output.
+pub(crate) const TURN_INTERRUPTED_PUBLIC_MESSAGE: &str =
+    "Turn ended without a response because the runtime restarted. Please send your message again.";
+
 /// Top-level error type aggregating all domain-specific errors.
 #[derive(Debug, Error)]
 pub enum EgoPulseError {
