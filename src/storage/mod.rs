@@ -472,6 +472,33 @@ impl TurnRunState {
     }
 }
 
+/// What a terminal Turn failure records.
+///
+/// The two texts serve different readers and must not be conflated: `kind` and
+/// `diagnostic` stay in `turn_runs` for operators, while `public` is written
+/// into the conversation, where anyone can read it. Internal diagnostics
+/// (config fingerprints, payload decoding, resume validation) belong in
+/// `diagnostic` only.
+pub(crate) struct TurnFailure {
+    /// Stable classification persisted as `turn_runs.error_kind`.
+    pub(crate) kind: String,
+    /// Operator-facing detail persisted as `turn_runs.error_message`.
+    pub(crate) diagnostic: String,
+    /// Conversation text. Must be safe to show a user.
+    pub(crate) public: String,
+}
+
+impl TurnFailure {
+    /// A failure whose diagnostic text is already safe to show.
+    pub(crate) fn shared(kind: &str, text: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            diagnostic: text.to_string(),
+            public: text.to_string(),
+        }
+    }
+}
+
 // Tool再実行可能性の分類 (`tool_calls.idempotency_class`)。
 //
 // `read_only` は外部状態を変更しない。`idempotent` は同じ idempotency key

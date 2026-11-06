@@ -242,6 +242,8 @@ AgentLoop は final response と最新の session snapshot を `AgentLoopResult`
 
 指数バックオフには full jitter を掛ける。`Retry-After` がある場合はサーバー指示をそのまま使う。複数の会話が同時に同じレート制限へ当たったとき、固定 delay では同時リトライになるため。
 
+リトライ可否の判定だけでなく、試行回数の記録とバックオフ待機も `tokio::time::timeout_at(deadline, ...)` の内側で実行する。待機は provider から見えない処理であり、期限の外に置くと DB 待ちが長い場合に iteration window を超える。期限に到達した場合は、その時点までの実際のエラーをそのまま返す（合成の timeout に置き換えない）。
+
 turn 中の保存は phase ごとに進む。
 
 1. user message を session 末尾に追加する
@@ -462,12 +464,21 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 |---|---|
 | 書き込み単位 | `turn_runs` の状態遷移・origin の terminal reason・会話エントリを**同一 transaction**で確定する。分けると「Turn は端末なのに履歴が無い」状態が恒久化する（以後の `fail()` は端末判定で早期 return し、起動時 recovery も端末 Turn を対象にしないため補完されない） |
 | メッセージ ID | `turn-failure:<turn_id>`（決定的。`INSERT OR IGNORE` により再実行しても増えない） |
-| `content` | `user_facing_summary()`（内部エラー文字列や provider の生レスポンスを含めない） |
 | 対象経路 | `fail_turn` / `fail_turn_and_terminate_origin` / `fail_invalid_durable_turn` / `recover_interrupted_turns` |
-| LLM 文脈 | `load_session_snapshot` が `turn_failure` を除外する。エージェントが自分のエラーを文脈として読まない |
+| LLM 文脈 | `load_session_snapshot` と `get_recent_context_messages` が `turn_failure` を除外する。エージェントが自分のエラーを文脈として読まない |
 | チャネル配送 | Discord / Telegram は従来どおりチャネルへも送信する。Web は履歴が唯一の配信経路 |
 
-起動時 recovery が付ける文言は、出力未公開なら再送を促す `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら副作用の確認を促す `RECOVERED_UNCERTAIN_MESSAGE` を使う。
+#### 内部診断と公開文言の分離
+
+`turn_runs` に残す診断情報と、会話に書く文言は読者が違う。`TurnFailure { kind, diagnostic, public }` が両者を明示的に運び、`diagnostic` は `turn_runs.error_message` に、`public` は `messages.content` に入る。会話に書く以上、`public` は利用者が読んで意味の通る文でなければならない。
+
+| 経路 | `diagnostic`（`turn_runs`） | `public`（会話） |
+|---|---|---|
+| LLM / Tool 実行の失敗 | `user_facing_summary()` | 同じ文言（`TurnFailure::shared`） |
+| resume 検証の失敗 | `config fingerprint mismatch on resume` 等の内部診断 | `RESUME_FAILED_PUBLIC_MESSAGE` |
+| dispatcher による破棄 | stop reason と内部 note | `TURN_REJECTED_PUBLIC_MESSAGE` |
+| 保存済み payload の解読失敗 | `DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE` | `DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE` |
+| 起動時 recovery | `recovered on startup: ...` | 出力未公開なら `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら `RECOVERED_UNCERTAIN_MESSAGE` |
 
 ### 10.3 crash recovery
 

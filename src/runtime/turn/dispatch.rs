@@ -17,8 +17,8 @@ use crate::error::EgoPulseError;
 use crate::runtime::status::RuntimeStatus;
 use crate::runtime::{AppState, Criticality, TaskKind, TaskSpec, channel_input, metrics};
 use crate::storage::{
-    DISPATCHER_BATCH_LIMIT, DURABLE_PAYLOAD_INVALID_ERROR_KIND, Database, TurnRunState,
-    call_blocking,
+    DISPATCHER_BATCH_LIMIT, DURABLE_PAYLOAD_INVALID_ERROR_KIND, Database, TurnFailure,
+    TurnRunState, call_blocking,
 };
 
 // ---------------------------------------------------------------------------
@@ -416,6 +416,10 @@ where
 /// # Errors
 ///
 /// Returns [`EgoPulseError`] only when shutdown begins mid-retry.
+/// Conversation text for a Turn the dispatcher stopped before it completed.
+const TURN_REJECTED_PUBLIC_MESSAGE: &str =
+    "Turn was stopped before it completed. Please send your message again.";
+
 async fn persist_turn_rejection(
     state: &AppState,
     scope: crate::conversation::ConversationScope,
@@ -447,7 +451,15 @@ async fn persist_turn_rejection(
                     TurnRunState::Accepted | TurnRunState::InputCommitted => {
                         db.cancel_turn(&turn_id, &reason, &note)
                     }
-                    _ => db.fail_turn(&turn_id, TurnRunState::Uncertain, &reason, &note),
+                    _ => db.fail_turn(
+                        &turn_id,
+                        TurnRunState::Uncertain,
+                        TurnFailure {
+                            kind: reason,
+                            diagnostic: note,
+                            public: TURN_REJECTED_PUBLIC_MESSAGE.to_string(),
+                        },
+                    ),
                 }
             })
         },

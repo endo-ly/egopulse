@@ -59,7 +59,7 @@ fn record_turn_failure_message_locked(
 - `commit_message_locked`（`chat.rs:706`）は `&Transaction` を受けるのでそのまま合成できる。`seq` 採番・`chats.revision` 更新も同関数が行う
 - 決定的 ID `turn-failure:{turn_id}` + `INSERT OR IGNORE` により**冪等**。再実行しても増えない
 - `session_json: None` を渡すため LLM セッションスナップショットは進めない（失敗文を文脈に混ぜない）
-- `error_message` は既に `sanitize_error_message`（`lifecycle.rs:449`）= `user_facing_summary()` を200文字に切ったもの。引数追加は不要
+- `TurnFailure { kind, diagnostic, public }` を導入し、`fail_turn` の引数にする。`kind` は `turn_runs.error_kind`、`diagnostic` は `turn_runs.error_message`、`public` は `messages.content`。LLM/Tool 失敗は `TurnFailure::shared` で同一文言、resume / dispatcher 破棄 / payload 解読失敗は専用の公開文言定数を使う
 - 対象関数のトランザクションを `TransactionBehavior::Immediate` に変更する（`messages` / `chats` へ書き込むため、Deferred のアップグレードで BUSY を避ける）
 - 起動時 recovery の文言は、出力未公開なら `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら `RECOVERED_UNCERTAIN_MESSAGE` を使う（内部診断文字列をユーザーに見せない）
 
@@ -67,10 +67,11 @@ fn record_turn_failure_message_locked(
 
 ### Step 2 — LLM 文脈から除外（必須）
 
-`Database::load_session_snapshot`（`chat.rs:1006`）のクエリ：
-```sql
-WHERE chat_id = ?1 AND seq IS NOT NULL AND message_kind <> 'turn_failure'
-```
+LLM に渡す経路は2つあり、両方から除外する。
+
+1. `Database::load_session_snapshot`（`chat.rs:1006`）のクエリに `AND message_kind <> 'turn_failure'`
+2. `Database::get_recent_context_messages` を新設し、Pulse の `load_recent_messages`（`pulse/scheduler.rs:433`）を切り替える。`get_recent_messages` は `message_kind` を制限しないため、直前に失敗した Turn のエラー文が次の Pulse Activation の文脈に入る
+
 これを入れないと、次ターンのプロンプトに自分のエラー文が混入する（`session.rs:536 loaded_from_recent` は `message_kind` を見ていない）。
 
 ### Step 3 — Web UI で表示（frontend）
@@ -170,6 +171,7 @@ for attempt in 1..=MAX_LLM_RETRIES {
 - 1回目の attempt は deadline の全量（300秒）を使える → 「正常な長い生成に300秒を許容する」既存方針を維持
 - リトライは残時間しか使えない → **総経過時間は 300秒を超えない**
 - リトライ可否の判定も `deadline > Instant::now() + backoff` に変更（deadline を跨ぐ sleep をしない）
+- 試行回数の記録（`before_retry`）とバックオフ待機も `tokio::time::timeout_at(deadline, ...)` の内側に入れる。期限の外に置くと DB 待ちが長い場合に window を超える。期限到達時は実際のエラーを返す
 - `LlmError::DeadlineExceeded` を追加（`src/error.rs`）
   - `is_retryable() == false`。deadline を食い切った時点で残り時間は 0 であり、次の attempt は走れない
   - `user_facing_summary()` = `"LLM API request timed out. Please try again later."`
@@ -202,6 +204,9 @@ for attempt in 1..=MAX_LLM_RETRIES {
 | `should_retry` | deadline 超過で `false`／published で `false`／非 retryable で `false` |
 | retry loop | `tokio::time::pause()` + 応答しない fake provider で、attempt が deadline で打ち切られ、次 attempt を開始しない |
 | retry loop | backoff が deadline を跨ぐ場合はリトライしない |
+| retry loop | 前処理と待機が deadline で打ち切られる（遅い `before_retry` を注入） |
+| storage | `TurnFailure` の `diagnostic` が `turn_runs` に、`public` が `messages` に入る |
+| storage | `get_recent_context_messages` が `turn_failure` を除外する |
 | `shared_http_client` 相当 | 接続だけして応答しない TcpListener に対し、`read_timeout` で `is_timeout()` になる |
 | 回帰 | 既存の `retryable_llm_error_is_retried_within_same_iteration` が通る |
 

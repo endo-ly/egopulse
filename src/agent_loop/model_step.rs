@@ -223,7 +223,29 @@ impl<'a> ModelRunner<'a> {
                         && before_deadline
                         && attempt < MAX_LLM_RETRIES
                     {
-                        before_retry().await;
+                        // The deadline covers the wait too: recording the
+                        // attempt and sleeping are work the provider never
+                        // sees, so leaving them outside the bound would let a
+                        // slow DB hold the Turn past the iteration window.
+                        let waited = tokio::time::timeout_at(deadline, async {
+                            before_retry().await;
+                            tokio::time::sleep(backoff).await;
+                        })
+                        .await;
+                        if waited.is_err() {
+                            warn!(
+                                attempt,
+                                max = MAX_LLM_RETRIES,
+                                backoff_ms = backoff.as_millis() as u64,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                error = %error,
+                                "llm iteration deadline exhausted while waiting to retry"
+                            );
+                            return Err(ModelRequestError {
+                                error,
+                                output_published: published,
+                            });
+                        }
                         warn!(
                             attempt,
                             max = MAX_LLM_RETRIES,
@@ -232,7 +254,6 @@ impl<'a> ModelRunner<'a> {
                             error = %error,
                             "retryable llm error; retrying same iteration"
                         );
-                        tokio::time::sleep(backoff).await;
                         continue;
                     }
                     return Err(ModelRequestError {
@@ -782,11 +803,10 @@ mod tests {
                 .all(|delay| *delay <= Duration::from_millis(1_000)),
             "delay must not exceed the exponential ceiling"
         );
+        let distinct: std::collections::HashSet<Duration> = attempt_two.iter().copied().collect();
         assert!(
-            attempt_two
-                .iter()
-                .any(|delay| *delay < Duration::from_millis(1_000)),
-            "delay must be jittered"
+            distinct.len() > 1,
+            "delay must vary between retries, got {distinct:?}"
         );
         assert!(llm_retry_backoff(4, &error) <= Duration::from_millis(4_000));
     }
@@ -860,6 +880,84 @@ mod tests {
             elapsed >= MODEL_ITERATION_DEADLINE
                 && elapsed < MODEL_ITERATION_DEADLINE + Duration::from_secs(1),
             "attempt must be cut at the iteration deadline, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retry_wait_is_bounded_by_the_iteration_deadline() {
+        // Arrange: the attempt fails immediately with a retryable 429, but the
+        // pre-retry work is slow enough that the backoff would cross the
+        // deadline. Recording the attempt and sleeping happen inside the
+        // iteration window, so they must be cut too.
+        tokio::time::pause();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            (0..MAX_LLM_RETRIES)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        body_preview: "rate limited".to_string(),
+                        retry_after_secs: Some(150),
+                    })
+                })
+                .collect(),
+            vec![0; MAX_LLM_RETRIES],
+        );
+        let observer = provider.clone();
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("iteration-deadline-wait");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(ModelStepRequest {
+            state: &dependencies,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+
+        // Act
+        let started = tokio::time::Instant::now();
+        let result = runner
+            .retry_transient_failures(DeltaPublication::Published, None, || async {
+                tokio::time::sleep(Duration::from_secs(200)).await;
+            })
+            .await;
+
+        // Assert: the wait stops at the deadline, and the caller keeps the
+        // cause that actually happened rather than a synthetic timeout.
+        let error = match result {
+            Err(error) => error.into_parts().0,
+            Ok(_) => panic!("retry wait must be cut at the deadline"),
+        };
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(crate::error::LlmError::ApiError { status, .. })
+                if status.as_u16() == 429
+        ));
+        assert_eq!(observer.seen_messages().len(), 1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= MODEL_ITERATION_DEADLINE
+                && elapsed < MODEL_ITERATION_DEADLINE + Duration::from_secs(1),
+            "wait must stop at the iteration deadline, elapsed={elapsed:?}"
         );
     }
 

@@ -6,7 +6,7 @@ use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::runtime::turn::StopReason;
 use crate::runtime::turn::{ScheduledTurn, deserialize_scheduled_turn};
-use crate::storage::{AcceptOutcome, TurnRun, TurnRunState, call_blocking};
+use crate::storage::{AcceptOutcome, TurnFailure, TurnRun, TurnRunState, call_blocking};
 use tracing::warn;
 
 /// Outcome of idempotent Turn acceptance.
@@ -233,10 +233,11 @@ impl<'a> TurnLifecycle<'a> {
         };
         let error_kind = error.error_kind();
         let error_message = sanitize_error_message(error);
+        let failure = TurnFailure::shared(error_kind, &error_message);
         let turn_id_for_fail = turn_id;
         let result = if self.origin_id.is_empty() {
             call_blocking(self.runtime.db_for(self.scope), move |db| {
-                db.fail_turn(&turn_id_for_fail, target, error_kind, &error_message)
+                db.fail_turn(&turn_id_for_fail, target, failure)
             })
             .await
         } else {
@@ -246,8 +247,7 @@ impl<'a> TurnLifecycle<'a> {
                 db.fail_turn_and_terminate_origin(
                     &turn_id_for_fail,
                     target,
-                    error_kind,
-                    &error_message,
+                    failure,
                     &origin_id,
                     &terminal_reason,
                 )
@@ -283,8 +283,11 @@ pub(crate) async fn fail_resume_permanently(
         db.fail_turn(
             &turn_id_for_db,
             TurnRunState::Failed,
-            "validation",
-            &reason_for_db,
+            TurnFailure {
+                kind: "validation".to_string(),
+                diagnostic: reason_for_db,
+                public: RESUME_FAILED_PUBLIC_MESSAGE.to_string(),
+            },
         )
     })
     .await
@@ -292,6 +295,13 @@ pub(crate) async fn fail_resume_permanently(
         warn!(error = %error, %turn_id_owned, "failed to mark unrecoverable resume turn as failed");
     }
 }
+
+/// Conversation text for a Turn that could not be resumed after a restart.
+///
+/// The resume validation reasons name config fingerprints, payload decoding,
+/// and missing input rows; none of that belongs in the conversation.
+const RESUME_FAILED_PUBLIC_MESSAGE: &str =
+    "Turn could not be resumed after a restart. Please send your message again.";
 
 /// Validates and decodes a durable `input_committed` resume target.
 pub(crate) async fn validate_resume(
