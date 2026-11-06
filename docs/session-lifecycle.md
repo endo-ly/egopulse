@@ -196,8 +196,9 @@ Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実�
 - assistant delta・narration・Tool Call を外部へ公開していない
 - assistant message を commit していない
 - Tool 実行を開始していない
-- error が明示的に retryable（429 / 5xx / 接続失敗 / 読取り timeout）
+- error が明示的に retryable（429 / 5xx / 接続失敗 / 読取り timeout / iteration deadline 到達）
 - 試行回数が上限（3 回）以内
+- 次の試行が iteration deadline 内に収まる
 
 **再試行禁止**（いずれか該当で `failed` または `uncertain` へ遷移）:
 
@@ -228,6 +229,18 @@ accept / resume validation
 AgentLoop は final response と最新の session snapshot を `AgentLoopResult` として返す。final message の保存、`output_published`、`completed` への遷移は TurnExecutor が行うため、Loop の反復と durable Turn の完了条件は混在しない。
 
 再試行回数上限に達した場合、または再試行禁止条件に該当した場合は Turn を `failed`（出力未公開）または `uncertain`（出力公開済み）として終了する。Codex 認証の 401 では次回 Turn 向けに token refresh を試みるが、失敗した Turn を再開しない。
+
+### 待ち時間の上限
+
+1 回の model iteration は `MODEL_ITERATION_DEADLINE`（300 秒）で打ち切る。各 attempt は残り時間で `tokio::time::timeout` されるため、試行の**開始**だけを制限するのでは上限にならない。1 回目の attempt は全量を使えるので、正常な長い生成は従来どおり許容し、リトライは残り時間しか使えない。
+
+| 層 | 値 | 役割 |
+|---|---|---|
+| `REQUEST_TIMEOUT_SECS` | 300 秒 | 1 リクエストの総 deadline（HTTP client） |
+| `READ_TIMEOUT_SECS` | 90 秒 | read 間の無応答 deadline。毎 read でリセットされるため、進行中の長い生成は落とさず、接続後に1バイトも返らない prefill 停滞だけを検出する |
+| `MODEL_ITERATION_DEADLINE` | 300 秒 | 1 model iteration の総 deadline（全 attempt 合計） |
+
+指数バックオフには full jitter を掛ける。`Retry-After` がある場合はサーバー指示をそのまま使う。複数の会話が同時に同じレート制限へ当たったとき、固定 delay では同時リトライになるため。
 
 turn 中の保存は phase ごとに進む。
 
@@ -440,6 +453,21 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 ```
 
 各状態の意味は [db.md §turn_runs](./db.md#turn_runs) を参照。
+
+### 10.2.1 失敗の可視化
+
+`failed` / `uncertain` への遷移は、会話にも `message_kind = turn_failure` のメッセージとして記録する。Web UI は `GET /api/history` だけを情報源とするため、失敗が `turn_runs` にしか無いとリロード後に消える。
+
+| 項目 | 内容 |
+|---|---|
+| 書き込み単位 | `turn_runs` の状態遷移・origin の terminal reason・会話エントリを**同一 transaction**で確定する。分けると「Turn は端末なのに履歴が無い」状態が恒久化する（以後の `fail()` は端末判定で早期 return し、起動時 recovery も端末 Turn を対象にしないため補完されない） |
+| メッセージ ID | `turn-failure:<turn_id>`（決定的。`INSERT OR IGNORE` により再実行しても増えない） |
+| `content` | `user_facing_summary()`（内部エラー文字列や provider の生レスポンスを含めない） |
+| 対象経路 | `fail_turn` / `fail_turn_and_terminate_origin` / `fail_invalid_durable_turn` / `recover_interrupted_turns` |
+| LLM 文脈 | `load_session_snapshot` が `turn_failure` を除外する。エージェントが自分のエラーを文脈として読まない |
+| チャネル配送 | Discord / Telegram は従来どおりチャネルへも送信する。Web は履歴が唯一の配信経路 |
+
+起動時 recovery が付ける文言は、出力未公開なら再送を促す `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら副作用の確認を促す `RECOVERED_UNCERTAIN_MESSAGE` を使う。
 
 ### 10.3 crash recovery
 
