@@ -233,7 +233,11 @@ impl<'a> TurnLifecycle<'a> {
         };
         let error_kind = error.error_kind();
         let error_message = sanitize_error_message(error);
-        let failure = TurnFailure::shared(error_kind, &error_message);
+        let failure = if target == TurnRunState::Uncertain {
+            TurnFailure::with_public(error_kind, &error_message, UNCERTAIN_FAILURE_PUBLIC_MESSAGE)
+        } else {
+            TurnFailure::shared(error_kind, &error_message)
+        };
         let turn_id_for_fail = turn_id;
         let result = if self.origin_id.is_empty() {
             call_blocking(self.runtime.db_for(self.scope), move |db| {
@@ -295,6 +299,13 @@ pub(crate) async fn fail_resume_permanently(
         warn!(error = %error, %turn_id_owned, "failed to mark unrecoverable resume turn as failed");
     }
 }
+
+/// Conversation text for a Turn that may already have produced output or Tool
+/// side effects.
+///
+/// Retrying such a Turn can duplicate an operation the user already paid for,
+/// so it must not carry the "please try again" advice a clean failure does.
+pub(crate) const UNCERTAIN_FAILURE_PUBLIC_MESSAGE: &str = "Turn ended without a final response after it may have changed something outside EgoPulse. Check the result before sending your message again.";
 
 /// Conversation text for a Turn that could not be resumed after a restart.
 ///

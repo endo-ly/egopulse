@@ -191,7 +191,7 @@ fn record_turn_failure_message_locked(
 }
 
 /// Returns the deterministic id of the conversation entry for a failed Turn.
-fn turn_failure_message_id(turn_id: &str) -> String {
+pub(crate) fn turn_failure_message_id(turn_id: &str) -> String {
     format!("turn-failure:{turn_id}")
 }
 
@@ -204,7 +204,7 @@ const RECOVERED_FAILED_MESSAGE: &str =
 
 /// Conversation text for a Turn a restart stopped after it may have produced
 /// output or Tool side effects.
-const RECOVERED_UNCERTAIN_MESSAGE: &str = "Turn ended without a final response because the runtime restarted. Check for side effects before retrying.";
+const RECOVERED_UNCERTAIN_MESSAGE: &str = "Turn ended without a final response because the runtime restarted. Check the result before sending your message again.";
 
 fn require_state_locked(
     tx: &rusqlite::Transaction<'_>,

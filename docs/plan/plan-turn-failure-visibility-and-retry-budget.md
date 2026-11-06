@@ -60,6 +60,8 @@ fn record_turn_failure_message_locked(
 - 決定的 ID `turn-failure:{turn_id}` + `INSERT OR IGNORE` により**冪等**。再実行しても増えない
 - `session_json: None` を渡すため LLM セッションスナップショットは進めない（失敗文を文脈に混ぜない）
 - `TurnFailure { kind, diagnostic, public }` を導入し、`fail_turn` の引数にする。`kind` は `turn_runs.error_kind`、`diagnostic` は `turn_runs.error_message`、`public` は `messages.content`。LLM/Tool 失敗は `TurnFailure::shared` で同一文言、resume / dispatcher 破棄 / payload 解読失敗は専用の公開文言定数を使う
+- `uncertain`（出力公開済み・Tool 副作用の可能性あり）は `failed` と公開文言を分ける。再送すると操作が重複し得るため、再実行を促さず結果の確認を促す
+- push チャネル（Discord / Telegram）と observer 通知は、保存済み `turn_failure` の本文をそのまま使う。文言を2箇所で組み立てると片方だけが再実行を促し得る
 - 対象関数のトランザクションを `TransactionBehavior::Immediate` に変更する（`messages` / `chats` へ書き込むため、Deferred のアップグレードで BUSY を避ける）
 - 起動時 recovery の文言は、出力未公開なら `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら `RECOVERED_UNCERTAIN_MESSAGE` を使う（内部診断文字列をユーザーに見せない）
 
@@ -206,6 +208,7 @@ for attempt in 1..=MAX_LLM_RETRIES {
 | retry loop | backoff が deadline を跨ぐ場合はリトライしない |
 | retry loop | 前処理と待機が deadline で打ち切られる（遅い `before_retry` を注入） |
 | storage | `TurnFailure` の `diagnostic` が `turn_runs` に、`public` が `messages` に入る |
+| dispatch | `uncertain` の会話エントリが再実行を促さない／push 通知が保存済み本文と一致する |
 | storage | `get_recent_context_messages` が `turn_failure` を除外する |
 | `shared_http_client` 相当 | 接続だけして応答しない TcpListener に対し、`read_timeout` で `is_timeout()` になる |
 | 回帰 | 既存の `retryable_llm_error_is_retried_within_same_iteration` が通る |

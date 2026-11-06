@@ -100,7 +100,7 @@ pub(crate) use tool::{
     ClaimOutcome, ClaimParams, ReadOnlyToolOutcome, canonical_tool_input, input_hash,
 };
 pub(crate) use turn::RecoveredOrigin;
-pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun};
+pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun, turn_failure_message_id};
 
 /// Result of attempting to stage a human follow-up for the active Tool phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,6 +495,15 @@ impl TurnFailure {
             kind: kind.to_string(),
             diagnostic: text.to_string(),
             public: text.to_string(),
+        }
+    }
+
+    /// A failure whose conversation text differs from its diagnostic.
+    pub(crate) fn with_public(kind: &str, diagnostic: &str, public: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            diagnostic: diagnostic.to_string(),
+            public: public.to_string(),
         }
     }
 }

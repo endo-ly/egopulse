@@ -1033,7 +1033,9 @@ async fn execute_and_publish_scheduled_turn(
                 }
             }
             if observer_key.is_some() {
-                let error_message = error.user_facing_summary();
+                let error_message = persisted_failure_message(state, turn)
+                    .await
+                    .unwrap_or_else(|| error.user_facing_summary());
                 let retain_observer = match retain_observer_for_staged_follow_up(state, turn).await
                 {
                     Ok(retain_observer) => retain_observer,
@@ -1068,7 +1070,11 @@ async fn execute_and_publish_scheduled_turn(
             } else if turn.context.channel.as_str() != "web" {
                 // Web delivers failures through the persisted conversation
                 // entry, which `GET /api/history` serves after a reload.
-                send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
+                let error_message = persisted_failure_message(state, turn)
+                    .await
+                    .unwrap_or_else(|| error.user_facing_summary());
+                send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error_message)
+                    .await;
             }
         }
     }
@@ -1287,13 +1293,28 @@ fn tool_progress_enabled(config: &crate::config::Config, context: &SurfaceContex
     }
 }
 
+/// Returns the text the conversation already shows for this Turn's failure.
+///
+/// The persisted entry is the single source of truth: the Web UI reads it
+/// through history, and every push channel sends the same wording. Deriving
+/// the text twice would let the two disagree about whether a retry is safe.
+async fn persisted_failure_message(state: &AppState, turn: &ScheduledTurn) -> Option<String> {
+    let message_id = crate::storage::turn_failure_message_id(&turn.turn_id);
+    call_blocking(state.db_for(turn.context.scope), move |db| {
+        db.get_message_content(&message_id)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn send_turn_failure_to_channel(
     adapter: Option<&dyn crate::channels::adapter::ChannelAdapter>,
     external_chat_id: &str,
-    error: &EgoPulseError,
+    summary: &str,
 ) {
     let Some(adapter) = adapter else { return };
-    let message = format!("⚠️ {}", error.user_facing_summary());
+    let message = format!("⚠️ {summary}");
     if let Err(send_err) = adapter.send_text(external_chat_id, &message).await {
         tracing::warn!(
             error = %send_err,
@@ -1821,6 +1842,140 @@ mod tests {
             )
             .expect("count user messages");
         assert_eq!(user_messages, 1, "input must be persisted once");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pushed_failure_text_matches_the_conversation_entry() {
+        // Arrange: a failed Turn whose conversation entry already exists.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(final_provider()),
+        );
+        let context = crate::test_util::cli_context("pushed-failure-text");
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("cli", &context.session_key(), "cli", "default")
+            .expect("chat");
+        let run = match state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "pushed-failure-text",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept")
+        {
+            crate::storage::AcceptOutcome::Created(run)
+            | crate::storage::AcceptOutcome::Existing(run) => run,
+        };
+        state
+            .db
+            .fail_turn(
+                &run.turn_id,
+                TurnRunState::Uncertain,
+                TurnFailure::with_public("llm", "internal diagnostic", "public text"),
+            )
+            .expect("fail");
+        let turn = ScheduledTurn {
+            turn_id: run.turn_id,
+            context: context.clone(),
+            input: "hello".to_string(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
+            received_at: None,
+            response_delivery: ResponseDelivery::Channel,
+        };
+
+        // Act
+        let pushed = persisted_failure_message(&state, &turn).await;
+
+        // Assert: push channels reuse the conversation wording, so a Turn that
+        // may have changed something never tells the user to retry.
+        assert_eq!(pushed.as_deref(), Some("public text"));
+
+        // A Turn without an entry falls back to the caller's summary.
+        let missing = ScheduledTurn {
+            turn_id: "turn-without-entry".to_string(),
+            ..turn
+        };
+        assert!(persisted_failure_message(&state, &missing).await.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncertain_turn_does_not_invite_a_plain_retry() {
+        // Arrange: output is published, then every attempt fails. The Turn can
+        // no longer be retried safely because a response and possibly Tool side
+        // effects already left EgoPulse.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let retry_count = crate::agent_loop::model_step::MAX_LLM_RETRIES;
+        let provider = RecordingProvider::new(
+            (0..retry_count)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        body_preview: "test failure".to_string(),
+                        retry_after_secs: None,
+                    })
+                })
+                .collect(),
+            vec![0; retry_count],
+        )
+        .with_streaming_delta("partial output");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        );
+        let mut context = crate::test_util::cli_context("uncertain-public-text");
+        context.channel = "web".to_string();
+        context.chat_type = "web".to_string();
+
+        // Act
+        let result = execute_turn_with_progress_and_snapshot(
+            &state,
+            &context,
+            "hello",
+            state.config_manager.current_blocking(),
+            None,
+            None,
+        )
+        .await;
+
+        // Assert: the operator keeps the error summary, while the conversation
+        // warns about the side effects instead of telling the user to retry.
+        assert!(result.is_err(), "failure must reach the caller");
+        let conn = state.db.get_conn().expect("connection");
+        let (turn_state, error_message): (String, String) = conn
+            .query_row("SELECT state, error_message FROM turn_runs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("turn run");
+        assert_eq!(turn_state, "uncertain");
+        assert_eq!(
+            error_message,
+            "LLM API server error. Please try again later."
+        );
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM messages WHERE message_kind = 'turn_failure'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failure entry must be persisted");
+        assert_eq!(
+            content,
+            crate::agent_loop::turn::lifecycle::UNCERTAIN_FAILURE_PUBLIC_MESSAGE
+        );
+        assert!(
+            !content.contains("try again later"),
+            "an uncertain Turn must not invite a plain retry: {content}"
+        );
     }
 
     #[tokio::test]

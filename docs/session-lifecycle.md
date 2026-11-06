@@ -474,11 +474,16 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 
 | 経路 | `diagnostic`（`turn_runs`） | `public`（会話） |
 |---|---|---|
-| LLM / Tool 実行の失敗 | `user_facing_summary()` | 同じ文言（`TurnFailure::shared`） |
+| LLM / Tool 実行の失敗（`failed`） | `user_facing_summary()` | 同じ文言（`TurnFailure::shared`） |
+| LLM / Tool 実行の失敗（`uncertain`） | `user_facing_summary()` | `UNCERTAIN_FAILURE_PUBLIC_MESSAGE` |
 | resume 検証の失敗 | `config fingerprint mismatch on resume` 等の内部診断 | `RESUME_FAILED_PUBLIC_MESSAGE` |
 | dispatcher による破棄 | stop reason と内部 note | `TURN_REJECTED_PUBLIC_MESSAGE` |
 | 保存済み payload の解読失敗 | `DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE` | `DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE` |
 | 起動時 recovery | `recovered on startup: ...` | 出力未公開なら `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら `RECOVERED_UNCERTAIN_MESSAGE` |
+
+`uncertain` は外部出力や Tool 副作用が既に発生している可能性がある状態であり、同じ依頼を再送すると操作が重複し得る。そのため `failed` の「再度送ってください」という案内を流用せず、結果の確認を促す文言にする。
+
+会話エントリの文言は push チャネルにもそのまま使う。`TurnDispatcher` は失敗時に `turn-failure:<turn_id>` の保存済み本文を読み、observer への通知と Discord / Telegram への送信に同じ文字列を使う。文言を2箇所で組み立てると、片方だけが再実行を促す状態になり得るため。
 
 ### 10.3 crash recovery
 
