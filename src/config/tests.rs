@@ -35,13 +35,17 @@ fn runtime_endpoint_resolution_reads_only_state_root() {
 
 #[test]
 fn runtime_endpoint_resolution_uses_default_state_root_when_omitted() {
+    // The default root is derived from HOME, so pin it: other tests rewrite
+    // HOME through `EnvVarGuard`, and without the guard this assertion can
+    // observe one of their temporary directories instead.
     let dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", dir.path());
     let config_path = dir.path().join("egopulse.config.yaml");
     std::fs::write(&config_path, "default_provider: missing\n").expect("write config");
 
     let resolved = super::resolve_state_root(Some(&config_path)).expect("resolve endpoint");
 
-    assert_eq!(resolved, default_state_root().expect("default state root"));
+    assert_eq!(resolved, dir.path().join(".egopulse"));
 }
 
 #[test]
