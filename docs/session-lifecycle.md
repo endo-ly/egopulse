@@ -477,7 +477,7 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 | LLM / Tool 実行の失敗（`failed`） | `user_facing_summary()` | 同じ文言（`TurnFailure::shared`） |
 | LLM / Tool 実行の失敗（`uncertain`） | `user_facing_summary()` | `UNCERTAIN_FAILURE_PUBLIC_MESSAGE` |
 | resume 検証の失敗 | `config fingerprint mismatch on resume` 等の内部診断 | `RESUME_FAILED_PUBLIC_MESSAGE` |
-| dispatcher による破棄 | stop reason と内部 note | `TURN_REJECTED_PUBLIC_MESSAGE` |
+| dispatcher による破棄（`uncertain`） | stop reason と内部 note | `TURN_REJECTED_UNCERTAIN_PUBLIC_MESSAGE` |
 | 保存済み payload の解読失敗 | `DURABLE_PAYLOAD_INVALID_ERROR_MESSAGE` | `DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE` |
 | 起動時 recovery | `recovered on startup: ...` | 出力未公開なら `RECOVERED_FAILED_MESSAGE`、公開済みかもしれないなら `RECOVERED_UNCERTAIN_MESSAGE` |
 

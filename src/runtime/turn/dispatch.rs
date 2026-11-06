@@ -394,6 +394,14 @@ where
     }
 }
 
+/// Conversation text for a Turn the dispatcher stopped after execution had
+/// already begun.
+///
+/// Every state this path finalizes is past `input_committed`, where a response
+/// or a Tool side effect may already exist. The text must therefore not invite
+/// a plain retry the way a clean failure does.
+const TURN_REJECTED_UNCERTAIN_PUBLIC_MESSAGE: &str = "Turn was stopped before it completed. It may have already changed something outside EgoPulse, so check the result before sending your message again.";
+
 /// Persists the durable rejection of a turn, retrying across transient storage
 /// failures so a momentary DB hiccup does not leave a rejected turn runnable.
 /// Queued turns are cancelled; turns that already started execution are moved
@@ -416,10 +424,6 @@ where
 /// # Errors
 ///
 /// Returns [`EgoPulseError`] only when shutdown begins mid-retry.
-/// Conversation text for a Turn the dispatcher stopped before it completed.
-const TURN_REJECTED_PUBLIC_MESSAGE: &str =
-    "Turn was stopped before it completed. Please send your message again.";
-
 async fn persist_turn_rejection(
     state: &AppState,
     scope: crate::conversation::ConversationScope,
@@ -457,7 +461,7 @@ async fn persist_turn_rejection(
                         TurnFailure {
                             kind: reason,
                             diagnostic: note,
-                            public: TURN_REJECTED_PUBLIC_MESSAGE.to_string(),
+                            public: TURN_REJECTED_UNCERTAIN_PUBLIC_MESSAGE.to_string(),
                         },
                     ),
                 }
@@ -2122,6 +2126,92 @@ mod tests {
         assert!(
             result.is_err(),
             "startup recovery must abort (fail-closed) on storage failure"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatcher_rejection_does_not_invite_a_retry_after_execution_started() {
+        // Arrange: a Turn that already began its model iteration, so a response
+        // or Tool side effect may exist.
+        use crate::conversation::ConversationScope;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(final_provider()),
+        );
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("cli", "cli:rejection-text", "cli", "default")
+            .expect("chat");
+        let run = match state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "rejection-text",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept")
+        {
+            crate::storage::AcceptOutcome::Created(run)
+            | crate::storage::AcceptOutcome::Existing(run) => run,
+        };
+        let mut input =
+            crate::storage::StoredMessage::user(chat_id, "user".to_string(), "hello".to_string());
+        input.turn_id = Some(run.turn_id.clone());
+        state
+            .db
+            .commit_turn_input_with_conversation(&input, "[]", None, &run.turn_id, 1, Some("fp"))
+            .expect("commit input");
+        state
+            .db
+            .begin_turn_model_iteration(&run.turn_id, 1, "hash")
+            .expect("begin model");
+
+        // Act
+        persist_turn_rejection(
+            &state,
+            ConversationScope::Normal,
+            &run.turn_id,
+            "chain_depth_exceeded",
+            "origin chain terminated",
+        )
+        .await
+        .expect("reject");
+
+        // Assert: the operator keeps the stop reason, while the conversation
+        // asks the user to check the result instead of retrying.
+        let (turn_state, error_message): (String, String) = state
+            .db
+            .get_conn()
+            .expect("connection")
+            .query_row(
+                "SELECT state, error_message FROM turn_runs WHERE turn_id = ?1",
+                rusqlite::params![run.turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn run");
+        assert_eq!(turn_state, "uncertain");
+        assert_eq!(error_message, "origin chain terminated");
+        let content: String = state
+            .db
+            .get_conn()
+            .expect("connection")
+            .query_row(
+                "SELECT content FROM messages WHERE message_kind = 'turn_failure'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failure entry must be persisted");
+        assert_eq!(content, TURN_REJECTED_UNCERTAIN_PUBLIC_MESSAGE);
+        assert!(
+            content.contains("check the result"),
+            "an uncertain Turn must not invite a plain retry: {content}"
         );
     }
 

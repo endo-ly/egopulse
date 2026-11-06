@@ -208,7 +208,7 @@ for attempt in 1..=MAX_LLM_RETRIES {
 | retry loop | backoff が deadline を跨ぐ場合はリトライしない |
 | retry loop | 前処理と待機が deadline で打ち切られる（遅い `before_retry` を注入） |
 | storage | `TurnFailure` の `diagnostic` が `turn_runs` に、`public` が `messages` に入る |
-| dispatch | `uncertain` の会話エントリが再実行を促さない／push 通知が保存済み本文と一致する |
+| dispatch | `uncertain` の会話エントリが再実行を促さない（lifecycle 経由・dispatcher 破棄の両方）／push 通知が保存済み本文と一致する |
 | storage | `get_recent_context_messages` が `turn_failure` を除外する |
 | `shared_http_client` 相当 | 接続だけして応答しない TcpListener に対し、`read_timeout` で `is_timeout()` になる |
 | 回帰 | 既存の `retryable_llm_error_is_retried_within_same_iteration` が通る |
