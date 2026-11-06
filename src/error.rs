@@ -113,6 +113,9 @@ impl EgoPulseError {
             Self::Llm(LlmError::InvalidResponse(_)) => {
                 "LLM returned an invalid response.".to_string()
             }
+            Self::Llm(LlmError::DeadlineExceeded) => {
+                "LLM API request timed out. Please try again later.".to_string()
+            }
             Self::Storage(_) => "Internal storage error.".to_string(),
             _ => "An unexpected error occurred.".to_string(),
         }
@@ -325,6 +328,8 @@ pub enum LlmError {
     },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
+    #[error("llm_deadline_exceeded: no response within the model iteration deadline")]
+    DeadlineExceeded,
     #[error("llm_request_construction_failed: {0}")]
     RequestConstructionFailed(String),
 }
@@ -346,16 +351,18 @@ impl LlmError {
     /// the provider returned any body, or a 429 / 5xx response.
     ///
     /// Non-retryable variants (`InvalidResponse`, `InitFailed`,
-    /// `RequestConstructionFailed`, and 4xx other than 429) either indicate a
-    /// deterministic problem or imply the provider already produced a response
-    /// that must not be silently discarded.
+    /// `RequestConstructionFailed`, `DeadlineExceeded`, and 4xx other than 429)
+    /// either indicate a deterministic problem, imply the provider already
+    /// produced a response that must not be silently discarded, or mean the
+    /// iteration's time window is gone.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::RequestFailed(_) => true,
             Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
-            Self::InitFailed(_) | Self::InvalidResponse(_) | Self::RequestConstructionFailed(_) => {
-                false
-            }
+            Self::InitFailed(_)
+            | Self::InvalidResponse(_)
+            | Self::DeadlineExceeded
+            | Self::RequestConstructionFailed(_) => false,
         }
     }
 }
