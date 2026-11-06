@@ -1021,7 +1021,7 @@ async fn execute_and_publish_scheduled_turn(
                 }
             }
             if observer_key.is_some() {
-                let error_message = error.user_message();
+                let error_message = error.user_facing_summary();
                 let retain_observer = match retain_observer_for_staged_follow_up(state, turn).await
                 {
                     Ok(retain_observer) => retain_observer,
@@ -1053,7 +1053,9 @@ async fn execute_and_publish_scheduled_turn(
                 } else {
                     finish_observer(state, turn, error_message);
                 }
-            } else {
+            } else if turn.context.channel.as_str() != "web" {
+                // Web delivers failures through the persisted conversation
+                // entry, which `GET /api/history` serves after a reload.
                 send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
             }
         }
@@ -1811,6 +1813,58 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn failed_web_turn_persists_a_visible_failure_entry() {
+        // Arrange: every attempt fails, so the Turn never produces output.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let retry_count = crate::agent_loop::model_step::MAX_LLM_RETRIES;
+        let provider = RecordingProvider::new(
+            (0..retry_count)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        body_preview: "test failure".to_string(),
+                        retry_after_secs: None,
+                    })
+                })
+                .collect(),
+            vec![0; retry_count],
+        );
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        );
+        let mut context = crate::test_util::cli_context("web-failure-entry");
+        context.channel = "web".to_string();
+        context.chat_type = "web".to_string();
+
+        // Act
+        let result = execute_turn_with_progress_and_snapshot(
+            &state,
+            &context,
+            "hello",
+            state.config_manager.current_blocking(),
+            None,
+            None,
+        )
+        .await;
+
+        // Assert: the Web UI reads failures from history only, so the failure
+        // must exist as a conversation entry the agent will never read back.
+        assert!(result.is_err(), "failure must reach the caller");
+        let conn = state.db.get_conn().expect("connection");
+        let (content, turn_id): (String, String) = conn
+            .query_row(
+                "SELECT content, turn_id FROM messages WHERE message_kind = 'turn_failure'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("failure entry must be persisted");
+        assert_eq!(content, "LLM API server error. Please try again later.");
+        assert!(!turn_id.is_empty(), "failure entry must name its Turn");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
         use crate::llm::MessagesResponse;
         use crate::runtime::turn::ScheduledTurn;
@@ -2550,7 +2604,9 @@ mod tests {
                     assert_eq!(message_id, &format!("turn:{}:assistant:1", child_ids[0]));
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
-                    assert!(message.contains("follow-up 0 failed"));
+                    // The client sees the user-facing summary, never the raw
+                    // provider text; the Turn id is what identifies the child.
+                    assert_eq!(message, "LLM returned an invalid response.");
                     assert!(
                         !terminal,
                         "the first child error must not end the interaction"
@@ -2569,7 +2625,7 @@ mod tests {
                     assert_eq!(message_id, &format!("turn:{}:assistant:1", child_ids[1]));
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
-                    assert!(message.contains("follow-up 1 failed"));
+                    assert_eq!(message, "LLM returned an invalid response.");
                     assert!(terminal, "the last child error must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
                 }

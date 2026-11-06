@@ -1389,6 +1389,13 @@
     max-width: 60%;
   }
 
+  /* A failed Turn is a transcript entry, so it uses the reading width of an
+     assistant reply instead of the narrow system-notice width. */
+  .message-row.bubble-failure {
+    align-self: center;
+    width: min(900px, 100%);
+  }
+
   /* Tool outputs share the assistant row width so their left edge aligns,
       but the inner card/body is capped narrower so they read as metadata. */
   .message-row.bubble-tool {

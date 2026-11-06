@@ -375,7 +375,6 @@ describe("chatReducer retry and error", () => {
         seq: 2,
         state: "error",
         terminal: true,
-        errorMessage: "boom",
       },
       "lyre",
     );
@@ -383,7 +382,6 @@ describe("chatReducer retry and error", () => {
     // The partial message keeps its streamed id; nothing is renamed.
     expect(state.messages.map((m) => m.id)).toEqual([USER_ID, ASSISTANT_1]);
     expect(state.messages.find((m) => m.id === ASSISTANT_1)?.content).toBe("途中まで生成");
-    expect(state.error).toBe("boom");
     expect(isWaitingForAssistant(state)).toBe(false);
 
     // A history refetch carrying only the persisted input keeps both rows
@@ -419,7 +417,6 @@ describe("chatReducer retry and error", () => {
         seq: 2,
         state: "error",
         terminal: false,
-        errorMessage: "parent failed",
       },
       "lyre",
     );

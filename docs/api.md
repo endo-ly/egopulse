@@ -289,7 +289,7 @@ GET /api/history?session_key=main&limit=300&before_seq=6524
 
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 
-メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input, attachments}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。
+メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call` / `turn_failure`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input, attachments}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。`message_kind: "turn_failure"` のメッセージは Turn が応答を返さず終了した記録で、`content` はユーザー向けサマリ。WebUI はエラー項目として描画する。
 
 `attachments` は `send_attachment` が Web へ配信したファイルの配列で、各要素は `{id, filename, content_type, size_bytes}` を持つ。通常のツールでは空配列。WebUI は成功した `send_attachment` に `attachments` がある場合、ツールカードの代わりに添付カード（音声プレイヤーまたはダウンロード）を描画する。
 

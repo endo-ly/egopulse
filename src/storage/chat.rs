@@ -1033,12 +1033,19 @@ impl Database {
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
                         message_kind, recipient_agent_id, seq, turn_id, parent_message_id
                  FROM messages
-                 WHERE chat_id = ?1 AND seq IS NOT NULL
+                 WHERE chat_id = ?1 AND seq IS NOT NULL AND message_kind <> ?2
                  ORDER BY seq DESC
-                 LIMIT ?2",
+                 LIMIT ?3",
             )?;
             let mut messages = stmt
-                .query_map(params![chat_id, limit as i64], row_to_stored_message)?
+                .query_map(
+                    params![
+                        chat_id,
+                        super::MessageKind::TurnFailure.to_string(),
+                        limit as i64
+                    ],
+                    row_to_stored_message,
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             messages.reverse();
             messages
@@ -1337,6 +1344,43 @@ mod tests {
                 .messages_json
                 .is_none()
         );
+    }
+
+    #[test]
+    fn load_session_snapshot_excludes_turn_failure_entries() {
+        // Arrange: a conversation entry that reports a failed Turn is visible
+        // in history but must never reach the model as context.
+        let (db, _dir) = test_db();
+        let chat_id = 400;
+        store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
+        store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?2))",
+            rusqlite::params![
+                "turn-failure:turn-1",
+                chat_id,
+                "system",
+                "LLM API rate limited.",
+                "system",
+                "2024-01-01T00:00:02Z",
+                "turn_failure"
+            ],
+        )
+        .expect("store failure entry");
+
+        // Act
+        let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+
+        // Assert
+        let ids: Vec<&str> = snapshot
+            .recent_messages
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["msg-1", "msg-2"]);
     }
 
     #[test]

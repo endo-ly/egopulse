@@ -378,6 +378,10 @@ define_enum! {
         AgentSend => "agent_send",
         SystemEvent => "system_event",
         ToolCall => "tool_call",
+        // The Turn ended without a response. Persisted into the conversation so
+        // the failure survives a reload, and excluded from the LLM session
+        // snapshot so the agent never reads its own error back as context.
+        TurnFailure => "turn_failure",
     }
 }
 

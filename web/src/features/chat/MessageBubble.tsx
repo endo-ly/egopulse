@@ -21,7 +21,10 @@ export const MessageBubble = memo(function MessageBubble({
   pulseTrace,
   authToken,
 }: MessageBubbleProps) {
-  const cls = `message-row bubble-${message.sender_kind}`;
+  // A failed Turn is persisted as a transcript entry so it survives a reload;
+  // it reads as an error rather than as a system notice.
+  const isFailure = message.message_kind === "turn_failure";
+  const cls = `message-row bubble-${isFailure ? "failure" : message.sender_kind}`;
 
   return (
     <div className={cls}>
@@ -32,7 +35,7 @@ export const MessageBubble = memo(function MessageBubble({
         agentAvatars={agentAvatars}
       />
       {pulseTrace && <PulseTrace trace={pulseTrace} authToken={authToken} />}
-      <div className="message-body">
+      <div className={isFailure ? "message-body run-error" : "message-body"}>
         {message.sender_kind === "assistant" ? (
           <MarkdownRenderer content={message.content} />
         ) : (
