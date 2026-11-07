@@ -467,6 +467,58 @@ agents:
 
 #[test]
 #[serial]
+fn loader_parses_agent_mcp_servers() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let file_path = write_config(
+        &temp_dir,
+        r#"default_provider: openai
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-openai
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret
+default_agent: alice
+agents:
+  alice:
+    label: Alice
+    mcp_servers:
+      - " github "
+      - ""
+      - filesystem
+  bob:
+    label: Bob
+  carol:
+    label: Carol
+    mcp_servers: []"#,
+    );
+
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    let alice = config
+        .agents
+        .get(&super::AgentId::new("alice"))
+        .expect("alice");
+    assert_eq!(
+        alice.mcp_servers.as_deref(),
+        Some(["github".to_string(), "filesystem".to_string()].as_slice())
+    );
+    let bob = config.agents.get(&super::AgentId::new("bob")).expect("bob");
+    assert!(bob.mcp_servers.is_none());
+    let carol = config
+        .agents
+        .get(&super::AgentId::new("carol"))
+        .expect("carol");
+    assert_eq!(carol.mcp_servers, Some(Vec::new()));
+}
+
+#[test]
+#[serial]
 fn loader_normalizes_agent_reasoning_effort() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
@@ -528,6 +580,7 @@ fn save_load_round_trip_preserves_agent_profiles() {
             provider: Some("openai".to_string()),
             model: Some("gpt-5".to_string()),
             reasoning_effort: Some("high".to_string()),
+            mcp_servers: Some(vec!["github".to_string()]),
             profiles: HashMap::from([(
                 "voice".to_string(),
                 super::AgentProfileConfig {
@@ -601,6 +654,10 @@ fn save_load_round_trip_preserves_agent_profiles() {
     assert_eq!(voice.provider.as_deref(), Some("local"));
     assert_eq!(voice.model.as_deref(), Some("qwen2.5"));
     assert_eq!(alice.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        alice.mcp_servers.as_deref(),
+        Some(["github".to_string()].as_slice())
+    );
 }
 
 #[test]

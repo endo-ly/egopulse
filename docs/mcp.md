@@ -158,11 +158,35 @@ HTTP client transport で接続。`endpoint` に接続し `headers` を付与。
 
 ### 起動時初期化
 
-MCP は `AppState` 構築時に `McpManager::new()` で初期化される。各 server に接続後、`tools/list` でツール一覧を取得し、`create_tool_adapters()` で `McpToolAdapter` にラップして `ToolRegistry` に登録する。
+MCP は `AppState` 構築時に `McpManager::new()` で初期化される。各 server に接続後、`tools/list` でツール一覧を取得して `cached_tools` に保持する。公開は Turn ごとに `McpManager::all_tool_definitions()` が行う。
 
 ### 公開
 
-`McpToolAdapter` 経由で built-in tool と同じ `ToolDefinition` 形式で LLM に公開される。`ToolRegistry` は built-in / MCP の区別なく全 tool を一様に管理する。
+`McpManager` が保持する tool を `ToolRegistry::definitions_async()` が built-in tool と同じ `ToolDefinition` 形式で LLM に公開する。`ToolRegistry` は built-in / MCP の区別なく全 tool を一様に管理する。
+
+### Agent 別の公開範囲
+
+接続は全 agent で共有するが、各 agent が使える server は `egopulse.config.yaml` の `agents.<id>.mcp_servers` で制御する。
+
+| 設定 | 意味 |
+|---|---|
+| 省略（`null`） | 全 server |
+| `[]` | MCP tool なし |
+| `["github", "filesystem"]` | その server の tool のみ |
+
+```yaml
+agents:
+  reviewer:
+    label: Reviewer
+    mcp_servers: [github, filesystem]
+```
+
+- server 名は `mcp.json` の `mcpServers` のキー（sanitize 前）を指定する
+- 解決は Turn 開始時の config snapshot に対して行い、tool 定義と実行の判定を同じ snapshot で揃える
+- 公開されていない server の tool は LLM に定義を渡さない。呼ばれても `not_found` の `unknown tool` として扱う
+- 起動時に設定済み server と突き合わせ、未知の名前は `warn` を出す。未知の名前があっても runtime は起動する
+- `egopulse.config.yaml` のホットリロードは次 Turn から反映される
+- これは公開範囲の制御であり、server process は接続済み全 server の資格情報を持つ。agent ごとに資格情報を分離するには server 定義自体を分ける
 
 ### Tool Naming
 
@@ -171,9 +195,10 @@ LLM に見える名前は `mcp_{server}_{tool}` 形式。英数字と `_` 以外
 ### 実行フロー
 
 1. `ToolRegistry::execute()` が tool 名を受け取る
-2. `McpManager::is_mcp_tool()` で server と tool を特定
-3. `McpManager::execute_tool()` が `call_tool` を送信
-4. MCP response の content を text に整形
+2. `mcp_` で始まる名前を `McpManager::execute_tool_by_name()` へ渡す
+3. scope に含まれない server の tool は `not_found` の `unknown tool` となる
+4. `McpManager::execute_tool()` が `call_tool` を送信
+5. MCP response の content を text に整形
 
 ### 入力規則
 

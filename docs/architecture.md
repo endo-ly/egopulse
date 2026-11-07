@@ -387,7 +387,7 @@ TurnExecutor
        ├─ secret_db 初期化 (Config::needs_secret_db() が true の場合のみ)
        ├─ SkillManager 構築
       ├─ McpManager 初期化 (MCP server 接続)
-      ├─ ToolRegistry 構築 (built-in + MCP adapters)
+      ├─ ToolRegistry 構築 (built-in + MCP tools)
       ├─ ChannelAdapter 登録
       ├─ SOUL.md プロビジョニング
       ├─ Durable state recovery (running tool_calls → uncertain, interrupt された turn_runs を安全停止)

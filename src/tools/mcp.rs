@@ -4,7 +4,7 @@
 //! `mcp.json` / `mcp.d/*.json` から global + workspace の設定をマージし、
 //! stdio / streamable_http 両対応で接続する。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,8 +26,8 @@ use rmcp::transport::{
     streamable_http_client::StreamableHttpClientTransportConfig,
 };
 
-use crate::config::default_state_root;
 use crate::config::secret_ref::{DotenvFile, ResolvedValue, StringOrRef, resolve_string_or_ref};
+use crate::config::{AgentId, Config, default_state_root};
 use crate::error::{ConfigError, EgoPulseError, McpError};
 use crate::llm::ToolDefinition;
 use crate::tools::is_plausible_secret_value;
@@ -218,6 +218,63 @@ struct FailedServer {
     name: String,
     config: McpServerConfig,
     error: String,
+}
+
+/// MCP servers whose tools are visible to one agent.
+///
+/// The connection itself is shared by every agent; this scope only decides
+/// which definitions are published and which calls the runtime accepts.
+#[derive(Debug)]
+pub(crate) struct McpScope {
+    /// `None` keeps every configured server; `Some` is an allowlist.
+    allowed: Option<HashSet<String>>,
+}
+
+impl McpScope {
+    /// Every configured server is visible.
+    pub(crate) fn all() -> Self {
+        Self { allowed: None }
+    }
+
+    /// No MCP server is visible.
+    pub(crate) fn none() -> Self {
+        Self {
+            allowed: Some(HashSet::new()),
+        }
+    }
+
+    /// Builds a scope from an agent's `mcp_servers` setting.
+    ///
+    /// `None` inherits every server, matching the field's default. An empty
+    /// list hides all MCP tools from the agent.
+    pub(crate) fn from_servers(servers: Option<&[String]>) -> Self {
+        match servers {
+            None => Self::all(),
+            Some(servers) => Self {
+                allowed: Some(servers.iter().cloned().collect()),
+            },
+        }
+    }
+
+    /// Resolves the scope of `agent_id` in `config`.
+    ///
+    /// An agent missing from the configuration has no MCP access; turns for
+    /// such an agent cannot be created because LLM resolution fails first.
+    pub(crate) fn for_agent(config: &Config, agent_id: &str) -> Self {
+        config
+            .agents
+            .get(&AgentId::new(agent_id))
+            .map(|agent| Self::from_servers(agent.mcp_servers.as_deref()))
+            .unwrap_or_else(Self::none)
+    }
+
+    /// Whether tools from `server` are visible in this scope.
+    pub(crate) fn allows(&self, server: &str) -> bool {
+        match &self.allowed {
+            None => true,
+            Some(allowed) => allowed.contains(server),
+        }
+    }
 }
 
 pub(crate) struct McpManager {
@@ -542,21 +599,13 @@ impl McpManager {
         McpStatus { connected, failed }
     }
 
-    pub(crate) fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.servers
-            .iter()
-            .flat_map(|server| {
-                server.cached_tools.iter().map(|tool| {
-                    let full_name = sanitize_tool_name(&server.name, tool.name.as_ref());
-                    ToolDefinition {
-                        name: full_name,
-                        description: tool.description.clone().unwrap_or_default().to_string(),
-                        parameters: serde_json::to_value(&tool.input_schema)
-                            .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
-                    }
-                })
-            })
-            .collect()
+    pub(crate) fn all_tool_definitions(&self, scope: &McpScope) -> Vec<ToolDefinition> {
+        tool_definitions_for(
+            self.servers
+                .iter()
+                .filter(|server| scope.allows(&server.name))
+                .map(|server| (server.name.as_str(), server.cached_tools.as_slice())),
+        )
     }
 
     /// Returns `true` if the MCP tool's annotations indicate it is read-only.
@@ -583,9 +632,13 @@ impl McpManager {
         &self,
         sanitized_name: &str,
         input: serde_json::Value,
+        scope: &McpScope,
     ) -> Option<Result<String, McpError>> {
         let (server_idx, original_name) = self.tool_name_index.get(sanitized_name)?;
         let server = self.servers.get(*server_idx)?;
+        if !scope.allows(&server.name) {
+            return None;
+        }
         Some(
             self.execute_tool(
                 *server_idx,
@@ -805,6 +858,22 @@ fn build_tool_name_index(servers: &[ConnectedServer]) -> HashMap<String, (usize,
         }
     }
     index
+}
+
+fn tool_definitions_for<'a>(
+    servers: impl IntoIterator<Item = (&'a str, &'a [Tool])>,
+) -> Vec<ToolDefinition> {
+    servers
+        .into_iter()
+        .flat_map(|(server, tools)| {
+            tools.iter().map(move |tool| ToolDefinition {
+                name: sanitize_tool_name(server, tool.name.as_ref()),
+                description: tool.description.clone().unwrap_or_default().to_string(),
+                parameters: serde_json::to_value(&tool.input_schema)
+                    .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
+            })
+        })
+        .collect()
 }
 
 fn filter_tools_for_server(server_name: &str, tools: &[Tool]) -> Vec<Tool> {
@@ -1290,6 +1359,102 @@ mod tests {
         let result = sanitize_tool_name(&long_server, &long_tool);
         assert!(result.starts_with("mcp_"));
         assert!(result.len() <= 64);
+    }
+
+    #[test]
+    fn scope_semantics_follow_the_agent_setting() {
+        // Arrange / Act
+        let all = McpScope::all();
+        let listed = McpScope::from_servers(Some(&["github".to_string()]));
+        let empty = McpScope::from_servers(Some(&[]));
+        let inherited = McpScope::from_servers(None);
+
+        // Assert
+        assert!(all.allows("anything"));
+        assert!(listed.allows("github"));
+        assert!(!listed.allows("filesystem"));
+        assert!(!empty.allows("github"));
+        assert!(inherited.allows("filesystem"));
+    }
+
+    #[test]
+    fn scope_for_agent_reads_the_agent_allowlist() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        config.agents.insert(
+            AgentId::new("reviewer"),
+            crate::config::AgentConfig {
+                label: "Reviewer".to_string(),
+                mcp_servers: Some(vec!["github".to_string()]),
+                ..Default::default()
+            },
+        );
+
+        // Act
+        let reviewer = McpScope::for_agent(&config, "reviewer");
+        let default_agent = McpScope::for_agent(&config, "default");
+        let unknown = McpScope::for_agent(&config, "ghost");
+
+        // Assert
+        assert!(reviewer.allows("github"));
+        assert!(!reviewer.allows("filesystem"));
+        assert!(default_agent.allows("filesystem"));
+        assert!(!unknown.allows("filesystem"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manager_scopes_definitions_and_calls_to_allowed_servers() {
+        // Arrange: two servers expose one tool each.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join(".egopulse");
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp_tools_server.py")
+            .to_string_lossy()
+            .to_string();
+        let servers = serde_json::json!({"mcpServers": {
+            "alpha": {"transport": "stdio", "command": "python3", "args": [fixture, "ping"]},
+            "beta": {"transport": "stdio", "command": "python3", "args": [fixture, "pong"]},
+        }});
+        std::fs::write(state_root.join("mcp.json"), servers.to_string()).expect("write mcp.json");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut manager = McpManager::new(&workspace, DotenvFile::default())
+            .await
+            .expect("manager");
+        let alpha_only = McpScope::from_servers(Some(&["alpha".to_string()]));
+        let definition_names = |scope: &McpScope| -> Vec<String> {
+            let mut names: Vec<String> = manager
+                .all_tool_definitions(scope)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Act / Assert: definitions follow the scope.
+        assert_eq!(
+            definition_names(&McpScope::all()),
+            vec!["mcp_alpha_ping", "mcp_beta_pong"]
+        );
+        assert_eq!(definition_names(&alpha_only), vec!["mcp_alpha_ping"]);
+        assert!(definition_names(&McpScope::none()).is_empty());
+
+        // Act / Assert: calls follow the same scope.
+        let allowed = manager
+            .execute_tool_by_name("mcp_alpha_ping", serde_json::json!({}), &alpha_only)
+            .await;
+        assert_eq!(allowed.expect("alpha allowed").expect("call"), "ping:ok");
+        let denied = manager
+            .execute_tool_by_name("mcp_beta_pong", serde_json::json!({}), &alpha_only)
+            .await;
+        assert!(denied.is_none(), "beta must not execute outside the scope");
+
+        manager.shutdown().await;
     }
 
     #[test]

@@ -686,7 +686,9 @@ impl TurnExecutor<'_> {
             format_direct_input(user_input, &received_at, &config_snapshot.config.timezone),
         );
 
-        let tool_defs = self.state.tools.definitions_async().await;
+        let mcp_scope =
+            crate::tools::mcp::McpScope::for_agent(&config_snapshot.config, &self.context.agent_id);
+        let tool_defs = self.state.tools.definitions_async(&mcp_scope).await;
         let tools_json = serde_json::to_string(&tool_defs).ok();
 
         // The Turn's input message keeps the canonical request key as its
