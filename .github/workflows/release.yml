@@ -129,7 +129,7 @@ jobs:
       matrix:
         target:
           - label: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             bin: egopulse
             target_triple: x86_64-unknown-linux-gnu
             asset_triple: x86_64-unknown-linux-gnu
