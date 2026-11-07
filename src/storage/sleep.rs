@@ -121,35 +121,6 @@ fn finish_step_in_tx(
     Ok(())
 }
 
-fn finish_memory_steps_in_tx(
-    tx: &Transaction<'_>,
-    sleep_run_id: &str,
-    result: SleepStepResult<'_>,
-) -> Result<(), StorageError> {
-    for (step_name, input_tokens, output_tokens) in [
-        (
-            SleepStepName::SemanticUpdate,
-            result.input_tokens,
-            result.output_tokens,
-        ),
-        (SleepStepName::ProspectiveUpdate, 0, 0),
-    ] {
-        finish_step_in_tx(
-            tx,
-            sleep_run_id,
-            step_name,
-            SleepStepResult {
-                status: result.status,
-                input_tokens,
-                output_tokens,
-                error_message: result.error_message,
-                metadata_json: result.metadata_json,
-            },
-        )?;
-    }
-    Ok(())
-}
-
 fn row_to_sleep_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SleepRun> {
     let status = parse_row_enum!(row, 2, SleepRunStatus)?;
     let trigger = parse_row_enum!(row, 3, SleepRunTrigger)?;
@@ -496,39 +467,6 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically transitions both memory update steps from pending to running.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when either step is not pending or database access fails.
-    pub(crate) fn start_memory_update_steps(&self, sleep_run_id: &str) -> Result<(), StorageError> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let pending = SleepStepStatus::Pending.to_string();
-        let running = SleepStepStatus::Running.to_string();
-
-        for step_name in [
-            SleepStepName::SemanticUpdate,
-            SleepStepName::ProspectiveUpdate,
-        ] {
-            let changed = tx.execute(
-                "UPDATE sleep_run_steps
-                 SET status = ?1, started_at = ?2
-                 WHERE sleep_run_id = ?3 AND step_name = ?4 AND status = ?5",
-                params![running, now, sleep_run_id, step_name.to_string(), pending],
-            )?;
-            if changed == 0 {
-                return Err(StorageError::Conflict(format!(
-                    "sleep_run_step:{sleep_run_id}:{step_name} is not pending"
-                )));
-            }
-        }
-
-        tx.commit()?;
-        Ok(())
-    }
-
     /// Finishes a running sleep step with terminal status, tokens, and metadata.
     ///
     /// # Errors
@@ -568,61 +506,6 @@ impl Database {
                 step_name
             )));
         }
-        Ok(())
-    }
-
-    /// Atomically finishes both memory update steps with the same terminal status.
-    ///
-    /// The shared LLM usage is recorded once on `semantic_update` so run-level
-    /// aggregation does not double count it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when either step is not running or database access fails.
-    pub(crate) fn finish_memory_update_steps(
-        &self,
-        sleep_run_id: &str,
-        result: SleepStepResult<'_>,
-    ) -> Result<(), StorageError> {
-        let mut conn = self.get_conn()?;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = chrono::Utc::now().to_rfc3339();
-        let running = SleepStepStatus::Running.to_string();
-
-        for (step_name, input_tokens, output_tokens) in [
-            (
-                SleepStepName::SemanticUpdate,
-                result.input_tokens,
-                result.output_tokens,
-            ),
-            (SleepStepName::ProspectiveUpdate, 0, 0),
-        ] {
-            let changed = tx.execute(
-                "UPDATE sleep_run_steps
-                 SET status = ?1, finished_at = ?2,
-                     input_tokens = ?3, output_tokens = ?4,
-                     error_message = ?5, metadata_json = ?6
-                 WHERE sleep_run_id = ?7 AND step_name = ?8 AND status = ?9",
-                params![
-                    result.status.to_string(),
-                    now,
-                    input_tokens,
-                    output_tokens,
-                    result.error_message,
-                    result.metadata_json,
-                    sleep_run_id,
-                    step_name.to_string(),
-                    running,
-                ],
-            )?;
-            if changed == 0 {
-                return Err(StorageError::Conflict(format!(
-                    "sleep_run_step:{sleep_run_id}:{step_name} is not running"
-                )));
-            }
-        }
-
-        tx.commit()?;
         Ok(())
     }
 
@@ -687,43 +570,50 @@ impl Database {
         Ok(())
     }
 
-    /// Atomically advances all shared Memory Update checkpoints and finishes
-    /// semantic/prospective with the same terminal status.
-    pub(crate) fn commit_memory_update_success(
+    /// Atomically records the semantic snapshot, advances the semantic event
+    /// checkpoint, and marks `semantic_update` successful.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StorageError::Conflict` when `result` is not success, when the
+    /// checkpoint is not the agent's `semantic_update` / `episode_events`
+    /// cursor, when the checkpoint does not advance, or when the step is not
+    /// running.
+    pub(crate) fn commit_semantic_update_success(
         &self,
         sleep_run_id: &str,
         agent_id: &str,
+        content_before: &str,
+        content_after: &str,
+        checkpoint: &SleepStepCheckpoint,
         result: SleepStepResult<'_>,
-        checkpoints: &[SleepStepCheckpoint],
-        snapshots: &[(MemoryFile, String, String)],
     ) -> Result<(), StorageError> {
-        require_success_result("commit_memory_update_success", &result)?;
-        for checkpoint in checkpoints {
-            if !matches!(
+        require_success_result("commit_semantic_update_success", &result)?;
+        if checkpoint.step_name != SleepStepName::SemanticUpdate
+            || checkpoint.source_kind != CheckpointSourceKind::EpisodeEvents
+            || checkpoint.agent_id != agent_id
+            || checkpoint.source_id != agent_id
+        {
+            return Err(StorageError::Conflict(format!(
+                "invalid semantic update checkpoint scope: agent={} step={} source={}:{}",
+                checkpoint.agent_id,
                 checkpoint.step_name,
-                SleepStepName::SemanticUpdate | SleepStepName::ProspectiveUpdate
-            ) || checkpoint.agent_id != agent_id
-            {
-                return Err(StorageError::Conflict(format!(
-                    "invalid memory update checkpoint scope: agent={} step={}",
-                    checkpoint.agent_id, checkpoint.step_name,
-                )));
-            }
+                checkpoint.source_kind,
+                checkpoint.source_id,
+            )));
         }
         let mut conn = self.get_conn()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for (file, content_before, content_after) in snapshots {
-            insert_memory_snapshot_in_tx(
-                &tx,
-                sleep_run_id,
-                agent_id,
-                *file,
-                content_before,
-                content_after,
-            )?;
-        }
-        commit_checkpoints_in_tx(&tx, checkpoints)?;
-        finish_memory_steps_in_tx(&tx, sleep_run_id, result)?;
+        insert_memory_snapshot_in_tx(
+            &tx,
+            sleep_run_id,
+            agent_id,
+            MemoryFile::Semantic,
+            content_before,
+            content_after,
+        )?;
+        commit_checkpoints_in_tx(&tx, std::slice::from_ref(checkpoint))?;
+        finish_step_in_tx(&tx, sleep_run_id, SleepStepName::SemanticUpdate, result)?;
         tx.commit()?;
         Ok(())
     }
@@ -919,18 +809,11 @@ impl Database {
                  AND event_checkpoint.step_name = 'event_extraction'
                  AND event_checkpoint.source_kind = 'messages'
                  AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
-                LEFT JOIN sleep_step_checkpoints prospective_checkpoint
-                  ON prospective_checkpoint.agent_id = c.agent_id
-                 AND prospective_checkpoint.step_name = 'prospective_update'
-                 AND prospective_checkpoint.source_kind = 'messages'
-                 AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
                 WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
                   AND m.seq IS NOT NULL
                   AND (
                        event_checkpoint.cursor_at IS NULL
                        OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
-                       OR prospective_checkpoint.cursor_at IS NULL
-                       OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
                   )
                 GROUP BY m.chat_id, m.id
              )",
@@ -938,6 +821,31 @@ impl Database {
             |row| row.get(0),
         )
         .map_err(Into::into)
+    }
+
+    /// Returns whether episode events exist after the agent's `semantic_update`
+    /// checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database access failure.
+    pub(crate) fn has_agent_pending_semantic_events(
+        &self,
+        agent_id: &str,
+    ) -> Result<bool, StorageError> {
+        let Some(latest) = self.get_latest_episode_event_cursor(agent_id)? else {
+            return Ok(false);
+        };
+        let checkpoint = self.get_sleep_checkpoint(
+            agent_id,
+            SleepStepName::SemanticUpdate,
+            CheckpointSourceKind::EpisodeEvents,
+            agent_id,
+        )?;
+        Ok(match checkpoint {
+            Some(checkpoint) => (checkpoint.cursor_at, checkpoint.cursor_id) < latest,
+            None => true,
+        })
     }
 
     pub(crate) fn get_agent_sessions_with_pending_sleep_messages(
@@ -970,18 +878,11 @@ impl Database {
                  AND event_checkpoint.step_name = 'event_extraction'
                  AND event_checkpoint.source_kind = 'messages'
                  AND event_checkpoint.source_id = CAST(c.chat_id AS TEXT)
-                LEFT JOIN sleep_step_checkpoints prospective_checkpoint
-                  ON prospective_checkpoint.agent_id = c.agent_id
-                 AND prospective_checkpoint.step_name = 'prospective_update'
-                 AND prospective_checkpoint.source_kind = 'messages'
-                 AND prospective_checkpoint.source_id = CAST(c.chat_id AS TEXT)
                 WHERE c.agent_id = ?1 AND c.chat_type != 'voice'
                   AND m.seq IS NOT NULL
                   AND (
                        event_checkpoint.cursor_at IS NULL
                        OR (m.timestamp, m.id) > (event_checkpoint.cursor_at, event_checkpoint.cursor_id)
-                       OR prospective_checkpoint.cursor_at IS NULL
-                       OR (m.timestamp, m.id) > (prospective_checkpoint.cursor_at, prospective_checkpoint.cursor_id)
                   )
              )
              SELECT
@@ -1067,7 +968,7 @@ impl Database {
     }
 
     /// Returns, for each of `run_ids` that published changes, the memory files
-    /// it changed in `episodic` → `semantic` → `prospective` order.
+    /// it changed in `episodic` → `semantic` order.
     ///
     /// The same publication rule as [`Database::list_memory_changes`] applies:
     /// only runs finalized as `success` / `partial_failure` count, and
@@ -1093,8 +994,7 @@ impl Database {
              WHERE ms.run_id IN ({run_id_placeholders})
                AND ms.content_before != ms.content_after
                AND sr.status IN (?, ?)
-             ORDER BY CASE ms.file
-                 WHEN 'episodic' THEN 0 WHEN 'semantic' THEN 1 ELSE 2 END"
+             ORDER BY CASE ms.file WHEN 'episodic' THEN 0 ELSE 1 END"
         );
         let mut values: Vec<rusqlite::types::Value> =
             run_ids.iter().map(|id| id.clone().into()).collect();
@@ -1118,7 +1018,7 @@ impl Database {
     /// does not yet have one for this run, so the publication bundle has a
     /// complete snapshot set regardless of which steps ran or were skipped.
     ///
-    /// `base` is `(MemoryFile, base_content)` for each of the three files.
+    /// `base` is `(MemoryFile, base_content)` for each memory file.
     ///
     /// # Errors
     ///
@@ -1277,7 +1177,7 @@ mod tests {
     }
 
     #[test]
-    fn try_create_sleep_run_inserts_four_pending_steps_atomically() {
+    fn try_create_sleep_run_inserts_three_pending_steps_atomically() {
         // Arrange
         let (db, _dir) = test_db();
 
@@ -1287,13 +1187,12 @@ mod tests {
             .expect("try create")
             .expect("should insert");
 
-        // Assert: 4 step rows created with pending status
+        // Assert: 3 step rows created with pending status
         let steps = db.list_sleep_run_steps(&id).expect("list steps");
-        assert_eq!(steps.len(), 4, "should have 4 step rows");
+        assert_eq!(steps.len(), 3, "should have 3 step rows");
         assert_eq!(steps[0].step_name, SleepStepName::EpisodicUpdate);
         assert_eq!(steps[1].step_name, SleepStepName::EventExtraction);
-        assert_eq!(steps[2].step_name, SleepStepName::ProspectiveUpdate);
-        assert_eq!(steps[3].step_name, SleepStepName::SemanticUpdate);
+        assert_eq!(steps[2].step_name, SleepStepName::SemanticUpdate);
         for step in &steps {
             assert_eq!(step.status, SleepStepStatus::Pending);
             assert!(step.started_at.is_none(), "started_at should be NULL");
@@ -1340,7 +1239,7 @@ mod tests {
 
     #[test]
     fn sleep_step_lifecycle_rejects_invalid_transition() {
-        // Arrange: run with 4 pending steps
+        // Arrange: run with pending steps
         let (db, _dir) = test_db();
         let run_id = db
             .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
@@ -1414,7 +1313,6 @@ mod tests {
         finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 10, 5);
         finish_step_failed(&db, &run_id, SleepStepName::EpisodicUpdate, "LLM error");
         skip_step(&db, &run_id, SleepStepName::SemanticUpdate);
-        skip_step(&db, &run_id, SleepStepName::ProspectiveUpdate);
         let status = db.finalize_sleep_run(&run_id).expect("finalize");
         assert_eq!(status, SleepRunStatus::PartialFailure);
         let run = db.get_sleep_run(&run_id).expect("get").expect("run");
@@ -1462,19 +1360,7 @@ mod tests {
             .expect("inserted");
         finish_step_success(&db, &run_id, SleepStepName::EventExtraction, 100, 50);
         finish_step_success(&db, &run_id, SleepStepName::EpisodicUpdate, 200, 80);
-        db.start_memory_update_steps(&run_id)
-            .expect("start memory update");
-        db.finish_memory_update_steps(
-            &run_id,
-            SleepStepResult {
-                status: SleepStepStatus::Success,
-                input_tokens: 300,
-                output_tokens: 120,
-                error_message: None,
-                metadata_json: None,
-            },
-        )
-        .expect("finish memory update");
+        finish_step_success(&db, &run_id, SleepStepName::SemanticUpdate, 300, 120);
 
         // Act
         db.finalize_sleep_run(&run_id).expect("finalize");
@@ -1484,20 +1370,6 @@ mod tests {
         assert_eq!(run.input_tokens, 600);
         assert_eq!(run.output_tokens, 250);
         assert_eq!(run.total_tokens, 850);
-
-        let steps = db.list_sleep_run_steps(&run_id).expect("steps");
-        let semantic = steps
-            .iter()
-            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
-            .expect("semantic step");
-        let prospective = steps
-            .iter()
-            .find(|step| step.step_name == SleepStepName::ProspectiveUpdate)
-            .expect("prospective step");
-        assert_eq!(semantic.status, SleepStepStatus::Success);
-        assert_eq!(prospective.status, SleepStepStatus::Success);
-        assert_eq!(semantic.input_tokens, 300);
-        assert_eq!(prospective.input_tokens, 0);
     }
 
     #[test]
@@ -1689,10 +1561,6 @@ mod tests {
         assert!(db.list_sleep_run_steps(&id).expect("steps").is_empty());
     }
 
-    // ---------------------------------------------------------------------------
-    // Message range queries (event extract refactor)
-    // ---------------------------------------------------------------------------
-
     fn finish_step_success(
         db: &Database,
         run_id: &str,
@@ -1854,7 +1722,7 @@ mod tests {
         let fixtures = [
             ("both", "success", ("semantic", "a", "b")),
             ("both", "success", ("episodic", "a", "b")),
-            ("partial", "partial_failure", ("prospective", "a", "b")),
+            ("partial", "partial_failure", ("semantic", "a", "b")),
             ("unchanged", "success", ("episodic", "a", "a")),
             ("pending", "running", ("episodic", "a", "b")),
             ("not-asked", "success", ("episodic", "a", "b")),
@@ -1874,6 +1742,322 @@ mod tests {
             changed["both"],
             vec![MemoryFile::Episodic, MemoryFile::Semantic]
         );
-        assert_eq!(changed["partial"], vec![MemoryFile::Prospective]);
+        assert_eq!(changed["partial"], vec![MemoryFile::Semantic]);
+    }
+
+    fn insert_checkpoint(
+        db: &Database,
+        agent_id: &str,
+        step_name: &str,
+        source_kind: &str,
+        source_id: &str,
+        cursor_at: &str,
+        cursor_id: &str,
+    ) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO sleep_step_checkpoints
+                (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                agent_id,
+                step_name,
+                source_kind,
+                source_id,
+                cursor_at,
+                cursor_id,
+                "2026-01-01T00:00:00+00:00",
+            ],
+        )
+        .expect("insert checkpoint");
+    }
+
+    fn insert_message(db: &Database, agent_id: &str, chat_id: i64, id: &str, timestamp: &str) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+             VALUES (?1, ?2, 'alice', 'hi', 'user', ?3, 'message',
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?2))",
+            params![id, chat_id, timestamp],
+        )
+        .expect("insert message");
+        conn.execute(
+            "INSERT OR IGNORE INTO chats
+                (chat_id, chat_type, last_message_time, channel, external_chat_id, agent_id)
+             VALUES (?1, 'direct', ?2, 'test', ?3, ?4)",
+            params![chat_id, timestamp, format!("test:chat{chat_id}"), agent_id],
+        )
+        .expect("insert chat");
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (chat_id, messages_json, updated_at)
+             VALUES (?1, '[{\"role\":\"user\",\"content\":\"hi\"}]', ?2)",
+            params![chat_id, timestamp],
+        )
+        .expect("insert session");
+    }
+
+    #[test]
+    fn commit_semantic_update_success_rejects_foreign_checkpoint_scope() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        db.start_sleep_step(&run_id, SleepStepName::SemanticUpdate)
+            .expect("start semantic");
+        let result = || SleepStepResult {
+            status: SleepStepStatus::Success,
+            input_tokens: 10,
+            output_tokens: 5,
+            error_message: None,
+            metadata_json: None,
+        };
+        let checkpoints = [
+            SleepStepCheckpoint {
+                agent_id: "agent-a".to_string(),
+                step_name: SleepStepName::EventExtraction,
+                source_kind: CheckpointSourceKind::Messages,
+                source_id: "agent-a".to_string(),
+                cursor_at: "2026-01-01T00:00:01Z".to_string(),
+                cursor_id: "m-1".to_string(),
+                updated_at: "2026-01-01T00:00:01Z".to_string(),
+            },
+            SleepStepCheckpoint {
+                agent_id: "agent-a".to_string(),
+                step_name: SleepStepName::SemanticUpdate,
+                source_kind: CheckpointSourceKind::Messages,
+                source_id: "agent-a".to_string(),
+                cursor_at: "2026-01-01T00:00:01Z".to_string(),
+                cursor_id: "m-1".to_string(),
+                updated_at: "2026-01-01T00:00:01Z".to_string(),
+            },
+            SleepStepCheckpoint {
+                agent_id: "agent-b".to_string(),
+                step_name: SleepStepName::SemanticUpdate,
+                source_kind: CheckpointSourceKind::EpisodeEvents,
+                source_id: "agent-a".to_string(),
+                cursor_at: "2026-01-01T00:00:01Z".to_string(),
+                cursor_id: "e-1".to_string(),
+                updated_at: "2026-01-01T00:00:01Z".to_string(),
+            },
+            SleepStepCheckpoint {
+                agent_id: "agent-a".to_string(),
+                step_name: SleepStepName::SemanticUpdate,
+                source_kind: CheckpointSourceKind::EpisodeEvents,
+                source_id: "agent-b".to_string(),
+                cursor_at: "2026-01-01T00:00:01Z".to_string(),
+                cursor_id: "e-1".to_string(),
+                updated_at: "2026-01-01T00:00:01Z".to_string(),
+            },
+        ];
+
+        // Act / Assert
+        for checkpoint in checkpoints {
+            let error = db
+                .commit_semantic_update_success(
+                    &run_id,
+                    "agent-a",
+                    "before",
+                    "after",
+                    &checkpoint,
+                    result(),
+                )
+                .expect_err("foreign checkpoint must be rejected");
+            assert!(matches!(error, StorageError::Conflict(_)));
+        }
+
+        let snapshots = db.get_snapshots_for_run(&run_id).expect("snapshots");
+        assert!(snapshots.is_empty());
+        let checkpoint = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "agent-a",
+            )
+            .expect("read checkpoint");
+        assert!(checkpoint.is_none());
+        let steps = db.list_sleep_run_steps(&run_id).expect("steps");
+        let semantic = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step");
+        assert_eq!(semantic.status, SleepStepStatus::Running);
+    }
+
+    #[test]
+    fn commit_semantic_update_success_records_snapshot_checkpoint_and_step() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run_id = db
+            .try_create_sleep_run("agent-a", SleepRunTrigger::Manual)
+            .expect("create")
+            .expect("run id");
+        db.start_sleep_step(&run_id, SleepStepName::SemanticUpdate)
+            .expect("start semantic");
+        let checkpoint = SleepStepCheckpoint {
+            agent_id: "agent-a".to_string(),
+            step_name: SleepStepName::SemanticUpdate,
+            source_kind: CheckpointSourceKind::EpisodeEvents,
+            source_id: "agent-a".to_string(),
+            cursor_at: "2026-01-01T00:00:01Z".to_string(),
+            cursor_id: "e-1".to_string(),
+            updated_at: "2026-01-01T00:00:01Z".to_string(),
+        };
+
+        // Act
+        db.commit_semantic_update_success(
+            &run_id,
+            "agent-a",
+            "# Semantic\n- old",
+            "# Semantic\n- new",
+            &checkpoint,
+            SleepStepResult {
+                status: SleepStepStatus::Success,
+                input_tokens: 10,
+                output_tokens: 5,
+                error_message: None,
+                metadata_json: None,
+            },
+        )
+        .expect("commit");
+
+        // Assert
+        let snapshots = db.get_snapshots_for_run(&run_id).expect("snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].file, MemoryFile::Semantic);
+        assert_eq!(snapshots[0].content_before, "# Semantic\n- old");
+        assert_eq!(snapshots[0].content_after, "# Semantic\n- new");
+        let stored = db
+            .get_sleep_checkpoint(
+                "agent-a",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "agent-a",
+            )
+            .expect("checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(stored.cursor_at, checkpoint.cursor_at);
+        assert_eq!(stored.cursor_id, checkpoint.cursor_id);
+        let steps = db.list_sleep_run_steps(&run_id).expect("steps");
+        let semantic = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step");
+        assert_eq!(semantic.status, SleepStepStatus::Success);
+        assert_eq!(semantic.input_tokens, 10);
+        assert_eq!(semantic.output_tokens, 5);
+    }
+
+    #[test]
+    fn pending_sleep_messages_follow_event_extraction_checkpoint_only() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let chat_id = 1;
+        insert_message(&db, "agent-a", chat_id, "m-1", "2026-01-01T00:00:01Z");
+        insert_message(&db, "agent-a", chat_id, "m-2", "2026-01-01T00:00:02Z");
+        insert_message(&db, "agent-a", chat_id, "m-3", "2026-01-01T00:00:03Z");
+
+        // Act / Assert: before any checkpoint every message is pending.
+        assert_eq!(
+            db.count_agent_pending_sleep_messages("agent-a")
+                .expect("count"),
+            3
+        );
+
+        insert_checkpoint(
+            &db,
+            "agent-a",
+            "event_extraction",
+            "messages",
+            "1",
+            "2026-01-01T00:00:01Z",
+            "m-1",
+        );
+
+        // Act / Assert: only messages after the event checkpoint are pending.
+        assert_eq!(
+            db.count_agent_pending_sleep_messages("agent-a")
+                .expect("count"),
+            2
+        );
+        let sessions = db
+            .get_agent_sessions_with_pending_sleep_messages("agent-a", 10)
+            .expect("sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].chat_id, chat_id);
+
+        // Once the checkpoint reaches the last message the session drops out.
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "UPDATE sleep_step_checkpoints
+             SET cursor_at = '2026-01-01T00:00:03Z', cursor_id = 'm-3'
+             WHERE agent_id = 'agent-a' AND step_name = 'event_extraction'",
+            [],
+        )
+        .expect("advance checkpoint");
+        assert_eq!(
+            db.count_agent_pending_sleep_messages("agent-a")
+                .expect("count"),
+            0
+        );
+        assert!(
+            db.get_agent_sessions_with_pending_sleep_messages("agent-a", 10)
+                .expect("sessions")
+                .is_empty()
+        );
+    }
+
+    fn insert_episode_event(db: &Database, agent_id: &str, id: &str, encoded_at: &str) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO episode_events
+                (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                 ripple_strength, certainty, sleep_run_id, source_refs_json,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3, 'insight', ?4, 'body', 3, 'stated', 'backfill', NULL, ?3, ?3)",
+            params![id, agent_id, encoded_at, format!("event {id}")],
+        )
+        .expect("insert episode event");
+    }
+
+    #[test]
+    fn pending_semantic_events_follow_the_semantic_checkpoint() {
+        // Arrange
+        let (db, _dir) = test_db();
+        assert!(
+            !db.has_agent_pending_semantic_events("agent-a")
+                .expect("initial")
+        );
+
+        // Act / Assert: an event without a checkpoint is pending.
+        insert_episode_event(&db, "agent-a", "e-1", "2026-01-01T00:00:01Z");
+        assert!(
+            db.has_agent_pending_semantic_events("agent-a")
+                .expect("after event")
+        );
+
+        // A checkpoint at the latest event marks it processed.
+        insert_checkpoint(
+            &db,
+            "agent-a",
+            "semantic_update",
+            "episode_events",
+            "agent-a",
+            "2026-01-01T00:00:01Z",
+            "e-1",
+        );
+        assert!(
+            !db.has_agent_pending_semantic_events("agent-a")
+                .expect("after checkpoint")
+        );
+
+        // A newer event makes the backlog pending again.
+        insert_episode_event(&db, "agent-a", "e-2", "2026-01-01T00:00:02Z");
+        assert!(
+            db.has_agent_pending_semantic_events("agent-a")
+                .expect("after newer event")
+        );
     }
 }

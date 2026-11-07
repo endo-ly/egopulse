@@ -14,7 +14,6 @@ use crate::storage::{
 };
 
 use super::SleepBatchError;
-use super::memory_update;
 use super::prompt::{escape_xml_content, normalize_llm_response};
 
 /// Guard message injected on retry when the event extraction response is not valid JSON.
@@ -298,9 +297,9 @@ pub(crate) fn build_extract_chunks(
             message_count: 0,
             estimated_tokens: 0,
         };
-        let blocks = memory_update::session_blocks(&session_info, &text, max_chars);
+        let blocks = session_blocks(&session_info, &text, max_chars);
         for block in blocks {
-            memory_update::append_chunk_block(&mut chunks, &mut current, block, max_chars);
+            append_chunk_block(&mut chunks, &mut current, block, max_chars);
         }
     }
 
@@ -308,6 +307,84 @@ pub(crate) fn build_extract_chunks(
         chunks.push(current);
     }
     Ok(chunks)
+}
+
+pub(super) fn session_blocks(
+    session: &crate::storage::AgentSessionInfo,
+    messages: &str,
+    max_chars: usize,
+) -> Vec<String> {
+    let open = format!(
+        "<session channel=\"{}\" chat=\"{}\">",
+        session.channel, session.external_chat_id
+    );
+    let close = "</session>";
+    let wrapper_chars = open.len() + close.len() + 3;
+    let body_max_chars = max_chars.saturating_sub(wrapper_chars).max(1);
+    let parts = split_text_by_chars(messages, body_max_chars);
+    let total = parts.len();
+
+    parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, part)| {
+            if total == 1 {
+                format!("{open}\n{part}\n{close}\n")
+            } else {
+                format!(
+                    "<session channel=\"{}\" chat=\"{}\" chunk=\"{}\" chunks=\"{}\">\n{}\n</session>\n",
+                    session.channel,
+                    session.external_chat_id,
+                    index + 1,
+                    total,
+                    part
+                )
+            }
+        })
+        .collect()
+}
+
+pub(super) fn append_chunk_block(
+    chunks: &mut Vec<String>,
+    current: &mut String,
+    block: String,
+    max_chars: usize,
+) {
+    if !current.is_empty() && current.len().saturating_add(block.len()) > max_chars {
+        chunks.push(std::mem::take(current));
+    }
+    current.push_str(&block);
+}
+
+fn split_text_by_chars(text: &str, max_chars: usize) -> Vec<String> {
+    if text.is_empty() || text.chars().count() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let mut end = nth_char_boundary(text, start, max_chars).unwrap_or(text.len());
+        if end < text.len()
+            && let Some(relative_newline) = text[start..end].rfind('\n')
+        {
+            let newline_end = start + relative_newline + 1;
+            if newline_end > start {
+                end = newline_end;
+            }
+        }
+        parts.push(text[start..end].trim().to_string());
+        start = end;
+    }
+
+    parts
+}
+
+fn nth_char_boundary(text: &str, start: usize, max_chars: usize) -> Option<usize> {
+    text[start..]
+        .char_indices()
+        .nth(max_chars)
+        .map(|(index, _)| start + index)
 }
 
 pub(crate) fn to_episode_events(

@@ -156,7 +156,6 @@ pub(super) async fn get_agent_profile(
             "memory": {
                 "episodic": chars(&memory.episodic),
                 "semantic": chars(&memory.semantic),
-                "prospective": chars(&memory.prospective),
             },
             "skills": app_state.skills.discover_skills().len(),
         }))

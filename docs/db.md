@@ -29,7 +29,7 @@ egopulse.db (SQLite / WAL mode) — ConversationScope::Normal のストレージ
 ├── sleep_step_checkpoints   — Step処理checkpoint（agent×step×source state）
 ├── pulse_runs               — Pulse（注意活性化）実行履歴
 ├── episode_events           — エピソード記憶台帳（Event Extraction で蓄積）
-├── episode_rollups          — エピソード記憶の週次/月次派生要約（Call2 で生成）
+├── episode_rollups          — エピソード記憶の週次/月次派生要約（rollup で生成）
 ├── memory_snapshots         — スリープ実行中のメモリファイル更新履歴（run×file log）
 ├── turn_runs                — Turn実行状態機械（durable turn lifecycle）
 ├── turn_origins             — origin（人間入力の chain）ごとの実行 turn 数・終端理由
@@ -379,7 +379,7 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 - `record_skipped_sleep_run(agent_id, trigger, reason)` — 実行しないと判定した Sleep を、理由付きの終了済み `skipped` run として INSERT（ステップは作らない）
 - `get_sleep_run(id)` — id で取得
 - `list_sleep_runs(agent_id, statuses, limit)` — agent_id と status（空ならすべて）で絞り込み + started_at 降順
-- `count_agent_pending_sleep_messages(agent_id)` — `event_extraction` / `prospective_update` いずれかの checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複除外して計数（Sleep 候補判定の cursor として `finished_at` ではなく checkpoint を使用）
+- `count_agent_pending_sleep_messages(agent_id)` — `event_extraction` checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複除外して計数（Sleep 候補判定の cursor として `finished_at` ではなく checkpoint を使用）
 - `get_agent_sessions_with_pending_sleep_messages(agent_id, limit)` — 同じ pending 条件でセッションを「最古の pending message が古い順、同値なら `chat_id` 順」で取得（hot session による backlog 飢餖防止）
 
 **設計ポイント**:
@@ -391,12 +391,12 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 
 ### sleep_run_steps
 
-Sleep Batch の step 別実行 log。run 内の各処理工程（event_extraction, episodic_update, semantic_update, prospective_update）の status/token/error を保持。
+Sleep Batch の step 別実行 log。run 内の各処理工程（event_extraction, episodic_update, semantic_update）の status/token/error を保持。
 
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | sleep_run_id | TEXT | PK（複合）, FK CASCADE | sleep_runs.id への参照 |
-| step_name | TEXT | PK（複合）, CHECK | 処理工程名（4種） |
+| step_name | TEXT | PK（複合）, CHECK | 処理工程名（3種） |
 | status | TEXT | NOT NULL, CHECK | 状態（pending/running/success/failed/skipped） |
 | started_at | TEXT | nullable | 開始時刻（RFC3339） |
 | finished_at | TEXT | nullable | 終了時刻（RFC3339） |
@@ -421,7 +421,7 @@ agent×step×source 単位の処理 checkpoint。各 step が次回どこから�
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | agent_id | TEXT | PK（複合） | エージェント識別子 |
-| step_name | TEXT | PK（複合）, CHECK | checkpoint を所有する step（3種、episodic_update は持たない） |
+| step_name | TEXT | PK（複合）, CHECK | checkpoint を所有する step（2種、episodic_update は持たない） |
 | source_kind | TEXT | PK（複合）, CHECK | 入力種別（messages/episode_events） |
 | source_id | TEXT | PK（複合） | messages: chat_id, episode_events: agent_id |
 | cursor_at | TEXT | NOT NULL | 最後に成功処理した行の時刻 |
@@ -483,7 +483,7 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 | id | TEXT | PK | UUID v4 |
 | run_id | TEXT | NOT NULL, UNIQUE*, FK CASCADE | sleep_runs.id への参照 |
 | agent_id | TEXT | NOT NULL | エージェント識別子 |
-| file | TEXT | NOT NULL, CHECK | 対象ファイル（episodic/semantic/prospective） |
+| file | TEXT | NOT NULL, CHECK | 対象ファイル（episodic/semantic） |
 | content_before | TEXT | NOT NULL | 更新前のファイル内容 |
 | content_after | TEXT | NOT NULL | 更新後のファイル内容 |
 | created_at | TEXT | NOT NULL | 作成時刻（RFC3339） |
@@ -494,14 +494,14 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 - `create_memory_snapshot(run_id, agent_id, file, content_before, content_after)` — INSERT
 - `get_snapshots_for_run(run_id)` — run_id 絞り込み + created_at 昇順
 - `list_memory_changes(agent_id, limit)` — 公開済みの変更履歴（全ファイル）。所属 run が `success` / `partial_failure` かつ `content_before != content_after` の行を created_at 降順で返す
-- `changed_memory_files(run_ids)` — run ごとの変更のあった記憶ファイル。`list_memory_changes` と同じ公開済み条件で、`episodic` → `semantic` → `prospective` の順に返す
+- `changed_memory_files(run_ids)` — run ごとの変更のあった記憶ファイル。`list_memory_changes` と同じ公開済み条件で、`episodic` → `semantic` の順に返す
 - `get_latest_snapshot_for_file(agent_id, file)` — agent+file の最新1件
 - `ensure_memory_snapshots_complete(run_id, agent_id, base)` — 欠落 file に `content_before == content_after == base` の snapshot を補完する
 - `list_running_sleep_runs()` — `status = 'running'` の Run を開始順に取得（スタートアップリカバリ用）
 
 **設計ポイント**:
 - **Aggregate snapshot 方針**: 1回 LLM 呼び出し前提のため、phase ごとではなく run 単位で1ファイルにつき1件の snapshot を保存する
-- **完全な3ファイルセット**: finalize 前に3種類の snapshot が揃うことを publication bundle の整合性条件とする。各 Step は成功時に担当 file の snapshot を commit し、未実行・未変更の file は `ensure_memory_snapshots_complete()` が `before == after == base` で補完する。`content_before` は常に Run 開始時の bundle（base）を使用する
+- **完全な2ファイルセット**: finalize 前に2種類の snapshot が揃うことを publication bundle の整合性条件とする。各 Step は成功時に担当 file の snapshot を commit し、未実行・未変更の file は `ensure_memory_snapshots_complete()` が `before == after == base` で補完する。`content_before` は常に Run 開始時の bundle（base）を使用する
 - **Publication / Recovery**: `publish_bundle()` は `content_before` を precondition とし、`content_after` を原子的に公開する。スタートアップリカバリは `content_after` から再公開し、現状が `before` / `after` のいずれにも一致しない場合は startup を停止する
 
 ---
@@ -548,7 +548,7 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 
 ### episode_rollups
 
-Call2 (Episodic View Materialization) で生成される週次・月次の派生要約。
+episodic_update の rollup で生成される週次・月次の派生要約。
 `episode_events` から再生成可能な派生キャッシュ。正本は `episode_events`。
 
 | カラム | 型 | 制約 | 説明 |
@@ -725,7 +725,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 | `SleepRunStep` | sleep_run_steps | sleep_run_id, step_name, status, started_at, finished_at, input_tokens, output_tokens, error_message, metadata_json |
 | `SleepStepCheckpoint` | sleep_step_checkpoints | agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at |
 | `SleepRunStatus` | — | 5種の enum: `Running`, `Success`, `PartialFailure`, `Failed`, `Skipped`（SQL: `running`, `success`, `partial_failure`, `failed`, `skipped`） |
-| `SleepStepName` | — | 4種の enum: `EventExtraction`, `EpisodicUpdate`, `SemanticUpdate`, `ProspectiveUpdate`（SQL: `event_extraction`, `episodic_update`, `semantic_update`, `prospective_update`） |
+| `SleepStepName` | — | 3種の enum: `EventExtraction`, `EpisodicUpdate`, `SemanticUpdate`（SQL: `event_extraction`, `episodic_update`, `semantic_update`） |
 | `SleepStepStatus` | — | 5種の enum: `Pending`, `Running`, `Success`, `Failed`, `Skipped`（SQL: `pending`, `running`, `success`, `failed`, `skipped`） |
 | `CheckpointSourceKind` | — | 2種の enum: `Messages`, `EpisodeEvents`（SQL: `messages`, `episode_events`） |
 | `PulseRun` | pulse_runs | id, agent_id, intention_id, due_key, chat_id, message_id, status, started_at, finished_at, output_kind, output_text, error_message, attention_snapshot |
@@ -750,7 +750,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `21`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `22`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
@@ -761,7 +761,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
 5. `set_schema_version(conn, 6, "description")` または transaction 用 helper を呼び出し
 
-> **Note**: 現行のコードラインでは v1 から v21 までを順に適用する。以下は主要なマイグレーションの履歴。
+> **Note**: 現行のコードラインでは v1 から v22 までを順に適用する。以下は主要なマイグレーションの履歴。
 
 #### v3: add episode_events table + 4 indexes
 
@@ -774,7 +774,7 @@ Event Extraction の保存先として `episode_events` テーブルを新規追
 
 #### v6: add episode_rollups table + 2 indexes
 
-Call2 Episodic View Materialization 用の `episode_rollups` テーブルを新規追加。
+episodic_update の rollup 用 `episode_rollups` テーブルを新規追加。
 CHECK 制約（granularity、max_ripple）と 2 つの複合インデックスを含む。
 
 #### v12: durable turn lifecycle + integer seq/revision
@@ -807,6 +807,10 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 #### v21: pulse_runs.attention_snapshot
 
 `pulse_runs` に `attention_snapshot`（nullable）を追加する。既存の run は `NULL` のまま残る。
+
+#### v22: drop prospective memory from the sleep schema
+
+`sleep_run_steps` / `sleep_step_checkpoints` / `memory_snapshots` を再構築し、`prospective_update` step と `prospective` snapshot を CHECK 制約から外す。既存の prospective 行は削除し、episodic / semantic の行と sleep run は保持する。`sleep_run_steps` は `step_name IN ('event_extraction', 'episodic_update', 'semantic_update')`、`sleep_step_checkpoints` は `event_extraction`（messages）と `semantic_update`（episode_events）の組合せのみ、`memory_snapshots` は `file IN ('episodic', 'semantic')` を許可する。
 
 ### 外部キー制約が最小限
 

@@ -22,7 +22,7 @@ const PROFILE: AgentProfile = {
     soul: { scope: "agent", path: "agents/lyre/SOUL.md", chars: 2100 },
     rules: [],
     secret: { path: "agents/lyre/SECRET.md", exists: false },
-    memory: { episodic: 8000, semantic: 400, prospective: 0 },
+    memory: { episodic: 8000, semantic: 400 },
     skills: 3,
   },
 };

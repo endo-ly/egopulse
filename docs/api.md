@@ -459,7 +459,7 @@ GET /api/sleep/runs?agent_id={agent_id}&status={status}&before={before}&limit={l
 | `trigger` | `string` | `manual`, `scheduled`, `backfill` |
 | `error_message` | `string \| null` | `failed` ではエラー、`skipped` ではスキップ理由 |
 | `session_count` | `number` | `source_chats_json` から算出した対象セッション数 |
-| `changed_memory` | `string[]` | 内容が変わった記憶ファイル（`episodic` → `semantic` → `prospective` の順）。公開済みの run（`success` / `partial_failure`）だけが持ち、それ以外は空 |
+| `changed_memory` | `string[]` | 内容が変わった記憶ファイル（`episodic` → `semantic` の順）。公開済みの run（`success` / `partial_failure`）だけが持ち、それ以外は空 |
 
 `has_more` は、返したページより古い run が残っているかを示す。`before` と併用して履歴の末尾まで遡れる。並び順は `started_at` 降順・`id` 降順で、`before` はその順序で比較する。
 
@@ -494,14 +494,14 @@ GET /api/sleep/runs/{run_id}
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `run` | `object` | sleep_runs テーブルの内容（一覧の各要素と同じ項目） |
-| `snapshots` | `array` | この run の memory_snapshots。確定済み run は `episodic`, `semantic`, `prospective` の3件フルセット（変更のないファイルは `content_before` = `content_after` で含まれる） |
+| `snapshots` | `array` | この run の memory_snapshots。確定済み run は `episodic`, `semantic` の2件フルセット（変更のないファイルは `content_before` = `content_after` で含まれる） |
 | `steps` | `array` | この run のステップ実行結果。パイプライン順にソート済み |
 
 `steps` の各要素: `step`, `status`, `started_at`, `finished_at`, `input_tokens`, `output_tokens`, `error_message`。
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
-| `step` | `string` | `event_extraction`, `episodic_update`, `semantic_update`, `prospective_update` |
+| `step` | `string` | `event_extraction`, `episodic_update`, `semantic_update` |
 | `status` | `string` | `pending`, `running`, `success`, `failed`, `skipped` |
 
 ---
@@ -512,13 +512,12 @@ GET /api/sleep/runs/{run_id}
 GET /api/agents/{agent_id}/memory
 ```
 
-agent の現在の公開済み長期記憶3ファイルの内容を返す。
+agent の現在の公開済み長期記憶2ファイルの内容を返す。
 
 | フィールド | 型 | 説明 |
 |-----------|-----|------|
 | `memory.episodic` | `string` | `episodic.md` の内容（未作成・空は空文字） |
 | `memory.semantic` | `string` | `semantic.md` の内容 |
-| `memory.prospective` | `string` | `prospective.md` の内容 |
 
 `agent_id` が不正な場合（パストラバーサル等）は `400` を返す。
 
@@ -637,7 +636,7 @@ agent の実効 LLM 設定・bot 紐づけ・system prompt に注入されるソ
 | `profile.prompt_sources.soul` | 注入される SOUL（`scope` / `path` / `chars`）。なければ `null` |
 | `profile.prompt_sources.rules[]` | 注入される AGENTS.md（注入順） |
 | `profile.prompt_sources.secret` | SECRET.md のパス（`path`）と有無（`exists`）。本文と文字数は含めない |
-| `profile.prompt_sources.memory` | 長期記憶3ファイルの文字数 |
+| `profile.prompt_sources.memory` | 長期記憶2ファイルの文字数 |
 | `profile.prompt_sources.skills` | 利用可能なスキル数 |
 
 #### prompt ファイル
@@ -721,7 +720,7 @@ GET /api/agents/{agent_id}/memory/history?limit=20
 
 `limit` は既定 20、最大 100。
 
-3 層（episodic / semantic / prospective）をまたいだ公開済みの変更（所属 Sleep run が `success` / `partial_failure` で、内容が変わった snapshot）を新しい順に返す。
+2 種（episodic / semantic）をまたいだ公開済みの変更（所属 Sleep run が `success` / `partial_failure` で、内容が変わった snapshot）を新しい順に返す。
 
 ```json
 {

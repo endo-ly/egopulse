@@ -12,7 +12,7 @@ Session / Memory / Tool / PULSE are all keyed by `agent_id` as the dominant iden
 
 ### Sleep batch & Long time memory
 
-Conversation history is distilled into three layers: episodic (episodic memory) / semantic (semantic memory) / prospective (prospective memory). Agents organize the past through Sleep batches and retain memory long-term.
+Conversation history is encoded into episode events and distilled into two memory layers: episodic (episodic memory) / semantic (semantic memory). Agents organize the past through Sleep batches and retain memory long-term.
 
 ### PULSE
 
