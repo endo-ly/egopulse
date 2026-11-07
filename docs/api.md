@@ -634,6 +634,7 @@ agent の実効 LLM 設定・bot 紐づけ・system prompt に注入されるソ
 | `profile.llm[]` | 実効 provider / model。先頭は profile のないチャネル（`channel: null`）、続いて profile を持つチャネルごとに1件 |
 | `profile.llm[].provider_source` / `model_source` | 解決元。`profile` / `agent` / `global_default` / `provider_default` |
 | `profile.bindings` | `discord_bot` / `telegram_bot`（未設定は `null`） |
+| `profile.mcp_servers` | この agent に公開される MCP server。`all` が `true` なら全 server、`servers` に `agents.<id>.mcp_servers` の値が入る |
 | `profile.prompt_sources.soul` | 注入される SOUL（`scope` / `path` / `chars`）。なければ `null` |
 | `profile.prompt_sources.rules[]` | 注入される AGENTS.md（注入順） |
 | `profile.prompt_sources.secret` | SECRET.md のパス（`path`）と有無（`exists`）。本文と文字数は含めない |

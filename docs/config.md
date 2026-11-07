@@ -466,6 +466,7 @@ SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md
 | `reasoning_effort` | `string \| null` | 任意 | `null` | エージェント固有の推論量。設定時は Chat Completions の `reasoning_effort`、Responses API の `reasoning.effort` へそのまま渡す |
 | `discord_bot` | `string \| null` | 任意 | `null` | このエージェントが紐づく Discord Bot ID。`channels.discord.bots` のキーを参照 |
 | `telegram_bot` | `string \| null` | 任意 | `null` | このエージェントが紐づく Telegram Bot ID。`channels.telegram.telegram_bots` のキーを参照 |
+| `mcp_servers` | `[string] \| null` | 任意 | `null` | このエージェントが使える MCP server 名（`mcp.json` の `mcpServers` のキー）。`null` は全 server、`[]` は MCP tool なし |
 | `profiles` | `map` | 任意 | `{}` | チャネル別オーバーライド。キーがチャネル名（例: `voice`） |
 
 #### `profiles.<channel_name>` のフィールド
@@ -505,6 +506,20 @@ agents:
     model: gpt-5.3-codex
     reasoning_effort: high
 ```
+
+`mcp_servers` は、その Agent に公開される MCP tool を server 単位で絞る。`mcp.json` の server 定義は全 Agent 共通で接続され、公開範囲だけが Agent ごとに変わる。省略時は全 server、空リストは MCP tool なし。tool 名ではなく server 名（`mcpServers` のキー）を指定する。
+
+```yaml
+agents:
+  reviewer:
+    label: Reviewer
+    mcp_servers: [github, filesystem]
+  assistant:
+    label: Assistant
+    mcp_servers: []
+```
+
+公開範囲の判定は Turn 開始時の snapshot で行う。詳細は [mcp.md](./mcp.md#agent-別の公開範囲) を参照。
 
 ---
 
@@ -829,7 +844,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 | フィールド | 反映範囲 |
 |---|---|
 | `default_provider` / `default_model` / `default_agent` | 新しい Turn の既定値 |
-| `agents.<id>.*` | Agent の provider / model / profile / routing と agent_send の宛先 |
+| `agents.<id>.*` | Agent の provider / model / profile / routing / MCP tool 公開範囲と agent_send の宛先 |
 | `providers.<id>.*` | Provider 定義、credential、model、endpoint。Provider cache は revision ごとに分離 |
 | `timezone` | Sleep / Pulse および Turn の時刻解決 |
 | `compaction_*` / `compact_keep_recent` / `max_history_messages` / `default_context_window_tokens` | 新しい Turn の履歴・コンテキスト処理 |

@@ -360,12 +360,14 @@ build_system_prompt()  ──→  system prompt (文字列)
                                ↓
 process_turn()         ──→  llm.send_message(&system_prompt, messages, Some(tools))
                                                              ↑
-                         state.tools.definitions_async().await
+                         state.tools.definitions_async(agent scope).await
                                ↓
-               [ToolRegistry] → built-in 8 tools + MCP tools (Vec<ToolDefinition>)
+               [ToolRegistry] → built-in tools + MCP tools (Vec<ToolDefinition>)
                                ↓
                          API body の "tools" フィールド
 ```
+
+MCP tool の定義は Agent の `mcp_servers` 設定で絞られる（[mcp.md §5](./mcp.md#agent-別の公開範囲)）。built-in tool は常に公開される。
 
 通常 Turn と Pulse Activation は、tool loop の48回目に終了警告を追加し、49〜50回目は最終回答を優先する指示を追加する。
 

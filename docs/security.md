@@ -211,6 +211,7 @@ prefix を持たない値や Config に登録されていない値も、周囲�
 | bash の隔離 | `.env` と `<state_root>/runtime/`（DB・バックアップ・会話アーカイブ・Local API のソケット）を bash から読めない | 方針メッセージが表示される。必要な値は skill の `required_env` で注入し、それ以外はユーザーに依頼する |
 | Web 添付配信 | `runtime/attachments/` は workspace 外かつ bash sandbox の対象。配信は Bearer 認証必須で、ID は canonical UUID + 許可拡張子のみ | 音声以外は `application/octet-stream` + `Content-Disposition: attachment` で返し、アプリ origin で能動コンテンツを実行させない |
 | MCP の秘密参照 | `mcp.json` の `env` / `exec` 参照は、workspace 側の `mcp.json` にも書ける。Runtime が解決した値を自前のエンドポイントへ送らせる意図的な迂回は防げない | §7 の対象外（意図的な迂回） |
+| MCP の Agent 別公開 | `agents.<id>.mcp_servers` は LLM への公開と実行だけを絞る。接続済み server process は全 server の資格情報を保持する | 資格情報を分離するには server 定義自体を分ける |
 
 ---
 
