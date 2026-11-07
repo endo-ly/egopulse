@@ -1,4 +1,20 @@
-//! LLM response normalization and JSON extraction utilities.
+//! LLM response normalization, JSON extraction, and prompt sizing utilities.
+
+/// Fraction of the context window a sleep LLM call may occupy.
+pub(super) const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;
+/// Rough characters-per-token ratio used for prompt budget estimates.
+pub(super) const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
+const MAX_SLEEP_CHUNK_SESSION_TOKENS: usize = 12_000;
+const MIN_SLEEP_CHUNK_SESSION_TOKENS: usize = 4_000;
+
+/// Token budget for one sleep prompt chunk.
+pub(super) fn chunk_token_budget(context_window_tokens: usize) -> usize {
+    let threshold = (context_window_tokens as f64 * SLEEP_BATCH_OVERFLOW_RATIO) as usize;
+    threshold.saturating_div(3).clamp(
+        MIN_SLEEP_CHUNK_SESSION_TOKENS,
+        MAX_SLEEP_CHUNK_SESSION_TOKENS,
+    )
+}
 
 /// Normalizes a raw LLM response into a string that is more likely to parse as JSON.
 ///

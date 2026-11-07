@@ -45,7 +45,7 @@ describe("DiffViewer", () => {
     const before = lines(600, "same");
     const after = `${lines(600, "same")}\nextra`;
     const { container } = render(
-      <DiffViewer before={before} after={after} fileName="prospective" />,
+      <DiffViewer before={before} after={after} fileName="semantic" />,
     );
     switchToUnified(container);
 

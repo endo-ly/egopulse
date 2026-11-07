@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 21;
+pub(super) const SCHEMA_VERSION: i64 = 22;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1093,6 +1093,107 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         set_schema_version_in_tx(&tx, 21, "add pulse_runs.attention_snapshot")?;
         tx.commit()?;
         version = 21;
+    }
+
+    if version < 22 {
+        let tx = conn.unchecked_transaction()?;
+
+        // Rebuild the sleep tables without the retired prospective memory.
+        // The scratch tables are dropped first so a rollback re-run starts clean.
+        for table in [
+            "sleep_run_steps_v22",
+            "sleep_step_checkpoints_v22",
+            "memory_snapshots_v22",
+        ] {
+            tx.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+        }
+
+        tx.execute_batch(
+            "CREATE TABLE sleep_run_steps_v22 (
+                sleep_run_id    TEXT NOT NULL,
+                step_name       TEXT NOT NULL CHECK (step_name IN ('event_extraction', 'episodic_update', 'semantic_update')),
+                status          TEXT NOT NULL CHECK (status IN ('pending', 'running', 'success', 'failed', 'skipped')),
+                started_at      TEXT,
+                finished_at     TEXT,
+                input_tokens    INTEGER NOT NULL DEFAULT 0,
+                output_tokens   INTEGER NOT NULL DEFAULT 0,
+                error_message   TEXT,
+                metadata_json   TEXT,
+                PRIMARY KEY (sleep_run_id, step_name),
+                FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
+            );
+
+            INSERT INTO sleep_run_steps_v22
+            SELECT sleep_run_id, step_name, status, started_at, finished_at,
+                   input_tokens, output_tokens, error_message, metadata_json
+            FROM sleep_run_steps
+            WHERE step_name != 'prospective_update';
+
+            DROP TABLE sleep_run_steps;
+            ALTER TABLE sleep_run_steps_v22 RENAME TO sleep_run_steps;
+
+            CREATE INDEX IF NOT EXISTS idx_sleep_run_steps_step_status
+                ON sleep_run_steps(step_name, status, started_at);",
+        )?;
+
+        tx.execute_batch(
+            "CREATE TABLE sleep_step_checkpoints_v22 (
+                agent_id     TEXT NOT NULL,
+                step_name    TEXT NOT NULL,
+                source_kind  TEXT NOT NULL,
+                source_id    TEXT NOT NULL,
+                cursor_at    TEXT NOT NULL,
+                cursor_id    TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                PRIMARY KEY (agent_id, step_name, source_kind, source_id),
+                CHECK (step_name IN ('event_extraction', 'semantic_update')),
+                CHECK (source_kind IN ('messages', 'episode_events')),
+                CHECK (
+                    (step_name = 'event_extraction' AND source_kind = 'messages')
+                    OR (step_name = 'semantic_update' AND source_kind = 'episode_events')
+                )
+            );
+
+            INSERT INTO sleep_step_checkpoints_v22
+            SELECT agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at
+            FROM sleep_step_checkpoints
+            WHERE step_name != 'prospective_update';
+
+            DROP TABLE sleep_step_checkpoints;
+            ALTER TABLE sleep_step_checkpoints_v22 RENAME TO sleep_step_checkpoints;",
+        )?;
+
+        tx.execute_batch(
+            "CREATE TABLE memory_snapshots_v22 (
+                id              TEXT PRIMARY KEY,
+                run_id          TEXT NOT NULL,
+                agent_id        TEXT NOT NULL,
+                file            TEXT NOT NULL,
+                content_before  TEXT NOT NULL,
+                content_after   TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                UNIQUE (run_id, file),
+                FOREIGN KEY (run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE,
+                CHECK (file IN ('episodic', 'semantic'))
+            );
+
+            INSERT INTO memory_snapshots_v22
+            SELECT id, run_id, agent_id, file, content_before, content_after, created_at
+            FROM memory_snapshots
+            WHERE file != 'prospective';
+
+            DROP TABLE memory_snapshots;
+            ALTER TABLE memory_snapshots_v22 RENAME TO memory_snapshots;
+
+            CREATE INDEX IF NOT EXISTS idx_memory_snapshots_run_id
+                ON memory_snapshots(run_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_snapshots_agent_created
+                ON memory_snapshots(agent_id, created_at);",
+        )?;
+
+        set_schema_version_in_tx(&tx, 22, "drop prospective memory from sleep schema")?;
+        tx.commit()?;
+        version = 22;
     }
 
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
@@ -2496,6 +2597,217 @@ mod tests {
             [],
         )
         .expect("semantic_update + episode_events should be valid");
+    }
+
+    // --- v22: drop prospective memory ----------------------------------------
+
+    /// Creates a v22 database, then restores the v21 sleep tables (old CHECK
+    /// constraints) and seeds one row of each prospective shape.
+    fn create_v21_sleep_state(dir: &tempfile::TempDir) -> super::super::Database {
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        {
+            let conn = db.get_conn().expect("conn");
+            conn.execute_batch(
+                "DROP TABLE sleep_run_steps;
+                 DROP TABLE sleep_step_checkpoints;
+                 DROP TABLE memory_snapshots;
+
+                 CREATE TABLE sleep_run_steps (
+                    sleep_run_id    TEXT NOT NULL,
+                    step_name       TEXT NOT NULL CHECK (step_name IN ('event_extraction', 'episodic_update', 'semantic_update', 'prospective_update')),
+                    status          TEXT NOT NULL CHECK (status IN ('pending', 'running', 'success', 'failed', 'skipped')),
+                    started_at      TEXT,
+                    finished_at     TEXT,
+                    input_tokens    INTEGER NOT NULL DEFAULT 0,
+                    output_tokens   INTEGER NOT NULL DEFAULT 0,
+                    error_message   TEXT,
+                    metadata_json   TEXT,
+                    PRIMARY KEY (sleep_run_id, step_name),
+                    FOREIGN KEY (sleep_run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE
+                 );
+                 CREATE INDEX idx_sleep_run_steps_step_status
+                    ON sleep_run_steps(step_name, status, started_at);
+
+                 CREATE TABLE sleep_step_checkpoints (
+                    agent_id     TEXT NOT NULL,
+                    step_name    TEXT NOT NULL,
+                    source_kind  TEXT NOT NULL,
+                    source_id    TEXT NOT NULL,
+                    cursor_at    TEXT NOT NULL,
+                    cursor_id    TEXT NOT NULL,
+                    updated_at   TEXT NOT NULL,
+                    PRIMARY KEY (agent_id, step_name, source_kind, source_id),
+                    CHECK (step_name IN ('event_extraction', 'semantic_update', 'prospective_update')),
+                    CHECK (source_kind IN ('messages', 'episode_events')),
+                    CHECK (
+                        (step_name IN ('event_extraction', 'prospective_update') AND source_kind = 'messages')
+                        OR (step_name = 'semantic_update' AND source_kind = 'episode_events')
+                    )
+                 );
+
+                 CREATE TABLE memory_snapshots (
+                    id              TEXT PRIMARY KEY,
+                    run_id          TEXT NOT NULL,
+                    agent_id        TEXT NOT NULL,
+                    file            TEXT NOT NULL,
+                    content_before  TEXT NOT NULL,
+                    content_after   TEXT NOT NULL,
+                    created_at      TEXT NOT NULL,
+                    UNIQUE (run_id, file),
+                    FOREIGN KEY (run_id) REFERENCES sleep_runs(id) ON DELETE CASCADE,
+                    CHECK (file IN ('episodic', 'semantic', 'prospective'))
+                 );
+                 CREATE INDEX idx_memory_snapshots_run_id ON memory_snapshots(run_id);
+                 CREATE INDEX idx_memory_snapshots_agent_created
+                    ON memory_snapshots(agent_id, created_at);
+
+                 INSERT INTO sleep_runs (id, agent_id, status, trigger_type, started_at)
+                 VALUES ('run-1', 'agent-a', 'running', 'manual', '2026-01-01T00:00:00Z');
+
+                 INSERT INTO sleep_run_steps (sleep_run_id, step_name, status) VALUES
+                    ('run-1', 'event_extraction', 'success'),
+                    ('run-1', 'episodic_update', 'success'),
+                    ('run-1', 'semantic_update', 'success'),
+                    ('run-1', 'prospective_update', 'success');
+
+                 INSERT INTO sleep_step_checkpoints
+                    (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+                 VALUES
+                    ('agent-a', 'event_extraction', 'messages', '1', '2026-01-01T00:00:01Z', 'm-1', '2026-01-01T00:00:01Z'),
+                    ('agent-a', 'prospective_update', 'messages', '1', '2026-01-01T00:00:01Z', 'm-1', '2026-01-01T00:00:01Z'),
+                    ('agent-a', 'semantic_update', 'episode_events', 'agent-a', '2026-01-01T00:00:01Z', 'e-1', '2026-01-01T00:00:01Z');
+
+                 INSERT INTO memory_snapshots
+                    (id, run_id, agent_id, file, content_before, content_after, created_at)
+                 VALUES
+                    ('s-ep', 'run-1', 'agent-a', 'episodic', 'old', 'new', '2026-01-01T00:00:00Z'),
+                    ('s-sem', 'run-1', 'agent-a', 'semantic', 'old', 'new', '2026-01-01T00:00:00Z'),
+                    ('s-pro', 'run-1', 'agent-a', 'prospective', 'old', 'new', '2026-01-01T00:00:00Z');",
+            )
+            .expect("create v21 sleep state");
+            super::set_schema_version(&conn, 21, "test v21 baseline").expect("set version");
+        }
+        db
+    }
+
+    fn schema_version_of(db: &super::super::Database) -> i64 {
+        let conn = db.get_conn().expect("conn");
+        conn.query_row(
+            "SELECT value FROM db_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("schema version")
+        .parse()
+        .expect("numeric version")
+    }
+
+    #[test]
+    fn migration_v22_drops_prospective_rows_and_constraints() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v21_sleep_state(&dir);
+
+        // Act
+        {
+            let conn = db.get_conn().expect("conn");
+            super::run_migrations(&conn).expect("migrate to v22");
+        }
+
+        // Assert: prospective rows are gone, the rest remain.
+        let conn = db.get_conn().expect("conn");
+        let steps: Vec<String> = conn
+            .prepare("SELECT step_name FROM sleep_run_steps ORDER BY step_name")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            steps,
+            vec!["episodic_update", "event_extraction", "semantic_update"]
+        );
+        let checkpoints: Vec<String> = conn
+            .prepare("SELECT step_name FROM sleep_step_checkpoints ORDER BY step_name")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(checkpoints, vec!["event_extraction", "semantic_update"]);
+        let snapshots: Vec<String> = conn
+            .prepare("SELECT file FROM memory_snapshots ORDER BY file")
+            .expect("prepare")
+            .query_map([], |row| row.get(0))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(snapshots, vec!["episodic", "semantic"]);
+
+        // Assert: the retired values are rejected by the new CHECK constraints.
+        assert!(
+            conn.execute(
+                "INSERT INTO sleep_run_steps (sleep_run_id, step_name, status)
+                 VALUES ('run-1', 'prospective_update', 'pending')",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO sleep_step_checkpoints
+                    (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+                 VALUES ('agent-a', 'prospective_update', 'messages', '1', '2026-01-01T00:00:02Z', 'm-2', '2026-01-01T00:00:02Z')",
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO memory_snapshots
+                    (id, run_id, agent_id, file, content_before, content_after, created_at)
+                 VALUES ('s-pro-2', 'run-1', 'agent-a', 'prospective', 'a', 'b', '2026-01-01T00:00:02Z')",
+                [],
+            )
+            .is_err()
+        );
+
+        assert_eq!(schema_version_of(&db), 22);
+    }
+
+    #[test]
+    fn migration_v22_is_idempotent_on_rerun() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = create_v21_sleep_state(&dir);
+        {
+            let conn = db.get_conn().expect("conn");
+            super::run_migrations(&conn).expect("first migration");
+        }
+
+        // Act
+        rollback_schema(&db, 21, "v22 rerun");
+
+        // Assert: data survives and the schema stays at v22.
+        let conn = db.get_conn().expect("conn");
+        let step_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sleep_run_steps", [], |row| row.get(0))
+            .expect("count steps");
+        assert_eq!(step_count, 3);
+        let checkpoint_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sleep_step_checkpoints", [], |row| {
+                row.get(0)
+            })
+            .expect("count checkpoints");
+        assert_eq!(checkpoint_count, 2);
+        let snapshot_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_snapshots", [], |row| {
+                row.get(0)
+            })
+            .expect("count snapshots");
+        assert_eq!(snapshot_count, 2);
+        assert_eq!(schema_version_of(&db), 22);
     }
 
     // --- v9: memory_snapshots constraints -------------------------------------

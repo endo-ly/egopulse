@@ -38,7 +38,7 @@ const PROFILE: AgentProfile = {
     soul: { scope: "agent", path: "agents/lyre/SOUL.md", chars: 2100 },
     rules: [{ scope: "global", path: "AGENTS.md", chars: 300 }],
     secret: { path: "agents/lyre/SECRET.md", exists: true },
-    memory: { episodic: 8400, semantic: 3200, prospective: 0 },
+    memory: { episodic: 8400, semantic: 3200 },
     skills: 6,
   },
 };
@@ -565,7 +565,7 @@ describe("AgentPanel", () => {
     // Arrange
     stubApi({
       "/api/agents/lyre/memory": {
-        memory: { episodic: "", semantic: "# Facts\n- tea", prospective: "" },
+        memory: { episodic: "", semantic: "# Facts\n- tea" },
       },
       "/api/agents/lyre/memory/history": { changes: [CHANGE] },
     });
@@ -579,7 +579,6 @@ describe("AgentPanel", () => {
     expect(cards.map((card) => card.querySelector(".doc-card-path")?.textContent)).toEqual([
       "episodic.md",
       "semantic.md",
-      "prospective.md",
     ]);
     expect(cards[1].textContent).toContain("updated");
     expect(screen.queryByRole("tab")).toBeNull();
@@ -595,7 +594,7 @@ describe("AgentPanel", () => {
     // Arrange
     const long = Array.from({ length: 40 }, (_, i) => `- fact ${i}`).join("\n");
     stubApi({
-      "/api/agents/lyre/memory": { memory: { episodic: long, semantic: "", prospective: "" } },
+      "/api/agents/lyre/memory": { memory: { episodic: long, semantic: "" } },
       "/api/agents/lyre/memory/history": { changes: [] },
     });
 

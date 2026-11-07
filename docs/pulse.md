@@ -56,7 +56,7 @@ Pulse の本質は次の一文に集約される。
 | 概念 | 役割 | 主な入力 | 主な出力 |
 |---|---|---|---|
 | 通常 Turn | ユーザー入力への応答 | 会話メッセージ | 応答・ツール実行 |
-| Sleep Batch | 経験を長期記憶へ畳む | 会話履歴・記憶ファイル | episodic / semantic / prospective memory |
+| Sleep Batch | 経験を長期記憶へ畳む | 会話履歴・記憶ファイル | episodic / semantic memory |
 | Pulse | 注意を活性化する | 時間・記憶・signal | PULSE_OK / 通知 |
 
 ```text
@@ -165,8 +165,7 @@ Pulse は agent 配下の `PULSE.yaml` を使う。
         ├── PULSE.yaml
         └── memory/
             ├── episodic.md
-            ├── semantic.md
-            └── prospective.md
+            └── semantic.md
 ```
 
 ファイルは純粋な YAML ドキュメントである（front matter は使わない）。
@@ -535,11 +534,11 @@ system prompt = build_system_prompt() の出力
   SOUL.md
   + Core Instructions
   + AGENTS.md
-  + Long-term Memory (episodic / semantic / prospective)
+  + Long-term Memory (episodic / semantic)
   + Skills catalog
 ```
 
-Capsule (user message) には prospective memory を含めない。
+Capsule (user message) には long-term memory を含めない。
 理由: system prompt 経由で既に注入されているため、2重注入を避ける。
 
 この構成により:

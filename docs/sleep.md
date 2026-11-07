@@ -1,15 +1,15 @@
 # EgoPulse Sleep Batch
 
 セッションの長期記憶昇格処理（Sleep Batch）の仕様。
-会話履歴を構造化されたエピソード記憶・意味記憶・展望記憶に蒸留し、LLM のコンテキストに注入する。
+会話履歴を `episode_events` として符号化し、そこからエピソード記憶（`episodic.md`）と意味記憶（`semantic.md`）を導出して LLM のコンテキストに注入する。
 
 ## 目次
 
 1. [概要](#1-概要)
 2. [アーキテクチャ](#2-アーキテクチャ)
-3. [Step 1: Event Extraction](#3-step-1-event-extraction)
-4. [Step 2: Episodic Update](#4-step-2-episodic-update)
-5. [Step 3: Memory Update](#5-step-3-memory-update)
+3. [event_extraction](#3-event_extraction)
+4. [episodic_update](#4-episodic_update)
+5. [semantic_update](#5-semantic_update)
 6. [Finalize](#6-finalize)
 7. [Episodic Renderer](#7-episodic-renderer)
 8. [Sleep Scheduler](#8-sleep-scheduler)
@@ -21,15 +21,16 @@
 
 ## 1. 概要
 
-Sleep Batch は、会話セッションの長期記憶昇格処理である。
+Sleep Batch は、会話セッションを長期記憶へ昇格する処理である。
 
-### 記憶の3層構造
+### 記憶の構造
+
+`episode_events` が正本であり、2 つの記憶ファイルはそこから導出されるビューである。
 
 | 記憶種別 | ファイル | 内容 | 生成元 |
 |---|---|---|---|
-| Episodic Memory | `episodic.md` | 過去のやり取りや出来事の記録 | Step 2 (Episodic Renderer) |
-| Semantic Memory | `semantic.md` | 知識や概念の定義、学習済み情報 | Step 3 (LLM) |
-| Prospective Memory | `prospective.md` | 予定、TODO、将来の意図 | Step 3 (LLM) |
+| Episodic Memory | `episodic.md` | 出来事・経験。いつ・何が起きたか | episodic_update（Episodic Renderer） |
+| Semantic Memory | `semantic.md` | 知識・概念・原則。出来事から切り離された意味 | semantic_update（LLM） |
 
 ### 実行トリガー
 
@@ -43,46 +44,54 @@ Sleep Batch は、会話セッションの長期記憶昇格処理である。
 
 ## 2. アーキテクチャ
 
-### 4-Step パイプライン
+### パイプライン
 
-Sleep Batch は 4 つの独立したステップで構成される。各ステップは独立して成功・失敗・スキップを記録し、失敗しても次のステップに進む（best-effort）。
+Sleep Batch は 3 つの step と publish / finalize で構成される。各 step は独立して成功・失敗・スキップを記録し、失敗しても次の step に進む（best-effort）。
 
 ```text
-1. collect_sleep_input()
-       │
-       ├─ Skip: pending メッセージ ≤ 64 → skipped run を記録して終了
-       │
-       └─ Proceed: 最古の pending セッションを取得（最大20件）
-              │
-       2. try_create_sleep_run() で排他チェック + run 作成
-              │ （4つの pending step を DB に原子挿入）
-              │
-       3. prepare_batch_context()
-              │ LLM プロバイダー解決、メモリ読み込み、トークン予算計算
-              │
-       4. Step 1: Event Extraction（best-effort）
-              │
-       5. Step 2: Episodic Update（best-effort）
-              │ Rollup Planner → 週次Rollup LLM → 月次Rollup LLM → Renderer
-              │
-       6. Step 3: Memory Update（best-effort）
-              │ semantic + prospective を単一 LLM コールで更新
-              │ （DB 上は semantic_update / prospective_update の2 step）
-              │
-       7. finalize_batch()
-              │ セッションアーカイブ + checkpoint 判定 + クリア
-              │
-       8. finalize_sleep_run() で run 状態集約
+collect_sleep_input()
+      │
+      ├─ Skip: pending メッセージ ≤ 64 かつ未処理 semantic events なし
+      │        → skipped run を記録して終了
+      │
+      └─ Proceed:
+            pending メッセージ > 64 → 最古の pending セッションを取得（最大20件）
+            semantic backlog のみ → セッションなし
+             │
+       try_create_sleep_run() で排他チェック + run 作成
+             │ （3つの pending step を DB に原子挿入）
+             │
+       prepare_batch_context()
+             │ LLM プロバイダー解決、メモリ読み込み、トークン予算計算
+             │
+       event_extraction（best-effort）
+             │ messages → episode_events
+             │
+       episodic_update（best-effort）
+             │ Rollup Planner → 週次/月次 Rollup LLM → Renderer
+             │
+       semantic_update（best-effort）
+             │ checkpoint 以降の episode_events → semantic.md
+             │
+       publish_memory_bundle()
+             │ episodic.md + semantic.md を原子的に公開
+             │
+       finalize_published_run_blocking()
+             │ セッションアーカイブ + checkpoint 判定 + クリア
+             │
+       finalize_sleep_run() で run 状態集約
 ```
 
-### LLM コール構造
+### step 一覧
 
-| コール | 対応 Step | 入力 | 出力 |
-|---|---|---|---|
-| Call 1 | Event Extraction | 会話メッセージ | `episode_events` |
-| Call 2a | Week Rollup | 週内イベント | `episode_rollups` (week) |
-| Call 2b | Month Rollup | 週次要約 | `episode_rollups` (month) |
-| Call 3 | Memory Update | semantic + prospective + messages + events | `semantic.md` + `prospective.md` |
+step 名は DB の `step_name` 値を正式名称とする。
+
+| step | 入力 | 出力 | LLM | checkpoint |
+|---|---|---|---|---|
+| `event_extraction` | messages | `episode_events` | あり | `messages` × chat_id |
+| `episodic_update` | `episode_events` / `episode_rollups` | rollup + `episodic.md` | rollup 必要時のみ | なし |
+| `semantic_update` | `episode_events`（checkpoint 以降） | `semantic.md` | 新規 events がある時のみ | `episode_events` × agent_id |
+| publish / finalize | candidate bundle | `episodic.md` + `semantic.md` 公開、セッションアーカイブ | なし | — |
 
 ### チェックポイントによる増分処理
 
@@ -92,35 +101,53 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
 |---|---|---|
 | event_extraction | `messages` | chat_id ごとの (timestamp, message_id) |
 | semantic_update | `episode_events` | agent_id ごとの (encoded_at, event_id) |
-| prospective_update | `messages` | chat_id ごとの (timestamp, message_id) |
 | episodic_update | — | カーソルなし（events テーブルから再導出） |
 
 カーソルは `(cursor_at, cursor_id)` の辞書順で比較し、新しい値のみで更新する（`ON CONFLICT DO UPDATE WHERE (cursor_at, cursor_id) < (?, ?)`）。
 
-### 候補セッション選択
+### 実行条件と候補セッション選択
 
-`collect_sleep_input` は run の監査時刻（`finished_at`）ではなく、step checkpoint を唯一の処理済み判定として使用する。これにより「何を処理済みとするか」が Sleep 全体で一つの規則に統一される。
+`collect_sleep_input` は run の監査時刻（`finished_at`）ではなく、step checkpoint を唯一の処理済み判定として使用する。実行条件は次のいずれかを満たすことである。
 
-- **pending 件数**: `event_extraction` または `prospective_update` のいずれかの checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複を除外して数える。件数が `SKIP_THRESHOLD`（64）以下なら Skip し、理由（件数と閾値）を `error_message` に持つ終了済みの `skipped` run を記録する。ステップとスナップショットは作らない。
-- **候補抽出**: 同じ pending 条件でセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。最新セッション優先にしないため、継続的に更新される hot session が古い backlog を処理待ちにし続けない。
+- **pending メッセージ**: `event_extraction` checkpoint より新しい `messages` が `SKIP_THRESHOLD`（64）を超える
+- **semantic backlog**: `semantic_update` checkpoint より新しい `episode_events` が存在する
+
+どちらも満たさない場合は Skip し、理由（件数と閾値）を `error_message` に持つ終了済みの `skipped` run を記録する。ステップとスナップショットは作らない。
+
+- **候補抽出**: pending メッセージが閾値を超えた場合のみセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。最新セッション優先にしないため、継続的に更新される hot session が古い backlog を処理待ちにし続けない。
+- **semantic backlog のみの run**: セッションを渡さないため event_extraction は `skipped` になり、episodic_update / semantic_update だけがイベント由来の更新を行う。閾値以下のメッセージは event_extraction の対象にしない。
 - **1 run 上限**: `MAX_SOURCE_SESSIONS`（20）は 1 回の run の入力サイズ制限として維持する。上限から漏れたセッションは pending のまま残り、次回候補でも必ず見える。
-- **失敗時の再処理**: step が失敗した場合は該当 checkpoint が進まない。次回 collection でも同じ message が pending に残る。
-- **`source_chats_json`**: 実際に選んだセッションだけを保存する。
+- **失敗時の再処理**: step が失敗した場合は該当 checkpoint が進まない。event_extraction の失敗は同じ message が、semantic_update の失敗は同じ event が pending として残り、次回の実行条件になる。
+- **`source_chats_json`**: 実際に選んだセッションだけを保存する。semantic backlog のみの run では空配列になる。
+
+### トークン予算
+
+```rust
+// src/sleep/prompt.rs
+const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;  // コンテキスト窓の80%まで使用
+const MAX_SLEEP_CHUNK_SESSION_TOKENS: usize = 12_000;
+const MIN_SLEEP_CHUNK_SESSION_TOKENS: usize = 4_000;
+const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
+
+// chunk_token_budget(context_window) = clamp(context_window * 0.8 / 3, 4000, 12000)
+```
+
+プロンプトの文字数上限は `chunk_token_budget(context_window) * ESTIMATED_CHARS_PER_TOKEN` で計算する。
 
 ---
 
-## 3. Step 1: Event Extraction
+## 3. event_extraction
 
 セッション履歴から構造化されたエピソードイベントを抽出する。
 
 ### 処理内容
 
-1. `sleep_step_checkpoints` から各 chat の最終カーソルを読み取り
-2. カーソル以降のメッセージを `messages` テーブルから取得
+1. `sleep_step_checkpoints` から各 chat の最終カーソルを読み取る
+2. カーソル以降のメッセージを `messages` テーブルから取得（upper bound は実行時点の最新メッセージ）
 3. メッセージをテキスト化（tool result は 200 文字で truncate、`<thinking>` タグ除去）
 4. トークン制限でチャンク分割
 5. 各チャンクを LLM に渡し、イベントを抽出
-6. 抽出されたイベントを `episode_events` テーブルに保存 + カーソル更新
+6. 抽出されたイベントを `episode_events` テーブルに保存 + chat ごとの checkpoint 更新
 
 ### 入力
 
@@ -138,8 +165,8 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
     {
       "experienced_at": "2026-05-27T04:00:00+09:00",
       "kind": "decision",
-      "title": "Sleep Batch を3-Call構成に再設計",
-      "body_md": "Call 1/Event抽出、Call 2/Rollup生成、Call 3/Memory更新に分離",
+      "title": "Sleep Batch の記憶構成を再設計",
+      "body_md": "episode_events を正本とし、episodic / semantic の2ファイルを導出する構成にした",
       "ripple_strength": 4,
       "certainty": "stated"
     }
@@ -188,7 +215,7 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
 
 ---
 
-## 4. Step 2: Episodic Update
+## 4. episodic_update
 
 エピソードイベントから週次・月次ロールアップを生成し、`episodic.md` を構築する。
 
@@ -294,32 +321,34 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
 
 - **Best-effort**: 失敗しても既存ロールアップを維持
 - **冪等**: 同一 `(agent_id, granularity, period_key)` で upsert
-- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`CALL2_RETRY_GUARD`）
+- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`ROLLUP_RETRY_GUARD`）
 - **セキュリティ**: 入出力に secret redaction を適用
 
 ---
 
-## 5. Step 3: Memory Update
+## 5. semantic_update
 
-セッション履歴とエピソードイベントから意味記憶と展望記憶を更新する。
+checkpoint 以降のエピソードイベントから意味記憶（`semantic.md`）を更新する。会話メッセージは読まない。
 
 ### 処理内容
 
-1. **入力収集**
-   - Prospective: `messages` テーブルからカーソル以降のメッセージを取得
-   - Semantic: `episode_events` テーブルからカーソル以降のイベントを取得
-2. イベント JSON を先頭チャンクに埋め込む（`<episode-events>...</episode-events>`）
-3. セッションテキストをチャンク分割
-4. 各チャンクを LLM に渡し、`semantic.md` と `prospective.md` を生成
-5. 各チャンクの出力を次チャンクの入力 memory として引き継ぐ
+1. `start_sleep_step(run_id, SemanticUpdate)` で step を running にする
+2. checkpoint `(agent_id, semantic_update, episode_events, agent_id)` を読む
+3. upper bound を `get_latest_episode_event_cursor(agent_id)` で固定する（同 run の event_extraction が入れた events を含む）
+4. `get_episode_events_after_cursor(agent_id, cursor, upper_bound)` で `ORDER BY encoded_at, id` の events を取得する
+5. events が 0 件なら `skipped` で終了する。checkpoint と snapshot は触らない
+6. events を重要度で絞り込まず全件をバッチに分割し、順に LLM へ渡す。各出力の `semantic` を次バッチの入力 semantic として引き継ぐ
+7. 全バッチ成功時は 1 トランザクションで「semantic snapshot 挿入（変更なしでも挿入）＋ checkpoint を最後の event の `(encoded_at, id)` へ前進 ＋ step success」を行う
+8. どこかで失敗した場合は step を `failed` にする。checkpoint は進めず、snapshot も作らない。candidate の semantic は base のまま
 
 ### LLM プロンプト構造
 
-プロンプト `src/sleep/prompts/update_long_term_prompt.md` を使用。キー概念：
-- **海馬**役割：日中の経験を睡眠中に整理・定着・転送する
-- **リプレイ**：連続した経験を束ねて再活性化し、既存スキーマと照合
-- **大脳皮質転送**：出来事ではなくパターン・原則を抽出して semantic.md へ
-- **展望記憶**：タスク・目標の追加・完了管理
+プロンプト `src/sleep/prompts/semantic_prompt.md` を使用。キー概念：
+
+- **海馬**役割：日中の経験を睡眠中に再活性化し、大脳皮質へ転送する
+- **意味記憶のみ**：エピソード記憶の整理は episodic_update が担う
+- **パターン抽出**：出来事の要約ではなく、1年後も有効な知識・原則を抽出する
+- **転送しないもの**：日付・進捗・件数、予定・TODO、一度きりの出来事
 
 ### 入力構造
 
@@ -330,84 +359,63 @@ Sleep Batch は 4 つの独立したステップで構成される。各ステ�
   ...現在の semantic.md（XMLエスケープ済み）...
 </memory-semantic>
 
-<memory-prospective>
-  ...現在の prospective.md（XMLエスケープ済み）...
-</memory-prospective>
-
-<sessions>
-  &lt;episode-events&gt;
-  [...events JSON...]
-  &lt;/episode-events&gt;
-
-  &lt;session channel="discord" chat="12345" chunk="1" chunks="2"&gt;
-  ...メッセージテキスト...
-  &lt;/session&gt;
-</sessions>
+<episode-events>
+  [{"experienced_at":"...","kind":"decision","title":"...","body_md":"...","ripple_strength":4,"certainty":"stated"}]
+</episode-events>
 ```
 
-**注意**: `<memory-semantic>` / `<memory-prospective>` / `<sessions>` は生の XML タグだが、内部コンテンツは全て `escape_xml_content()` でエスケープされる。したがって LLM は実際に `&lt;episode-events&gt;` / `&lt;session&gt;` という文字列を見る。
+- 1 event = 1 JSON オブジェクト。フィールドは `experienced_at`, `kind`, `title`, `body_md`, `ripple_strength`, `certainty` の 6 つで、`id` は含めない
+- events はバッチ単位で JSON 配列にする
+- `<memory-semantic>` / `<episode-events>` は生の XML タグだが、内部コンテンツは全て `escape_xml_content()` でエスケープされる
 
-### トークン予算
+### バッチ処理
 
-```rust
-const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;  // コンテキスト窓の80%まで使用
-const MAX_SLEEP_CHUNK_SESSION_TOKENS: usize = 12_000;
-const MIN_SLEEP_CHUNK_SESSION_TOKENS: usize = 4_000;
-const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
-
-// chunk_session_tokens = clamp(context_window * 0.8 / 3, 4000, 12000)
+```text
+バッチ 1: 古い events → semantic を生成
+     │
+バッチ 2: 次の events + バッチ1の semantic → semantic を更新
+     │
+バッチ N: 最新の events + バッチN-1の semantic → 最終 semantic
 ```
 
-メモリファイルのトークン + セッショントークンが `context_window * 0.8` を超える場合、`ContextOverflow` エラーとなる。
+バッチは `build_event_batches(events, max_chars)` で、直列化後 `max_chars` 文字以内になるよう順序を保って分割する。1 event 単体が上限を超える場合はその event だけのバッチになる（event は分割しない）。
 
 ### 出力
 
 ```json
 {
-  "semantic": "更新後の semantic.md 全文（Markdown文字列）",
-  "prospective": "更新後の prospective.md 全文（Markdown文字列）"
+  "semantic": "更新後の semantic.md 全文（Markdown文字列）"
 }
 ```
 
 ### 制約
 
-- 出力は **2 キーのみ**: `semantic`, `prospective`
-- 追加キー（`episodic`, `summary_md`, `phases` 等）は `ParseFailed` で拒否される
-- `episodic.md` は Step 3 では更新しない（Episodic Renderer が担当）
-
-### チャンク処理
-
-```text
-チャンク 1: 最古の pending セッション + エピソードイベント → 出力 memory を生成
-     │
-チャンク 2: 2番目に古いセッション → 前チャンクの memory を引き継いで処理
-     │
-チャンク N: 最新のセッション → 前チャンクの memory を引き継いで処理
-     │
-最終出力: semantic.md + prospective.md
-```
-
-チャンク順は候補セッションの取得順（§2 候補セッション選択の「最古の pending message が古い順」）と同じ。1つのセッションが文字数上限を超える場合は、そのセッション内で `<session ... chunk="i" chunks="n">` としてさらに分割される。
+- 出力は **1 キーのみ**: `semantic`
+- 追加キーや非 string 値は `ParseFailed` で拒否される
+- `episodic.md` は semantic_update では更新しない（Episodic Renderer が担当）
 
 ### 動作特性
 
 - **Best-effort**: 失敗しても既存の記憶ファイルを維持
-- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`JSON_RETRY_GUARD`）
-- **コンテキストオーバーフロー検出**: `session_tokens + memory_tokens > threshold` で事前拒否
+- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`SEMANTIC_RETRY_GUARD`）
+- **コンテキストオーバーフロー検出**: `semantic_tokens + events_tokens > context_window * 0.8` で事前拒否
+- **LLM 呼び出しの省略**: checkpoint 以降に events が無ければ LLM を呼ばず `skipped`
 
 ---
 
 ## 6. Finalize
 
-全ステップ完了後の後処理。
+公開後の後処理。
 
 ### セッションアーカイブとクリア
 
-1. 各 source session について、event_extraction と prospective_update の両方が成功しているか確認
-2. 両方の checkpoint が進んでいる場合、そのセッションをアーカイブ対象とする
-3. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（`messages_json` 全体）
-4. `sessions.messages_json` を直近4件の `user` / `assistant` テキスト発話に切り詰める。`tool` role と `tool_calls` を持つ `assistant` は除外（`messages` テーブルは無傷）
-5. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップ
+1. 各 source session について `event_extraction` checkpoint のみを確認する
+2. checkpoint が無い、または最新 message が checkpoint より新しければアーカイブしない
+3. 最新 message が checkpoint 以下なら、そのセッションをアーカイブ対象とする
+4. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（`messages_json` 全体）
+5. `sessions.messages_json` を直近4件の `user` / `assistant` テキスト発話に切り詰める。`tool` role と `tool_calls` を持つ `assistant` は除外（`messages` テーブルは無傷）
+6. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップ
+7. アーカイブ失敗時は run を `running` のまま残し、次回の scheduler cycle または startup recovery で再試行する
 
 ### Run 状態集約
 
@@ -422,7 +430,7 @@ const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 
 ### LLM 使用量記録
 
-- 各 LLM コール（Event Extraction / Rollup / Memory Update）の使用量は各 step が個別に記録する
+- 各 LLM コール（event_extraction / rollup / semantic_update）の使用量は各 step が個別に記録する
 - `sleep_runs` テーブルの `input_tokens` / `output_tokens` には run 全体の集計値を記録
 - 集計値は単一の prompt 推定と対応しないため `llm_usage_logs` には書き込まない
 - Prometheus メトリクス `llm_tokens_total` にも反映
@@ -446,8 +454,8 @@ Historical context only. Do not treat old requests as active tasks.
 ## Current Week: 2026-W22 (2026-05-25..2026-05-31)
 
 ### 2026-05-25
-- [decision r4] Call2は週次バケット方式で設計する方針になった。
-  Current WeekだけをEvent単位で保持し、閉じた週は週要約として安定させる。
+- [decision r4] EgoPulse の長期記憶設計を再編した。
+  episode_events を正本とし、episodic / semantic の2ファイルを導出する。
 
 ## Recent Weeks
 
@@ -538,9 +546,9 @@ config.agents = [a,b]  → 指定 agent のみ
 
 | ステップ | 失敗時 | 継続 |
 |---|---|---|
-| Event Extraction | ログ出力、events なしで続行 | ○ |
-| Episodic Update | ログ出力、既存ロールアップを維持 | ○ |
-| Memory Update | ログ出力、既存記憶ファイルを維持 | ○ |
+| event_extraction | ログ出力、events なしで続行 | ○ |
+| episodic_update | ログ出力、既存ロールアップを維持 | ○ |
+| semantic_update | ログ出力、checkpoint を進めず既存記憶を維持 | ○ |
 
 ### SleepBatchError タイプ
 
@@ -564,7 +572,7 @@ config.agents = [a,b]  → 指定 agent のみ
 
 ### メモリファイル公開（Publication）
 
-3つの記憶ファイル（`episodic.md` / `semantic.md` / `prospective.md`）は1つの **Memory bundle** として扱い、末尾の `publish_bundle()` でのみ公開する。各 Step は候補（candidate）をインメモリに更新するだけで、公開 Markdown を直接変更しない。
+2つの記憶ファイル（`episodic.md` / `semantic.md`）は1つの **Memory bundle** として扱い、末尾の `publish_bundle()` でのみ公開する。各 Step は候補（candidate）をインメモリに更新するだけで、公開 Markdown を直接変更しない。
 
 #### Per-agent RwLock
 
@@ -578,30 +586,34 @@ config.agents = [a,b]  → 指定 agent のみ
 
 `publish_bundle(agent_id, run_id, base, candidate)` は write lock 保持下で次の順序で実行する。
 
-1. 現在の3ファイルを読み、各 `content_before`（`base`）と一致することを確認（precondition）
+1. 現在の2ファイルを読み、各 `content_before`（`base`）と一致することを確認（precondition）
    - 不一致は手動編集とみなし `MemoryError::Conflict` で中断。現行ファイルはそのまま
 2. 各ファイルを `<file>.md.<run_id>.tmp` に書き、`flush` / `sync_all`
-3. `episodic` → `semantic` → `prospective` の順で rename
+3. `episodic` → `semantic` の順で rename
 4. ディレクトリを `sync_all`
 5. `MemoryLoader` cache を candidate bundle に更新
 
 #### Snapshot 完全性
 
-finalize 前、同じ `run_id` について3種類（episodic / semantic / prospective）の `memory_snapshots` を揃える。更新が無かった file にも `content_before == content_after == base` の snapshot を `ensure_memory_snapshots_complete()` で補完する。これを publication bundle の整合性条件とする。
+finalize 前、同じ `run_id` について2種類（episodic / semantic）の `memory_snapshots` を揃える。更新が無かった file にも `content_before == content_after == base` の snapshot を `ensure_memory_snapshots_complete()` で補完する。これを publication bundle の整合性条件とする。
+
+#### prospective.md の扱い
+
+`prospective.md` は runtime から読まれず、公開対象にも含まれない。ディスク上に残っていても削除・変更しない。
 
 #### 手動編集検出
 
- precondition 不一致（実行開始後にファイルが書き換えられた）は `Conflict` となり、現行ファイルを維持したまま Sleep Run を `failed` に遷移する。
+precondition 不一致（実行開始後にファイルが書き換えられた）は `Conflict` となり、現行ファイルを維持したまま run を `running` のまま残し、次回公開で再試行する。
 
 ### スタートアップリカバリ
 
 Runtime 起動時、`status = running` の Sleep Run を検査する（TurnDispatcher / Channel 起動前）。
 
-- 3種類の snapshot が揃っている場合、各ファイルの現状が `content_before` または `content_after` のいずれかに一致することを検証し、`content_after` から再公開（rename 再実行）して Run を成功へ遷移
+- 2種類の snapshot が揃っている場合、各ファイルの現状が `content_before` または `content_after` のいずれかに一致することを検証し、`content_after` から再公開（rename 再実行）して Run を成功へ遷移
 - snapshot が揃っていない Run は `failed` へ遷移
 - 現状が `before` / `after` のどちらにも一致しない場合、startup を error で停止
 
-これにより、1ファイル目・2ファイル目の rename 後、全 rename 後・run success 前のいずれの停止点からも同じ bundle へ収束する。
+これにより、1ファイル目の rename 後、全 rename 後・run success 前のいずれの停止点からも同じ bundle へ収束する。
 
 ---
 
@@ -628,7 +640,7 @@ redaction 後の内容だけを DB と記憶ファイルに保存する。
 
 ### Agent ID 検証
 
-ファイル書き込み前に `safe_agent_id_for_write()` で以下を拒否：
+ファイル書き込み前に `safe_agent_id()` で以下を拒否：
 - `..`（パストラバーサル）
 - `/`, `\`, `:`（パス区切り文字）
 
@@ -642,4 +654,3 @@ redaction 後の内容だけを DB と記憶ファイルに保存する。
 | 設定（`sleep_batch` セクション含む） | [config.md §3.7](./config.md#37-sleep-batch-設定sleep_batch) |
 | REST API（Sleep エンドポイント含む） | [api.md §2.9](./api.md#29-sleep-batch) |
 | WebUI の Schedule 画面 | [webui/schedule.md](./webui/schedule.md) |
-

@@ -27,7 +27,6 @@ const STEP_LABELS: Record<string, string> = {
   event_extraction: "Event extraction",
   episodic_update: "Episodic update",
   semantic_update: "Semantic update",
-  prospective_update: "Prospective update",
 };
 
 export function stepLabel(step: string): string {

@@ -33,8 +33,7 @@
 │       ├── PULSE.yaml
 │       └── memory/
 │           ├── episodic.md
-│           ├── semantic.md
-│           └── prospective.md
+│           └── semantic.md
 │
 ├── skills/
 │   └── egopulse/SKILL.md
@@ -106,15 +105,13 @@ agents/
     ├── AGENTS.md          # エージェント個別の Memories
     └── memory/            # 長期記憶（Phase 1）
         ├── episodic.md    # エピソード記憶
-        ├── semantic.md    # 意味記憶
-        └── prospective.md # 展望記憶
+        └── semantic.md    # 意味記憶
 ```
 
 | ファイル | 内容 | 備考 |
 |---|---|---|
 | `episodic.md` | 過去のやり取りや出来事の記録 | 存在しない場合はセクションごと省略 |
 | `semantic.md` | 知識や概念の定義、学習済み情報 | 存在しない場合はセクションごと省略 |
-| `prospective.md` | 予定、TODO、将来の意図 | 存在しない場合はセクションごと省略 |
 
 ### 2.3 skills/ — 組み込みスキル
 

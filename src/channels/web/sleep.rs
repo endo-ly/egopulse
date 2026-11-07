@@ -285,7 +285,6 @@ pub(super) async fn get_agent_memory(
         "memory": {
             "episodic": bundle.episodic,
             "semantic": bundle.semantic,
-            "prospective": bundle.prospective,
         }
     })))
 }
@@ -723,13 +722,6 @@ mod tests {
         insert_sleep_step(
             &web_state.app_state.db,
             "run-steps",
-            "prospective_update",
-            "skipped",
-            None,
-        );
-        insert_sleep_step(
-            &web_state.app_state.db,
-            "run-steps",
             "episodic_update",
             "success",
             None,
@@ -742,24 +734,18 @@ mod tests {
         assert_eq!(body["ok"], serde_json::json!(true));
 
         let steps = body["steps"].as_array().expect("steps array");
-        assert_eq!(steps.len(), 4);
+        assert_eq!(steps.len(), 3);
         let step_names: Vec<&str> = steps
             .iter()
             .map(|step| step["step"].as_str().expect("step name"))
             .collect();
         assert_eq!(
             step_names,
-            vec![
-                "event_extraction",
-                "episodic_update",
-                "semantic_update",
-                "prospective_update",
-            ]
+            vec!["event_extraction", "episodic_update", "semantic_update"]
         );
         assert_eq!(steps[0]["status"], "success");
         assert_eq!(steps[2]["status"], "failed");
         assert_eq!(steps[2]["error_message"], "rate limited");
-        assert_eq!(steps[3]["status"], "skipped");
     }
 
     #[tokio::test]
@@ -782,7 +768,6 @@ mod tests {
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["memory"]["episodic"], "# Episodic\n- entry\n");
         assert_eq!(body["memory"]["semantic"], "# Semantic\n");
-        assert_eq!(body["memory"]["prospective"], "");
     }
 
     #[tokio::test]
@@ -797,7 +782,6 @@ mod tests {
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["memory"]["episodic"], "");
         assert_eq!(body["memory"]["semantic"], "");
-        assert_eq!(body["memory"]["prospective"], "");
     }
 
     #[tokio::test]

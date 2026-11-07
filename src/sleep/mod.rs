@@ -7,9 +7,9 @@ pub(crate) mod scheduler;
 mod episodic_renderer;
 mod event_extraction;
 mod event_rollup;
-mod memory_update;
 mod orchestrator;
 mod prompt;
+mod semantic_update;
 
 #[derive(Debug, Error)]
 pub enum SleepBatchError {

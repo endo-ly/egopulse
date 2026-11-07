@@ -66,12 +66,12 @@ agent の現在の姿を一望するページ。各要素から詳細セクシ�
 
 ### 2.5 Memory
 
-episodic / semantic / prospective の 3 層を 1 ページで扱う。
+episodic / semantic の 2 種を 1 ページで扱う。
 
 | 領域 | 内容 |
 |---|---|
-| Files | 3 層を順にカードで表示する。文字数と最終更新（直近の変更時刻）を添え、長いものは先頭のみ表示して全文表示に切り替えられる |
-| Changes | 3 層をまたいだ公開済みの変更を新しい順に並べる。各行は層・時刻・増減行数を示し、開くと diff（[schedule.md §5.3](./schedule.md#53-diffviewer) の DiffViewer）を表示する。最新の 1 件は開いた状態で表示する。Sleep run 由来の行は Schedule タブの run 詳細へリンクする |
+| Files | 2 種を順にカードで表示する。文字数と最終更新（直近の変更時刻）を添え、長いものは先頭のみ表示して全文表示に切り替えられる |
+| Changes | 2 種をまたいだ公開済みの変更を新しい順に並べる。各行は層・時刻・増減行数を示し、開くと diff（[schedule.md §5.3](./schedule.md#53-diffviewer) の DiffViewer）を表示する。最新の 1 件は開いた状態で表示する。Sleep run 由来の行は Schedule タブの run 詳細へリンクする |
 
 ### 2.6 Skills
 
@@ -118,8 +118,8 @@ API の詳細は [api.md §2.12](../api.md#212-agent-画面)。
 |---|---|
 | `GET /api/agents/:agentId/profile` | 実効モデルと解決元、bindings、prompt に注入されるファイルのパス・サイズ |
 | `GET /api/agents/:agentId/files/:kind` | `soul` / `rules` / `secret` の各層（パス・内容・適用有無・存在・ハッシュ） |
-| `GET /api/agents/:agentId/memory` | 現在の長期記憶 3 ファイル |
-| `GET /api/agents/:agentId/memory/history` | 3 層をまたいだ公開済みの変更履歴 |
+| `GET /api/agents/:agentId/memory` | 現在の長期記憶 2 ファイル |
+| `GET /api/agents/:agentId/memory/history` | 2 種をまたいだ公開済みの変更履歴 |
 | `GET /api/sleep/runs?agent_id=&status=` | Recent activity の Sleep run |
 | `GET /api/skills` / `GET /api/skills/:name` / `GET /api/skills/:name/files/*` | スキル一覧・詳細・同梱ファイル。スキルは agent 非依存のためグローバルなパスに置く |
 | `PUT /api/agents/:agentId/files/:kind` | 編集（`expected_hash` 必須） |
