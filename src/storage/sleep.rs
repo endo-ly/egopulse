@@ -1536,10 +1536,6 @@ mod tests {
         assert!(db.list_sleep_run_steps(&id).expect("steps").is_empty());
     }
 
-    // ---------------------------------------------------------------------------
-    // Message range queries (event extract refactor)
-    // ---------------------------------------------------------------------------
-
     fn finish_step_success(
         db: &Database,
         run_id: &str,

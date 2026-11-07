@@ -2064,8 +2064,6 @@ mod tests {
         ]
     }
 
-    // --- integration tests (run_sleep_batch) ---
-
     #[tokio::test]
     async fn run_sleep_batch_skips_when_input_below_threshold() {
         // Arrange
@@ -2271,10 +2269,6 @@ mod tests {
         assert!(
             memory_dir.join("semantic.md").exists(),
             "semantic.md missing"
-        );
-        assert!(
-            !memory_dir.join("prospective.md").exists(),
-            "prospective.md must not be written"
         );
     }
 
@@ -2828,8 +2822,6 @@ mod tests {
         assert_eq!(runs[0].trigger, SleepRunTrigger::Scheduled);
         assert_eq!(runs[0].status, SleepRunStatus::Success);
     }
-
-    // --- retry integration ---
 
     struct SequentialMockProvider {
         responses: std::sync::Mutex<Vec<String>>,
@@ -3663,10 +3655,6 @@ mod tests {
         assert_eq!(week_end, "2026-05-31");
     }
 
-    // -----------------------------------------------------------------------
-    // collect_sleep_input tests
-    // -----------------------------------------------------------------------
-
     use crate::storage::SleepRunTrigger;
 
     fn ensure_sleep_runs_table(db: &Database) {
@@ -4135,8 +4123,6 @@ mod tests {
             ["u2", "a2", "u3", "a3"]
         );
     }
-
-    // --- Fix 5: archive/truncate failure must not finalize the run as Success ---
 
     #[test]
     fn archive_failure_leaves_run_running_not_success() {

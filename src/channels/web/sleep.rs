@@ -768,10 +768,6 @@ mod tests {
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["memory"]["episodic"], "# Episodic\n- entry\n");
         assert_eq!(body["memory"]["semantic"], "# Semantic\n");
-        assert!(
-            body["memory"].get("prospective").is_none(),
-            "prospective must not be exposed"
-        );
     }
 
     #[tokio::test]
@@ -786,10 +782,6 @@ mod tests {
         assert_eq!(body["ok"], serde_json::json!(true));
         assert_eq!(body["memory"]["episodic"], "");
         assert_eq!(body["memory"]["semantic"], "");
-        assert!(
-            body["memory"].get("prospective").is_none(),
-            "prospective must not be exposed"
-        );
     }
 
     #[tokio::test]

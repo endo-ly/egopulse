@@ -787,10 +787,6 @@ pub(crate) fn build_rollup_user_prompt(input_json: &str) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,7 +808,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 1: current_week — Monday start
     // -----------------------------------------------------------------------
     #[test]
     fn test_current_week_monday_start() {
@@ -877,7 +872,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 2: recent_weeks — identifies 4 closed weeks
     // -----------------------------------------------------------------------
     #[test]
     fn test_recent_weeks_identifies_4_closed() {
@@ -902,7 +896,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 4: detects new closed week (W-1 has no rollup)
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_new_closed_week() {
@@ -928,7 +921,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 5: detects missing week rollup (W-2 has no rollup)
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_missing_week_rollup() {
@@ -959,7 +951,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 6: detects delayed events in closed week
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_delayed_events_in_closed_week() {
@@ -996,7 +987,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 7: detects event count mismatch
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_event_count_mismatch() {
@@ -1037,7 +1027,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 8: month planner detects completed month with week rollups
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_week_rolling_out() {
@@ -1069,7 +1058,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 9: month planner detects missing month rollups
     // -----------------------------------------------------------------------
     #[test]
     fn test_detects_missing_month_rollup() {
@@ -1101,7 +1089,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 10: planner no longer detects background candidates (moved to batch.rs)
     // -----------------------------------------------------------------------
     #[test]
     fn test_planner_does_not_detect_background_candidates() {
@@ -1139,7 +1126,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 11: returns empty when no updates needed (both planners)
     // -----------------------------------------------------------------------
     #[test]
     fn test_returns_empty_when_no_updates_needed() {
@@ -1203,7 +1189,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 12: excludes current week events from month rollup
     // -----------------------------------------------------------------------
     #[test]
     fn test_excludes_current_week_events_from_month_rollup() {
@@ -1245,10 +1230,6 @@ mod tests {
             "current week events should NOT trigger background_candidate month rollup"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // Rollup LLM Integration Tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_build_week_rollup_requests_json_structure() {
@@ -1500,9 +1481,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Fix 1 test: month planner skips month when rollup already exists
-    // -----------------------------------------------------------------------
     #[test]
     fn test_week_rolling_out_suppressed_when_month_exists() {
         let now = jst_dt(2026, 5, 27, 10, 0);
@@ -1637,10 +1615,6 @@ mod tests {
         let june_req2 = reqs2.iter().find(|r| r.period_key == "2026-06");
         assert!(june_req2.is_none(), "should skip existing month rollup");
     }
-
-    // -----------------------------------------------------------------------
-    // Split prompt template tests
-    // -----------------------------------------------------------------------
 
     #[test]
     fn test_system_prompt_reads_split_templates() {

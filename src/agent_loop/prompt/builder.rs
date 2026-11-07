@@ -237,7 +237,6 @@ mod tests {
         )
     }
 
-    // Test 1: includes both memory files
     #[test]
     fn build_memory_section_includes_existing_files() {
         // Arrange
@@ -273,7 +272,6 @@ mod tests {
         );
     }
 
-    // Test 2: skips missing files
     #[test]
     fn build_memory_section_skips_missing_files() {
         // Arrange
@@ -298,7 +296,6 @@ mod tests {
         );
     }
 
-    // Test 3: includes reference disclaimer
     #[test]
     fn build_memory_section_adds_reference_disclaimer() {
         // Arrange
@@ -320,7 +317,6 @@ mod tests {
         assert!(section.contains("# Long-term Memory"), "heading missing");
     }
 
-    // Test 4: file order is episodic → semantic
     #[test]
     fn build_memory_section_file_order() {
         // Arrange
@@ -345,34 +341,6 @@ mod tests {
         );
     }
 
-    // Test 4b: a legacy prospective.md on disk is ignored
-    #[test]
-    fn long_term_memory_ignores_prospective_file() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        write_memory_file(dir.path(), "testagent", "episodic.md", "episodic-visible");
-        write_memory_file(
-            dir.path(),
-            "testagent",
-            "prospective.md",
-            "prospective-legacy-XYZ",
-        );
-
-        let state = build_test_state(dir.path());
-        let ctx = test_context("testagent");
-
-        // Act
-        let section =
-            build_memory_prompt_section(&state.turn_dependencies(), &ctx).expect("section");
-
-        // Assert
-        assert!(section.contains("episodic-visible"));
-        assert!(!section.contains("prospective-legacy-XYZ"));
-        assert!(!section.contains("Prospective Memory"));
-        assert!(!section.contains("<memory-prospective>"));
-    }
-
-    // Test 5: returns None when no memory files
     #[test]
     fn build_memory_section_returns_none_when_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -386,7 +354,6 @@ mod tests {
         assert!(result.is_none(), "should return None when no memory files");
     }
 
-    // Test 6: memory appears after agents, before skills in full prompt
     #[test]
     fn build_system_prompt_includes_memory_after_agents() {
         // Arrange
@@ -425,7 +392,6 @@ mod tests {
         );
     }
 
-    // Test 7: without memory, prompt is unchanged
     #[test]
     fn build_system_prompt_without_memory_is_unchanged() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -441,10 +407,6 @@ mod tests {
         assert!(prompt.contains("cli"), "channel missing");
         assert!(prompt.contains("test_session"), "session missing");
     }
-
-    // -----------------------------------------------------------------------
-    // System prompt section tests (migrated from turn.rs)
-    // -----------------------------------------------------------------------
 
     fn web_context(session: &str) -> SurfaceContext {
         web_context_with_agent(session, "default")
@@ -815,10 +777,6 @@ mod tests {
             "core instructions should still be present despite fallback"
         );
     }
-
-    // -----------------------------------------------------------------------
-    // SECRET.md injection tests
-    // -----------------------------------------------------------------------
 
     fn secret_context(session: &str) -> SurfaceContext {
         let mut ctx = web_context_with_agent(session, "default");

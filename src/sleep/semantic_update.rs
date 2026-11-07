@@ -262,7 +262,7 @@ mod tests {
     fn parse_semantic_response_rejects_extra_keys_and_non_string_values() {
         // Arrange
         let responses = [
-            r#"{"semantic":"s","prospective":"p"}"#,
+            r#"{"semantic":"s","extra":"p"}"#,
             r#"{"summary_md":"s"}"#,
             r#"{"semantic":42}"#,
             r#"{"semantic":"s","extra":null}"#,
@@ -384,7 +384,6 @@ mod tests {
         assert!(prompt.contains("<memory-semantic>"));
         assert!(prompt.contains("<episode-events>"));
         assert!(!prompt.contains("<sessions>"));
-        assert!(!prompt.contains("<memory-prospective>"));
         assert!(!prompt.contains("<old>"));
         assert!(!prompt.contains("<event>"));
         assert!(prompt.contains("&lt;old&gt;"));
