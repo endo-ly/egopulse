@@ -19,9 +19,9 @@ Self-hosted AI agent runtime (Rust/Tokio). TUI / Web UI / Discord / Telegram in 
 - `storage/` - SQLite（WAL モード）永続化。会話・メッセージ・セッション・ツール呼び出し・LLM 利用量を保存。マイグレーション管理も含む
 - `tools/` - ツールシステム。ファイル操作・シェル実行・検索・メッセージ送信などの built-in ツールに加え、MCP クライアントで外部ツールサーバーを接続。コマンド検閲・機密パスブロックも担う
 - `setup/` - 初回セットアップウィザード
-- `sleep/` - Sleep バッチ。会話履歴を episodic（エピソード）/ semantic（意味）/ prospective（展望）の 3 層に蒸留し、過去を整理して長期記憶へ昇格。手動実行とスケジューラ双方に対応
+- `sleep/` - Sleep バッチ。会話履歴を episode_events に符号化し、episodic（エピソード）/ semantic（意味）の記憶ファイルへ蒸留して長期記憶へ昇格。手動実行とスケジューラ双方に対応
 - `pulse/` - Pulse。時間・記憶・外界からの signal を受け取り、いま意識へ上げるべきものを選んで短く活性化
-- `memory.rs` - 長期記憶ファイル（episodic / semantic / prospective）の読み込み
+- `memory.rs` - 長期記憶ファイル（episodic / semantic）の読み込みと原子的な公開・リカバリ
 - `skills.rs` - スキル管理。発見・読み込み・カタログ生成。SOUL.md / AGENTS.md によるエージェント人格と規約の定義もここで読み込む
 - `slash_commands.rs` - スラッシュコマンドのディスパッチと LLM プロファイル管理
 - `error.rs` - エラー型

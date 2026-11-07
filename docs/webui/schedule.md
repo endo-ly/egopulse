@@ -143,7 +143,7 @@ Activation 中のツール実行は、通知を保存した会話の Pulse trace
 |---|---|
 | 見出し | `Sleep` / `Manual sleep` / `Backfill sleep` |
 | Run summary | 上段の左。status（`Success` / `Partial failure` / `Failed` / `Skipped` / `Running`）と、Tokens（総トークン数）・Sessions（対象セッション数）・Started（開始時刻）・Took（所要時間）・Run（`#` + 先頭6文字、ホバーで全 ID）。Took は Started の下に置く。値のない項目は出さない。ステップの成否は Pipeline の行が示すので件数は繰り返さない |
-| Pipeline | 上段の右。4 ステップ（Event extraction → Episodic update → Semantic update → Prospective update）をパイプライン順に 1 行ずつ並べ、行はアイコン・ステップ名・トークン数（入力 + 出力。0 は非表示）。成功は `✓` と success 色、失敗は danger 色の `✕`、skipped / pending は薄く表示する。全ステップが成功した run でも各ステップを残す。失敗したステップのエラーは全文表示する |
+| Pipeline | 上段の右。3 ステップ（Event extraction → Episodic update → Semantic update）をパイプライン順に 1 行ずつ並べ、行はアイコン・ステップ名・トークン数（入力 + 出力。0 は非表示）。成功は `✓` と success 色、失敗は danger 色の `✕`、skipped / pending は薄く表示する。全ステップが成功した run でも各ステップを残す。失敗したステップのエラーは全文表示する |
 | Memory changes | 公開済みの run（`success` / `partial_failure`）だけに表示する。見出しの右に、変更のあったファイルを増減行数付き（`episodic +4 −0`）のチップで並べ、選んだファイルの diff を表示する。既定は最初のファイル。変更がなければ `Memory was left unchanged.` |
 
 - 実行しないと判定した run は `Did not run: {理由}.` を表示し、Pipeline は出さない
