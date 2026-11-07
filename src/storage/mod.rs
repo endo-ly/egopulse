@@ -548,16 +548,14 @@ define_enum! {
         EventExtraction => "event_extraction",
         EpisodicUpdate => "episodic_update",
         SemanticUpdate => "semantic_update",
-        ProspectiveUpdate => "prospective_update",
     }
 }
 
 impl SleepStepName {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 3] = [
         Self::EventExtraction,
         Self::EpisodicUpdate,
         Self::SemanticUpdate,
-        Self::ProspectiveUpdate,
     ];
 }
 
@@ -585,7 +583,6 @@ define_enum! {
     pub(crate) enum MemoryFile {
         Episodic => "episodic",
         Semantic => "semantic",
-        Prospective => "prospective",
     }
 }
 

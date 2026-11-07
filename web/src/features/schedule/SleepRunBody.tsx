@@ -149,7 +149,7 @@ function stepGlyph(status: SleepStepStatus): string {
   }
 }
 
-const MEMORY_FILES = ["episodic", "semantic", "prospective"] as const;
+const MEMORY_FILES = ["episodic", "semantic"] as const;
 
 function MemoryChanges({ snapshots }: { snapshots: MemorySnapshot[] }) {
   const changed = useMemo(

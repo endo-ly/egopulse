@@ -1,7 +1,7 @@
 //! Agent long-term memory: bundle loading, atomic publication, and crash recovery.
 //!
-//! The three memory files (`episodic.md`, `semantic.md`, `prospective.md`) are
-//! treated as a single [`MemoryBundle`]. Reads ([`MemoryLoader::load_bundle`])
+//! The two memory files (`episodic.md`, `semantic.md`) are treated as a
+//! single [`MemoryBundle`]. Reads ([`MemoryLoader::load_bundle`])
 //! take a per-agent **read lock** and serve the published bundle from an
 //! in-memory cache (disk is only touched on the first load, before the cache
 //! is warm). Sleep publication ([`MemoryLoader::publish_bundle`]) takes the
@@ -10,8 +10,7 @@
 //! readers observe either the fully old or the fully new bundle, never an
 //! in-flight mix.
 //!
-//! Publication replaces all three files via per-file temp-file + fsync +
-//! rename. Because the renames are sequential, a crash between them can leave a
+//! Publication replaces both files via per-file temp-file + fsync + rename. Because the renames are sequential, a crash between them can leave a
 //! **mixed bundle on disk**; that on-disk state is never exposed to live
 //! readers (the write lock), and [`MemoryLoader::recover_publication`] re-drives
 //! the rename sequence from the persisted `memory_snapshots` on the next
@@ -25,7 +24,7 @@ use tracing::warn;
 
 use crate::runtime::metrics;
 
-/// The three long-term memory files published atomically as one bundle.
+/// The two long-term memory files published atomically as one bundle.
 ///
 /// Each field holds the raw file content (empty string when the file is absent
 /// or empty). Callers that want to omit empty sections (e.g. the Turn prompt
@@ -34,7 +33,6 @@ use crate::runtime::metrics;
 pub(crate) struct MemoryBundle {
     pub episodic: String,
     pub semantic: String,
-    pub prospective: String,
 }
 
 impl MemoryBundle {
@@ -43,33 +41,30 @@ impl MemoryBundle {
         match file {
             MemoryFile::Episodic => &self.episodic,
             MemoryFile::Semantic => &self.semantic,
-            MemoryFile::Prospective => &self.prospective,
         }
     }
 
-    /// Whether all three files are empty (no memory published yet).
+    /// Whether both files are empty (no memory published yet).
     pub(crate) fn all_empty(&self) -> bool {
-        self.episodic.is_empty() && self.semantic.is_empty() && self.prospective.is_empty()
+        self.episodic.is_empty() && self.semantic.is_empty()
     }
 }
 
-/// The three memory file kinds, mirroring [`crate::storage::MemoryFile`] without
+/// The two memory file kinds, mirroring [`crate::storage::MemoryFile`] without
 /// pulling the storage dependency into this module's public surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemoryFile {
     Episodic,
     Semantic,
-    Prospective,
 }
 
 impl MemoryFile {
-    const ALL: [Self; 3] = [Self::Episodic, Self::Semantic, Self::Prospective];
+    const ALL: [Self; 2] = [Self::Episodic, Self::Semantic];
 
     const fn file_name(self) -> &'static str {
         match self {
             Self::Episodic => "episodic.md",
             Self::Semantic => "semantic.md",
-            Self::Prospective => "prospective.md",
         }
     }
 }
@@ -251,7 +246,7 @@ impl MemoryLoader {
     /// `after` (post-publication) content; otherwise the run is in an
     /// unclassifiable state and recovery halts with
     /// [`MemoryError::RecoveryValidation`]. The `after` bundle is then
-    /// (re)written atomically so all three files converge to the intended
+    /// (re)written atomically so both files converge to the intended
     /// post-publication state.
     ///
     /// # Errors
@@ -372,7 +367,7 @@ fn sync_created_ancestors(memory_dir: &Path, agents_dir: &Path) -> Result<(), Me
 
 /// Removes orphaned `*.tmp` files from the memory dir. Best-effort: errors are
 /// logged and never fail a publication, since a leftover temp file does not
-/// affect correctness (only the three canonical files are ever read).
+/// affect correctness (only the two canonical files are ever read).
 fn cleanup_stale_temp_files(memory_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(memory_dir) else {
         return;
@@ -406,7 +401,6 @@ fn read_bundle(memory_dir: &Path) -> Result<MemoryBundle, MemoryError> {
     Ok(MemoryBundle {
         episodic: read_file_or_empty(&memory_dir.join(MemoryFile::Episodic.file_name()))?,
         semantic: read_file_or_empty(&memory_dir.join(MemoryFile::Semantic.file_name()))?,
-        prospective: read_file_or_empty(&memory_dir.join(MemoryFile::Prospective.file_name()))?,
     })
 }
 
@@ -456,29 +450,26 @@ mod tests {
         fs::write(path, content).expect("write memory file");
     }
 
-    fn bundle_of(ep: &str, sem: &str, pro: &str) -> MemoryBundle {
+    fn bundle_of(ep: &str, sem: &str) -> MemoryBundle {
         MemoryBundle {
             episodic: ep.to_string(),
             semantic: sem.to_string(),
-            prospective: pro.to_string(),
         }
     }
 
     // --- load_bundle ---
 
     #[test]
-    fn load_bundle_reads_all_three_files() {
+    fn load_bundle_reads_both_files() {
         let dir = tempfile::tempdir().unwrap();
         write_memory_file(dir.path(), "a", "episodic.md", "ep");
         write_memory_file(dir.path(), "a", "semantic.md", "sem");
-        write_memory_file(dir.path(), "a", "prospective.md", "pro");
 
         let loader = make_loader(dir.path());
         let bundle = loader.load_bundle("a").expect("bundle");
 
         assert_eq!(bundle.episodic, "ep");
         assert_eq!(bundle.semantic, "sem");
-        assert_eq!(bundle.prospective, "pro");
     }
 
     #[test]
@@ -498,7 +489,6 @@ mod tests {
         let bundle = loader.load_bundle("a").expect("bundle");
         assert_eq!(bundle.episodic, "ep");
         assert!(bundle.semantic.is_empty());
-        assert!(bundle.prospective.is_empty());
     }
 
     #[test]
@@ -512,12 +502,12 @@ mod tests {
     // --- publish_bundle ---
 
     #[test]
-    fn publish_bundle_writes_all_three_files() {
+    fn publish_bundle_writes_both_files() {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
         let base = MemoryBundle::default();
-        let candidate = bundle_of("new ep", "new sem", "new pro");
+        let candidate = bundle_of("new ep", "new sem");
 
         loader
             .publish_bundle("a", "run-1", &base, &candidate)
@@ -532,10 +522,6 @@ mod tests {
             fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
             "new sem"
         );
-        assert_eq!(
-            fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
-            "new pro"
-        );
 
         let loaded = loader.load_bundle("a").expect("load");
         assert_eq!(*loaded, candidate);
@@ -547,13 +533,13 @@ mod tests {
         write_memory_file(dir.path(), "a", "episodic.md", "base ep");
 
         let loader = make_loader(dir.path());
-        let base = bundle_of("base ep", "", "");
+        let base = bundle_of("base ep", "");
 
         // Simulate a manual edit between run start and publication.
         write_memory_file(dir.path(), "a", "episodic.md", "manually edited");
 
         let err = loader
-            .publish_bundle("a", "run-1", &base, &bundle_of("new ep", "", ""))
+            .publish_bundle("a", "run-1", &base, &bundle_of("new ep", ""))
             .expect_err("should conflict");
         assert!(matches!(err, MemoryError::Conflict { .. }));
 
@@ -581,16 +567,15 @@ mod tests {
                 "a",
                 "seed",
                 &MemoryBundle::default(),
-                &bundle_of("ep-a", "sem-a", "pro-a"),
+                &bundle_of("ep-a", "sem-a"),
             )
             .expect("seed publish");
         let loaded = loader.load_bundle("a").expect("load warms cache");
-        assert_eq!(*loaded, bundle_of("ep-a", "sem-a", "pro-a"));
+        assert_eq!(*loaded, bundle_of("ep-a", "sem-a"));
 
         // External manual edit to B on disk, bypassing the loader.
         write_memory_file(dir.path(), "a", "episodic.md", "ep-b");
         write_memory_file(dir.path(), "a", "semantic.md", "sem-b");
-        write_memory_file(dir.path(), "a", "prospective.md", "pro-b");
 
         // A run that started from the now-stale cached base A conflicts against
         // the edited disk B.
@@ -598,8 +583,8 @@ mod tests {
             .publish_bundle(
                 "a",
                 "run-1",
-                &bundle_of("ep-a", "sem-a", "pro-a"),
-                &bundle_of("new", "new", "new"),
+                &bundle_of("ep-a", "sem-a"),
+                &bundle_of("new", "new"),
             )
             .expect_err("should conflict");
         assert!(matches!(err, MemoryError::Conflict { .. }));
@@ -607,19 +592,19 @@ mod tests {
         // The conflict realigned the cache to B, so the next load returns B
         // (not the stale A).
         let loaded = loader.load_bundle("a").expect("load after conflict");
-        assert_eq!(*loaded, bundle_of("ep-b", "sem-b", "pro-b"));
+        assert_eq!(*loaded, bundle_of("ep-b", "sem-b"));
 
         // A run based on the realigned base B now succeeds.
         loader
             .publish_bundle(
                 "a",
                 "run-2",
-                &bundle_of("ep-b", "sem-b", "pro-b"),
-                &bundle_of("final", "final", "final"),
+                &bundle_of("ep-b", "sem-b"),
+                &bundle_of("final", "final"),
             )
             .expect("next run succeeds against realigned base");
         let loaded = loader.load_bundle("a").expect("load after success");
-        assert_eq!(*loaded, bundle_of("final", "final", "final"));
+        assert_eq!(*loaded, bundle_of("final", "final"));
     }
 
     #[test]
@@ -628,12 +613,7 @@ mod tests {
         let loader = make_loader(dir.path());
 
         loader
-            .publish_bundle(
-                "a",
-                "run-1",
-                &MemoryBundle::default(),
-                &bundle_of("e", "s", "p"),
-            )
+            .publish_bundle("a", "run-1", &MemoryBundle::default(), &bundle_of("e", "s"))
             .expect("publish");
 
         let memory_dir = dir.path().join("agents").join("a").join("memory");
@@ -668,7 +648,7 @@ mod tests {
         let loader = make_loader(dir.path());
 
         let before = MemoryBundle::default();
-        let after = bundle_of("after ep", "after sem", "after pro");
+        let after = bundle_of("after ep", "after sem");
 
         // No files exist yet → current == before (all empty).
         loader
@@ -684,14 +664,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
-        let before = bundle_of("old ep", "old sem", "old pro");
-        let after = bundle_of("new ep", "new sem", "new pro");
+        let before = bundle_of("old ep", "old sem");
+        let after = bundle_of("new ep", "new sem");
 
-        // Simulate a crash after episodic was renamed to `after` but the others
-        // are still `before`.
+        // Simulate a crash after episodic was renamed to `after` but the other
+        // file is still `before`.
         write_memory_file(dir.path(), "a", "episodic.md", "new ep");
         write_memory_file(dir.path(), "a", "semantic.md", "old sem");
-        write_memory_file(dir.path(), "a", "prospective.md", "old pro");
 
         loader
             .recover_publication("a", "run-1", &before, &after)
@@ -706,8 +685,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let loader = make_loader(dir.path());
 
-        let before = bundle_of("old ep", "", "");
-        let after = bundle_of("new ep", "", "");
+        let before = bundle_of("old ep", "");
+        let after = bundle_of("new ep", "");
 
         // A content that matches neither before nor after.
         write_memory_file(dir.path(), "a", "episodic.md", "mystery");
@@ -730,15 +709,13 @@ mod tests {
         let before = MemoryBundle {
             episodic: String::new(),
             semantic: String::new(),
-            prospective: String::new(),
         };
         let after = MemoryBundle {
             episodic: "# Episodic\n\n- entry\n".to_string(),
             semantic: "# Semantic\n".to_string(),
-            prospective: String::new(),
         };
 
-        // Simulate a crash after all three files were renamed to `after`.
+        // Simulate a crash after both files were renamed to `after`.
         write_memory_file(dir.path(), "a", "episodic.md", "# Episodic\n\n- entry\n");
         write_memory_file(dir.path(), "a", "semantic.md", "# Semantic\n");
 
@@ -770,7 +747,7 @@ mod tests {
                 "a",
                 "seed",
                 &MemoryBundle::default(),
-                &bundle_of("gen1-ep", "gen1-sem", "gen1-pro"),
+                &bundle_of("gen1-ep", "gen1-sem"),
             )
             .expect("seed publish");
 
@@ -781,8 +758,8 @@ mod tests {
                 .publish_bundle(
                     "a",
                     "gen2",
-                    &bundle_of("gen1-ep", "gen1-sem", "gen1-pro"),
-                    &bundle_of("gen2-ep", "gen2-sem", "gen2-pro"),
+                    &bundle_of("gen1-ep", "gen1-sem"),
+                    &bundle_of("gen2-ep", "gen2-sem"),
                 )
                 .expect("gen2 publish");
         });
@@ -808,15 +785,8 @@ mod tests {
                     } else {
                         0
                     };
-                    let prospective_gen = if bundle.prospective == "gen1-pro" {
-                        1
-                    } else if bundle.prospective == "gen2-pro" {
-                        2
-                    } else {
-                        0
-                    };
                     assert!(
-                        generation == semantic_gen && generation == prospective_gen,
+                        generation == semantic_gen,
                         "torn read detected: {:?}",
                         bundle
                     );
@@ -831,6 +801,6 @@ mod tests {
 
         // Final state is generation 2.
         let final_bundle = loader.load_bundle("a").expect("final load");
-        assert_eq!(*final_bundle, bundle_of("gen2-ep", "gen2-sem", "gen2-pro"));
+        assert_eq!(*final_bundle, bundle_of("gen2-ep", "gen2-sem"));
     }
 }

@@ -492,7 +492,7 @@ mod tests {
         let events = vec![make_event(
             "2026-05-25T10:00:00+09:00",
             "decision",
-            "Call2 weekly bucket design",
+            "weekly bucket design",
             "Keep Current Week in event units; stabilize closed weeks as summaries.",
             4,
         )];
@@ -534,7 +534,7 @@ mod tests {
         );
         assert!(output.contains("## Current Week: 2026-W22 (2026-05-25..2026-05-31)"));
         assert!(output.contains("### 2026-05-25"));
-        assert!(output.contains("- [decision r4] Call2 weekly bucket design"));
+        assert!(output.contains("- [decision r4] weekly bucket design"));
         assert!(
             output.contains(
                 "  Keep Current Week in event units; stabilize closed weeks as summaries."

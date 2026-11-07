@@ -97,7 +97,7 @@ export interface SleepRun {
   total_tokens: number;
   error_message: string | null;
   session_count: number;
-  /** Memory files this run published changes to, episodic → semantic → prospective. */
+  /** Memory files this run published changes to, episodic → semantic. */
   changed_memory: string[];
 }
 
@@ -207,7 +207,7 @@ export interface MemorySnapshot {
   created_at: string;
 }
 
-export const MEMORY_LAYERS = ["episodic", "semantic", "prospective"] as const;
+export const MEMORY_LAYERS = ["episodic", "semantic"] as const;
 export type MemoryLayer = (typeof MEMORY_LAYERS)[number];
 
 /** Published content of each long-term memory layer. */

@@ -691,9 +691,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 response: serde_json::json!({
-                    "episodic": "",
-                    "semantic": "",
-                    "prospective": ""
+                    "semantic": ""
                 })
                 .to_string(),
             }

@@ -25,7 +25,7 @@ const RUN = {
   total_tokens: 1200,
   error_message: "semantic update failed: rate limited",
   session_count: 3,
-  changed_memory: ["episodic", "prospective"],
+  changed_memory: ["episodic", "semantic"],
 };
 
 function snapshot(file: string, before: string, after: string) {
@@ -40,14 +40,12 @@ const DETAIL = {
   run: RUN,
   snapshots: [
     snapshot("episodic", "# Episodic\n- old\n", "# Episodic\n- new\n"),
-    snapshot("semantic", "# Semantic\n", "# Semantic\n"),
-    snapshot("prospective", "- a\n", "- a\n- b\n"),
+    snapshot("semantic", "- a\n", "- a\n- b\n"),
   ],
   steps: [
     step("event_extraction", "success"),
     step("episodic_update", "success"),
     step("semantic_update", "failed", "rate limited"),
-    step("prospective_update", "skipped"),
   ],
 };
 
@@ -61,7 +59,7 @@ describe("SleepRunBody", () => {
 
     // Assert
     await waitFor(() => {
-      expect(container.querySelectorAll(".pipeline-step")).toHaveLength(4);
+      expect(container.querySelectorAll(".pipeline-step")).toHaveLength(3);
     });
     const facts = container.querySelector(".sleep-run-facts")!;
     // The duration follows the start time; step outcomes are the pipeline rows.
@@ -76,8 +74,8 @@ describe("SleepRunBody", () => {
     expect(facts.textContent).toContain("4m 0s");
     expect(container.querySelector(".run-detail-title")!.textContent).toBe("Sleep");
     const steps = Array.from(container.querySelectorAll(".pipeline-step"));
-    expect(steps.map((el) => el.getAttribute("data-status"))).toEqual(["success", "success", "failed", "skipped"]);
-    expect(steps.map((el) => el.querySelector(".pipeline-step-icon")!.textContent)).toEqual(["✓", "✓", "✕", "–"]);
+    expect(steps.map((el) => el.getAttribute("data-status"))).toEqual(["success", "success", "failed"]);
+    expect(steps.map((el) => el.querySelector(".pipeline-step-icon")!.textContent)).toEqual(["✓", "✓", "✕"]);
     expect(steps[0].textContent).toContain("150");
     expect(container.querySelector(".pipeline-failure")!.textContent).toContain("rate limited");
   });
@@ -95,7 +93,7 @@ describe("SleepRunBody", () => {
     fireEvent.click(chips[1]);
 
     // Assert
-    expect(chips.map((chip) => chip.firstChild!.textContent)).toEqual(["episodic", "prospective"]);
+    expect(chips.map((chip) => chip.firstChild!.textContent)).toEqual(["episodic", "semantic"]);
     expect(chips[0].querySelector(".count-add")!.textContent).toBe("+1");
     await waitFor(() => {
       expect(chips[1].getAttribute("aria-pressed")).toBe("true");
@@ -127,17 +125,15 @@ describe("SleepRunBody", () => {
 
     // Assert
     await waitFor(() => {
-      expect(container.querySelectorAll(".pipeline-step")).toHaveLength(4);
+      expect(container.querySelectorAll(".pipeline-step")).toHaveLength(3);
     });
     const rows = Array.from(container.querySelectorAll(".pipeline-step"));
     expect(rows.map((el) => el.querySelector(".pipeline-step-name")!.textContent)).toEqual([
       "Event extraction",
       "Episodic update",
       "Semantic update",
-      "Prospective update",
     ]);
     expect(rows.map((el) => el.querySelector(".pipeline-step-meta")!.textContent)).toEqual([
-      "150",
       "150",
       "150",
       "150",

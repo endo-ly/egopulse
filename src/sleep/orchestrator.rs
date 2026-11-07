@@ -1,5 +1,5 @@
-//! Sleep batch orchestrator — coordinates 4 independent steps:
-//! event_extraction, episodic_update, semantic_update, prospective_update.
+//! Sleep batch orchestrator — coordinates event_extraction, episodic_update,
+//! semantic_update, and publish/finalize.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -25,7 +25,8 @@ use super::SleepBatchError;
 use super::episodic_renderer;
 use super::event_extraction::{self, ExtractedEvent};
 use super::event_rollup;
-use super::memory_update;
+use super::prompt::chunk_token_budget;
+use super::semantic_update;
 
 /// Threshold (≤ 64) at which sleep is skipped due to too few new messages.
 pub(crate) const SKIP_THRESHOLD: i64 = 64;
@@ -203,8 +204,9 @@ pub(crate) async fn run_sleep_batch_with_snapshot(
 
 /// Extracts episode events from past conversation history for backfilling.
 ///
-/// Unlike normal sleep batch (which runs 4 steps), this only runs event extraction
-/// (Event Extraction) using the messages table. Old backfill events in the
+/// Unlike normal sleep batch (which runs the full event_extraction →
+/// episodic_update → semantic_update → publish sequence), this only runs
+/// event_extraction using the messages table. Old backfill events in the
 /// same period are replaced in a single transaction with new results.
 ///
 /// # Parameters
@@ -277,7 +279,7 @@ pub async fn run_events_extract(
             &crate::config::ProviderId::new(&resolved.provider),
             &resolved.model,
         );
-        let chunk_session_tokens = memory_update::sleep_chunk_session_tokens(context_tokens);
+        let chunk_session_tokens = chunk_token_budget(context_tokens);
 
         let agent_for_chats = resolved_agent.clone();
         let from_for_chats = from_owned.clone();
@@ -374,8 +376,8 @@ async fn call_rollup_llm_with_retry(
     input_json: &str,
     valid_keys: &HashSet<String>,
     agent_id: &str,
-) -> Result<(Vec<event_rollup::Call2RollupOutput>, i64, i64), SleepBatchError> {
-    let user_prompt = event_rollup::build_call2_user_prompt(input_json);
+) -> Result<(Vec<event_rollup::RollupOutputItem>, i64, i64), SleepBatchError> {
+    let user_prompt = event_rollup::build_rollup_user_prompt(input_json);
     let user_message = Message::text("user", user_prompt);
 
     let response = provider
@@ -387,15 +389,15 @@ async fn call_rollup_llm_with_retry(
     let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
     let output_json = event_rollup::redact_secrets(&response.content);
 
-    match event_rollup::parse_call2_output(&output_json, valid_keys) {
+    match event_rollup::parse_rollup_output(&output_json, valid_keys) {
         Ok(outputs) => Ok((outputs, first_input, first_output)),
         Err(first_error) => {
             warn!(
                 agent_id = %agent_id,
                 error = %first_error,
-                "Call2 parse failed; retrying once"
+                "rollup parse failed; retrying once"
             );
-            const CALL2_RETRY_GUARD: &str = "\
+            const ROLLUP_RETRY_GUARD: &str = "\
 Your previous response was not valid JSON according to the expected schema. \
 You must respond with ONLY a JSON object containing exactly one key: \
 \"rollups\" (an array of rollup objects). \
@@ -405,7 +407,7 @@ Output the raw JSON object and nothing else.";
             let retry_messages = vec![
                 user_message,
                 Message::text("assistant", &response.content),
-                Message::text("user", CALL2_RETRY_GUARD),
+                Message::text("user", ROLLUP_RETRY_GUARD),
             ];
             let retry_response = provider
                 .send_message(system_prompt, Arc::new(retry_messages), None)
@@ -418,13 +420,13 @@ Output the raw JSON object and nothing else.";
             let combined_output = first_output.saturating_add(retry_output);
             let retry_json = event_rollup::redact_secrets(&retry_response.content);
 
-            match event_rollup::parse_call2_output(&retry_json, valid_keys) {
+            match event_rollup::parse_rollup_output(&retry_json, valid_keys) {
                 Ok(outputs) => Ok((outputs, combined_input, combined_output)),
                 Err(retry_error) => {
                     warn!(
                         agent_id = %agent_id,
                         error = %retry_error,
-                        "Call2 retry also failed"
+                        "rollup retry also failed"
                     );
                     Err(SleepBatchError::ParseFailed(retry_error.to_string()))
                 }
@@ -448,18 +450,17 @@ struct BatchContext {
     config: Arc<crate::config::Config>,
 }
 
-struct MessageStepInput {
+struct ExtractionInput {
     chunks: Vec<String>,
     checkpoints: Vec<SleepStepCheckpoint>,
 }
 
-fn load_message_step_input(
+fn load_extraction_input(
     ctx: &BatchContext,
     db: &Database,
     agent_id: &str,
-    step_name: SleepStepName,
-) -> Result<MessageStepInput, SleepBatchError> {
-    let max_tokens = memory_update::sleep_chunk_session_tokens(ctx.context_tokens);
+) -> Result<ExtractionInput, SleepBatchError> {
+    let max_tokens = chunk_token_budget(ctx.context_tokens);
     let max_chars = max_tokens.saturating_mul(3);
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -472,7 +473,7 @@ fn load_message_step_input(
         };
         let checkpoint = db.get_sleep_checkpoint(
             agent_id,
-            step_name,
+            SleepStepName::EventExtraction,
             CheckpointSourceKind::Messages,
             &source_id,
         )?;
@@ -490,7 +491,7 @@ fn load_message_step_input(
 
         checkpoints.push(SleepStepCheckpoint {
             agent_id: agent_id.to_string(),
-            step_name,
+            step_name: SleepStepName::EventExtraction,
             source_kind: CheckpointSourceKind::Messages,
             source_id,
             cursor_at: last.timestamp.clone(),
@@ -499,8 +500,8 @@ fn load_message_step_input(
         });
 
         let text = event_extraction::messages_to_extract_text(&messages);
-        for block in memory_update::session_blocks(session, &text, max_chars) {
-            memory_update::append_chunk_block(&mut chunks, &mut current, block, max_chars);
+        for block in event_extraction::session_blocks(session, &text, max_chars) {
+            event_extraction::append_chunk_block(&mut chunks, &mut current, block, max_chars);
         }
     }
 
@@ -508,7 +509,7 @@ fn load_message_step_input(
         chunks.push(current);
     }
 
-    Ok(MessageStepInput {
+    Ok(ExtractionInput {
         chunks,
         checkpoints,
     })
@@ -540,7 +541,7 @@ async fn execute_batch(
         let mut ctx = prepare_batch_context(state, agent_id, sessions, &run_id, &snapshot).await?;
         run_event_extraction_step(&mut ctx, &db, agent_id).await?;
         run_episodic_update_step(&mut ctx, state, &db, agent_id).await?;
-        run_memory_update_step(&mut ctx, &db, agent_id).await?;
+        run_semantic_update_step(&mut ctx, &db, agent_id).await?;
 
         finalize_batch(&ctx, state, &db, agent_id).await?;
 
@@ -636,7 +637,7 @@ async fn prepare_batch_context(
     })
 }
 
-/// Step 1: Event Extraction — extracts episode events from session chunks.
+/// Event Extraction — extracts episode events from session chunks.
 async fn run_event_extraction_step(
     ctx: &mut BatchContext,
     db: &Arc<Database>,
@@ -648,7 +649,7 @@ async fn run_event_extraction_step(
     })
     .await?;
 
-    let input = match load_message_step_input(ctx, db, agent_id, SleepStepName::EventExtraction) {
+    let input = match load_extraction_input(ctx, db, agent_id) {
         Ok(input) => input,
         Err(error) => {
             finish_step_failed(
@@ -785,7 +786,7 @@ async fn finish_step_skipped(db: &Arc<Database>, run_id: &str, step_name: SleepS
     .ok();
 }
 
-/// Step 2: Episodic Update — rollup generation and episodic.md rendering.
+/// Episodic Update — rollup generation and episodic.md rendering.
 async fn run_episodic_update_step(
     ctx: &mut BatchContext,
     _state: &AppState,
@@ -973,7 +974,7 @@ async fn run_rollup_logic(
 
     // Week rollup generation
     if !week_requests.is_empty() {
-        let mut week_events_map: HashMap<String, Vec<event_rollup::Call2Event>> = HashMap::new();
+        let mut week_events_map: HashMap<String, Vec<event_rollup::RollupEvent>> = HashMap::new();
         for req in &week_requests {
             let req_start = req.period_start.clone();
             let req_end = req.period_end_exclusive.clone();
@@ -984,9 +985,9 @@ async fn run_rollup_logic(
             })
             .await?;
 
-            let call2_events: Vec<event_rollup::Call2Event> = period_events
+            let rollup_events: Vec<event_rollup::RollupEvent> = period_events
                 .iter()
-                .map(|e| event_rollup::Call2Event {
+                .map(|e| event_rollup::RollupEvent {
                     id: e.id.clone(),
                     experienced_at: e.experienced_at.clone(),
                     kind: e.kind.to_string(),
@@ -996,21 +997,21 @@ async fn run_rollup_logic(
                     certainty: e.certainty.to_string(),
                 })
                 .collect();
-            week_events_map.insert(req_key, call2_events);
+            week_events_map.insert(req_key, rollup_events);
         }
 
-        let week_input = event_rollup::build_call2_input(&week_requests, &week_events_map);
+        let week_input = event_rollup::build_week_rollup_requests(&week_requests, &week_events_map);
         let week_input_json = serde_json::to_string_pretty(&serde_json::json!({
             "rollup_requests": week_input
         }))
         .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
         let week_input_json = event_rollup::redact_secrets(&week_input_json);
 
-        let week_system_prompt = event_rollup::build_call2_system_prompt_week(agent_id);
+        let week_system_prompt = event_rollup::build_week_rollup_system_prompt(agent_id);
         let valid_keys: HashSet<String> =
             week_requests.iter().map(|r| r.period_key.clone()).collect();
 
-        let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
+        let (rollup_outputs, rollup_in, rollup_out) = call_rollup_llm_with_retry(
             &ctx.provider,
             &week_system_prompt,
             &week_input_json,
@@ -1019,8 +1020,8 @@ async fn run_rollup_logic(
         )
         .await?;
 
-        total_input = total_input.saturating_add(call2_in);
-        total_output = total_output.saturating_add(call2_out);
+        total_input = total_input.saturating_add(rollup_in);
+        total_output = total_output.saturating_add(rollup_out);
 
         let requests_by_key: HashMap<&str, &event_rollup::RollupRequest> = week_requests
             .iter()
@@ -1084,15 +1085,15 @@ async fn run_rollup_logic(
 
     // Month rollup generation
     if !month_requests.is_empty() {
-        let mut week_rollups_map: HashMap<String, Vec<event_rollup::Call2WeekRollupSummary>> =
+        let mut week_rollups_map: HashMap<String, Vec<event_rollup::WeekRollupSummary>> =
             HashMap::new();
         for req in &month_requests {
-            let summaries: Vec<event_rollup::Call2WeekRollupSummary> = existing_week_rollups
+            let summaries: Vec<event_rollup::WeekRollupSummary> = existing_week_rollups
                 .iter()
                 .filter(|wr| {
                     event_rollup::week_in_month(&wr.period_key, &req.period_key, tz_chrono)
                 })
-                .map(|wr| event_rollup::Call2WeekRollupSummary {
+                .map(|wr| event_rollup::WeekRollupSummary {
                     period_key: wr.period_key.clone(),
                     summary_md: wr.summary_md.clone(),
                     max_ripple: wr.max_ripple,
@@ -1126,7 +1127,7 @@ async fn run_rollup_logic(
             }
         }
 
-        let month_input = event_rollup::build_call2_input_month(
+        let month_input = event_rollup::build_month_rollup_requests(
             &month_requests,
             &week_rollups_map,
             &previous_month_map,
@@ -1137,13 +1138,13 @@ async fn run_rollup_logic(
         .map_err(|e| SleepBatchError::Internal(e.to_string()))?;
         let month_input_json = event_rollup::redact_secrets(&month_input_json);
 
-        let month_system_prompt = event_rollup::build_call2_system_prompt_month(agent_id);
+        let month_system_prompt = event_rollup::build_month_rollup_system_prompt(agent_id);
         let valid_keys: HashSet<String> = month_requests
             .iter()
             .map(|r| r.period_key.clone())
             .collect();
 
-        let (rollup_outputs, call2_in, call2_out) = call_rollup_llm_with_retry(
+        let (rollup_outputs, rollup_in, rollup_out) = call_rollup_llm_with_retry(
             &ctx.provider,
             &month_system_prompt,
             &month_input_json,
@@ -1152,8 +1153,8 @@ async fn run_rollup_logic(
         )
         .await?;
 
-        total_input = total_input.saturating_add(call2_in);
-        total_output = total_output.saturating_add(call2_out);
+        total_input = total_input.saturating_add(rollup_in);
+        total_output = total_output.saturating_add(rollup_out);
 
         let requests_by_key: HashMap<&str, &event_rollup::RollupRequest> = month_requests
             .iter()
@@ -1207,143 +1208,82 @@ async fn run_rollup_logic(
     ))
 }
 
-/// Steps 3 & 4: Memory Update — updates semantic and prospective memory via a single LLM call.
-async fn run_memory_update_step(
+/// semantic_update: folds episode events newer than the semantic checkpoint
+/// into `semantic.md` (candidate only; published at finalize).
+async fn run_semantic_update_step(
     ctx: &mut BatchContext,
     db: &Arc<Database>,
     agent_id: &str,
 ) -> Result<(), SleepBatchError> {
     let run_id = ctx.run_id.clone();
     call_blocking(Arc::clone(db), move |db| {
-        db.start_memory_update_steps(&run_id)
+        db.start_sleep_step(&run_id, SleepStepName::SemanticUpdate)
     })
     .await?;
 
-    let prospective_input =
-        load_message_step_input(ctx, db, agent_id, SleepStepName::ProspectiveUpdate)?;
-    let semantic_checkpoint = db.get_sleep_checkpoint(
-        agent_id,
-        SleepStepName::SemanticUpdate,
-        CheckpointSourceKind::EpisodeEvents,
-        agent_id,
-    )?;
-    let semantic_cursor = semantic_checkpoint
-        .as_ref()
-        .map(|value| (value.cursor_at.as_str(), value.cursor_id.as_str()));
-    let events = match db.get_latest_episode_event_cursor(agent_id)? {
-        Some(upper_bound) => db.get_episode_events_after_cursor(
-            agent_id,
-            semantic_cursor,
-            (&upper_bound.0, &upper_bound.1),
-        )?,
-        None => Vec::new(),
+    let events = match load_semantic_events(db, agent_id) {
+        Ok(events) => events,
+        Err(error) => {
+            warn!(error = %error, "semantic update: failed to load episode events");
+            finish_step_failed(
+                db,
+                &ctx.run_id,
+                SleepStepName::SemanticUpdate,
+                error.to_string(),
+            )
+            .await;
+            return Ok(());
+        }
     };
 
-    if prospective_input.chunks.is_empty() && events.is_empty() {
-        let run_id = ctx.run_id.clone();
-        call_blocking(Arc::clone(db), move |db| {
-            db.finish_memory_update_steps(
-                &run_id,
-                SleepStepResult {
-                    status: SleepStepStatus::Skipped,
-                    input_tokens: 0,
-                    output_tokens: 0,
-                    error_message: None,
-                    metadata_json: None,
-                },
-            )
-        })
-        .await?;
+    if events.is_empty() {
+        finish_step_skipped(db, &ctx.run_id, SleepStepName::SemanticUpdate).await;
         return Ok(());
     }
 
-    let mut checkpoints = prospective_input.checkpoints;
-    if let Some(last) = events.last() {
-        checkpoints.push(SleepStepCheckpoint {
-            agent_id: agent_id.to_string(),
-            step_name: SleepStepName::SemanticUpdate,
-            source_kind: CheckpointSourceKind::EpisodeEvents,
-            source_id: agent_id.to_string(),
-            cursor_at: last.encoded_at.clone(),
-            cursor_id: last.id.clone(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-        });
-    }
-
-    let event_text = if events.is_empty() {
-        String::new()
-    } else {
-        let event_values = events
-            .iter()
-            .map(|event| {
-                serde_json::json!({
-                    "id": event.id,
-                    "experienced_at": event.experienced_at,
-                    "kind": event.kind.to_string(),
-                    "title": event.title,
-                    "body_md": event.body_md,
-                    "ripple_strength": event.ripple_strength,
-                    "certainty": event.certainty.to_string(),
-                })
-            })
-            .collect::<Vec<_>>();
-        format!(
-            "<episode-events>\n{}\n</episode-events>\n",
-            serde_json::to_string(&event_values)
-                .map_err(|error| SleepBatchError::Internal(error.to_string()))?
-        )
-    };
-    let mut chunks = prospective_input.chunks;
-    if chunks.is_empty() {
-        chunks.push(event_text);
-    } else if !event_text.is_empty() {
-        chunks[0] = format!("{event_text}\n{}", chunks[0]);
-    }
-
-    let total_chunks = chunks.len();
-    let mut working_memory = ctx.candidate_memory.clone();
+    let max_chars = chunk_token_budget(ctx.context_tokens).saturating_mul(3);
+    let batches = semantic_update::build_event_batches(&events, max_chars);
+    let total_batches = batches.len();
+    let mut working = ctx.candidate_memory.semantic.clone();
     let mut total_input: i64 = 0;
     let mut total_output: i64 = 0;
     let mut step_failed = false;
     let mut error_msg = None;
 
-    for (index, sessions_text) in chunks.into_iter().enumerate() {
-        let input = match memory_update::build_sleep_input_from_parts(
+    for (index, events_json) in batches.into_iter().enumerate() {
+        let input = match semantic_update::build_semantic_input(
             agent_id,
-            working_memory.clone(),
-            sessions_text,
+            working.clone(),
+            events_json,
             ctx.context_tokens,
-            0,
         ) {
             Ok(input) => input,
-            Err(e) => {
-                warn!(error = %e, "failed to build sleep input");
+            Err(error) => {
+                warn!(error = %error, "semantic update: failed to build input");
                 step_failed = true;
-                error_msg = Some(e.to_string());
+                error_msg = Some(error.to_string());
                 break;
             }
         };
-
-        let system_prompt = memory_update::build_sleep_system_prompt(&input);
-        match memory_update::send_sleep_request(
+        let system_prompt = semantic_update::build_semantic_system_prompt(&input);
+        match semantic_update::send_semantic_request(
             &ctx.provider,
             agent_id,
             &system_prompt,
             index + 1,
-            total_chunks,
+            total_batches,
         )
         .await
         {
-            Ok((output, inp, out)) => {
+            Ok((semantic, inp, out)) => {
                 total_input = total_input.saturating_add(inp);
                 total_output = total_output.saturating_add(out);
-                working_memory.semantic = output.semantic.clone();
-                working_memory.prospective = output.prospective.clone();
+                working = semantic;
             }
-            Err(e) => {
-                warn!(error = %e, "memory update failed");
+            Err(error) => {
+                warn!(error = %error, "semantic update failed");
                 step_failed = true;
-                error_msg = Some(e.to_string());
+                error_msg = Some(error.to_string());
                 break;
             }
         }
@@ -1352,8 +1292,9 @@ async fn run_memory_update_step(
     if step_failed {
         let run_id = ctx.run_id.clone();
         call_blocking(Arc::clone(db), move |db| {
-            db.finish_memory_update_steps(
+            db.finish_sleep_step(
                 &run_id,
+                SleepStepName::SemanticUpdate,
                 SleepStepResult {
                     status: SleepStepStatus::Failed,
                     input_tokens: total_input,
@@ -1367,28 +1308,28 @@ async fn run_memory_update_step(
         return Ok(());
     }
 
-    // Always commit a snapshot for both memory files (even when unchanged) so
-    // the publication bundle has a complete snapshot set. content_before uses
-    // the run-start base; content_after uses the candidate produced here.
-    let snapshots = [
-        (
-            MemoryFile::Semantic,
-            ctx.base_memory.semantic.clone(),
-            working_memory.semantic.clone(),
-        ),
-        (
-            MemoryFile::Prospective,
-            ctx.base_memory.prospective.clone(),
-            working_memory.prospective.clone(),
-        ),
-    ];
+    let last = events.last().expect("events are non-empty");
+    let checkpoint = SleepStepCheckpoint {
+        agent_id: agent_id.to_string(),
+        step_name: SleepStepName::SemanticUpdate,
+        source_kind: CheckpointSourceKind::EpisodeEvents,
+        source_id: agent_id.to_string(),
+        cursor_at: last.encoded_at.clone(),
+        cursor_id: last.id.clone(),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let content_before = ctx.base_memory.semantic.clone();
+    let content_after = working.clone();
 
     let run_id = ctx.run_id.clone();
     let agent_id_owned = agent_id.to_string();
     if let Err(error) = call_blocking(Arc::clone(db), move |db| {
-        db.commit_memory_update_success(
+        db.commit_semantic_update_success(
             &run_id,
             &agent_id_owned,
+            &content_before,
+            &content_after,
+            &checkpoint,
             SleepStepResult {
                 status: SleepStepStatus::Success,
                 input_tokens: total_input,
@@ -1396,32 +1337,50 @@ async fn run_memory_update_step(
                 error_message: None,
                 metadata_json: None,
             },
-            &checkpoints,
-            &snapshots,
         )
     })
     .await
     {
-        let run_id = ctx.run_id.clone();
-        let error_message = error.to_string();
-        call_blocking(Arc::clone(db), move |db| {
-            db.finish_memory_update_steps(
-                &run_id,
-                SleepStepResult {
-                    status: SleepStepStatus::Failed,
-                    input_tokens: total_input,
-                    output_tokens: total_output,
-                    error_message: Some(&error_message),
-                    metadata_json: None,
-                },
-            )
-        })
-        .await?;
+        warn!(error = %error, "failed to commit semantic update");
+        finish_step_failed(
+            db,
+            &ctx.run_id,
+            SleepStepName::SemanticUpdate,
+            error.to_string(),
+        )
+        .await;
         return Ok(());
     }
 
-    ctx.candidate_memory = working_memory;
+    ctx.candidate_memory.semantic = working;
     Ok(())
+}
+
+/// Loads episode events newer than the semantic checkpoint, bounded by the
+/// latest event cursor at call time.
+fn load_semantic_events(
+    db: &Database,
+    agent_id: &str,
+) -> Result<Vec<EpisodeEvent>, SleepBatchError> {
+    let checkpoint = db.get_sleep_checkpoint(
+        agent_id,
+        SleepStepName::SemanticUpdate,
+        CheckpointSourceKind::EpisodeEvents,
+        agent_id,
+    )?;
+    let cursor = checkpoint
+        .as_ref()
+        .map(|value| (value.cursor_at.clone(), value.cursor_id.clone()));
+    let Some(upper_bound) = db.get_latest_episode_event_cursor(agent_id)? else {
+        return Ok(Vec::new());
+    };
+    Ok(db.get_episode_events_after_cursor(
+        agent_id,
+        cursor
+            .as_ref()
+            .map(|(cursor_at, cursor_id)| (cursor_at.as_str(), cursor_id.as_str())),
+        (&upper_bound.0, &upper_bound.1),
+    )?)
 }
 
 /// Finalizes batch: writes memory files, archives sessions, logs usage.
@@ -1540,27 +1499,12 @@ fn finalize_published_run_blocking(
             CheckpointSourceKind::Messages,
             &source_id,
         )?;
-        let prospective_checkpoint = db.get_sleep_checkpoint(
-            agent_id,
-            SleepStepName::ProspectiveUpdate,
-            CheckpointSourceKind::Messages,
-            &source_id,
-        )?;
-        let (Some(event_checkpoint), Some(prospective_checkpoint)) =
-            (event_checkpoint, prospective_checkpoint)
-        else {
+        // Archive only once event extraction has caught up with the session's
+        // latest message; otherwise new activity arrived after this run's snapshot.
+        let Some(event_checkpoint) = event_checkpoint else {
             continue;
         };
-        let boundary = std::cmp::min(
-            (event_checkpoint.cursor_at, event_checkpoint.cursor_id),
-            (
-                prospective_checkpoint.cursor_at,
-                prospective_checkpoint.cursor_id,
-            ),
-        );
-        // If the session still has messages past the boundary, it is not yet
-        // safe to archive (new activity arrived after this run's snapshot), so
-        // it is intentionally left untouched — not a failure.
+        let boundary = (event_checkpoint.cursor_at, event_checkpoint.cursor_id);
         let Some(latest) = db.get_latest_message_cursor(session.chat_id)? else {
             continue;
         };
@@ -1627,7 +1571,7 @@ fn finalize_published_run_blocking(
     Ok(())
 }
 
-/// Ensures the run has a complete 3-file snapshot set, reads it back, and
+/// Ensures the run has a complete 2-file snapshot set, reads it back, and
 /// publishes the candidate bundle atomically.
 ///
 /// Returns an error when publication cannot complete (manual-edit conflict,
@@ -1650,7 +1594,6 @@ async fn publish_memory_bundle(
             &[
                 (MemoryFile::Episodic, base.episodic.as_str()),
                 (MemoryFile::Semantic, base.semantic.as_str()),
-                (MemoryFile::Prospective, base.prospective.as_str()),
             ],
         )
     })
@@ -1693,7 +1636,7 @@ async fn publish_memory_bundle(
 
 /// Builds `(before, after)` bundles from a run's snapshots.
 ///
-/// Returns `None` unless exactly one snapshot exists for each of the three
+/// Returns `None` unless exactly one snapshot exists for each of the two
 /// memory files.
 fn build_bundles_from_snapshots(
     snapshots: &[MemorySnapshot],
@@ -1702,7 +1645,6 @@ fn build_bundles_from_snapshots(
     let mut after = MemoryBundle::default();
     let mut seen_episodic = false;
     let mut seen_semantic = false;
-    let mut seen_prospective = false;
     for snapshot in snapshots {
         match snapshot.file {
             MemoryFile::Episodic => {
@@ -1715,21 +1657,16 @@ fn build_bundles_from_snapshots(
                 after.semantic = snapshot.content_after.clone();
                 seen_semantic = true;
             }
-            MemoryFile::Prospective => {
-                before.prospective = snapshot.content_before.clone();
-                after.prospective = snapshot.content_after.clone();
-                seen_prospective = true;
-            }
         }
     }
-    // All three files must have a snapshot row; otherwise the bundle is
-    // incomplete and publication must not proceed.
-    (seen_episodic && seen_semantic && seen_prospective).then_some((before, after))
+    // Both files must have a snapshot row; otherwise the bundle is incomplete
+    // and publication must not proceed.
+    (seen_episodic && seen_semantic).then_some((before, after))
 }
 
 /// Recovers memory publication for sleep runs left `running` by a crash.
 ///
-/// For each running run: if its 3-file snapshot set is complete, re-drive the
+/// For each running run: if its 2-file snapshot set is complete, re-drive the
 /// publication from the persisted `after` bundle and transition the run to its
 /// derived terminal status. If the snapshot set is incomplete, the run is
 /// marked failed. If the on-disk content matches neither `before` nor `after`,
@@ -1942,8 +1879,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 response: serde_json::json!({
-                    "semantic": "",
-                    "prospective": ""
+                    "semantic": ""
                 })
                 .to_string(),
                 input_tokens: 0,
@@ -1956,18 +1892,6 @@ mod tests {
                 response: response.to_string(),
                 input_tokens: 0,
                 output_tokens: 0,
-            }
-        }
-
-        fn with_usage(input: i64, output: i64) -> Self {
-            Self {
-                response: serde_json::json!({
-                    "semantic": "",
-                    "prospective": ""
-                })
-                .to_string(),
-                input_tokens: input,
-                output_tokens: output,
             }
         }
     }
@@ -2110,13 +2034,33 @@ mod tests {
         crate::test_util::build_state_with_config(config, Some(llm), None, Some(Arc::new(db)), None)
     }
 
+    fn event_response(title: &str) -> String {
+        serde_json::json!({
+            "events": [{
+                "experienced_at": "2025-01-01T00:01:00Z",
+                "kind": "decision",
+                "title": title,
+                "body_md": "decided to test",
+                "ripple_strength": 3,
+                "certainty": "stated"
+            }]
+        })
+        .to_string()
+    }
+
+    fn semantic_response(text: &str) -> String {
+        serde_json::json!({ "semantic": text }).to_string()
+    }
+
     fn all_success_responses() -> Vec<String> {
         vec![
-            r#"{"events":[]}"#.to_string(),
-            r#"{"events":[]}"#.to_string(),
+            event_response("extracted event"),
+            // The rollup parser retries once, so the second event response is
+            // the deliberately-invalid first attempt.
+            event_response("ignored"),
             r#"{"rollups":[]}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
-            r#"{"semantic":"","prospective":""}"#.to_string(),
+            serde_json::json!({"semantic": "# Semantic\n\n- fact"}).to_string(),
         ]
     }
 
@@ -2267,8 +2211,7 @@ mod tests {
             r#"{"rollups":[]}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
             serde_json::json!({
-                "semantic": "# Semantic\n\n- fact",
-                "prospective": "# Prospective\n\n- todo"
+                "semantic": "# Semantic\n\n- fact"
             })
             .to_string(),
         ]));
@@ -2310,7 +2253,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_sleep_batch_persists_all_three_memory_files() {
+    async fn run_sleep_batch_persists_both_memory_files() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
         let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
@@ -2330,8 +2273,8 @@ mod tests {
             "semantic.md missing"
         );
         assert!(
-            memory_dir.join("prospective.md").exists(),
-            "prospective.md missing"
+            !memory_dir.join("prospective.md").exists(),
+            "prospective.md must not be written"
         );
     }
 
@@ -2339,9 +2282,13 @@ mod tests {
     async fn run_sleep_batch_creates_complete_snapshot_set_for_every_file() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
-        // all_success_responses yields no rollups and empty semantic/prospective,
-        // so no file actually changes — yet each must still have a snapshot.
-        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
+        // Extraction yields no events, so semantic is skipped and neither file
+        // changes — yet each must still have a snapshot.
+        let llm = Arc::new(SequentialMockProvider::new(vec![
+            r#"{"events":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+            r#"{"rollups":[]}"#.to_string(),
+        ]));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -2358,22 +2305,15 @@ mod tests {
             .expect("snapshots");
         assert_eq!(
             snapshots.len(),
-            3,
-            "all three memory files must have a snapshot, even unchanged ones"
+            2,
+            "both memory files must have a snapshot, even unchanged ones"
         );
-        // semantic and prospective are unchanged (LLM returned empty strings),
-        // so their snapshots must still exist with before == after.
-        for snapshot in &snapshots {
-            if matches!(
-                snapshot.file,
-                MemoryFile::Semantic | MemoryFile::Prospective
-            ) {
-                assert_eq!(
-                    snapshot.content_before, snapshot.content_after,
-                    "unchanged file snapshot must have before == after"
-                );
-            }
-        }
+        // Semantic did not change; its snapshot must still exist with before == after.
+        let semantic = snapshots
+            .iter()
+            .find(|snapshot| snapshot.file == MemoryFile::Semantic)
+            .expect("semantic snapshot");
+        assert_eq!(semantic.content_before, semantic.content_after);
     }
 
     #[tokio::test]
@@ -2386,13 +2326,7 @@ mod tests {
         std::fs::create_dir_all(&memory_dir).expect("create memory dir");
         std::fs::write(memory_dir.join("episodic.md"), "base ep").expect("write base");
 
-        let llm = Arc::new(SequentialMockProvider::new(vec![
-            r#"{"events":[]}"#.to_string(),
-            r#"{"events":[]}"#.to_string(),
-            r#"{"rollups":[]}"#.to_string(),
-            r#"{"rollups":[]}"#.to_string(),
-            serde_json::json!({"semantic":"new sem","prospective":"new pro"}).to_string(),
-        ]));
+        let llm = Arc::new(SequentialMockProvider::new(all_success_responses()));
         // Simulate a manual edit to episodic.md after the run captured base but
         // before publication. The run loads base at start, so the edit happens
         // after that snapshot but before finalize.
@@ -2432,12 +2366,10 @@ mod tests {
         let before = MemoryBundle {
             episodic: "old ep".to_string(),
             semantic: "old sem".to_string(),
-            prospective: "old pro".to_string(),
         };
         let after = MemoryBundle {
             episodic: "new ep".to_string(),
             semantic: "new sem".to_string(),
-            prospective: "new pro".to_string(),
         };
 
         // Create a running sleep run with a complete snapshot set.
@@ -2455,7 +2387,6 @@ mod tests {
         // Crash point 1: only episodic renamed to `after`.
         std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
         std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
-        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
         recover_memory_publication(&state).expect("recover 1");
         assert_bundle(&memory_dir, &after);
         assert_eq!(
@@ -2472,12 +2403,10 @@ mod tests {
         let before = MemoryBundle {
             episodic: "old ep".to_string(),
             semantic: "old sem".to_string(),
-            prospective: "old pro".to_string(),
         };
         let after = MemoryBundle {
             episodic: "new ep".to_string(),
             semantic: "new sem".to_string(),
-            prospective: "new pro".to_string(),
         };
 
         let run_id = state
@@ -2493,7 +2422,6 @@ mod tests {
         // All files already at `after`, but the run is still `running`.
         std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
         std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
-        std::fs::write(memory_dir.join("prospective.md"), "new pro").unwrap();
 
         recover_memory_publication(&state).expect("recover");
         assert_bundle(&memory_dir, &after);
@@ -2504,19 +2432,17 @@ mod tests {
     }
 
     #[test]
-    fn recover_memory_publication_converges_after_two_files_renamed() {
+    fn recover_memory_publication_converges_after_one_file_renamed() {
         let (db, dir) = test_db();
         let state = build_test_state(db, dir.path());
 
         let before = MemoryBundle {
             episodic: "old ep".to_string(),
             semantic: "old sem".to_string(),
-            prospective: "old pro".to_string(),
         };
         let after = MemoryBundle {
             episodic: "new ep".to_string(),
             semantic: "new sem".to_string(),
-            prospective: "new pro".to_string(),
         };
 
         let run_id = state
@@ -2529,10 +2455,9 @@ mod tests {
 
         let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
         std::fs::create_dir_all(&memory_dir).unwrap();
-        // Crash point 2: episodic and semantic renamed to `after`, prospective still `before`.
+        // Crash point: episodic was renamed to `after`, semantic is still `before`.
         std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
-        std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
-        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
+        std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
 
         recover_memory_publication(&state).expect("recover");
         assert_bundle(&memory_dir, &after);
@@ -2550,12 +2475,10 @@ mod tests {
         let before = MemoryBundle {
             episodic: "old ep".to_string(),
             semantic: "old sem".to_string(),
-            prospective: "old pro".to_string(),
         };
         let after = MemoryBundle {
             episodic: "new ep".to_string(),
             semantic: "new sem".to_string(),
-            prospective: "new pro".to_string(),
         };
 
         let run_id = state
@@ -2570,7 +2493,6 @@ mod tests {
         // A third-party edit that matches neither before nor after.
         std::fs::write(memory_dir.join("episodic.md"), "mystery").unwrap();
         std::fs::write(memory_dir.join("semantic.md"), "old sem").unwrap();
-        std::fs::write(memory_dir.join("prospective.md"), "old pro").unwrap();
 
         let err = recover_memory_publication(&state).expect_err("should halt");
         assert!(
@@ -2607,7 +2529,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_memory_publication_archives_source_sessions_like_normal_path() {
+    fn finalize_archives_session_after_event_extraction_alone() {
         // Major 4: a crash between memory publication and session archiving
         // must still converge to the normal-path state. Recovery drives the
         // same archive/truncate/finalize, reconstructing targets from the
@@ -2638,34 +2560,29 @@ mod tests {
 
         // Checkpoints at the last message so the session is archivable.
         let conn = state.db.get_conn().expect("pool");
-        for step in ["event_extraction", "prospective_update"] {
-            conn.execute(
-                "INSERT INTO sleep_step_checkpoints
-                 (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
-                 VALUES (?1, ?2, 'messages', ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    agent,
-                    step,
-                    chat_id.to_string(),
-                    "2025-06-01T00:00:08Z",
-                    "a-8",
-                    chrono::Utc::now().to_rfc3339(),
-                ],
-            )
-            .expect("seed checkpoint");
-        }
+        conn.execute(
+            "INSERT INTO sleep_step_checkpoints
+             (agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at)
+             VALUES (?1, 'event_extraction', 'messages', ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                agent,
+                chat_id.to_string(),
+                "2025-06-01T00:00:08Z",
+                "a-8",
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )
+        .expect("seed checkpoint");
         drop(conn);
 
         // Run with complete snapshots + the archive plan persisted pre-crash.
         let before = MemoryBundle {
             episodic: "old ep".to_string(),
             semantic: "old sem".to_string(),
-            prospective: "old pro".to_string(),
         };
         let after = MemoryBundle {
             episodic: "new ep".to_string(),
             semantic: "new sem".to_string(),
-            prospective: "new pro".to_string(),
         };
         let run_id = state
             .db
@@ -2693,7 +2610,6 @@ mod tests {
         std::fs::create_dir_all(&memory_dir).unwrap();
         std::fs::write(memory_dir.join("episodic.md"), "new ep").unwrap();
         std::fs::write(memory_dir.join("semantic.md"), "new sem").unwrap();
-        std::fs::write(memory_dir.join("prospective.md"), "new pro").unwrap();
 
         recover_memory_publication(&state).expect("recover");
 
@@ -2730,12 +2646,7 @@ mod tests {
     fn mark_all_steps_success(db: &Database, run_id: &str) {
         let conn = db.get_conn().expect("pool");
         let now = chrono::Utc::now().to_rfc3339();
-        for step in [
-            "event_extraction",
-            "episodic_update",
-            "semantic_update",
-            "prospective_update",
-        ] {
+        for step in ["event_extraction", "episodic_update", "semantic_update"] {
             conn.execute(
                 "UPDATE sleep_run_steps
                  SET status = 'success', started_at = ?1, finished_at = ?1
@@ -2756,11 +2667,6 @@ mod tests {
         for (file, b, a) in [
             (MemoryFile::Episodic, &before.episodic, &after.episodic),
             (MemoryFile::Semantic, &before.semantic, &after.semantic),
-            (
-                MemoryFile::Prospective,
-                &before.prospective,
-                &after.prospective,
-            ),
         ] {
             seed_one_snapshot(db, run_id, agent_id, file, b, a);
         }
@@ -2800,10 +2706,6 @@ mod tests {
             std::fs::read_to_string(memory_dir.join("semantic.md")).unwrap(),
             expected.semantic
         );
-        assert_eq!(
-            std::fs::read_to_string(memory_dir.join("prospective.md")).unwrap(),
-            expected.prospective
-        );
     }
 
     /// Provider that edits `episodic.md` on-disk right before the memory update
@@ -2829,7 +2731,7 @@ mod tests {
             messages: Arc<Vec<Message>>,
             tools: Option<Arc<Vec<ToolDefinition>>>,
         ) -> Result<MessagesResponse, crate::error::LlmError> {
-            let is_memory_step = system.contains("更新を担う");
+            let is_memory_step = system.contains("意味記憶（semantic.md）を更新する");
             if is_memory_step {
                 let mut edited = self.edited.lock().unwrap();
                 if !*edited {
@@ -2983,9 +2885,9 @@ mod tests {
     }
 
     /// Provider for the multi-run drain test: returns an event-extraction-shaped
-    /// response for event/rollup calls and a 2-key semantic/prospective response
-    /// for the long-term memory update step (whose parser requires exactly those
-    /// two keys). The memory step is identified by its prompt's unique wording.
+    /// response for event/rollup calls and a one-key semantic response for the
+    /// semantic update step. The semantic step is identified by its prompt's
+    /// unique wording.
     struct DrainMockProvider;
 
     #[async_trait]
@@ -3002,10 +2904,9 @@ mod tests {
             _messages: Arc<Vec<Message>>,
             _tools: Option<Arc<Vec<ToolDefinition>>>,
         ) -> Result<MessagesResponse, crate::error::LlmError> {
-            let content = if system.contains("更新を担う") {
+            let content = if system.contains("意味記憶（semantic.md）を更新する") {
                 serde_json::json!({
-                    "semantic": "# Semantic\n\n- fact",
-                    "prospective": "# Prospective\n\n- todo"
+                    "semantic": "# Semantic\n\n- fact"
                 })
                 .to_string()
             } else if system.to_lowercase().contains("rollup") || system.contains("ロールアップ")
@@ -3039,13 +2940,12 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
 
         let good_response = serde_json::json!({
-            "semantic": "retried",
-            "prospective": "retried"
+            "semantic": "retried"
         })
         .to_string();
         let provider = SequentialMockProvider::new(vec![
-            r#"{"not":"valid events"}"#.to_string(),
-            r#"{"not":"valid events"}"#.to_string(),
+            event_response("retry event"),
+            r#"{"not":"valid rollups"}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
             r#"{"not":"valid semantic"}"#.to_string(),
@@ -3091,7 +2991,13 @@ mod tests {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
-        let llm = Arc::new(MockLlmProvider::with_usage(100, 200));
+        let llm = Arc::new(SequentialMockWithUsage::new(vec![
+            (event_response("usage event"), 50, 30),
+            (r#"{"not":"valid rollups"}"#.to_string(), 10, 10),
+            (r#"{"rollups":[]}"#.to_string(), 10, 10),
+            (r#"{"rollups":[]}"#.to_string(), 10, 10),
+            (semantic_response("# Semantic"), 100, 200),
+        ]));
         let state = build_test_state_with_llm(db, dir.path(), llm);
 
         run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
@@ -3162,7 +3068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_sleep_batch_extracts_events_before_memory_update() {
+    async fn run_sleep_batch_extracts_events_before_semantic_update() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
 
@@ -3183,7 +3089,7 @@ mod tests {
             (events_response, 50, 50),
             (r#"{"rollups":[]}"#.to_string(), 50, 50),
             (r#"{"rollups":[]}"#.to_string(), 50, 50),
-            (r#"{"semantic":"","prospective":""}"#.to_string(), 50, 50),
+            (r#"{"semantic":""}"#.to_string(), 50, 50),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
@@ -3236,15 +3142,15 @@ mod tests {
         })
         .to_string();
         let memory_response = serde_json::json!({
-            "semantic": "",
-            "prospective": ""
+            "semantic": ""
         })
         .to_string();
-        let call2_response = r#"{"rollups":[]}"#.to_string();
+        let rollup_response = r#"{"rollups":[]}"#.to_string();
 
         let provider = SequentialMockWithUsage::new(vec![
             (events_response, 100, 100),
-            (call2_response, 50, 50),
+            (rollup_response.clone(), 50, 50),
+            (rollup_response, 50, 50),
             (memory_response, 100, 100),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
@@ -3276,8 +3182,7 @@ mod tests {
         seed_messages_for_proceed(&db, "test-agent");
 
         let memory_response = serde_json::json!({
-            "semantic": "updated",
-            "prospective": "updated"
+            "semantic": "updated"
         })
         .to_string();
 
@@ -3317,7 +3222,7 @@ mod tests {
             r#"not json"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
-            r#"{"semantic":"updated","prospective":"updated"}"#.to_string(),
+            r#"{"semantic":"updated"}"#.to_string(),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
 
@@ -3339,14 +3244,9 @@ mod tests {
             .iter()
             .find(|s| s.step_name == SleepStepName::SemanticUpdate)
             .expect("semantic step exists");
-        let prospective = steps
-            .iter()
-            .find(|s| s.step_name == SleepStepName::ProspectiveUpdate)
-            .expect("prospective step exists");
 
         assert_eq!(episodic.status, SleepStepStatus::Success);
-        assert_eq!(semantic.status, SleepStepStatus::Success);
-        assert_eq!(prospective.status, SleepStepStatus::Success);
+        assert_eq!(semantic.status, SleepStepStatus::Skipped);
     }
 
     #[tokio::test]
@@ -3365,16 +3265,16 @@ mod tests {
             }]
         })
         .to_string();
-        let call2_response = r#"{"rollups":[]}"#.to_string();
+        let rollup_response = r#"{"rollups":[]}"#.to_string();
         let memory_response = serde_json::json!({
-            "semantic": "s",
-            "prospective": "p"
+            "semantic": "s"
         })
         .to_string();
 
         let provider = SequentialMockWithUsage::new(vec![
             (events_response, 50, 30),
-            (call2_response, 40, 20),
+            (rollup_response.clone(), 40, 20),
+            (rollup_response, 40, 20),
             (memory_response, 60, 40),
         ]);
         let state = build_test_state_with_llm(db, dir.path(), Arc::new(provider));
@@ -3389,6 +3289,368 @@ mod tests {
             .expect("list");
         assert!(runs[0].input_tokens > 0);
         assert!(runs[0].output_tokens > 0);
+    }
+
+    /// Provider that dispatches on the system prompt and records semantic
+    /// prompts. Semantic responses are consumed in order, so retry and
+    /// multi-batch scenarios stay explicit.
+    struct ScenarioProvider {
+        events_response: String,
+        rollup_response: String,
+        semantic_responses: std::sync::Mutex<Vec<String>>,
+        semantic_prompts: std::sync::Mutex<Vec<String>>,
+        semantic_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScenarioProvider {
+        fn new(events_response: String, semantic_responses: Vec<String>) -> Self {
+            Self {
+                events_response,
+                rollup_response: r#"{"rollups":[]}"#.to_string(),
+                semantic_responses: std::sync::Mutex::new(semantic_responses),
+                semantic_prompts: std::sync::Mutex::new(Vec::new()),
+                semantic_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn semantic_prompts(&self) -> Vec<String> {
+            self.semantic_prompts.lock().unwrap().clone()
+        }
+
+        fn semantic_calls(&self) -> usize {
+            self.semantic_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for ScenarioProvider {
+        fn provider_name(&self) -> &str {
+            "scenario-mock"
+        }
+
+        fn model_name(&self) -> &str {
+            "scenario-mock-model"
+        }
+
+        async fn send_message(
+            &self,
+            system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let content = if system.contains("意味記憶（semantic.md）を更新する") {
+                self.semantic_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.semantic_prompts
+                    .lock()
+                    .unwrap()
+                    .push(system.to_string());
+                let mut responses = self.semantic_responses.lock().unwrap();
+                if responses.is_empty() {
+                    String::new()
+                } else {
+                    responses.remove(0)
+                }
+            } else if system.to_lowercase().contains("rollup") || system.contains("ロールアップ")
+            {
+                self.rollup_response.clone()
+            } else {
+                self.events_response.clone()
+            };
+            Ok(MessagesResponse {
+                content,
+                reasoning_content: None,
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_update_reads_events_not_messages() {
+        // Arrange
+        let (db, dir) = test_db();
+        let chat_id = create_chat(&db, "test-agent", "-semantic-input");
+        for i in 1..=(SKIP_THRESHOLD + 1) {
+            store_msg(
+                &db,
+                &format!("raw-{i}"),
+                chat_id,
+                "RAW-MESSAGE-ONLY-TOKEN",
+                &format!("2025-01-01T00:00:{:02}Z", i % 60),
+            );
+        }
+        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
+            .expect("save session");
+        let provider = Arc::new(ScenarioProvider::new(
+            event_response("Extracted Event Title"),
+            vec![semantic_response("# Semantic")],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider.clone());
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        let prompts = provider.semantic_prompts();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(prompts[0].contains("Extracted Event Title"));
+        assert!(!prompts[0].contains("RAW-MESSAGE-ONLY-TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn semantic_update_skips_without_new_events_and_calls_no_llm() {
+        // Arrange
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let provider = Arc::new(ScenarioProvider::new(
+            r#"{"events":[]}"#.to_string(),
+            vec![semantic_response("# Semantic")],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider.clone());
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        assert_eq!(provider.semantic_calls(), 0);
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
+        let steps = state.db.list_sleep_run_steps(&runs[0].id).expect("steps");
+        let semantic = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step");
+        assert_eq!(semantic.status, SleepStepStatus::Skipped);
+        let checkpoint = state
+            .db
+            .get_sleep_checkpoint(
+                "test-agent",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "test-agent",
+            )
+            .expect("checkpoint");
+        assert!(checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    async fn semantic_update_advances_event_checkpoint_to_last_event() {
+        // Arrange
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let events = serde_json::json!({
+            "events": [
+                {
+                    "experienced_at": "2025-01-01T00:01:00Z",
+                    "kind": "decision",
+                    "title": "first",
+                    "body_md": "body-1",
+                    "ripple_strength": 3,
+                    "certainty": "stated"
+                },
+                {
+                    "experienced_at": "2025-01-01T00:02:00Z",
+                    "kind": "insight",
+                    "title": "second",
+                    "body_md": "body-2",
+                    "ripple_strength": 4,
+                    "certainty": "derived"
+                }
+            ]
+        })
+        .to_string();
+        let provider = Arc::new(ScenarioProvider::new(
+            events,
+            vec![semantic_response("# Semantic")],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider.clone());
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
+        let mut stored_events = state
+            .db
+            .list_episode_events_by_run(&runs[0].id)
+            .expect("events");
+        stored_events.sort_by(|a, b| {
+            (a.encoded_at.clone(), a.id.clone()).cmp(&(b.encoded_at.clone(), b.id.clone()))
+        });
+        let last = stored_events.last().expect("last event");
+        let checkpoint = state
+            .db
+            .get_sleep_checkpoint(
+                "test-agent",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "test-agent",
+            )
+            .expect("checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.cursor_at, last.encoded_at);
+        assert_eq!(checkpoint.cursor_id, last.id);
+    }
+
+    #[tokio::test]
+    async fn semantic_update_failure_keeps_checkpoint_and_base_semantic() {
+        // Arrange
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("memory dir");
+        std::fs::write(memory_dir.join("semantic.md"), "BASE SEMANTIC").expect("base semantic");
+        let provider = Arc::new(ScenarioProvider::new(
+            event_response("failure event"),
+            vec!["not json".to_string(), "not json".to_string()],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider.clone());
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
+        let steps = state.db.list_sleep_run_steps(&runs[0].id).expect("steps");
+        let semantic = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step");
+        assert_eq!(semantic.status, SleepStepStatus::Failed);
+        let checkpoint = state
+            .db
+            .get_sleep_checkpoint(
+                "test-agent",
+                SleepStepName::SemanticUpdate,
+                CheckpointSourceKind::EpisodeEvents,
+                "test-agent",
+            )
+            .expect("checkpoint");
+        assert!(checkpoint.is_none());
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).expect("semantic"),
+            "BASE SEMANTIC"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_update_carries_memory_across_batches() {
+        // Arrange
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let events = serde_json::json!({
+            "events": [
+                {
+                    "experienced_at": "2025-01-01T00:01:00Z",
+                    "kind": "decision",
+                    "title": "batch event 1",
+                    "body_md": "x".repeat(10_000),
+                    "ripple_strength": 3,
+                    "certainty": "stated"
+                },
+                {
+                    "experienced_at": "2025-01-01T00:02:00Z",
+                    "kind": "decision",
+                    "title": "batch event 2",
+                    "body_md": "y".repeat(10_000),
+                    "ripple_strength": 3,
+                    "certainty": "stated"
+                },
+                {
+                    "experienced_at": "2025-01-01T00:03:00Z",
+                    "kind": "decision",
+                    "title": "batch event 3",
+                    "body_md": "z".repeat(10_000),
+                    "ripple_strength": 3,
+                    "certainty": "stated"
+                }
+            ]
+        })
+        .to_string();
+        let provider = Arc::new(ScenarioProvider::new(
+            events,
+            vec![
+                semantic_response("# Semantic batch 1"),
+                semantic_response("# Semantic batch 2"),
+            ],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider.clone());
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        let prompts = provider.semantic_prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[1].contains("# Semantic batch 1"));
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).expect("semantic"),
+            "# Semantic batch 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_leaves_legacy_prospective_file_untouched() {
+        // Arrange
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        std::fs::create_dir_all(&memory_dir).expect("memory dir");
+        std::fs::write(memory_dir.join("prospective.md"), "LEGACY PROSPECTIVE")
+            .expect("legacy prospective");
+        let provider = Arc::new(ScenarioProvider::new(
+            event_response("publication event"),
+            vec![semantic_response("# Semantic new")],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider.clone());
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("prospective.md")).expect("legacy"),
+            "LEGACY PROSPECTIVE"
+        );
+        assert!(memory_dir.join("episodic.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).expect("semantic"),
+            "# Semantic new"
+        );
     }
 
     #[test]
@@ -3722,10 +3984,11 @@ mod tests {
     async fn next_sleep_run_retries_only_failed_step_input() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
+        let chat_id = create_chat(&db, "test-agent", "");
 
         let first_semantic_fail = vec![
-            r#"{"events":[]}"#.to_string(),
-            r#"{"events":[]}"#.to_string(),
+            event_response("first run event"),
+            r#"{"not":"valid rollups"}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
             r#"{"rollups":[]}"#.to_string(),
             r#"not json"#.to_string(),
@@ -3754,10 +4017,19 @@ mod tests {
             .expect("semantic");
         assert_eq!(semantic_first.status, SleepStepStatus::Failed);
 
-        let all_success_second = vec![
-            r#"{"rollups":[]}"#.to_string(),
-            r#"{"semantic":"second","prospective":"second"}"#.to_string(),
-        ];
+        // New activity above the threshold makes the next cycle proceed; the
+        // failed semantic step must pick up the events from the first run.
+        for i in 1..=(SKIP_THRESHOLD + 1) {
+            store_msg(
+                &state.db,
+                &format!("next-{i}"),
+                chat_id,
+                "hi",
+                &format!("2025-02-01T00:00:{:02}Z", i % 60),
+            );
+        }
+
+        let all_success_second = all_success_responses();
         let llm2 = Arc::new(SequentialMockProvider::new(all_success_second));
         let config = crate::test_util::test_config(&dir.path().to_string_lossy());
         let state2 = crate::test_util::build_state_for_restart_simulation(

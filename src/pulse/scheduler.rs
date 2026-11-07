@@ -273,8 +273,8 @@ async fn process_intention_with_activation_timeout(
     };
 
     // 6. Build capsule
-    // Prospective memory is already injected via build_system_prompt() in the
-    // system prompt; omitting it here avoids duplication.
+    // Long-term memory is already injected via build_system_prompt() in the
+    // system prompt; the capsule does not repeat it.
     let recent_messages = load_recent_messages(&state.db, home_surface.chat_id).await;
     let now_rfc3339 = now.to_rfc3339();
 

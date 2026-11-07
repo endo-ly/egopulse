@@ -435,7 +435,7 @@ fn make_month_request(
 }
 
 // ---------------------------------------------------------------------------
-// Call2 LLM Integration — Input Builder, Output Parser, Validation, Security
+// Rollup LLM Integration — Input Builder, Output Parser, Validation, Security
 // ---------------------------------------------------------------------------
 
 /// Maximum allowed length for `summary_md` in characters.
@@ -445,9 +445,9 @@ const SUMMARY_MD_MAX_LEN: usize = 10_000;
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Errors that can occur during Call2 LLM output parsing and validation.
+/// Errors that can occur during rollup LLM output parsing and validation.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum Call2Error {
+pub(crate) enum RollupOutputError {
     #[error("json parse failed: {0}")]
     JsonParse(String),
     #[error("validation failed: {0}")]
@@ -455,24 +455,24 @@ pub(crate) enum Call2Error {
 }
 
 // ---------------------------------------------------------------------------
-// Call2 Input / Output types
+// Rollup Input / Output types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct Call2RollupRequest {
+pub(crate) struct RollupLlmRequest {
     pub granularity: String,
     pub period_key: String,
     pub period_start: String,
     pub period_end_exclusive: String,
     pub reason: String,
     pub previous_summary_md: Option<String>,
-    pub events: Vec<Call2Event>,
-    pub week_rollups: Vec<Call2WeekRollupSummary>,
+    pub events: Vec<RollupEvent>,
+    pub week_rollups: Vec<WeekRollupSummary>,
     pub previous_month_summary_md: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct Call2Event {
+pub(crate) struct RollupEvent {
     pub id: String,
     pub experienced_at: String,
     pub kind: String,
@@ -484,22 +484,22 @@ pub(crate) struct Call2Event {
 
 /// A week rollup summary used as input for month rollup generation.
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct Call2WeekRollupSummary {
+pub(crate) struct WeekRollupSummary {
     pub period_key: String,
     pub summary_md: String,
     pub max_ripple: i64,
     pub event_count: i64,
 }
 
-/// Call2 LLM output JSON structure.
+/// Rollup LLM output JSON structure.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Call2Output {
-    pub rollups: Vec<Call2RollupOutput>,
+pub(crate) struct RollupOutput {
+    pub rollups: Vec<RollupOutputItem>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Call2RollupOutput {
+pub(crate) struct RollupOutputItem {
     pub granularity: String,
     pub period_key: String,
     pub summary_md: String,
@@ -511,18 +511,18 @@ pub(crate) struct Call2RollupOutput {
 // Input builder
 // ---------------------------------------------------------------------------
 
-/// Builds the Call2 input from rollup requests and their associated events.
+/// Builds the rollup input from rollup requests and their associated events.
 ///
 /// The caller populates `events_map` from DB queries keyed by `period_key`.
-pub(crate) fn build_call2_input(
+pub(crate) fn build_week_rollup_requests(
     rollup_requests: &[RollupRequest],
-    events_map: &HashMap<String, Vec<Call2Event>>,
-) -> Vec<Call2RollupRequest> {
+    events_map: &HashMap<String, Vec<RollupEvent>>,
+) -> Vec<RollupLlmRequest> {
     rollup_requests
         .iter()
         .map(|req| {
             let events = events_map.get(&req.period_key).cloned().unwrap_or_default();
-            Call2RollupRequest {
+            RollupLlmRequest {
                 granularity: granularity_to_str(req.granularity),
                 period_key: req.period_key.clone(),
                 period_start: req.period_start.clone(),
@@ -544,15 +544,15 @@ fn granularity_to_str(g: RollupGranularity) -> String {
     }
 }
 
-/// Builds the Call2 input for month rollup requests using week rollup summaries.
+/// Builds the month rollup input using week rollup summaries.
 ///
-/// Unlike `build_call2_input` which uses raw events, this uses week rollup
+/// Unlike `build_week_rollup_requests` which uses raw events, this uses week rollup
 /// summaries as input for month-level summarization.
-pub(crate) fn build_call2_input_month(
+pub(crate) fn build_month_rollup_requests(
     rollup_requests: &[RollupRequest],
-    week_rollups_map: &HashMap<String, Vec<Call2WeekRollupSummary>>,
+    week_rollups_map: &HashMap<String, Vec<WeekRollupSummary>>,
     previous_month_map: &HashMap<String, String>,
-) -> Vec<Call2RollupRequest> {
+) -> Vec<RollupLlmRequest> {
     rollup_requests
         .iter()
         .map(|req| {
@@ -561,7 +561,7 @@ pub(crate) fn build_call2_input_month(
                 .cloned()
                 .unwrap_or_default();
             let previous_month_summary_md = previous_month_map.get(&req.period_key).cloned();
-            Call2RollupRequest {
+            RollupLlmRequest {
                 granularity: granularity_to_str(req.granularity),
                 period_key: req.period_key.clone(),
                 period_start: req.period_start.clone(),
@@ -591,7 +591,7 @@ pub(crate) fn compute_month_rollup_stats(week_rollups: &[&ExistingRollupInfo]) -
     (max_ripple, event_count)
 }
 
-pub(crate) fn compute_rollup_stats(events: Option<&Vec<Call2Event>>) -> (i64, i64) {
+pub(crate) fn compute_rollup_stats(events: Option<&Vec<RollupEvent>>) -> (i64, i64) {
     let slice = events.map(|v| v.as_slice()).unwrap_or(&[]);
     let max_ripple = slice.iter().map(|e| e.ripple_strength).max().unwrap_or(3);
     let event_count = i64::try_from(slice.len()).unwrap_or(0);
@@ -602,22 +602,23 @@ pub(crate) fn compute_rollup_stats(events: Option<&Vec<Call2Event>>) -> (i64, i6
 // Output parser + validator
 // ---------------------------------------------------------------------------
 
-/// Parse and validate Call2 LLM output.
+/// Parse and validate rollup LLM output.
 ///
 /// Returns valid rollups. Rollups with empty `summary_md` are skipped
 /// with a warning. All other validation failures produce an error.
 ///
 /// # Errors
 ///
-/// Returns [`Call2Error::JsonParse`] when the input is not valid JSON or
-/// the structure does not match [`Call2Output`].
-/// Returns [`Call2Error::Validation`] when a rollup field violates constraints.
-pub(crate) fn parse_call2_output(
+/// Returns [`RollupOutputError::JsonParse`] when the input is not valid JSON or
+/// the structure does not match [`RollupOutput`].
+/// Returns [`RollupOutputError::Validation`] when a rollup field violates constraints.
+pub(crate) fn parse_rollup_output(
     json_str: &str,
     valid_period_keys: &HashSet<String>,
-) -> Result<Vec<Call2RollupOutput>, Call2Error> {
-    let output: Call2Output = serde_json::from_str(json_str)
-        .map_err(|e| Call2Error::JsonParse(format!("failed to parse Call2 output JSON: {e}")))?;
+) -> Result<Vec<RollupOutputItem>, RollupOutputError> {
+    let output: RollupOutput = serde_json::from_str(json_str).map_err(|e| {
+        RollupOutputError::JsonParse(format!("failed to parse rollup output JSON: {e}"))
+    })?;
 
     let mut valid_rollups = Vec::with_capacity(output.rollups.len());
 
@@ -637,18 +638,18 @@ pub(crate) fn parse_call2_output(
     Ok(valid_rollups)
 }
 
-fn validate_granularity(g: &str) -> Result<(), Call2Error> {
+fn validate_granularity(g: &str) -> Result<(), RollupOutputError> {
     if g != "week" && g != "month" {
-        return Err(Call2Error::Validation(format!(
+        return Err(RollupOutputError::Validation(format!(
             "invalid granularity: {g:?} (expected \"week\" or \"month\")"
         )));
     }
     Ok(())
 }
 
-fn validate_period_key(key: &str, valid: &HashSet<String>) -> Result<(), Call2Error> {
+fn validate_period_key(key: &str, valid: &HashSet<String>) -> Result<(), RollupOutputError> {
     if !valid.contains(key) {
-        return Err(Call2Error::Validation(format!(
+        return Err(RollupOutputError::Validation(format!(
             "unknown period_key: {key:?}"
         )));
     }
@@ -656,7 +657,7 @@ fn validate_period_key(key: &str, valid: &HashSet<String>) -> Result<(), Call2Er
 }
 
 /// Returns `true` if the rollup should be silently skipped.
-fn skip_empty_summary(rollup: &Call2RollupOutput) -> bool {
+fn skip_empty_summary(rollup: &RollupOutputItem) -> bool {
     if rollup.summary_md.trim().is_empty() {
         warn!(period_key = %rollup.period_key, "skipping rollup with empty summary_md");
         true
@@ -665,9 +666,9 @@ fn skip_empty_summary(rollup: &Call2RollupOutput) -> bool {
     }
 }
 
-fn validate_summary_length(summary: &str) -> Result<(), Call2Error> {
+fn validate_summary_length(summary: &str) -> Result<(), RollupOutputError> {
     if summary.len() > SUMMARY_MD_MAX_LEN {
-        return Err(Call2Error::Validation(format!(
+        return Err(RollupOutputError::Validation(format!(
             "summary_md too long: {} chars (max {SUMMARY_MD_MAX_LEN})",
             summary.len()
         )));
@@ -675,27 +676,29 @@ fn validate_summary_length(summary: &str) -> Result<(), Call2Error> {
     Ok(())
 }
 
-fn validate_no_event_ids(summary: &str) -> Result<(), Call2Error> {
+fn validate_no_event_ids(summary: &str) -> Result<(), RollupOutputError> {
     if summary.contains("evt_") {
-        return Err(Call2Error::Validation(
+        return Err(RollupOutputError::Validation(
             "summary_md must not contain event ID references (evt_ prefix)".to_string(),
         ));
     }
     Ok(())
 }
 
-fn validate_max_ripple(v: i64) -> Result<(), Call2Error> {
+fn validate_max_ripple(v: i64) -> Result<(), RollupOutputError> {
     if !(1..=5).contains(&v) {
-        return Err(Call2Error::Validation(format!(
+        return Err(RollupOutputError::Validation(format!(
             "max_ripple out of range: {v} (expected 1-5)"
         )));
     }
     Ok(())
 }
 
-fn validate_event_count(v: i64) -> Result<(), Call2Error> {
+fn validate_event_count(v: i64) -> Result<(), RollupOutputError> {
     if v < 0 {
-        return Err(Call2Error::Validation(format!("negative event_count: {v}")));
+        return Err(RollupOutputError::Validation(format!(
+            "negative event_count: {v}"
+        )));
     }
     Ok(())
 }
@@ -761,20 +764,20 @@ fn redact_prefixed_values(
 // Prompt builders
 // ---------------------------------------------------------------------------
 
-/// Builds the Call2 system prompt for week rollups from the embedded week prompt template.
-pub(crate) fn build_call2_system_prompt_week(agent_id: &str) -> String {
+/// Builds the rollup system prompt for week rollups from the embedded week prompt template.
+pub(crate) fn build_week_rollup_system_prompt(agent_id: &str) -> String {
     include_str!("prompts/rollup_week_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
-/// Builds the Call2 system prompt for month rollups from the embedded month prompt template.
-pub(crate) fn build_call2_system_prompt_month(agent_id: &str) -> String {
+/// Builds the rollup system prompt for month rollups from the embedded month prompt template.
+pub(crate) fn build_month_rollup_system_prompt(agent_id: &str) -> String {
     include_str!("prompts/rollup_month_prompt.md").replace("{AGENT_NAME}", agent_id)
 }
 
-/// Builds the Call2 user prompt with the input JSON.
-pub(crate) fn build_call2_user_prompt(input_json: &str) -> String {
+/// Builds the rollup user prompt with the input JSON.
+pub(crate) fn build_rollup_user_prompt(input_json: &str) -> String {
     format!(
-        "以下の Call2 入力 JSON に基づいて、必要な episode_rollups を生成してください。\n\n\
+        "以下の rollup 入力 JSON に基づいて、必要な episode_rollups を生成してください。\n\n\
          重要:\n\
          - 出力は JSON のみです。\n\
          - rollups 以外のトップレベルキーを出してはいけません。\n\
@@ -1244,11 +1247,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Call2 LLM Integration Tests
+    // Rollup LLM Integration Tests
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_call2_input_json_structure() {
+    fn test_build_week_rollup_requests_json_structure() {
         let req = RollupRequest {
             granularity: RollupGranularity::Week,
             period_key: "2026-W21".to_string(),
@@ -1257,7 +1260,7 @@ mod tests {
             reason: "closed_week".to_string(),
             previous_summary_md: None,
         };
-        let input = build_call2_input(&[req], &HashMap::new());
+        let input = build_week_rollup_requests(&[req], &HashMap::new());
         let wrapped = serde_json::json!({"rollup_requests": input});
         let json = serde_json::to_string(&wrapped).expect("serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse back");
@@ -1270,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_call2_input_includes_previous_summary() {
+    fn test_build_week_rollup_requests_includes_previous_summary() {
         let req = RollupRequest {
             granularity: RollupGranularity::Week,
             period_key: "2026-W21".to_string(),
@@ -1279,12 +1282,12 @@ mod tests {
             reason: "delayed_events".to_string(),
             previous_summary_md: Some("old summary".to_string()),
         };
-        let input = build_call2_input(&[req], &HashMap::new());
+        let input = build_week_rollup_requests(&[req], &HashMap::new());
         assert_eq!(input[0].previous_summary_md.as_deref(), Some("old summary"));
     }
 
     #[test]
-    fn test_build_call2_input_includes_events() {
+    fn test_build_week_rollup_requests_includes_events() {
         let req = RollupRequest {
             granularity: RollupGranularity::Week,
             period_key: "2026-W21".to_string(),
@@ -1293,7 +1296,7 @@ mod tests {
             reason: "closed_week".to_string(),
             previous_summary_md: None,
         };
-        let events = vec![Call2Event {
+        let events = vec![RollupEvent {
             id: "evt-001".to_string(),
             experienced_at: "2026-05-20T14:00:00+09:00".to_string(),
             kind: "decision".to_string(),
@@ -1304,32 +1307,32 @@ mod tests {
         }];
         let mut events_map = HashMap::new();
         events_map.insert("2026-W21".to_string(), events);
-        let input = build_call2_input(&[req], &events_map);
+        let input = build_week_rollup_requests(&[req], &events_map);
         assert_eq!(input[0].events.len(), 1);
         assert_eq!(input[0].events[0].id, "evt-001");
     }
 
     #[test]
-    fn test_parse_call2_output_valid_json() {
+    fn test_parse_rollup_output_valid_json() {
         let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- Summary","max_ripple":3,"event_count":5}]}"#;
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(json, &valid).expect("should parse");
+        let result = parse_rollup_output(json, &valid).expect("should parse");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].period_key, "2026-W21");
         assert_eq!(result[0].max_ripple, 3);
     }
 
     #[test]
-    fn test_parse_call2_output_missing_rollups_key() {
+    fn test_parse_rollup_output_missing_rollups_key() {
         let json = r#"{"events":[]}"#;
-        let result = parse_call2_output(json, &HashSet::new());
+        let result = parse_rollup_output(json, &HashSet::new());
         assert!(
             result.is_err(),
             "should error when 'rollups' key is missing"
         );
         match result.unwrap_err() {
-            Call2Error::JsonParse(msg) => assert!(
+            RollupOutputError::JsonParse(msg) => assert!(
                 msg.contains("unknown field") || msg.contains("missing field"),
                 "unexpected error: {msg}"
             ),
@@ -1338,27 +1341,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_call2_output_invalid_granularity() {
+    fn test_parse_rollup_output_invalid_granularity() {
         let json = r#"{"rollups":[{"granularity":"quarter","period_key":"2026-W21","summary_md":"- Summary","max_ripple":3,"event_count":5}]}"#;
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(json, &valid);
+        let result = parse_rollup_output(json, &valid);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::Validation(msg) => assert!(msg.contains("granularity"), "{msg}"),
+            RollupOutputError::Validation(msg) => assert!(msg.contains("granularity"), "{msg}"),
             other => panic!("expected Validation, got: {other}"),
         }
     }
 
     #[test]
-    fn test_parse_call2_output_unknown_period_key() {
+    fn test_parse_rollup_output_unknown_period_key() {
         let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W99","summary_md":"- Summary","max_ripple":3,"event_count":5}]}"#;
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(json, &valid);
+        let result = parse_rollup_output(json, &valid);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::Validation(msg) => assert!(msg.contains("period_key"), "{msg}"),
+            RollupOutputError::Validation(msg) => assert!(msg.contains("period_key"), "{msg}"),
             other => panic!("expected Validation, got: {other}"),
         }
     }
@@ -1368,7 +1371,7 @@ mod tests {
         let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"","max_ripple":3,"event_count":5}]}"#;
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(json, &valid).expect("should succeed");
+        let result = parse_rollup_output(json, &valid).expect("should succeed");
         assert!(
             result.is_empty(),
             "empty summary_md should be filtered out, not error"
@@ -1383,10 +1386,10 @@ mod tests {
         );
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(&json, &valid);
+        let result = parse_rollup_output(&json, &valid);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::Validation(msg) => assert!(msg.contains("too long"), "{msg}"),
+            RollupOutputError::Validation(msg) => assert!(msg.contains("too long"), "{msg}"),
             other => panic!("expected Validation, got: {other}"),
         }
     }
@@ -1396,10 +1399,10 @@ mod tests {
         let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- Something evt_abc123 happened","max_ripple":3,"event_count":5}]}"#;
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(json, &valid);
+        let result = parse_rollup_output(json, &valid);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::Validation(msg) => assert!(msg.contains("evt_"), "{msg}"),
+            RollupOutputError::Validation(msg) => assert!(msg.contains("evt_"), "{msg}"),
             other => panic!("expected Validation, got: {other}"),
         }
     }
@@ -1412,13 +1415,13 @@ mod tests {
             );
             let mut valid = HashSet::new();
             valid.insert("2026-W21".to_string());
-            let result = parse_call2_output(&json, &valid);
+            let result = parse_rollup_output(&json, &valid);
             assert!(
                 result.is_err(),
                 "max_ripple={invalid_ripple} should be invalid"
             );
             match result.unwrap_err() {
-                Call2Error::Validation(msg) => assert!(msg.contains("max_ripple"), "{msg}"),
+                RollupOutputError::Validation(msg) => assert!(msg.contains("max_ripple"), "{msg}"),
                 other => panic!("expected Validation, got: {other}"),
             }
         }
@@ -1429,40 +1432,40 @@ mod tests {
         let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- S","max_ripple":3,"event_count":-1}]}"#;
         let mut valid = HashSet::new();
         valid.insert("2026-W21".to_string());
-        let result = parse_call2_output(json, &valid);
+        let result = parse_rollup_output(json, &valid);
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::Validation(msg) => assert!(msg.contains("event_count"), "{msg}"),
+            RollupOutputError::Validation(msg) => assert!(msg.contains("event_count"), "{msg}"),
             other => panic!("expected Validation, got: {other}"),
         }
     }
 
     #[test]
-    fn test_call2_retry_on_json_parse_failure() {
+    fn test_rollup_retry_on_json_parse_failure() {
         let bad_json = "this is not json";
-        let result = parse_call2_output(bad_json, &HashSet::new());
+        let result = parse_rollup_output(bad_json, &HashSet::new());
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::JsonParse(_) => {}
+            RollupOutputError::JsonParse(_) => {}
             other => panic!("expected JsonParse, got: {other}"),
         }
     }
 
     #[test]
-    fn test_call2_retry_on_missing_field() {
+    fn test_rollup_retry_on_missing_field() {
         let json = r#"{"rollups":[{"granularity":"week","period_key":"2026-W21","summary_md":"- S","event_count":1}]}"#;
-        let result = parse_call2_output(json, &HashSet::new());
+        let result = parse_rollup_output(json, &HashSet::new());
         assert!(result.is_err());
         match result.unwrap_err() {
-            Call2Error::JsonParse(msg) => assert!(msg.contains("missing field"), "{msg}"),
+            RollupOutputError::JsonParse(msg) => assert!(msg.contains("missing field"), "{msg}"),
             other => panic!("expected JsonParse, got: {other}"),
         }
     }
 
     #[test]
-    fn test_call2_fallback_on_retry_exhaustion() {
+    fn test_rollup_fallback_on_retry_exhaustion() {
         let bad_json = "not valid json at all";
-        let result = parse_call2_output(bad_json, &HashSet::new());
+        let result = parse_rollup_output(bad_json, &HashSet::new());
         assert!(
             result.is_err(),
             "parse should fail, triggering retry/fallback in batch.rs"
@@ -1645,8 +1648,8 @@ mod tests {
         let agent_id = "test-agent";
 
         // Act
-        let week_prompt = build_call2_system_prompt_week(agent_id);
-        let month_prompt = build_call2_system_prompt_month(agent_id);
+        let week_prompt = build_week_rollup_system_prompt(agent_id);
+        let month_prompt = build_month_rollup_system_prompt(agent_id);
 
         // Assert — both should start with the role description
         assert!(
@@ -1697,13 +1700,13 @@ mod tests {
             previous_summary_md: None,
         };
 
-        let week_rollup_w27 = Call2WeekRollupSummary {
+        let week_rollup_w27 = WeekRollupSummary {
             period_key: "2026-W27".to_string(),
             summary_md: "W27 summary".to_string(),
             max_ripple: 3,
             event_count: 5,
         };
-        let week_rollup_w28 = Call2WeekRollupSummary {
+        let week_rollup_w28 = WeekRollupSummary {
             period_key: "2026-W28".to_string(),
             summary_md: "W28 summary".to_string(),
             max_ripple: 4,
@@ -1720,7 +1723,8 @@ mod tests {
         previous_month_map.insert("2026-07".to_string(), "Previous June summary".to_string());
 
         // Act — Input builder
-        let input = build_call2_input_month(&[month_req], &week_rollups_map, &previous_month_map);
+        let input =
+            build_month_rollup_requests(&[month_req], &week_rollups_map, &previous_month_map);
 
         // Assert — Input builder
         assert_eq!(input.len(), 1);
@@ -1836,7 +1840,7 @@ mod tests {
     #[test]
     fn compute_rollup_stats_from_actual_events() {
         let events = vec![
-            Call2Event {
+            RollupEvent {
                 id: "e1".to_string(),
                 experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
                 kind: "decision".to_string(),
@@ -1845,7 +1849,7 @@ mod tests {
                 ripple_strength: 3,
                 certainty: "stated".to_string(),
             },
-            Call2Event {
+            RollupEvent {
                 id: "e2".to_string(),
                 experienced_at: "2026-05-21T10:00:00+09:00".to_string(),
                 kind: "insight".to_string(),
@@ -1869,7 +1873,7 @@ mod tests {
 
     #[test]
     fn compute_rollup_stats_single_event() {
-        let events = vec![Call2Event {
+        let events = vec![RollupEvent {
             id: "e1".to_string(),
             experienced_at: "2026-05-20T10:00:00+09:00".to_string(),
             kind: "feat".to_string(),

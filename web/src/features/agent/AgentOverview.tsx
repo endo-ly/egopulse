@@ -239,7 +239,7 @@ function PromptCard({
       chars: rules.reduce((sum, source) => sum + source.chars, 0),
       detail: rules.length > 0 ? rules.map((source) => source.path).join(" + ") : "None",
     },
-    { section: "memory", label: "Memory", chars: totalMemoryChars(profile), detail: "episodic + semantic + prospective" },
+    { section: "memory", label: "Memory", chars: totalMemoryChars(profile), detail: "episodic + semantic" },
   ];
   const total = parts.reduce((sum, part) => sum + part.chars, 0);
 
