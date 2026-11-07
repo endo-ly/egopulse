@@ -37,27 +37,30 @@ const MAX_SOURCE_SESSIONS: usize = 20;
 /// everything; this only controls the agent-loop's live context residue.
 const SESSION_CLEAR_KEEP_RECENT: usize = 4;
 
-/// Decision from checking whether enough new messages exist for a sleep run.
+/// Decision from checking whether a sleep run has any work to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InputDecision {
-    /// Not enough new messages → skip the sleep run.
+    /// No work to do → skip the sleep run.
     Skip {
         /// Human-readable reason for the skip.
         reason: String,
         /// Number of new messages found (≤ SKIP_THRESHOLD).
         new_message_count: i64,
     },
-    /// Enough new messages → proceed with sleep run.
+    /// There is message volume above the threshold or unprocessed semantic
+    /// events → proceed with sleep run.
     Proceed {
-        /// Source sessions (limited to MAX_SOURCE_SESSIONS).
+        /// Source sessions (limited to MAX_SOURCE_SESSIONS). Empty when the run
+        /// only drains pending semantic events.
         sessions: Vec<AgentSessionInfo>,
         /// JSON array of source chat metadata (for sleep_runs.source_chats_json).
         source_chats_json: String,
     },
 }
 
-/// Collects sleep input from step checkpoints and, if above threshold, fetches
-/// the oldest pending source sessions.
+/// Collects sleep input from step checkpoints. Proceeds when new messages
+/// exceed the threshold or when episode events remain unprocessed by
+/// `semantic_update`; source sessions are selected only in the former case.
 ///
 /// # Errors
 ///
@@ -67,8 +70,9 @@ pub(crate) fn collect_sleep_input(
     agent_id: &str,
 ) -> Result<InputDecision, crate::error::StorageError> {
     let new_message_count = db.count_agent_pending_sleep_messages(agent_id)?;
+    let has_pending_events = db.has_agent_pending_semantic_events(agent_id)?;
 
-    if new_message_count <= SKIP_THRESHOLD {
+    if new_message_count <= SKIP_THRESHOLD && !has_pending_events {
         let reason = format!(
             "{new_message_count} new messages; runs when there are more than {SKIP_THRESHOLD}"
         );
@@ -78,8 +82,14 @@ pub(crate) fn collect_sleep_input(
         });
     }
 
-    let sessions =
-        db.get_agent_sessions_with_pending_sleep_messages(agent_id, MAX_SOURCE_SESSIONS)?;
+    // Only message extraction is threshold-gated. A run triggered solely by a
+    // semantic backlog passes no sessions, so event_extraction is skipped while
+    // the event-derived updates still run.
+    let sessions = if new_message_count > SKIP_THRESHOLD {
+        db.get_agent_sessions_with_pending_sleep_messages(agent_id, MAX_SOURCE_SESSIONS)?
+    } else {
+        Vec::new()
+    };
     let source_chats_json =
         serde_json::to_string(&sessions).map_err(crate::error::StorageError::SessionSerialize)?;
 
@@ -1955,6 +1965,19 @@ mod tests {
         .expect("store message");
     }
 
+    fn insert_episode_event(db: &Database, agent_id: &str, id: &str, encoded_at: &str) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO episode_events
+                (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                 ripple_strength, certainty, sleep_run_id, source_refs_json,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3, 'insight', ?4, ?5, 3, 'stated', 'backfill', NULL, ?3, ?3)",
+            rusqlite::params![id, agent_id, encoded_at, format!("event {id}"), "body"],
+        )
+        .expect("insert episode event");
+    }
+
     fn create_chat(db: &Database, agent_id: &str, suffix: &str) -> i64 {
         db.resolve_or_create_chat_id("test", &format!("test:chat{suffix}"), "direct", agent_id)
             .expect("create chat")
@@ -3706,6 +3729,71 @@ mod tests {
     }
 
     #[test]
+    fn collect_proceeds_when_semantic_events_are_pending() {
+        // Arrange
+        let (db, _dir) = test_db();
+        insert_episode_event(&db, "test-agent", "backfill-e1", "2026-01-01T00:00:01Z");
+
+        // Act
+        let result = collect_sleep_input(&db, "test-agent").expect("collect");
+
+        // Assert
+        match result {
+            InputDecision::Proceed {
+                sessions,
+                source_chats_json,
+            } => {
+                assert!(
+                    sessions.is_empty(),
+                    "message extraction must stay threshold-gated"
+                );
+                assert_eq!(source_chats_json, "[]");
+            }
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sleep_batch_processes_semantic_backlog_without_new_messages() {
+        // Arrange
+        let (db, dir) = test_db();
+        insert_episode_event(&db, "test-agent", "backfill-e1", "2026-01-01T00:00:01Z");
+        let provider = Arc::new(ScenarioProvider::new(
+            r#"{"events":[]}"#.to_string(),
+            vec![semantic_response("# Semantic from backlog")],
+        ));
+        let state = build_test_state_with_llm(db, dir.path(), provider);
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+        let steps = state.db.list_sleep_run_steps(&runs[0].id).expect("steps");
+        let extraction = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::EventExtraction)
+            .expect("extraction step");
+        let semantic = steps
+            .iter()
+            .find(|step| step.step_name == SleepStepName::SemanticUpdate)
+            .expect("semantic step");
+        assert_eq!(extraction.status, SleepStepStatus::Skipped);
+        assert_eq!(semantic.status, SleepStepStatus::Success);
+        let memory_dir = dir.path().join("agents").join("test-agent").join("memory");
+        assert_eq!(
+            std::fs::read_to_string(memory_dir.join("semantic.md")).expect("semantic"),
+            "# Semantic from backlog"
+        );
+    }
+
+    #[test]
     fn collect_returns_skip_when_below_threshold() {
         let (db, _dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "");
@@ -3972,7 +4060,6 @@ mod tests {
     async fn next_sleep_run_retries_only_failed_step_input() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
-        let chat_id = create_chat(&db, "test-agent", "");
 
         let first_semantic_fail = vec![
             event_response("first run event"),
@@ -4005,24 +4092,16 @@ mod tests {
             .expect("semantic");
         assert_eq!(semantic_first.status, SleepStepStatus::Failed);
 
-        // New activity above the threshold makes the next cycle proceed; the
-        // failed semantic step must pick up the events from the first run.
-        for i in 1..=(SKIP_THRESHOLD + 1) {
-            store_msg(
-                &state.db,
-                &format!("next-{i}"),
-                chat_id,
-                "hi",
-                &format!("2025-02-01T00:00:{:02}Z", i % 60),
-            );
-        }
-
-        let all_success_second = all_success_responses();
-        let llm2 = Arc::new(SequentialMockProvider::new(all_success_second));
+        // No new messages are added: the unprocessed semantic events alone must
+        // make the next cycle proceed and retry the failed step.
+        let provider = Arc::new(ScenarioProvider::new(
+            r#"{"events":[]}"#.to_string(),
+            vec![semantic_response("# Semantic second")],
+        ));
         let config = crate::test_util::test_config(&dir.path().to_string_lossy());
         let state2 = crate::test_util::build_state_for_restart_simulation(
             config,
-            Some(llm2),
+            Some(provider),
             None,
             Some(Arc::clone(&state.db)),
             None,

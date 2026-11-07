@@ -51,9 +51,12 @@ Sleep Batch は 3 つの step と publish / finalize で構成される。各 st
 ```text
 collect_sleep_input()
       │
-      ├─ Skip: pending メッセージ ≤ 64 → skipped run を記録して終了
+      ├─ Skip: pending メッセージ ≤ 64 かつ未処理 semantic events なし
+      │        → skipped run を記録して終了
       │
-      └─ Proceed: 最古の pending セッションを取得（最大20件）
+      └─ Proceed:
+            pending メッセージ > 64 → 最古の pending セッションを取得（最大20件）
+            semantic backlog のみ → セッションなし
              │
        try_create_sleep_run() で排他チェック + run 作成
              │ （3つの pending step を DB に原子挿入）
@@ -102,15 +105,20 @@ step 名は DB の `step_name` 値を正式名称とする。
 
 カーソルは `(cursor_at, cursor_id)` の辞書順で比較し、新しい値のみで更新する（`ON CONFLICT DO UPDATE WHERE (cursor_at, cursor_id) < (?, ?)`）。
 
-### 候補セッション選択
+### 実行条件と候補セッション選択
 
-`collect_sleep_input` は run の監査時刻（`finished_at`）ではなく、`event_extraction` checkpoint を唯一の処理済み判定として使用する。
+`collect_sleep_input` は run の監査時刻（`finished_at`）ではなく、step checkpoint を唯一の処理済み判定として使用する。実行条件は次のいずれかを満たすことである。
 
-- **pending 件数**: `event_extraction` checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複を除外して数える。件数が `SKIP_THRESHOLD`（64）以下なら Skip し、理由（件数と閾値）を `error_message` に持つ終了済みの `skipped` run を記録する。ステップとスナップショットは作らない。
-- **候補抽出**: 同じ pending 条件でセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。最新セッション優先にしないため、継続的に更新される hot session が古い backlog を処理待ちにし続けない。
+- **pending メッセージ**: `event_extraction` checkpoint より新しい `messages` が `SKIP_THRESHOLD`（64）を超える
+- **semantic backlog**: `semantic_update` checkpoint より新しい `episode_events` が存在する
+
+どちらも満たさない場合は Skip し、理由（件数と閾値）を `error_message` に持つ終了済みの `skipped` run を記録する。ステップとスナップショットは作らない。
+
+- **候補抽出**: pending メッセージが閾値を超えた場合のみセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。最新セッション優先にしないため、継続的に更新される hot session が古い backlog を処理待ちにし続けない。
+- **semantic backlog のみの run**: セッションを渡さないため event_extraction は `skipped` になり、episodic_update / semantic_update だけがイベント由来の更新を行う。閾値以下のメッセージは event_extraction の対象にしない。
 - **1 run 上限**: `MAX_SOURCE_SESSIONS`（20）は 1 回の run の入力サイズ制限として維持する。上限から漏れたセッションは pending のまま残り、次回候補でも必ず見える。
-- **失敗時の再処理**: step が失敗した場合は該当 checkpoint が進まない。次回 collection でも同じ message が pending に残る。
-- **`source_chats_json`**: 実際に選んだセッションだけを保存する。
+- **失敗時の再処理**: step が失敗した場合は該当 checkpoint が進まない。event_extraction の失敗は同じ message が、semantic_update の失敗は同じ event が pending として残り、次回の実行条件になる。
+- **`source_chats_json`**: 実際に選んだセッションだけを保存する。semantic backlog のみの run では空配列になる。
 
 ### トークン予算
 

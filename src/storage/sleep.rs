@@ -823,6 +823,31 @@ impl Database {
         .map_err(Into::into)
     }
 
+    /// Returns whether episode events exist after the agent's `semantic_update`
+    /// checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] on database access failure.
+    pub(crate) fn has_agent_pending_semantic_events(
+        &self,
+        agent_id: &str,
+    ) -> Result<bool, StorageError> {
+        let Some(latest) = self.get_latest_episode_event_cursor(agent_id)? else {
+            return Ok(false);
+        };
+        let checkpoint = self.get_sleep_checkpoint(
+            agent_id,
+            SleepStepName::SemanticUpdate,
+            CheckpointSourceKind::EpisodeEvents,
+            agent_id,
+        )?;
+        Ok(match checkpoint {
+            Some(checkpoint) => (checkpoint.cursor_at, checkpoint.cursor_id) < latest,
+            None => true,
+        })
+    }
+
     pub(crate) fn get_agent_sessions_with_pending_sleep_messages(
         &self,
         agent_id: &str,
@@ -1981,6 +2006,58 @@ mod tests {
             db.get_agent_sessions_with_pending_sleep_messages("agent-a", 10)
                 .expect("sessions")
                 .is_empty()
+        );
+    }
+
+    fn insert_episode_event(db: &Database, agent_id: &str, id: &str, encoded_at: &str) {
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO episode_events
+                (id, agent_id, experienced_at, encoded_at, kind, title, body_md,
+                 ripple_strength, certainty, sleep_run_id, source_refs_json,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3, 'insight', ?4, 'body', 3, 'stated', 'backfill', NULL, ?3, ?3)",
+            params![id, agent_id, encoded_at, format!("event {id}")],
+        )
+        .expect("insert episode event");
+    }
+
+    #[test]
+    fn pending_semantic_events_follow_the_semantic_checkpoint() {
+        // Arrange
+        let (db, _dir) = test_db();
+        assert!(
+            !db.has_agent_pending_semantic_events("agent-a")
+                .expect("initial")
+        );
+
+        // Act / Assert: an event without a checkpoint is pending.
+        insert_episode_event(&db, "agent-a", "e-1", "2026-01-01T00:00:01Z");
+        assert!(
+            db.has_agent_pending_semantic_events("agent-a")
+                .expect("after event")
+        );
+
+        // A checkpoint at the latest event marks it processed.
+        insert_checkpoint(
+            &db,
+            "agent-a",
+            "semantic_update",
+            "episode_events",
+            "agent-a",
+            "2026-01-01T00:00:01Z",
+            "e-1",
+        );
+        assert!(
+            !db.has_agent_pending_semantic_events("agent-a")
+                .expect("after checkpoint")
+        );
+
+        // A newer event makes the backlog pending again.
+        insert_episode_event(&db, "agent-a", "e-2", "2026-01-01T00:00:02Z");
+        assert!(
+            db.has_agent_pending_semantic_events("agent-a")
+                .expect("after newer event")
         );
     }
 }
