@@ -175,6 +175,10 @@ pub(super) async fn get_agent_profile(
                 "discord_bot": agent.discord_bot.as_ref().map(ToString::to_string),
                 "telegram_bot": agent.telegram_bot.as_ref().map(ToString::to_string),
             },
+            "mcp_servers": {
+                "all": agent.mcp_servers.is_none(),
+                "servers": agent.mcp_servers.clone().unwrap_or_default(),
+            },
             "prompt_sources": prompt_sources,
         }
     })))
@@ -508,6 +512,7 @@ mod tests {
                 label: "Lyre".to_string(),
                 model: Some("custom-model".to_string()),
                 reasoning_effort: Some("medium".to_string()),
+                mcp_servers: Some(vec!["github".to_string()]),
                 profiles: HashMap::from([(
                     "voice".to_string(),
                     AgentProfileConfig {
@@ -575,6 +580,10 @@ mod tests {
         assert_eq!(profile["label"], "Lyre");
         assert_eq!(profile["is_default"], false);
         assert_eq!(profile["reasoning_effort"], "medium");
+        assert_eq!(
+            profile["mcp_servers"],
+            serde_json::json!({"all": false, "servers": ["github"]})
+        );
         assert_eq!(
             profile["llm"],
             serde_json::json!([
