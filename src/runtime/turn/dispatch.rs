@@ -17,8 +17,8 @@ use crate::error::EgoPulseError;
 use crate::runtime::status::RuntimeStatus;
 use crate::runtime::{AppState, Criticality, TaskKind, TaskSpec, channel_input, metrics};
 use crate::storage::{
-    DISPATCHER_BATCH_LIMIT, DURABLE_PAYLOAD_INVALID_ERROR_KIND, Database, TurnRunState,
-    call_blocking,
+    DISPATCHER_BATCH_LIMIT, DURABLE_PAYLOAD_INVALID_ERROR_KIND, Database, TurnFailure,
+    TurnRunState, call_blocking,
 };
 
 // ---------------------------------------------------------------------------
@@ -447,7 +447,15 @@ async fn persist_turn_rejection(
                     TurnRunState::Accepted | TurnRunState::InputCommitted => {
                         db.cancel_turn(&turn_id, &reason, &note)
                     }
-                    _ => db.fail_turn(&turn_id, TurnRunState::Uncertain, &reason, &note),
+                    _ => db.fail_turn(
+                        &turn_id,
+                        TurnRunState::Uncertain,
+                        TurnFailure {
+                            kind: reason,
+                            diagnostic: note,
+                            public: crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE.to_string(),
+                        },
+                    ),
                 }
             })
         },
@@ -1020,8 +1028,9 @@ async fn execute_and_publish_scheduled_turn(
                     tracing::warn!(error = %db_err, "failed to store LLM failure system event");
                 }
             }
+            let failure_text = failure_text_for_delivery(state, turn).await;
             if observer_key.is_some() {
-                let error_message = error.user_message();
+                let error_message = failure_text;
                 let retain_observer = match retain_observer_for_staged_follow_up(state, turn).await
                 {
                     Ok(retain_observer) => retain_observer,
@@ -1053,8 +1062,11 @@ async fn execute_and_publish_scheduled_turn(
                 } else {
                     finish_observer(state, turn, error_message);
                 }
-            } else {
-                send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &error).await;
+            } else if turn.context.channel.as_str() != "web" {
+                // Web delivers failures through the persisted conversation
+                // entry, which `GET /api/history` serves after a reload.
+                send_turn_failure_to_channel(adapter.as_deref(), &external_chat_id, &failure_text)
+                    .await;
             }
         }
     }
@@ -1273,13 +1285,39 @@ fn tool_progress_enabled(config: &crate::config::Config, context: &SurfaceContex
     }
 }
 
+/// Returns the text to deliver for this Turn's failure.
+///
+/// The persisted conversation entry is the source of truth: the Web UI reads it
+/// through history, and every push channel sends the same wording. Deriving the
+/// text twice would let the two disagree about whether a retry is safe.
+///
+/// When the entry cannot be read the terminal state is unknown, so the fallback
+/// is the text that asks about the result. Falling back to the error summary
+/// could invite a retry of a Turn that already changed something.
+async fn failure_text_for_delivery(state: &AppState, turn: &ScheduledTurn) -> String {
+    persisted_failure_message(state, turn)
+        .await
+        .unwrap_or_else(|| crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE.to_string())
+}
+
+/// Reads the conversation entry the failure was recorded as.
+async fn persisted_failure_message(state: &AppState, turn: &ScheduledTurn) -> Option<String> {
+    let message_id = crate::storage::turn_failure_message_id(&turn.turn_id);
+    call_blocking(state.db_for(turn.context.scope), move |db| {
+        db.get_message_content(&message_id)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn send_turn_failure_to_channel(
     adapter: Option<&dyn crate::channels::adapter::ChannelAdapter>,
     external_chat_id: &str,
-    error: &EgoPulseError,
+    summary: &str,
 ) {
     let Some(adapter) = adapter else { return };
-    let message = format!("⚠️ {}", error.user_facing_summary());
+    let message = format!("⚠️ {summary}");
     if let Err(send_err) = adapter.send_text(external_chat_id, &message).await {
         tracing::warn!(
             error = %send_err,
@@ -1809,6 +1847,199 @@ mod tests {
         assert_eq!(user_messages, 1, "input must be persisted once");
     }
 
+    /// What a failed Turn left in the database.
+    struct FailureFacts {
+        turn_state: String,
+        diagnostic: String,
+        content: String,
+        turn_id: String,
+    }
+
+    /// Reads the terminal state, the operator diagnostic, and the conversation
+    /// entry a failed Turn recorded.
+    fn read_failure(state: &AppState) -> FailureFacts {
+        let conn = state.db.get_conn().expect("connection");
+        let (turn_state, diagnostic): (String, String) = conn
+            .query_row("SELECT state, error_message FROM turn_runs", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("turn run");
+        let (content, turn_id): (String, String) = conn
+            .query_row(
+                "SELECT content, turn_id FROM messages WHERE message_kind = 'turn_failure'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("failure entry must be persisted");
+        FailureFacts {
+            turn_state,
+            diagnostic,
+            content,
+            turn_id,
+        }
+    }
+
+    /// Runs one web Turn whose LLM calls always fail, publishing a delta first
+    /// when `publish_delta` is set.
+    async fn run_failing_web_turn(
+        request_key: &str,
+        publish_delta: bool,
+    ) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let retry_count = crate::agent_loop::model_step::MAX_LLM_RETRIES;
+        let provider = RecordingProvider::new(
+            (0..retry_count)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                        body_preview: "test failure".to_string(),
+                        retry_after_secs: None,
+                    })
+                })
+                .collect(),
+            vec![0; retry_count],
+        );
+        let provider = if publish_delta {
+            provider.with_streaming_delta("partial output")
+        } else {
+            provider
+        };
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(provider),
+        );
+        let mut context = crate::test_util::cli_context(request_key);
+        context.channel = "web".to_string();
+        context.chat_type = "web".to_string();
+
+        let result = execute_turn_with_progress_and_snapshot(
+            &state,
+            &context,
+            "hello",
+            state.config_manager.current_blocking(),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "failure must reach the caller");
+        (dir, state)
+    }
+
+    /// Accepts a Turn for `context` and records `failure` as its outcome.
+    async fn seed_failed_turn(
+        state: &AppState,
+        context: &SurfaceContext,
+        failure: TurnFailure,
+    ) -> ScheduledTurn {
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                &context.channel,
+                &context.session_key(),
+                &context.chat_type,
+                &context.agent_id,
+            )
+            .expect("chat");
+        let request_key = context.request_key.clone();
+        let run = match state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: &request_key,
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept")
+        {
+            crate::storage::AcceptOutcome::Created(run)
+            | crate::storage::AcceptOutcome::Existing(run) => run,
+        };
+        let turn_id = run.turn_id.clone();
+        state
+            .db
+            .fail_turn(&turn_id, TurnRunState::Uncertain, failure)
+            .expect("fail");
+        ScheduledTurn {
+            turn_id,
+            context: context.clone(),
+            input: "hello".to_string(),
+            origin_id: uuid::Uuid::new_v4().to_string(),
+            config_snapshot: None,
+            received_at: None,
+            response_delivery: ResponseDelivery::Channel,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn delivery_text_prefers_the_entry_and_falls_back_neutral() {
+        // Arrange: a failed Turn whose conversation entry already exists.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(final_provider()),
+        );
+        let context = crate::test_util::cli_context("delivery-text");
+        let turn = seed_failed_turn(
+            &state,
+            &context,
+            TurnFailure::with_public("llm", "internal diagnostic", "public text"),
+        )
+        .await;
+
+        // Act + Assert: push channels reuse the conversation wording.
+        assert_eq!(
+            failure_text_for_delivery(&state, &turn).await,
+            "public text"
+        );
+
+        // Act: the entry cannot be read, so the terminal state is unknown.
+        let missing = ScheduledTurn {
+            turn_id: "turn-without-entry".to_string(),
+            ..turn
+        };
+        let fallback = failure_text_for_delivery(&state, &missing).await;
+
+        // Assert: an unknown outcome must not invite a retry.
+        assert_eq!(fallback, crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_web_turn_persists_a_visible_failure_entry() {
+        // Arrange: every attempt fails, so the Turn never produces output.
+        let (_dir, state) = run_failing_web_turn("web-failure-entry", false).await;
+
+        // Assert: the Web UI reads failures from history only, so the failure
+        // must exist as a conversation entry the agent will never read back.
+        let failure = read_failure(&state);
+        assert_eq!(failure.turn_state, "failed");
+        assert_eq!(failure.content, failure.diagnostic);
+        assert!(!failure.turn_id.is_empty(), "entry must name its Turn");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncertain_turn_does_not_invite_a_plain_retry() {
+        // Arrange: output is published, then every attempt fails. The Turn can
+        // no longer be retried safely because a response and possibly Tool side
+        // effects already left EgoPulse.
+        let (_dir, state) = run_failing_web_turn("uncertain-public-text", true).await;
+
+        // Assert: the operator keeps the error summary, while the conversation
+        // warns about the side effects instead of telling the user to retry.
+        let failure = read_failure(&state);
+        assert_eq!(failure.turn_state, "uncertain");
+        assert_eq!(
+            failure.diagnostic,
+            "LLM API server error. Please try again later."
+        );
+        assert_eq!(failure.content, crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn scheduled_turn_logs_route_by_conversation_scope() {
@@ -1902,6 +2133,88 @@ mod tests {
             result.is_err(),
             "startup recovery must abort (fail-closed) on storage failure"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatcher_rejection_does_not_invite_a_retry_after_execution_started() {
+        // Arrange: a Turn that already began its model iteration, so a response
+        // or Tool side effect may exist.
+        use crate::conversation::ConversationScope;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = crate::test_util::build_state_with_provider(
+            dir.path().to_str().expect("utf8"),
+            Box::new(final_provider()),
+        );
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("cli", "cli:rejection-text", "cli", "default")
+            .expect("chat");
+        let run = match state
+            .db
+            .accept_or_get_turn(crate::storage::AcceptTurnParams {
+                chat_id,
+                request_key: "rejection-text",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "hash",
+                origin_id: None,
+                scheduled_request_json: None,
+            })
+            .expect("accept")
+        {
+            crate::storage::AcceptOutcome::Created(run)
+            | crate::storage::AcceptOutcome::Existing(run) => run,
+        };
+        let mut input =
+            crate::storage::StoredMessage::user(chat_id, "user".to_string(), "hello".to_string());
+        input.turn_id = Some(run.turn_id.clone());
+        state
+            .db
+            .commit_turn_input_with_conversation(&input, "[]", None, &run.turn_id, 1, Some("fp"))
+            .expect("commit input");
+        state
+            .db
+            .begin_turn_model_iteration(&run.turn_id, 1, "hash")
+            .expect("begin model");
+
+        // Act
+        persist_turn_rejection(
+            &state,
+            ConversationScope::Normal,
+            &run.turn_id,
+            "chain_depth_exceeded",
+            "origin chain terminated",
+        )
+        .await
+        .expect("reject");
+
+        // Assert: the operator keeps the stop reason, while the conversation
+        // asks the user to check the result instead of retrying.
+        let (turn_state, error_message): (String, String) = state
+            .db
+            .get_conn()
+            .expect("connection")
+            .query_row(
+                "SELECT state, error_message FROM turn_runs WHERE turn_id = ?1",
+                rusqlite::params![run.turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("turn run");
+        assert_eq!(turn_state, "uncertain");
+        assert_eq!(error_message, "origin chain terminated");
+        let content: String = state
+            .db
+            .get_conn()
+            .expect("connection")
+            .query_row(
+                "SELECT content FROM messages WHERE message_kind = 'turn_failure'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failure entry must be persisted");
+        assert_eq!(content, crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE);
     }
 
     #[tokio::test]
@@ -2550,7 +2863,9 @@ mod tests {
                     assert_eq!(message_id, &format!("turn:{}:assistant:1", child_ids[0]));
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
-                    assert!(message.contains("follow-up 0 failed"));
+                    // The client sees the user-facing summary, never the raw
+                    // provider text; the Turn id is what identifies the child.
+                    assert_eq!(message, "LLM returned an invalid response.");
                     assert!(
                         !terminal,
                         "the first child error must not end the interaction"
@@ -2569,7 +2884,7 @@ mod tests {
                     assert_eq!(message_id, &format!("turn:{}:assistant:1", child_ids[1]));
                 }
                 (false, DeliveredEvent::Error(message, terminal, turn_id)) => {
-                    assert!(message.contains("follow-up 1 failed"));
+                    assert_eq!(message, "LLM returned an invalid response.");
                     assert!(terminal, "the last child error must end the interaction");
                     assert_eq!(turn_id, &child_ids[1]);
                 }

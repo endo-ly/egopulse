@@ -40,6 +40,30 @@ describe("MessageBubble", () => {
     }
   });
 
+  it("turn_failure_renders_as_an_error_entry", () => {
+    // Act
+    const { container } = render(
+      <MessageBubble
+        message={msg({
+          sender_kind: "system",
+          message_kind: "turn_failure",
+          content: "LLM API server error. Please try again later.",
+        })}
+      />,
+    );
+
+    // Assert: a failed Turn is a transcript entry, not a system notice.
+    const row = container.querySelector(".bubble-failure");
+    expect(row).toBeTruthy();
+    expect(container.querySelector(".bubble-system")).toBeNull();
+    expect(row?.querySelector(".message-body")?.classList.contains("run-error")).toBe(
+      true,
+    );
+    expect(row?.querySelector(".message-body")?.textContent).toBe(
+      "LLM API server error. Please try again later.",
+    );
+  });
+
   it("assistant_message_renders_content_without_stream_markers", () => {
     // Message identity is stable, so bubbles carry no draft/cursor state:
     // progress is a separate indicator row owned by ChatTab.

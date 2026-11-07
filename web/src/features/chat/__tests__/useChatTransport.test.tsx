@@ -940,7 +940,6 @@ describe("useChatTransport reconnect", () => {
           seq: 2,
           state: "error",
           terminal: true,
-          errorMessage: "model failed",
         },
       });
     });

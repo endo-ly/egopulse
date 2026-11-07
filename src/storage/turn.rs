@@ -162,6 +162,42 @@ fn transition_locked(
     Ok(())
 }
 
+/// Records a terminal Turn failure as a conversation message inside `tx`.
+///
+/// The Web UI reads failures from `GET /api/history`, which only serves the
+/// `messages` table. Writing the entry in the same transaction as the
+/// `turn_runs` transition is what makes the failure durable: a separate commit
+/// could leave a terminal Turn with no visible failure, and nothing backfills
+/// it afterwards because recovery skips terminal Turns.
+///
+/// The message id is derived from the Turn, so a repeated call inserts nothing
+/// (`commit_message_locked` uses `INSERT OR IGNORE`).
+fn record_turn_failure_message_locked(
+    tx: &rusqlite::Transaction<'_>,
+    turn_id: &str,
+    public_message: &str,
+) -> Result<(), StorageError> {
+    let chat_id: i64 = tx.query_row(
+        "SELECT chat_id FROM turn_runs WHERE turn_id = ?1",
+        params![turn_id],
+        |row| row.get(0),
+    )?;
+    let mut message = super::StoredMessage::system(chat_id, public_message.to_string());
+    message.id = turn_failure_message_id(turn_id);
+    message.message_kind = super::MessageKind::TurnFailure;
+    message.turn_id = Some(turn_id.to_string());
+    super::chat::commit_message_locked(tx, &message, None, None)?;
+    Ok(())
+}
+
+/// Returns the deterministic id of the conversation entry for a failed Turn.
+pub(crate) fn turn_failure_message_id(turn_id: &str) -> String {
+    format!("turn-failure:{turn_id}")
+}
+
+/// Conversation text for a Turn whose saved request could not be read back.
+const DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE: &str = "Turn could not be resumed because its saved request was unreadable. Please send your message again.";
+
 fn require_state_locked(
     tx: &rusqlite::Transaction<'_>,
     turn_id: &str,
@@ -726,8 +762,16 @@ impl Database {
     /// proven safe; `failed` is used for clean failures before any output.
     ///
     /// The caller chooses the target state; this method validates that the
-    /// current state is non-terminal and records `error_kind` /
-    /// `error_message` / `finished_at`.
+    /// current state is non-terminal and records the failure.
+    ///
+    /// The failure is also written into the conversation as a
+    /// [`MessageKind::TurnFailure`] message in the **same** transaction. The
+    /// Web UI reads failures only from `GET /api/history`, so a separate commit
+    /// would leave a terminal Turn with no visible failure whenever the process
+    /// stops between the two writes — and no later path backfills it.
+    ///
+    /// `failure.diagnostic` goes to `turn_runs`; `failure.public` goes to the
+    /// conversation and must be safe for a user to read.
     ///
     /// # Errors
     ///
@@ -737,8 +781,7 @@ impl Database {
         &self,
         turn_id: &str,
         to: TurnRunState,
-        error_kind: &str,
-        error_message: &str,
+        failure: super::TurnFailure,
     ) -> Result<(), StorageError> {
         if !matches!(to, TurnRunState::Failed | TurnRunState::Uncertain) {
             return Err(StorageError::Conflict(format!(
@@ -746,7 +789,7 @@ impl Database {
             )));
         }
         let mut conn = self.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let current = read_state_locked(&tx, turn_id)?;
         if current.is_terminal() {
             return Err(StorageError::Conflict(format!(
@@ -762,8 +805,15 @@ impl Database {
                  finished_at = ?5,
                  updated_at = ?5
              WHERE turn_id = ?1",
-            params![turn_id, to.to_string(), error_kind, error_message, &now],
+            params![
+                turn_id,
+                to.to_string(),
+                &failure.kind,
+                &failure.diagnostic,
+                &now
+            ],
         )?;
+        record_turn_failure_message_locked(&tx, turn_id, &failure.public)?;
         tx.commit()?;
         Ok(())
     }
@@ -783,6 +833,10 @@ impl Database {
     /// is left untouched. The origin upsert uses `ON CONFLICT … DO UPDATE`, so
     /// a repeat call with the same reason is a no-op.
     ///
+    /// The conversation entry that makes the failure visible in
+    /// `GET /api/history` is written in this same transaction (see
+    /// [`Self::fail_turn`]).
+    ///
     /// # Errors
     ///
     /// Returns [`StorageError`] if the transaction fails.
@@ -790,8 +844,7 @@ impl Database {
         &self,
         turn_id: &str,
         to: TurnRunState,
-        error_kind: &str,
-        error_message: &str,
+        failure: super::TurnFailure,
         origin_id: &str,
         terminal_reason: &str,
     ) -> Result<(), StorageError> {
@@ -801,7 +854,7 @@ impl Database {
             )));
         }
         let mut conn = self.get_conn()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = chrono::Utc::now().to_rfc3339();
 
         // Turn failure (idempotent for already-terminal turns).
@@ -820,8 +873,15 @@ impl Database {
                      finished_at = ?5,
                      updated_at = ?5
                  WHERE turn_id = ?1",
-                params![turn_id, to.to_string(), error_kind, error_message, &now],
+                params![
+                    turn_id,
+                    to.to_string(),
+                    &failure.kind,
+                    &failure.diagnostic,
+                    &now
+                ],
             )?;
+            record_turn_failure_message_locked(&tx, turn_id, &failure.public)?;
         }
 
         // Origin terminal reason (idempotent upsert).
@@ -899,6 +959,7 @@ impl Database {
                 &now
             ],
         )?;
+        record_turn_failure_message_locked(&tx, turn_id, DURABLE_PAYLOAD_INVALID_PUBLIC_MESSAGE)?;
 
         if let Some(origin_id) = origin_id.filter(|origin_id| !origin_id.is_empty()) {
             tx.execute(
@@ -1114,6 +1175,14 @@ impl Database {
                         &now,
                     ],
                 )?;
+                record_turn_failure_message_locked(
+                    &tx,
+                    &row.turn_id,
+                    match to {
+                        TurnRunState::Uncertain => crate::error::TURN_UNCERTAIN_PUBLIC_MESSAGE,
+                        _ => crate::error::TURN_INTERRUPTED_PUBLIC_MESSAGE,
+                    },
+                )?;
                 recovered.push(RecoveredTurnRun {
                     turn_id: row.turn_id,
                     chat_id: row.chat_id,
@@ -1199,7 +1268,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Database, StoredMessage};
+    use crate::storage::{Database, MessageKind, SenderKind, StoredMessage, TurnFailure};
 
     fn test_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1573,8 +1642,12 @@ mod tests {
         commit_input(&db, &turn_id, &mut rev);
 
         // Act
-        db.fail_turn(&turn_id, TurnRunState::Failed, "llm_error", "boom")
-            .expect("fail");
+        db.fail_turn(
+            &turn_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("llm_error", "boom"),
+        )
+        .expect("fail");
 
         // Assert
         let run = db.get_turn_run(&turn_id).expect("get");
@@ -1599,13 +1672,136 @@ mod tests {
         db.fail_turn(
             &turn_id,
             TurnRunState::Uncertain,
-            "partial_output",
-            "delta emitted",
+            TurnFailure::shared("partial_output", "delta emitted"),
         )
         .expect("fail");
 
         // Assert
         assert_eq!(state(&db, &turn_id), TurnRunState::Uncertain);
+    }
+
+    #[test]
+    fn fail_turn_persists_turn_failure_message() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "failure-message").turn_id;
+
+        // Act
+        db.fail_turn(
+            &turn_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("llm", "LLM API rate limited."),
+        )
+        .expect("fail");
+
+        // Assert
+        let messages = db.get_recent_messages(1, 10).expect("messages");
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.id, format!("turn-failure:{turn_id}"));
+        assert_eq!(message.message_kind, MessageKind::TurnFailure);
+        assert_eq!(message.sender_kind, SenderKind::System);
+        assert_eq!(message.content, "LLM API rate limited.");
+        assert_eq!(message.turn_id.as_deref(), Some(turn_id.as_str()));
+        assert!(message.seq.is_some(), "failure entry must be ordered");
+    }
+
+    #[test]
+    fn fail_turn_keeps_internal_diagnostics_out_of_the_conversation() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "failure-diagnostic").turn_id;
+
+        // Act
+        db.fail_turn(
+            &turn_id,
+            TurnRunState::Failed,
+            TurnFailure {
+                kind: "validation".to_string(),
+                diagnostic: "config fingerprint mismatch on resume".to_string(),
+                public: "Turn could not be resumed after a restart.".to_string(),
+            },
+        )
+        .expect("fail");
+
+        // Assert: operators keep the diagnostic, users see the public text.
+        let run = db.get_turn_run(&turn_id).expect("get");
+        assert_eq!(
+            run.error_message.as_deref(),
+            Some("config fingerprint mismatch on resume")
+        );
+        let messages = db.get_recent_messages(1, 10).expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].content,
+            "Turn could not be resumed after a restart."
+        );
+    }
+
+    #[test]
+    fn fail_turn_records_the_failure_message_once() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "failure-once").turn_id;
+
+        // Act
+        db.fail_turn(
+            &turn_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("llm", "boom"),
+        )
+        .expect("first");
+        let second = db.fail_turn(
+            &turn_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("llm", "boom"),
+        );
+
+        // Assert
+        assert!(matches!(second, Err(StorageError::Conflict(_))));
+        let failures = db
+            .get_recent_messages(1, 10)
+            .expect("messages")
+            .into_iter()
+            .filter(|message| message.message_kind == MessageKind::TurnFailure)
+            .count();
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn fail_turn_and_terminate_origin_persists_turn_failure_message() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let run = match db
+            .accept_or_get_turn(AcceptTurnParams {
+                chat_id: 1,
+                request_key: "k-failure-origin",
+                config_revision: 1,
+                config_fingerprint: Some("fp"),
+                request_payload_hash: "h",
+                origin_id: Some("origin-failure"),
+                scheduled_request_json: None,
+            })
+            .expect("accept")
+        {
+            AcceptOutcome::Created(run) | AcceptOutcome::Existing(run) => run,
+        };
+
+        // Act
+        db.fail_turn_and_terminate_origin(
+            &run.turn_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("llm", "LLM API connection failed."),
+            "origin-failure",
+            "llm_failure",
+        )
+        .expect("fail");
+
+        // Assert
+        let messages = db.get_recent_messages(1, 10).expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_kind, MessageKind::TurnFailure);
+        assert_eq!(messages[0].content, "LLM API connection failed.");
     }
 
     #[test]
@@ -1630,8 +1826,7 @@ mod tests {
         db.fail_turn_and_terminate_origin(
             &run.turn_id,
             TurnRunState::Failed,
-            "llm_error",
-            "boom",
+            TurnFailure::shared("llm_error", "boom"),
             "origin-atomic",
             "llm_failure",
         )
@@ -1672,8 +1867,7 @@ mod tests {
         db.fail_turn_and_terminate_origin(
             &run.turn_id,
             TurnRunState::Failed,
-            "llm_error",
-            "boom",
+            TurnFailure::shared("llm_error", "boom"),
             "origin-idem",
             "llm_failure",
         )
@@ -1684,8 +1878,7 @@ mod tests {
         db.fail_turn_and_terminate_origin(
             &run.turn_id,
             TurnRunState::Failed,
-            "llm_error",
-            "boom",
+            TurnFailure::shared("llm_error", "boom"),
             "origin-idem",
             "llm_failure",
         )
@@ -1699,12 +1892,20 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let turn_id = accept(&db, "term").turn_id;
-        db.fail_turn(&turn_id, TurnRunState::Failed, "x", "y")
-            .expect("first fail");
+        db.fail_turn(
+            &turn_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("x", "y"),
+        )
+        .expect("first fail");
 
         // Act
         let error = db
-            .fail_turn(&turn_id, TurnRunState::Failed, "x", "y")
+            .fail_turn(
+                &turn_id,
+                TurnRunState::Failed,
+                TurnFailure::shared("x", "y"),
+            )
             .expect_err("terminal");
 
         // Assert
@@ -1719,7 +1920,11 @@ mod tests {
 
         // Act
         let error = db
-            .fail_turn(&turn_id, TurnRunState::Completed, "x", "y")
+            .fail_turn(
+                &turn_id,
+                TurnRunState::Completed,
+                TurnFailure::shared("x", "y"),
+            )
             .expect_err("non-failure target");
 
         // Assert
@@ -1768,6 +1973,14 @@ mod tests {
             db.scan_durable_resumable_turns_after("", "", 100)
                 .expect("scan")
                 .is_empty()
+        );
+        let messages = db.get_recent_messages(1, 10).expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_kind, MessageKind::TurnFailure);
+        assert_eq!(
+            messages[0].content,
+            "Turn could not be resumed because its saved request was unreadable. Please send your message again.",
+            "the conversation must not receive the internal payload diagnostic"
         );
     }
 
@@ -1894,8 +2107,12 @@ mod tests {
         // Arrange
         let (db, _dir) = test_db();
         let failed_id = accept(&db, "invalid-terminal-failed").turn_id;
-        db.fail_turn(&failed_id, TurnRunState::Failed, "existing", "existing")
-            .expect("fail");
+        db.fail_turn(
+            &failed_id,
+            TurnRunState::Failed,
+            TurnFailure::shared("existing", "existing"),
+        )
+        .expect("fail");
         let cancelled_id = accept(&db, "invalid-terminal-cancelled").turn_id;
         db.cancel_turn(&cancelled_id, "existing", "existing")
             .expect("cancel");
@@ -1903,8 +2120,7 @@ mod tests {
         db.fail_turn(
             &uncertain_id,
             TurnRunState::Uncertain,
-            "existing",
-            "existing",
+            TurnFailure::shared("existing", "existing"),
         )
         .expect("uncertain");
 
@@ -2033,6 +2249,30 @@ mod tests {
         assert_eq!(state(&db, &model_completed_id), TurnRunState::Uncertain);
         assert_eq!(state(&db, &tools_pending_id), TurnRunState::Uncertain);
         assert_eq!(state(&db, &tools_completed_id), TurnRunState::Uncertain);
+    }
+
+    #[test]
+    fn recover_interrupted_turns_persists_turn_failure_message() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let turn_id = accept(&db, "recovered-failure").turn_id;
+
+        // Act
+        db.recover_interrupted_turns().expect("recover");
+
+        // Assert
+        let failures: Vec<_> = db
+            .get_recent_messages(1, 10)
+            .expect("messages")
+            .into_iter()
+            .filter(|message| message.message_kind == MessageKind::TurnFailure)
+            .collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].id, format!("turn-failure:{turn_id}"));
+        assert_eq!(
+            failures[0].content,
+            crate::error::TURN_INTERRUPTED_PUBLIC_MESSAGE
+        );
     }
 
     #[test]

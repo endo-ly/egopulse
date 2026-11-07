@@ -359,7 +359,9 @@ mod tests {
     use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::llm::{Message, MessagesResponse, ToolCall};
     use crate::runtime::AppState;
-    use crate::storage::{AcceptTurnParams, StoredMessage, TurnRunState, call_blocking};
+    use crate::storage::{
+        AcceptTurnParams, StoredMessage, TurnFailure, TurnRunState, call_blocking,
+    };
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -556,7 +558,13 @@ mod tests {
         // final row already exists under the streamed id.
         call_blocking(Arc::clone(&state.db), {
             let turn_id = turn_id.clone();
-            move |db| db.fail_turn(&turn_id, TurnRunState::Failed, "test", "boom")
+            move |db| {
+                db.fail_turn(
+                    &turn_id,
+                    TurnRunState::Failed,
+                    TurnFailure::shared("test", "boom"),
+                )
+            }
         })
         .await
         .expect("fail turn");

@@ -100,7 +100,7 @@ pub(crate) use tool::{
     ClaimOutcome, ClaimParams, ReadOnlyToolOutcome, canonical_tool_input, input_hash,
 };
 pub(crate) use turn::RecoveredOrigin;
-pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun};
+pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun, turn_failure_message_id};
 
 /// Result of attempting to stage a human follow-up for the active Tool phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +378,10 @@ define_enum! {
         AgentSend => "agent_send",
         SystemEvent => "system_event",
         ToolCall => "tool_call",
+        // The Turn ended without a response. Persisted into the conversation so
+        // the failure survives a reload, and excluded from the LLM session
+        // snapshot so the agent never reads its own error back as context.
+        TurnFailure => "turn_failure",
     }
 }
 
@@ -464,6 +468,42 @@ impl TurnRunState {
             ToolsCompleted => matches!(to, ModelPending | Completed | Failed | Uncertain),
             // 終端状態は上で弾いているのでここには来ない。
             Completed | Failed | Cancelled | Uncertain => false,
+        }
+    }
+}
+
+/// What a terminal Turn failure records.
+///
+/// The two texts serve different readers and must not be conflated: `kind` and
+/// `diagnostic` stay in `turn_runs` for operators, while `public` is written
+/// into the conversation, where anyone can read it. Internal diagnostics
+/// (config fingerprints, payload decoding, resume validation) belong in
+/// `diagnostic` only.
+pub(crate) struct TurnFailure {
+    /// Stable classification persisted as `turn_runs.error_kind`.
+    pub(crate) kind: String,
+    /// Operator-facing detail persisted as `turn_runs.error_message`.
+    pub(crate) diagnostic: String,
+    /// Conversation text. Must be safe to show a user.
+    pub(crate) public: String,
+}
+
+impl TurnFailure {
+    /// A failure whose diagnostic text is already safe to show.
+    pub(crate) fn shared(kind: &str, text: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            diagnostic: text.to_string(),
+            public: text.to_string(),
+        }
+    }
+
+    /// A failure whose conversation text differs from its diagnostic.
+    pub(crate) fn with_public(kind: &str, diagnostic: &str, public: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            diagnostic: diagnostic.to_string(),
+            public: public.to_string(),
         }
     }
 }

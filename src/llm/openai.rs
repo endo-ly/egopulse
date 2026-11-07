@@ -9,6 +9,14 @@ use std::time::Duration;
 
 const REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// Inactivity deadline between reads of one request.
+///
+/// A provider that accepts the connection but never produces a byte (a
+/// saturated prefill queue, for example) fails here instead of holding the
+/// request open until the total deadline. The timer resets on every successful
+/// read, so a slow but progressing generation is unaffected.
+const READ_TIMEOUT_SECS: u64 = 90;
+
 /// HTTP client shared by every provider.
 ///
 /// Providers are created per conversation, so each one must not build its own
@@ -22,6 +30,7 @@ fn shared_http_client() -> Result<reqwest::Client, LlmError> {
                 .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
                 .build()
                 .map_err(|error| error.to_string())
         })

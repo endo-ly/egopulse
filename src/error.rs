@@ -7,6 +7,17 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Conversation text for a Turn that may already have produced output or Tool
+/// side effects.
+///
+/// Retrying such a Turn can duplicate an operation the user already paid for,
+/// so the text asks about the result instead of inviting a retry.
+pub(crate) const TURN_UNCERTAIN_PUBLIC_MESSAGE: &str = "Turn ended without a final response after it may have changed something outside EgoPulse. Check the result before sending your message again.";
+
+/// Conversation text for a Turn a restart stopped before it produced output.
+pub(crate) const TURN_INTERRUPTED_PUBLIC_MESSAGE: &str =
+    "Turn ended without a response because the runtime restarted. Please send your message again.";
+
 /// Top-level error type aggregating all domain-specific errors.
 #[derive(Debug, Error)]
 pub enum EgoPulseError {
@@ -112,6 +123,9 @@ impl EgoPulseError {
             }
             Self::Llm(LlmError::InvalidResponse(_)) => {
                 "LLM returned an invalid response.".to_string()
+            }
+            Self::Llm(LlmError::DeadlineExceeded) => {
+                "LLM API request timed out. Please try again later.".to_string()
             }
             Self::Storage(_) => "Internal storage error.".to_string(),
             _ => "An unexpected error occurred.".to_string(),
@@ -325,6 +339,8 @@ pub enum LlmError {
     },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
+    #[error("llm_deadline_exceeded: no response within the model iteration deadline")]
+    DeadlineExceeded,
     #[error("llm_request_construction_failed: {0}")]
     RequestConstructionFailed(String),
 }
@@ -346,16 +362,18 @@ impl LlmError {
     /// the provider returned any body, or a 429 / 5xx response.
     ///
     /// Non-retryable variants (`InvalidResponse`, `InitFailed`,
-    /// `RequestConstructionFailed`, and 4xx other than 429) either indicate a
-    /// deterministic problem or imply the provider already produced a response
-    /// that must not be silently discarded.
+    /// `RequestConstructionFailed`, `DeadlineExceeded`, and 4xx other than 429)
+    /// either indicate a deterministic problem, imply the provider already
+    /// produced a response that must not be silently discarded, or mean the
+    /// iteration's time window is gone.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::RequestFailed(_) => true,
             Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
-            Self::InitFailed(_) | Self::InvalidResponse(_) | Self::RequestConstructionFailed(_) => {
-                false
-            }
+            Self::InitFailed(_)
+            | Self::InvalidResponse(_)
+            | Self::DeadlineExceeded
+            | Self::RequestConstructionFailed(_) => false,
         }
     }
 }

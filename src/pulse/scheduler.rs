@@ -430,9 +430,12 @@ async fn update_run_failed(
 }
 
 /// Load up to 10 recent messages for the given chat (for capsule context).
+///
+/// Uses the LLM-visible view: a Turn that ended without a response is recorded
+/// for the user, not for the model.
 async fn load_recent_messages(db: &Arc<Database>, chat_id: i64) -> Vec<String> {
     crate::storage::call_blocking(Arc::clone(db), move |db| {
-        let messages = db.get_recent_messages(chat_id, 10)?;
+        let messages = db.get_recent_context_messages(chat_id, 10)?;
         Ok(messages.into_iter().map(|m| m.content).collect())
     })
     .await
@@ -632,6 +635,46 @@ mod tests {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s)
             .single()
             .expect("valid utc")
+    }
+
+    // --- activation context ---
+
+    #[tokio::test]
+    async fn activation_context_excludes_turn_failures() {
+        // Arrange: a Turn that ended without a response is recorded for the
+        // user; the next activation must not read it as conversation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_pulse_state(&dir, default_pulse_config(), vec![("lyre", "")]);
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("web", "web:pulse-context", "web", "lyre")
+            .expect("chat");
+        {
+            let conn = state.db.get_conn().expect("pool");
+            for (id, sender, content, kind) in [
+                ("msg-1", "user", "hello", "message"),
+                (
+                    "turn-failure:turn-1",
+                    "system",
+                    "LLM API server error. Please try again later.",
+                    "turn_failure",
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO messages (id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, seq)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                        (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE chat_id = ?2))",
+                    rusqlite::params![id, chat_id, sender, content, sender, "2026-11-06T00:00:00Z", kind],
+                )
+                .expect("store message");
+            }
+        }
+
+        // Act
+        let messages = load_recent_messages(&state.db, chat_id).await;
+
+        // Assert
+        assert_eq!(messages, vec!["hello".to_string()]);
     }
 
     // --- next scan delay tests (once reservation) ---

@@ -196,8 +196,9 @@ Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実�
 - assistant delta・narration・Tool Call を外部へ公開していない
 - assistant message を commit していない
 - Tool 実行を開始していない
-- error が明示的に retryable（429 / 5xx / 接続失敗 / 読取り timeout）
+- error が明示的に retryable（429 / 5xx / 接続失敗 / 読取り timeout / iteration deadline 到達）
 - 試行回数が上限（3 回）以内
+- 次の試行が iteration deadline 内に収まる
 
 **再試行禁止**（いずれか該当で `failed` または `uncertain` へ遷移）:
 
@@ -228,6 +229,12 @@ accept / resume validation
 AgentLoop は final response と最新の session snapshot を `AgentLoopResult` として返す。final message の保存、`output_published`、`completed` への遷移は TurnExecutor が行うため、Loop の反復と durable Turn の完了条件は混在しない。
 
 再試行回数上限に達した場合、または再試行禁止条件に該当した場合は Turn を `failed`（出力未公開）または `uncertain`（出力公開済み）として終了する。Codex 認証の 401 では次回 Turn 向けに token refresh を試みるが、失敗した Turn を再開しない。
+
+### 待ち時間の上限
+
+1 回の model iteration は全体で 300 秒、1 リクエストは 90 秒の無応答で打ち切る。1 回目の試行は全量を使えるため、正常に進行する長い生成は従来どおり許容し、リトライは残り時間しか使えない。無応答の期限は read のたびにリセットされるので、進行中の生成を落とさず、接続後に何も返らない状態だけを早く検出できる。
+
+試行回数の記録とバックオフ待機も同じ期限の内側で行う。これらは provider から見えない処理であり、外に置くと DB 待ちが長い場合に上限を超える。期限に到達した場合は、その時点までの実際のエラーをそのまま返す。
 
 turn 中の保存は phase ごとに進む。
 
@@ -441,6 +448,16 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 
 各状態の意味は [db.md §turn_runs](./db.md#turn_runs) を参照。
 
+### 10.2.1 失敗の可視化
+
+`failed` / `uncertain` への遷移は、会話にも `message_kind = turn_failure` のメッセージとして記録する。Web UI は履歴だけを情報源とするため、失敗が `turn_runs` にしか無いとリロード後に消える。
+
+- 状態遷移と会話エントリは同一 transaction で確定する。分けると「Turn は端末なのに履歴が無い」状態が残り、起動時 recovery も端末 Turn を対象にしないため二度と補完されない
+- `turn_runs` に残す内部診断と、会話に書く文言は分ける。会話に出る以上、利用者が読んで意味の通る文でなければならない
+- `uncertain` は出力や Tool 副作用が既に発生している可能性がある。再送すると操作が重複し得るため、再実行を促さず結果の確認を促す
+- 会話エントリの文言は push チャネルにもそのまま使う。2箇所で組み立てると、片方だけが再実行を促す状態になり得る
+- LLM に渡す文脈からは除外する。エージェントが自分のエラーを会話として読まない
+
 ### 10.3 crash recovery
 
 起動時の recovery は、Tool と Turn の状態を復元した後、terminal Turn に残った staged follow-up を通常の durable Turn として再投入し、続いて `TurnDispatcher` が実行可能な Turn を再実行する。再開条件を証明できない Turn を推測で再開せず、すべて停止状態へ移す。
@@ -456,7 +473,7 @@ accepted → input_committed → model_pending → model_completed → tools_pen
 | `model_pending` / `model_completed` / `tools_pending` / `tools_completed`（`scheduled_request_json` なし） | `uncertain`（外部出力や Tool 副作用が及んでいる可能性があり、再開の安全性を証明できない） |
 | `completed` / `failed` / `uncertain` / `cancelled` | 端末状態。変更しない |
 
-起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` / `tools_completed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため `failed` とする。`tools_completed` の resume は未commitの staged follow-upを先にsession snapshotへ反映し、元の input を再保存せず、完了済み Tool を再実行しない。
+起動時の recovery 分類は Turn の状態と durable payload の有無に基づいて行う。`input_committed` / `tools_completed` Turn を resume する際は、保存済み Config fingerprint と resume 時の Config snapshot が一致することも検証する。不一致の場合は安全な再開条件を満たさないため終了する。`input_committed` は `failed`、`tools_completed` は Tool の副作用が既に発生している可能性があるため `uncertain` とする。`tools_completed` の resume は未commitの staged follow-upを先にsession snapshotへ反映し、元の input を再保存せず、完了済み Tool を再実行しない。
 
 同時に `Database::recover_running_tools()` が `running` の Tool をすべて `uncertain` へ移行する（[tools.md](./tools.md) の Tool 実行台帳を参照）。
 

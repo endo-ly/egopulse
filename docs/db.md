@@ -223,7 +223,7 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 | content | TEXT | NOT NULL | メッセージ本文 |
 | sender_kind | TEXT | NOT NULL | 送信者種別（`user`, `assistant`, `system`）。`tool` はエージェント間通信（`agent_send`）専用のレガシー値 |
 | timestamp | TEXT | NOT NULL | RFC3339 タイムスタンプ |
-| message_kind | TEXT | NOT NULL DEFAULT 'message' | メッセージ種別（`message`, `agent_send`, `system_event`） |
+| message_kind | TEXT | NOT NULL DEFAULT 'message' | メッセージ種別（`message`, `agent_send`, `system_event`, `tool_call`, `turn_failure`） |
 | recipient_agent_id | TEXT | nullable | 受信エージェント ID。Multi-Agent Room で使用 |
 | seq | INTEGER | nullable | chat 内の単調増加 sequence。因果順序の根拠。未割当は NULL |
 | turn_id | TEXT | nullable | 所属 Turn（`turn_runs`）。legacy 行は NULL |
@@ -252,6 +252,7 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 | `agent_send` | エージェント間通信。`sender_kind` は `tool`、`recipient_agent_id` に宛先エージェント ID が設定される |
 | `system_event` | システムイベント。停止条件によるターン拒否や LLM 失敗を記録。`sender_id` は `"system"`、`sender_kind` は `system`。`content` は JSON 形式（`{"reason": "ChainDepthExceeded"}` 等） |
 | `tool_call` | ツール実行結果。`sender_kind` は `assistant`、`content` は JSON 文字列（`{tool, status, result, input}`） |
+| `turn_failure` | Turn が応答を返さず終了した記録。`sender_id` は `"system"`、`sender_kind` は `system`、`content` はユーザー向けサマリ。LLM の文脈には含めない |
 
 ---
 

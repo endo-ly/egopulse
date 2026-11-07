@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::time::Instant;
 
 use tracing::warn;
 
@@ -20,6 +21,14 @@ use crate::storage::call_blocking;
 
 /// Maximum number of attempts for a single LLM model iteration.
 pub(crate) const MAX_LLM_RETRIES: usize = 3;
+
+/// Wall-clock ceiling for one model iteration across every transport attempt.
+///
+/// A single attempt may use the whole window (a legitimate generation can take
+/// minutes); a retry only gets what is left. This is what bounds how long a
+/// Turn can sit without producing anything, regardless of how the provider
+/// fails.
+const MODEL_ITERATION_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Base backoff (milliseconds) for exponential LLM retry.
 const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
@@ -140,6 +149,12 @@ impl<'a> ModelRunner<'a> {
     /// Shared retry loop: retries retryable LLM errors up to [`MAX_LLM_RETRIES`]
     /// attempts unless output was already published. `before_retry` runs before
     /// each backoff so callers can record the attempt.
+    ///
+    /// Every attempt is capped by what remains of
+    /// [`MODEL_ITERATION_DEADLINE`], so the retries can never extend one model
+    /// iteration past that bound. Capping only the *start* of an attempt would
+    /// not be enough: a request that begins with one second left could still
+    /// run for the full transport timeout.
     async fn retry_transient_failures<F, Fut>(
         &self,
         delta_publication: DeltaPublication,
@@ -153,7 +168,10 @@ impl<'a> ModelRunner<'a> {
         let output_published = Arc::new(AtomicBool::new(false));
         let mut empty_reply_retry_attempted = false;
         let mut retry_messages = Arc::clone(&self.request.messages);
+        let started = Instant::now();
+        let deadline = started + MODEL_ITERATION_DEADLINE;
         for attempt in 1..=MAX_LLM_RETRIES {
+            let remaining = deadline.saturating_duration_since(Instant::now());
             let published_flag = Arc::clone(&output_published);
             let caller_on_delta = self.request.on_delta;
             let on_delta = move |text: String| {
@@ -162,14 +180,31 @@ impl<'a> ModelRunner<'a> {
                     caller_on_delta(text);
                 }
             };
-            let response = self
-                .run_once(
+            let response = match tokio::time::timeout(
+                remaining,
+                self.run_once(
                     Arc::clone(&retry_messages),
                     &mut empty_reply_retry_attempted,
                     Some(output_published.as_ref()),
                     &on_delta,
-                )
-                .await;
+                ),
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_elapsed) => {
+                    warn!(
+                        attempt,
+                        max = MAX_LLM_RETRIES,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "llm iteration deadline exhausted"
+                    );
+                    Err(ModelStepError::new(
+                        EgoPulseError::Llm(LlmError::DeadlineExceeded),
+                        Arc::clone(&retry_messages),
+                    ))
+                }
+            };
             match response {
                 Ok(step) => return Ok(step),
                 Err(step_error) => {
@@ -180,17 +215,45 @@ impl<'a> ModelRunner<'a> {
                         matches!(&error, EgoPulseError::Llm(error) if error.is_retryable());
                     let backoff = llm_retry_backoff(attempt, &error);
                     let within_backoff_limit = max_backoff.is_none_or(|limit| backoff <= limit);
-                    if retryable && !published && within_backoff_limit && attempt < MAX_LLM_RETRIES
+                    let before_deadline =
+                        backoff < deadline.saturating_duration_since(Instant::now());
+                    if retryable
+                        && !published
+                        && within_backoff_limit
+                        && before_deadline
+                        && attempt < MAX_LLM_RETRIES
                     {
-                        before_retry().await;
+                        // The deadline covers the wait too: recording the
+                        // attempt and sleeping are work the provider never
+                        // sees, so leaving them outside the bound would let a
+                        // slow DB hold the Turn past the iteration window.
+                        let waited = tokio::time::timeout_at(deadline, async {
+                            before_retry().await;
+                            tokio::time::sleep(backoff).await;
+                        })
+                        .await;
+                        if waited.is_err() {
+                            warn!(
+                                attempt,
+                                max = MAX_LLM_RETRIES,
+                                backoff_ms = backoff.as_millis() as u64,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                error = %error,
+                                "llm iteration deadline exhausted while waiting to retry"
+                            );
+                            return Err(ModelRequestError {
+                                error,
+                                output_published: published,
+                            });
+                        }
                         warn!(
                             attempt,
                             max = MAX_LLM_RETRIES,
                             backoff_ms = backoff.as_millis() as u64,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
                             error = %error,
                             "retryable llm error; retrying same iteration"
                         );
-                        tokio::time::sleep(backoff).await;
                         continue;
                     }
                     return Err(ModelRequestError {
@@ -461,6 +524,10 @@ fn model_request_hash(
 }
 
 /// Calculates the delay before the next LLM transport retry.
+///
+/// A server-supplied `Retry-After` is honored verbatim. Otherwise the delay is
+/// exponentially backed off and randomized: several conversations can hit the
+/// same rate limit at once, and a fixed delay would retry them in lockstep.
 fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
     if let EgoPulseError::Llm(LlmError::ApiError {
         retry_after_secs: Some(secs),
@@ -469,7 +536,9 @@ fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
     {
         return Duration::from_secs(*secs);
     }
-    Duration::from_millis(LLM_RETRY_BASE_BACKOFF_MS * 2u64.pow((attempt - 1) as u32))
+    let ceiling_ms =
+        LLM_RETRY_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
+    Duration::from_millis(rand::random_range(0..=ceiling_ms))
 }
 
 fn build_assistant_tool_phase(
@@ -676,20 +745,48 @@ mod tests {
         )
         .with_streaming_delta("unpublished partial output");
         let observer = provider.clone();
+        let (state, llm) = state_with_provider(&dir, provider, "transient-retry-limit");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
+
+        // Act
+        let result = runner
+            .run_with_transient_retry(Duration::from_secs(60))
+            .await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
+    }
+
+    /// Builds a state whose provider answers from `provider`, plus the LLM the
+    /// deadline tests drive.
+    fn state_with_provider(
+        dir: &tempfile::TempDir,
+        provider: RecordingProvider,
+        session: &str,
+    ) -> (crate::runtime::AppState, Arc<dyn LlmProvider>) {
         let state = build_state_with_provider(
             dir.path().to_str().expect("utf8").to_string(),
             Box::new(provider),
         );
-        let context = cli_context("transient-retry-limit");
+        let context = cli_context(session);
         let snapshot = state.config_manager.current_blocking();
         let llm = state
             .turn_dependencies()
             .llm_for_context_with_snapshot(&context, &snapshot)
             .expect("llm");
-        let dependencies = state.turn_dependencies();
-        let runner = ModelRunner::new(ModelStepRequest {
-            state: &dependencies,
-            llm: llm.as_ref(),
+        (state, llm)
+    }
+
+    /// The model-step request the deadline tests share.
+    fn deadline_test_request<'a>(
+        state: &'a TurnDependencies,
+        llm: &'a dyn LlmProvider,
+    ) -> ModelStepRequest<'a> {
+        ModelStepRequest {
+            state,
+            llm,
             system_prompt: "system prompt",
             messages: Arc::new(vec![Message::text("user", "hello")]),
             tools: None,
@@ -702,16 +799,171 @@ mod tests {
             iteration: 1,
             scope: ConversationScope::Normal,
             on_delta: &ignore_delta,
+        }
+    }
+
+    #[test]
+    fn llm_retry_backoff_stays_within_the_exponential_ceiling() {
+        // Arrange
+        let error = EgoPulseError::Llm(crate::error::LlmError::ApiError {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            body_preview: "provider error".to_string(),
+            retry_after_secs: None,
         });
 
         // Act
+        let attempt_two: Vec<Duration> = (0..200).map(|_| llm_retry_backoff(2, &error)).collect();
+
+        // Assert: bounded by the exponential ceiling, and actually randomized so
+        // conversations that hit the same limit do not retry in lockstep.
+        assert!(
+            attempt_two
+                .iter()
+                .all(|delay| *delay <= Duration::from_millis(1_000)),
+            "delay must not exceed the exponential ceiling"
+        );
+        let distinct: std::collections::HashSet<Duration> = attempt_two.iter().copied().collect();
+        assert!(
+            distinct.len() > 1,
+            "delay must vary between retries, got {distinct:?}"
+        );
+        assert!(llm_retry_backoff(4, &error) <= Duration::from_millis(4_000));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn iteration_deadline_cuts_a_hanging_attempt() {
+        // Arrange: the provider accepts the call and never answers.
+        tokio::time::pause();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            (0..MAX_LLM_RETRIES)
+                .map(|_| {
+                    Ok(MessagesResponse {
+                        content: "never returned".to_string(),
+                        reasoning_content: None,
+                        tool_calls: vec![],
+                        usage: None,
+                    })
+                })
+                .collect(),
+            vec![MODEL_ITERATION_DEADLINE.as_millis() as u64 * 2; MAX_LLM_RETRIES],
+        );
+        let observer = provider.clone();
+        let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-hang");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
+
+        // Act
+        let started = tokio::time::Instant::now();
         let result = runner
             .run_with_transient_retry(Duration::from_secs(60))
             .await;
 
+        // Assert: one attempt is cut at the deadline and nothing else starts.
+        let error = match result {
+            Err(error) => error.into_parts().0,
+            Ok(_) => panic!("hanging attempt must fail"),
+        };
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(crate::error::LlmError::DeadlineExceeded)
+        ));
+        assert_eq!(observer.seen_messages().len(), 1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= MODEL_ITERATION_DEADLINE
+                && elapsed < MODEL_ITERATION_DEADLINE + Duration::from_secs(1),
+            "attempt must be cut at the iteration deadline, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retry_wait_is_bounded_by_the_iteration_deadline() {
+        // Arrange: the attempt fails immediately with a retryable 429, but the
+        // pre-retry work is slow enough that the backoff would cross the
+        // deadline. Recording the attempt and sleeping happen inside the
+        // iteration window, so they must be cut too.
+        tokio::time::pause();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            (0..MAX_LLM_RETRIES)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        body_preview: "rate limited".to_string(),
+                        retry_after_secs: Some(150),
+                    })
+                })
+                .collect(),
+            vec![0; MAX_LLM_RETRIES],
+        );
+        let observer = provider.clone();
+        let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-wait");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
+
+        // Act
+        let started = tokio::time::Instant::now();
+        let result = runner
+            .retry_transient_failures(DeltaPublication::Published, None, || async {
+                tokio::time::sleep(Duration::from_secs(200)).await;
+            })
+            .await;
+
+        // Assert: the wait stops at the deadline, and the caller keeps the
+        // cause that actually happened rather than a synthetic timeout.
+        let error = match result {
+            Err(error) => error.into_parts().0,
+            Ok(_) => panic!("retry wait must be cut at the deadline"),
+        };
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(crate::error::LlmError::ApiError { status, .. })
+                if status.as_u16() == 429
+        ));
+        assert_eq!(observer.seen_messages().len(), 1);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= MODEL_ITERATION_DEADLINE
+                && elapsed < MODEL_ITERATION_DEADLINE + Duration::from_secs(1),
+            "wait must stop at the iteration deadline, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn retry_is_skipped_when_the_backoff_would_pass_the_deadline() {
+        // Arrange: the first attempt uses 200s of the 300s window and asks for a
+        // 150s retry delay, which cannot fit in what is left.
+        tokio::time::pause();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            (0..MAX_LLM_RETRIES)
+                .map(|_| {
+                    Err(crate::error::LlmError::ApiError {
+                        status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                        body_preview: "rate limited".to_string(),
+                        retry_after_secs: Some(150),
+                    })
+                })
+                .collect(),
+            vec![200_000; MAX_LLM_RETRIES],
+        );
+        let observer = provider.clone();
+        let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-backoff");
+        let dependencies = state.turn_dependencies();
+        let runner = ModelRunner::new(deadline_test_request(&dependencies, llm.as_ref()));
+
+        // Act
+        let result = runner
+            .run_with_transient_retry(Duration::from_secs(600))
+            .await;
+
         // Assert
         assert!(result.is_err());
-        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
+        assert_eq!(observer.seen_messages().len(), 1);
     }
 
     #[tokio::test]

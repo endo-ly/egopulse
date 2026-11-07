@@ -11,7 +11,6 @@ interface ChatEventBase {
   sessionKey: string;
   seq: number;
   terminal?: boolean;
-  errorMessage?: string;
 }
 
 /**
@@ -28,7 +27,6 @@ export type ChatEventPayload =
 
 export interface ChatState {
   messages: ChatMessage[];
-  error: string | null;
   /**
    * Runs awaiting assistant progress, as UI state — never as fake messages.
    * A run joins on accept (and on discard / non-terminal terminal events
@@ -44,7 +42,7 @@ export function isWaitingForAssistant(state: ChatState): boolean {
 }
 
 export function initialChatState(): ChatState {
-  return { messages: [], error: null, waitingRuns: [] };
+  return { messages: [], waitingRuns: [] };
 }
 
 export interface OptimisticUserMessage {
@@ -178,7 +176,7 @@ export function reduceChatEvent(
               runId: event.runId,
             },
           ];
-      return { ...clearWaitingRun(state, event.runId), messages, error: null };
+      return { ...clearWaitingRun(state, event.runId), messages };
     }
 
     case "done": {
@@ -218,15 +216,11 @@ export function reduceChatEvent(
 
     case "error": {
       // A failed turn resolves nothing: partial output keeps the id it
-      // streamed under, and history converges by id on refetch.
-      const next =
-        event.terminal === false
-          ? addWaitingRun(state, event.runId)
-          : clearWaitingRun(state, event.runId);
-      return {
-        ...next,
-        error: event.errorMessage ?? "unknown error",
-      };
+      // streamed under, and history converges by id on refetch. The failure
+      // itself arrives as a persisted `turn_failure` entry in that refetch.
+      return event.terminal === false
+        ? addWaitingRun(state, event.runId)
+        : clearWaitingRun(state, event.runId);
     }
   }
 }
