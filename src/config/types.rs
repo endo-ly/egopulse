@@ -553,6 +553,9 @@ pub(crate) struct AgentConfig {
     pub reasoning_effort: Option<String>,
     pub discord_bot: Option<BotId>,
     pub telegram_bot: Option<BotId>,
+    /// MCP server names this agent may use. `None` means every configured
+    /// server; `Some([])` hides all MCP tools from the agent.
+    pub mcp_servers: Option<Vec<String>>,
     pub profiles: HashMap<String, AgentProfileConfig>,
 }
 
@@ -565,6 +568,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("discord_bot", &self.discord_bot)
             .field("telegram_bot", &self.telegram_bot)
+            .field("mcp_servers", &self.mcp_servers)
             .field("profiles", &self.profiles)
             .finish()
     }

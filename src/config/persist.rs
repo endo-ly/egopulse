@@ -99,6 +99,8 @@ struct SerializableAgent {
     discord_bot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     telegram_bot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_servers: Option<Vec<String>>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     profiles: HashMap<String, SerializableAgentProfile>,
 }
@@ -454,6 +456,7 @@ impl From<&Config> for SerializableConfig {
                         reasoning_effort: a.reasoning_effort.clone(),
                         discord_bot: a.discord_bot.as_ref().map(|b| b.to_string()),
                         telegram_bot: a.telegram_bot.as_ref().map(|b| b.to_string()),
+                        mcp_servers: a.mcp_servers.clone(),
                         profiles: a
                             .profiles
                             .iter()
