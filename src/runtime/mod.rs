@@ -29,6 +29,7 @@ pub(crate) use turn::{ActiveTurnTracker, execute_observed_turn, execute_schedule
 use turn::{recover_durable_state, rehydrate_origin_tracker, spawn_turn_dispatcher};
 
 use fs2::FileExt;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -392,6 +393,7 @@ async fn build_runtime_tooling(
     let mcp = crate::tools::mcp::McpManager::new(&workspace_dir, config_manager.dotenv()).await?;
     let mcp_secrets = mcp.secrets();
     let mcp_manager = Arc::new(tokio::sync::RwLock::new(mcp));
+    warn_unknown_agent_mcp_servers(config, &workspace_dir);
 
     let mut tools = build_tool_registry(config, &deps.skills, config_manager);
     tools.set_mcp_manager(Arc::clone(&mcp_manager), mcp_secrets);
@@ -422,6 +424,54 @@ async fn build_runtime_tooling(
         agent_send_intake,
         workspace_dir,
     })
+}
+
+/// Logs `agents.<id>.mcp_servers` entries that match no configured server.
+///
+/// A typo would otherwise silently remove tools from an agent. The runtime
+/// keeps running because MCP configuration problems are never fatal.
+fn warn_unknown_agent_mcp_servers(config: &Config, workspace_dir: &Path) {
+    let known: HashSet<String> =
+        match crate::tools::mcp::configured_server_definitions(workspace_dir) {
+            Ok(definitions) => definitions.into_iter().map(|(name, _)| name).collect(),
+            Err(error) => {
+                warn!(
+                    %error,
+                    "failed to read MCP server definitions for allowlist validation"
+                );
+                return;
+            }
+        };
+    for (agent_id, server) in unknown_mcp_server_references(config, &known) {
+        warn!(
+            agent_id = %agent_id,
+            server = %server,
+            known = ?known,
+            "agent references an unknown MCP server"
+        );
+    }
+}
+
+/// Returns every `(agent_id, server)` pair whose server is not configured.
+fn unknown_mcp_server_references(
+    config: &Config,
+    known: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut unknown: Vec<(String, String)> = config
+        .agents
+        .iter()
+        .flat_map(|(agent_id, agent)| {
+            agent
+                .mcp_servers
+                .iter()
+                .flatten()
+                .filter(|server| !known.contains(*server))
+                .map(move |server| (agent_id.to_string(), server.clone()))
+        })
+        .collect();
+    unknown.sort();
+    unknown.dedup();
+    unknown
 }
 
 fn build_tool_registry(
@@ -972,6 +1022,28 @@ mod tests {
 
     fn test_config_for_runtime(state_root: String) -> crate::config::Config {
         crate::test_util::test_config(&state_root)
+    }
+
+    #[test]
+    fn unknown_mcp_server_references_reports_only_unconfigured_names() {
+        // Arrange
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = test_config_for_runtime(dir.path().to_string_lossy().to_string());
+        config.agents.insert(
+            crate::config::AgentId::new("reviewer"),
+            crate::config::AgentConfig {
+                label: "Reviewer".to_string(),
+                mcp_servers: Some(vec!["github".to_string(), "ghost".to_string()]),
+                ..Default::default()
+            },
+        );
+        let known: HashSet<String> = HashSet::from(["github".to_string()]);
+
+        // Act
+        let unknown = unknown_mcp_server_references(&config, &known);
+
+        // Assert
+        assert_eq!(unknown, vec![("reviewer".to_string(), "ghost".to_string())]);
     }
 
     #[test]

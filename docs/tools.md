@@ -62,15 +62,17 @@ registry に登録される tool は次の通り。`agent_send` は常に登録�
 
 登録箇所: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
 
-### MCP tool (Adapter 経由)
+### MCP tool
 
-MCP が有効な場合、`McpManager.create_tool_adapters()` が各 MCP tool を `McpToolAdapter` (Tool trait 実装) として生成し、`ToolRegistry.register_tool()` で登録する。Registry は MCP の存在を意識しない。
+MCP が有効な場合、`ToolRegistry::definitions_async()` が `McpManager::all_tool_definitions()` の結果を built-in の定義に追加する。実行は `mcp_` で始まる名前を `McpManager::execute_tool_by_name()` へ dispatch する。
+
+公開される MCP tool は Agent の `mcp_servers` 設定で絞られる（[config.md §3.11](./config.md#311-エージェント定義agentsid)）。built-in tool はこの制限を受けない。
 
 命名規則:
 
 - 英数字と `_` 以外の文字は `_` に置換される
 - 合計文字数が 64 文字を超える場合は `mcp_{sha256先頭8文字}` に短縮される
-- サニタイズ後の名前が衝突する場合は後続の tool がスキップされる
+- サニタイズ後の名前が衝突する場合は、server 名と tool 名から作るハッシュを suffix に付け、接続順に依存せず区別する
 
 例:
 

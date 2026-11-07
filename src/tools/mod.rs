@@ -41,6 +41,7 @@ use crate::config::secret_ref::DotenvFile;
 use crate::conversation::ConversationScope;
 use crate::llm::ToolDefinition;
 use crate::skills::SkillManager;
+use mcp::McpScope;
 
 const DEFAULT_MAX_LINES: usize = 2000;
 const DEFAULT_MAX_BYTES: usize = 100 * 1024;
@@ -415,16 +416,36 @@ impl ToolRegistry {
     }
 
     /// Collect tool definitions asynchronously, wrapped in `Arc` for cheap sharing.
-    pub(crate) async fn definitions_async(&self) -> Arc<Vec<ToolDefinition>> {
+    ///
+    /// Built-in tools are always published; MCP tools follow `scope` so an
+    /// agent sees only the servers it may use.
+    pub(crate) async fn definitions_async(&self, scope: &McpScope) -> Arc<Vec<ToolDefinition>> {
         let mut definitions: Vec<ToolDefinition> =
             self.tools.iter().map(|tool| tool.definition()).collect();
 
         if let Some(mcp_manager) = &self.mcp_manager {
             let guard = mcp_manager.read().await;
-            definitions.extend(guard.all_tool_definitions());
+            definitions.extend(guard.all_tool_definitions(scope));
         }
 
         Arc::new(definitions)
+    }
+
+    /// Resolves which MCP servers the executing agent may use.
+    ///
+    /// A Turn carries its start snapshot, so execution agrees with the
+    /// definitions published for that Turn. Direct executions without a
+    /// snapshot fall back to the current configuration.
+    fn mcp_scope(&self, context: &ToolExecutionContext) -> McpScope {
+        if let Some(snapshot) = &context.config_snapshot {
+            return McpScope::for_agent(&snapshot.config, &context.agent_id);
+        }
+        match &self.config_manager {
+            Some(config_manager) => {
+                McpScope::for_agent(&config_manager.current_blocking().config, &context.agent_id)
+            }
+            None => McpScope::all(),
+        }
     }
 
     /// Dispatches a Tool call. Returns an error result for unknown tools.
@@ -469,8 +490,9 @@ impl ToolRegistry {
         if let Some(mcp_manager) = &self.mcp_manager {
             if name.starts_with("mcp_") {
                 let result = {
+                    let scope = self.mcp_scope(context);
                     let guard = mcp_manager.read().await;
-                    guard.execute_tool_by_name(name, input).await
+                    guard.execute_tool_by_name(name, input, &scope).await
                 };
                 if let Some(result) = result {
                     return sanitize_tool_result(
@@ -1811,17 +1833,112 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn mcp_tools_follow_the_agent_scope() {
+        // Arrange: one MCP server, one agent with all servers and one agent
+        // whose empty allowlist hides every MCP tool.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+        let mut config = test_config(dir.path().to_str().expect("utf8"));
+        config.agents.insert(
+            crate::config::AgentId::new("restricted"),
+            crate::config::AgentConfig {
+                label: "Restricted".to_string(),
+                mcp_servers: Some(Vec::new()),
+                ..Default::default()
+            },
+        );
+        let workspace = config.workspace_dir().expect("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp_tools_server.py");
+        std::fs::write(
+            workspace.join("mcp.json"),
+            json!({"mcpServers": {"alpha": {
+                "transport": "stdio",
+                "command": "python3",
+                "args": [fixture.to_string_lossy(), "ping"],
+            }}})
+            .to_string(),
+        )
+        .expect("write mcp.json");
+        let manager = crate::tools::mcp::McpManager::new(
+            &workspace,
+            crate::test_util::state_root_dotenv(&config),
+        )
+        .await
+        .expect("manager");
+        let mut registry = test_registry(&config);
+        registry.set_mcp_manager(
+            Arc::new(tokio::sync::RwLock::new(manager)),
+            crate::tools::mcp::McpSecrets::default(),
+        );
+
+        // Act
+        let all = registry
+            .definitions_async(&crate::tools::mcp::McpScope::for_agent(&config, "default"))
+            .await;
+        let restricted = registry
+            .definitions_async(&crate::tools::mcp::McpScope::for_agent(
+                &config,
+                "restricted",
+            ))
+            .await;
+
+        // Assert: definitions follow the scope.
+        assert!(
+            all.iter()
+                .any(|definition| definition.name == "mcp_alpha_ping")
+        );
+        assert!(
+            !restricted
+                .iter()
+                .any(|definition| definition.name.starts_with("mcp_")),
+            "restricted agent must not see MCP tools"
+        );
+
+        // Act / Assert: execution follows the same scope.
+        let snapshot = Arc::new(crate::config::manager::ConfigSnapshot::new(
+            0,
+            config.clone(),
+            None,
+        ));
+        let mut context = test_context();
+        context.agent_id = "restricted".to_string();
+        context.config_snapshot = Some(Arc::clone(&snapshot));
+        let denied = registry
+            .execute("mcp_alpha_ping", json!({}), &context)
+            .await;
+        assert!(denied.is_error);
+        assert!(denied.content.contains("Unknown tool"));
+
+        context.agent_id = "default".to_string();
+        let allowed = registry
+            .execute("mcp_alpha_ping", json!({}), &context)
+            .await;
+        assert!(
+            !allowed.is_error,
+            "allowed agent should execute the tool: {}",
+            allowed.content
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn definitions_async_returns_arc() {
         let dir = tempfile::tempdir().expect("tempdir");
         let _home = EnvVarGuard::set("HOME", dir.path());
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        let defs = registry.definitions_async().await;
+        let defs = registry
+            .definitions_async(&crate::tools::mcp::McpScope::all())
+            .await;
 
         let ptr = Arc::as_ptr(&defs);
         assert!(!defs.is_empty(), "should have at least one tool definition");
-        let defs2 = registry.definitions_async().await;
+        let defs2 = registry
+            .definitions_async(&crate::tools::mcp::McpScope::all())
+            .await;
         let ptr2 = Arc::as_ptr(&defs2);
         assert_ne!(ptr, ptr2, "each call should produce a distinct Arc");
     }
@@ -1834,7 +1951,9 @@ mod tests {
         let config = test_config(dir.path().to_str().expect("utf8"));
         let registry = test_registry(&config);
 
-        let tool_defs = registry.definitions_async().await;
+        let tool_defs = registry
+            .definitions_async(&crate::tools::mcp::McpScope::all())
+            .await;
 
         let iterations = 10;
         let mut arc_clones = Vec::with_capacity(iterations);

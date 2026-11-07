@@ -4,7 +4,7 @@
 //! `mcp.json` / `mcp.d/*.json` から global + workspace の設定をマージし、
 //! stdio / streamable_http 両対応で接続する。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,8 +26,8 @@ use rmcp::transport::{
     streamable_http_client::StreamableHttpClientTransportConfig,
 };
 
-use crate::config::default_state_root;
 use crate::config::secret_ref::{DotenvFile, ResolvedValue, StringOrRef, resolve_string_or_ref};
+use crate::config::{AgentId, Config, default_state_root};
 use crate::error::{ConfigError, EgoPulseError, McpError};
 use crate::llm::ToolDefinition;
 use crate::tools::is_plausible_secret_value;
@@ -220,6 +220,63 @@ struct FailedServer {
     error: String,
 }
 
+/// MCP servers whose tools are visible to one agent.
+///
+/// The connection itself is shared by every agent; this scope only decides
+/// which definitions are published and which calls the runtime accepts.
+#[derive(Debug)]
+pub(crate) struct McpScope {
+    /// `None` keeps every configured server; `Some` is an allowlist.
+    allowed: Option<HashSet<String>>,
+}
+
+impl McpScope {
+    /// Every configured server is visible.
+    pub(crate) fn all() -> Self {
+        Self { allowed: None }
+    }
+
+    /// No MCP server is visible.
+    pub(crate) fn none() -> Self {
+        Self {
+            allowed: Some(HashSet::new()),
+        }
+    }
+
+    /// Builds a scope from an agent's `mcp_servers` setting.
+    ///
+    /// `None` inherits every server, matching the field's default. An empty
+    /// list hides all MCP tools from the agent.
+    pub(crate) fn from_servers(servers: Option<&[String]>) -> Self {
+        match servers {
+            None => Self::all(),
+            Some(servers) => Self {
+                allowed: Some(servers.iter().cloned().collect()),
+            },
+        }
+    }
+
+    /// Resolves the scope of `agent_id` in `config`.
+    ///
+    /// An agent missing from the configuration has no MCP access; turns for
+    /// such an agent cannot be created because LLM resolution fails first.
+    pub(crate) fn for_agent(config: &Config, agent_id: &str) -> Self {
+        config
+            .agents
+            .get(&AgentId::new(agent_id))
+            .map(|agent| Self::from_servers(agent.mcp_servers.as_deref()))
+            .unwrap_or_else(Self::none)
+    }
+
+    /// Whether tools from `server` are visible in this scope.
+    pub(crate) fn allows(&self, server: &str) -> bool {
+        match &self.allowed {
+            None => true,
+            Some(allowed) => allowed.contains(server),
+        }
+    }
+}
+
 pub(crate) struct McpManager {
     dotenv: DotenvFile,
     secrets: McpSecrets,
@@ -229,7 +286,9 @@ pub(crate) struct McpManager {
     configured_secrets: Vec<(String, String)>,
     servers: Vec<ConnectedServer>,
     failed_servers: Vec<FailedServer>,
-    /// Pre-computed index: sanitized tool name → (server index, original tool name).
+    /// Assigned LLM-visible name per `(server index, original tool name)`.
+    tool_names: HashMap<(usize, String), String>,
+    /// Pre-computed index: assigned tool name → (server index, original tool name).
     tool_name_index: HashMap<String, (usize, String)>,
 }
 
@@ -344,11 +403,15 @@ pub(crate) fn sanitize_tool_name(server: &str, tool: &str) -> String {
 }
 
 fn sha2_short(input: &str) -> String {
+    sha2_hex(input, 4)
+}
+
+fn sha2_hex(input: &str, bytes: usize) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
-    result[..4].iter().map(|b| format!("{b:02x}")).collect()
+    result[..bytes].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl McpManager {
@@ -363,11 +426,8 @@ impl McpManager {
         for (name, config) in &configs {
             match connect_server(name, config, workspace_dir, &dotenv).await {
                 Ok((client, tools, resolved)) => {
-                    let filtered_tools = filter_tools_for_server(name, &tools);
-                    let tool_display_names: Vec<String> = filtered_tools
-                        .iter()
-                        .map(|tool| sanitize_tool_name(name, tool.name.as_ref()))
-                        .collect();
+                    let tool_display_names: Vec<String> =
+                        tools.iter().map(|tool| tool.name.to_string()).collect();
 
                     tracing::info!(
                         server = name,
@@ -379,7 +439,7 @@ impl McpManager {
                         config: (*config).clone(),
                         resolved,
                         client,
-                        cached_tools: filtered_tools,
+                        cached_tools: tools,
                     });
                 }
                 Err(error) => {
@@ -398,15 +458,16 @@ impl McpManager {
             total = configs.len(),
             "MCP initialization complete"
         );
-        let tool_name_index = build_tool_name_index(&servers);
-        let manager = Self {
+        let mut manager = Self {
             dotenv,
             secrets: McpSecrets::default(),
             configured_secrets,
             servers,
             failed_servers,
-            tool_name_index,
+            tool_names: HashMap::new(),
+            tool_name_index: HashMap::new(),
         };
+        manager.rebuild_tool_names();
         manager.publish_secrets();
         Ok(manager)
     }
@@ -427,6 +488,40 @@ impl McpManager {
         self.secrets.replace(entries);
     }
 
+    /// Recomputes assigned tool names and the execution lookup after a
+    /// connection change.
+    ///
+    /// Names are derived from the complete set of connected tools so that a
+    /// collision introduced by a reconnect cannot make a published tool
+    /// unresolvable.
+    fn rebuild_tool_names(&mut self) {
+        self.tool_names = resolve_tool_names(
+            self.servers
+                .iter()
+                .map(|server| (server.name.as_str(), server.cached_tools.as_slice())),
+        );
+        self.tool_name_index = self
+            .tool_names
+            .iter()
+            .map(|((server_idx, tool_name), assigned)| {
+                (assigned.clone(), (*server_idx, tool_name.clone()))
+            })
+            .collect();
+        for ((server_idx, tool_name), assigned) in &self.tool_names {
+            let Some(server) = self.servers.get(*server_idx) else {
+                continue;
+            };
+            if assigned.as_str() != sanitize_tool_name(&server.name, tool_name) {
+                info!(
+                    server = %server.name,
+                    tool = %tool_name,
+                    assigned = %assigned,
+                    "MCP tool name collision; using a disambiguated name"
+                );
+            }
+        }
+    }
+
     /// Closes every connected server concurrently.
     ///
     /// Stdio servers get their stdin closed, a short grace period to exit, and
@@ -434,6 +529,7 @@ impl McpManager {
     /// "unknown tool" afterwards, so call this only once the runtime has
     /// drained its turns.
     pub(crate) async fn shutdown(&mut self) {
+        self.tool_names.clear();
         self.tool_name_index.clear();
         self.secrets.replace(Vec::new());
         let closes = self.servers.drain(..).map(|server| async move {
@@ -474,11 +570,8 @@ impl McpManager {
             return false;
         };
 
-        let filtered_tools = filter_tools_for_server(&name, &tools);
-        let tool_display_names: Vec<String> = filtered_tools
-            .iter()
-            .map(|tool| sanitize_tool_name(&name, tool.name.as_ref()))
-            .collect();
+        let tool_display_names: Vec<String> =
+            tools.iter().map(|tool| tool.name.to_string()).collect();
 
         info!(
             server = %name,
@@ -491,9 +584,9 @@ impl McpManager {
             config,
             resolved,
             client,
-            cached_tools: filtered_tools,
+            cached_tools: tools,
         });
-        self.tool_name_index = build_tool_name_index(&self.servers);
+        self.rebuild_tool_names();
         self.publish_secrets();
         true
     }
@@ -542,21 +635,24 @@ impl McpManager {
         McpStatus { connected, failed }
     }
 
-    pub(crate) fn all_tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.servers
+    pub(crate) fn all_tool_definitions(&self, scope: &McpScope) -> Vec<ToolDefinition> {
+        let mut definitions: Vec<ToolDefinition> = self
+            .tool_names
             .iter()
-            .flat_map(|server| {
-                server.cached_tools.iter().map(|tool| {
-                    let full_name = sanitize_tool_name(&server.name, tool.name.as_ref());
-                    ToolDefinition {
-                        name: full_name,
-                        description: tool.description.clone().unwrap_or_default().to_string(),
-                        parameters: serde_json::to_value(&tool.input_schema)
-                            .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
-                    }
-                })
+            .filter_map(|((server_idx, tool_name), assigned_name)| {
+                let server = self.servers.get(*server_idx)?;
+                if !scope.allows(&server.name) {
+                    return None;
+                }
+                let tool = server
+                    .cached_tools
+                    .iter()
+                    .find(|tool| tool.name.as_ref() == tool_name)?;
+                Some(tool_definition(assigned_name, tool))
             })
-            .collect()
+            .collect();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        definitions
     }
 
     /// Returns `true` if the MCP tool's annotations indicate it is read-only.
@@ -583,9 +679,13 @@ impl McpManager {
         &self,
         sanitized_name: &str,
         input: serde_json::Value,
+        scope: &McpScope,
     ) -> Option<Result<String, McpError>> {
         let (server_idx, original_name) = self.tool_name_index.get(sanitized_name)?;
         let server = self.servers.get(*server_idx)?;
+        if !scope.allows(&server.name) {
+            return None;
+        }
         Some(
             self.execute_tool(
                 *server_idx,
@@ -794,38 +894,62 @@ fn format_mcp_content(raw: RawContent) -> String {
     }
 }
 
-fn build_tool_name_index(servers: &[ConnectedServer]) -> HashMap<String, (usize, String)> {
-    let mut index = HashMap::new();
-    for (server_idx, server) in servers.iter().enumerate() {
-        for tool in &server.cached_tools {
-            let sanitized = sanitize_tool_name(&server.name, tool.name.as_ref());
-            index
-                .entry(sanitized)
-                .or_insert((server_idx, tool.name.to_string()));
+/// Assigns the LLM-visible name of every connected tool.
+///
+/// The base name is `mcp_{server}_{tool}`. Two pairs can sanitize to the same
+/// base name (for example server `a` with tool `b_c` and server `a_b` with
+/// tool `c`), so every member of a collision group gets a suffix derived from
+/// its exact server and tool names. The mapping therefore depends only on the
+/// set of names, never on connection order, and both definition publication
+/// and execution use it.
+fn resolve_tool_names<'a>(
+    servers: impl IntoIterator<Item = (&'a str, &'a [Tool])>,
+) -> HashMap<(usize, String), String> {
+    let mut entries: Vec<(usize, &str, String, String)> = Vec::new();
+    for (server_idx, (server, tools)) in servers.into_iter().enumerate() {
+        for tool in tools {
+            let tool_name = tool.name.to_string();
+            let base = sanitize_tool_name(server, &tool_name);
+            entries.push((server_idx, server, tool_name, base));
         }
     }
-    index
+
+    let mut base_counts: HashMap<String, usize> = HashMap::new();
+    for (_, _, _, base) in &entries {
+        *base_counts.entry(base.clone()).or_default() += 1;
+    }
+
+    entries
+        .into_iter()
+        .map(|(server_idx, server, tool_name, base)| {
+            let name = if base_counts[&base] == 1 {
+                base
+            } else {
+                disambiguate_tool_name(&base, server, &tool_name)
+            };
+            ((server_idx, tool_name), name)
+        })
+        .collect()
 }
 
-fn filter_tools_for_server(server_name: &str, tools: &[Tool]) -> Vec<Tool> {
-    let mut seen_names = std::collections::HashSet::new();
-    let mut filtered_tools = Vec::new();
+/// Appends a hash of the exact server and tool names so that colliding
+/// sanitized names stay distinct regardless of connection order.
+fn disambiguate_tool_name(base: &str, server: &str, tool: &str) -> String {
+    let suffix = sha2_hex(&format!("{server}\u{0}{tool}"), 8);
+    let max_base_len = TOOL_NAME_MAX_LEN.saturating_sub(suffix.len() + 1);
+    // Base names are ASCII because `sanitize_tool_name` replaces every other
+    // character with `_`.
+    let base = &base[..base.len().min(max_base_len)];
+    format!("{base}_{suffix}")
+}
 
-    for tool in tools {
-        let full = sanitize_tool_name(server_name, tool.name.as_ref());
-        if !seen_names.insert(full.clone()) {
-            warn!(
-                server = server_name,
-                original = %tool.name,
-                sanitized = %full,
-                "skipping MCP tool: sanitized name collides with existing tool"
-            );
-            continue;
-        }
-        filtered_tools.push(tool.clone());
+fn tool_definition(name: &str, tool: &Tool) -> ToolDefinition {
+    ToolDefinition {
+        name: name.to_string(),
+        description: tool.description.clone().unwrap_or_default().to_string(),
+        parameters: serde_json::to_value(&tool.input_schema)
+            .unwrap_or(serde_json::json!({"type": "object", "properties": {}})),
     }
-
-    filtered_tools
 }
 
 /// 秘密参照を解決してから接続する。参照が解決できないサーバーは接続せず、
@@ -1111,6 +1235,14 @@ mod tests {
     use crate::test_env::EnvVarGuard;
     use serial_test::serial;
 
+    fn tool(name: &str) -> Tool {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "inputSchema": {"type": "object", "properties": {}},
+        }))
+        .expect("tool")
+    }
+
     /// Returns false once the process is gone or only a zombie remains.
     #[cfg(target_os = "linux")]
     fn process_running(pid: u32) -> bool {
@@ -1197,6 +1329,7 @@ mod tests {
             configured_secrets: Vec::new(),
             servers: Vec::new(),
             failed_servers: Vec::new(),
+            tool_names: HashMap::new(),
             tool_name_index: HashMap::new(),
         };
         let mut cleanups = Vec::new();
@@ -1290,6 +1423,184 @@ mod tests {
         let result = sanitize_tool_name(&long_server, &long_tool);
         assert!(result.starts_with("mcp_"));
         assert!(result.len() <= 64);
+    }
+
+    #[test]
+    fn scope_semantics_follow_the_agent_setting() {
+        // Arrange / Act
+        let all = McpScope::all();
+        let listed = McpScope::from_servers(Some(&["github".to_string()]));
+        let empty = McpScope::from_servers(Some(&[]));
+        let inherited = McpScope::from_servers(None);
+
+        // Assert
+        assert!(all.allows("anything"));
+        assert!(listed.allows("github"));
+        assert!(!listed.allows("filesystem"));
+        assert!(!empty.allows("github"));
+        assert!(inherited.allows("filesystem"));
+    }
+
+    #[test]
+    fn scope_for_agent_reads_the_agent_allowlist() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        config.agents.insert(
+            AgentId::new("reviewer"),
+            crate::config::AgentConfig {
+                label: "Reviewer".to_string(),
+                mcp_servers: Some(vec!["github".to_string()]),
+                ..Default::default()
+            },
+        );
+
+        // Act
+        let reviewer = McpScope::for_agent(&config, "reviewer");
+        let default_agent = McpScope::for_agent(&config, "default");
+        let unknown = McpScope::for_agent(&config, "ghost");
+
+        // Assert
+        assert!(reviewer.allows("github"));
+        assert!(!reviewer.allows("filesystem"));
+        assert!(default_agent.allows("filesystem"));
+        assert!(!unknown.allows("filesystem"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manager_scopes_definitions_and_calls_to_allowed_servers() {
+        // Arrange: two servers expose one tool each.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join(".egopulse");
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp_tools_server.py")
+            .to_string_lossy()
+            .to_string();
+        let servers = serde_json::json!({"mcpServers": {
+            "alpha": {"transport": "stdio", "command": "python3", "args": [fixture, "ping"]},
+            "beta": {"transport": "stdio", "command": "python3", "args": [fixture, "pong"]},
+        }});
+        std::fs::write(state_root.join("mcp.json"), servers.to_string()).expect("write mcp.json");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut manager = McpManager::new(&workspace, DotenvFile::default())
+            .await
+            .expect("manager");
+        let alpha_only = McpScope::from_servers(Some(&["alpha".to_string()]));
+        let definition_names = |scope: &McpScope| -> Vec<String> {
+            let mut names: Vec<String> = manager
+                .all_tool_definitions(scope)
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Act / Assert: definitions follow the scope.
+        assert_eq!(
+            definition_names(&McpScope::all()),
+            vec!["mcp_alpha_ping", "mcp_beta_pong"]
+        );
+        assert_eq!(definition_names(&alpha_only), vec!["mcp_alpha_ping"]);
+        assert!(definition_names(&McpScope::none()).is_empty());
+
+        // Act / Assert: calls follow the same scope.
+        let allowed = manager
+            .execute_tool_by_name("mcp_alpha_ping", serde_json::json!({}), &alpha_only)
+            .await;
+        assert_eq!(allowed.expect("alpha allowed").expect("call"), "ping:ok");
+        let denied = manager
+            .execute_tool_by_name("mcp_beta_pong", serde_json::json!({}), &alpha_only)
+            .await;
+        assert!(denied.is_none(), "beta must not execute outside the scope");
+
+        manager.shutdown().await;
+    }
+
+    #[test]
+    fn colliding_tool_names_are_disambiguated_deterministically() {
+        // Arrange: both pairs sanitize to `mcp_a_b_c`.
+        let a = [tool("b_c")];
+        let a_b = [tool("c")];
+
+        // Act
+        let forward = resolve_tool_names([("a", a.as_slice()), ("a_b", a_b.as_slice())]);
+        let reverse = resolve_tool_names([("a_b", a_b.as_slice()), ("a", a.as_slice())]);
+
+        // Assert: distinct names that do not depend on connection order.
+        let a_name = &forward[&(0, "b_c".to_string())];
+        let a_b_name = &forward[&(1, "c".to_string())];
+        assert_ne!(a_name, a_b_name);
+        assert!(a_name.starts_with("mcp_a_b_c_"));
+        assert!(a_b_name.starts_with("mcp_a_b_c_"));
+        assert_eq!(reverse[&(1, "b_c".to_string())], *a_name);
+        assert_eq!(reverse[&(0, "c".to_string())], *a_b_name);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn manager_disambiguates_colliding_tool_names_across_servers() {
+        // Arrange: `a`/`b_c` and `a_b`/`c` both sanitize to `mcp_a_b_c`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().join(".egopulse");
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mcp_tools_server.py")
+            .to_string_lossy()
+            .to_string();
+        let servers = serde_json::json!({"mcpServers": {
+            "a": {"transport": "stdio", "command": "python3", "args": [fixture, "b_c"]},
+            "a_b": {"transport": "stdio", "command": "python3", "args": [fixture, "c"]},
+        }});
+        std::fs::write(state_root.join("mcp.json"), servers.to_string()).expect("write mcp.json");
+        let _home = EnvVarGuard::set("HOME", dir.path());
+
+        let mut manager = McpManager::new(&workspace, DotenvFile::default())
+            .await
+            .expect("manager");
+        let only_a = McpScope::from_servers(Some(&["a".to_string()]));
+        let only_a_b = McpScope::from_servers(Some(&["a_b".to_string()]));
+
+        // Act
+        let a_definitions = manager.all_tool_definitions(&only_a);
+        let a_b_definitions = manager.all_tool_definitions(&only_a_b);
+
+        // Assert: each allowed server resolves to its own tool.
+        assert_eq!(a_definitions.len(), 1);
+        assert_eq!(a_b_definitions.len(), 1);
+        let a_name = &a_definitions[0].name;
+        let a_b_name = &a_b_definitions[0].name;
+        assert_ne!(a_name, a_b_name, "colliding tools must get distinct names");
+        assert!(
+            manager
+                .execute_tool_by_name(a_b_name, serde_json::json!({}), &only_a)
+                .await
+                .is_none(),
+            "the other server's name must not resolve inside this scope"
+        );
+        assert_eq!(
+            manager
+                .execute_tool_by_name(a_name, serde_json::json!({}), &only_a)
+                .await
+                .expect("a is visible")
+                .expect("call"),
+            "b_c:ok"
+        );
+        assert_eq!(
+            manager
+                .execute_tool_by_name(a_b_name, serde_json::json!({}), &only_a_b)
+                .await
+                .expect("a_b is visible")
+                .expect("call"),
+            "c:ok"
+        );
+
+        manager.shutdown().await;
     }
 
     #[test]

@@ -179,7 +179,8 @@ pub(crate) async fn run_activation_with_snapshot(
         &context,
         &config_snapshot.config,
     );
-    let tool_defs = state.tools.definitions_async().await;
+    let mcp_scope = crate::tools::mcp::McpScope::for_agent(&config_snapshot.config, agent_id);
+    let tool_defs = state.tools.definitions_async(&mcp_scope).await;
     let mut messages = Arc::new(vec![Message::text("user", &capsule.prompt)]);
     let mut tool_phases = Vec::new();
     let guard_tracker = Arc::new(GuardDenialTracker::new());
@@ -452,7 +453,10 @@ mod tests {
         let state = crate::test_util::build_state_with_config(config, None, None, None, None);
 
         // Act: tool definitions should be loadable
-        let tool_defs = state.tools.definitions_async().await;
+        let tool_defs = state
+            .tools
+            .definitions_async(&crate::tools::mcp::McpScope::all())
+            .await;
 
         // Assert: tools are registered
         assert!(!tool_defs.is_empty(), "tool registry should have tools");

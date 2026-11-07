@@ -116,6 +116,7 @@ struct FileAgentConfig {
     reasoning_effort: Option<String>,
     discord_bot: Option<String>,
     telegram_bot: Option<String>,
+    mcp_servers: Option<Vec<String>>,
     profiles: Option<HashMap<String, FileAgentProfileConfig>>,
 }
 
@@ -797,6 +798,7 @@ fn normalize_agents(
             reasoning_effort: normalize_string(fa.reasoning_effort),
             discord_bot: normalize_string(fa.discord_bot).map(|s| BotId::new(&s)),
             telegram_bot: normalize_string(fa.telegram_bot).map(|s| BotId::new(&s)),
+            mcp_servers: normalize_mcp_servers(fa.mcp_servers),
             profiles: fa
                 .profiles
                 .unwrap_or_default()
@@ -830,6 +832,15 @@ fn normalize_agents(
     }
 
     Ok(normalized)
+}
+
+fn normalize_mcp_servers(servers: Option<Vec<String>>) -> Option<Vec<String>> {
+    servers.map(|servers| {
+        servers
+            .into_iter()
+            .filter_map(|server| normalize_string(Some(server)))
+            .collect()
+    })
 }
 
 fn normalize_sleep_batch(
