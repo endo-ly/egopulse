@@ -30,7 +30,9 @@ pub(crate) use messages::*;
 pub(crate) use openai::*;
 #[allow(unused_imports)]
 pub(crate) use responses::*;
-pub(crate) use retry::backoff;
+pub(crate) use retry::{
+    MAX_ATTEMPTS, RetryDecision, RetryFailure, RetryPolicy, RetryStop, complete_response, decide,
+};
 
 /// A single tool call requested by the LLM.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

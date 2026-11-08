@@ -12,7 +12,9 @@ use crate::agent_loop::message_format::{message_to_archive_text, message_to_text
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
-use crate::llm::{LlmProvider, Message, MessagesResponse};
+use crate::llm::{
+    LlmProvider, MAX_ATTEMPTS, Message, MessagesResponse, RetryPolicy, complete_response,
+};
 use tracing::{info, warn};
 
 /// Conservative chars-to-tokens ratio.  Real tokenizers produce ~1 token per
@@ -388,13 +390,32 @@ async fn send_summary_request(
     messages: Arc<Vec<Message>>,
     timeout_secs: u64,
 ) -> Result<MessagesResponse, SummarizeError> {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        llm.send_message(SUMMARIZER_SYSTEM_PROMPT, messages, None),
+    // `compaction_timeout_secs` bounds the whole request: attempts, backoff,
+    // and `Retry-After` waits share it, so a provider that keeps failing cannot
+    // stretch one summarization past the configured limit.
+    let policy = RetryPolicy::new(
+        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs),
+    );
+    complete_response(
+        policy,
+        || llm.send_message(SUMMARIZER_SYSTEM_PROMPT, Arc::clone(&messages), None),
+        |attempt, delay, error| {
+            warn!(
+                provider = llm.provider_name(),
+                model = llm.model_name(),
+                attempt,
+                max_attempts = MAX_ATTEMPTS,
+                delay_ms = delay.as_millis() as u64,
+                error = %error,
+                "compaction summarization failed; retrying"
+            );
+        },
     )
     .await
-    .map_err(|_| SummarizeError::Timeout)?
-    .map_err(SummarizeError::Provider)
+    .map_err(|failure| match failure.error {
+        Some(error) => SummarizeError::Provider(error),
+        None => SummarizeError::Timeout,
+    })
 }
 
 async fn log_summarizer_usage(
@@ -1308,6 +1329,186 @@ mod tests {
                 .as_text_lossy(),
             "final answer"
         );
+    }
+
+    async fn seed_session_with_old_turns(state: &crate::runtime::AppState, session: &str) -> i64 {
+        let lookup_session = session.to_string();
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                &format!("cli:{lookup_session}:agent:default"),
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        let seeded = vec![
+            Message::text("user", "old-user-1"),
+            Message::text("assistant", "old-assistant-1"),
+            Message::text("user", "old-user-2"),
+            Message::text("assistant", "old-assistant-2"),
+        ];
+        let seeded_json = serde_json::to_string(&seeded).expect("seeded json");
+        call_blocking(Arc::clone(&state.db), move |db| {
+            db.save_session(chat_id, &seeded_json)
+        })
+        .await
+        .expect("save session");
+        chat_id
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_retries_a_transient_summary_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Ok(MessagesResponse {
+                    content: "summary text".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0],
+        );
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-retry");
+        seed_session_with_old_turns(&state, "compaction-retry").await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("process turn");
+
+        // Assert: the summarizer was retried once within the timeout instead of
+        // falling back to the original history on the first 429.
+        assert_eq!(reply, "final answer");
+        let seen_systems = provider.seen_systems();
+        assert_eq!(seen_systems.len(), 3);
+        assert_eq!(seen_systems[0], SUMMARIZER_SYSTEM_PROMPT);
+        assert_eq!(seen_systems[1], SUMMARIZER_SYSTEM_PROMPT);
+        let seen_messages = provider.seen_messages();
+        assert!(
+            seen_messages[2][0]
+                .content
+                .as_text_lossy()
+                .contains("summary text")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_does_not_retry_before_a_long_retry_after() {
+        // Arrange: the provider asks for a longer wait than the whole
+        // compaction timeout, so retrying earlier would only hit the limit again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(200),
+                }),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-long-retry-after");
+        let chat_id = seed_session_with_old_turns(&state, "compaction-long-retry-after").await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("process turn");
+
+        // Assert: one summarizer attempt, then KeepOriginal.
+        assert_eq!(reply, "final answer");
+        assert_eq!(provider.seen_systems().len(), 2);
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("loaded session");
+        assert!(loaded.messages.iter().all(|message| {
+            !message
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER)
+        }));
+        assert_eq!(loaded.messages[0].content.as_text_lossy(), "old-user-1");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn compaction_keeps_original_messages_after_exhausting_summary_retries() {
+        // Arrange: every summarizer attempt is rate limited.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rate_limited = || {
+            Err(LlmError::ApiError {
+                status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                body_preview: "rate limited".to_string(),
+                retry_after_secs: Some(0),
+            })
+        };
+        let provider = RecordingProvider::new(
+            vec![
+                rate_limited(),
+                rate_limited(),
+                rate_limited(),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0, 0, 0],
+        );
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-exhausted-retries");
+        let chat_id = seed_session_with_old_turns(&state, "compaction-exhausted-retries").await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("process turn");
+
+        // Assert: three summary attempts, then the original history is kept.
+        assert_eq!(reply, "final answer");
+        assert_eq!(provider.seen_systems().len(), crate::llm::MAX_ATTEMPTS + 1);
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("loaded session");
+        assert_eq!(loaded.messages[0].content.as_text_lossy(), "old-user-1");
     }
 
     #[tokio::test]

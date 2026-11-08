@@ -546,7 +546,7 @@ Capsule (user message) には long-term memory を含めない。
 - 通常セッションと system prompt が完全一致 → prompt cache が最大効率で hit する
 - agent の人格・記憶・スキルが Pulse でも一貫して利用可能
 
-各 LLM 呼び出しは、通常 Turn と同じリトライ判定（`ModelRunner` の共通リトライループ）で一過性エラー（送信失敗・429・5xx）を最大 3 回まで試行する。Pulse は全エージェントを逐次スキャンするため、待機時間（サーバーの `Retry-After` を含む）が 60 秒を超えるリトライは行わず、その Activation を即座に `failed` とする。これによりプロバイダのクォータ枯渇時に後続の Pulse が止まらない。
+各 LLM 呼び出しは、通常 Turn と同じ共通リトライ判定（`llm::retry`）で一過性エラー（送信失敗・429・5xx）を最大 3 回まで試行する。Pulse は全エージェントを逐次スキャンするため、待機時間（サーバーの `Retry-After` を含む）が 60 秒を超えるリトライは行わず、その Activation を即座に `failed` とする。これによりプロバイダのクォータ枯渇時に後続の Pulse が止まらない。
 
 Pulse の生成途中の delta は破棄し、外部公開済み出力として扱わない。途中でストリームが中断しても同じ LLM 呼び出しを再試行でき、最終応答が空の場合も共通の runtime guard による回復を行う。通常 Turn は delta を外部公開した時点で再試行を抑止する。いずれも実行済み Tool や Activation 全体を再実行しない。
 
@@ -727,7 +727,7 @@ src/
 | timezone helper | now / local date / due 判定補助 |
 | active_turn defer | agent active 中は defer |
 | shutdown 連動 | runtime 停止時に scheduler も止まる |
-| retry utility | Turn と Pulse の LLM 呼び出しで共通のリトライループを利用（Pulse は待機時間に上限あり） |
+| retry utility | `llm::retry` の共通判定で Turn / Pulse / Sleep / Compaction / ask の試行回数・バックオフ・`Retry-After` の扱いを揃える（Pulse は待機時間に上限あり） |
 
 ### 11.3 分けるもの
 

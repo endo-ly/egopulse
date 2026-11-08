@@ -699,9 +699,25 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
         &crate::llm::HeaderContext::process_global(),
     )?;
     let messages = Arc::new(vec![Message::text("user", prompt)]);
+    // One-shot ask has no Turn deadline: bound the whole request (attempts and
+    // waits included) by the transport's request cap so retries restore
+    // transient failures without extending the command's worst case.
+    let policy =
+        crate::llm::RetryPolicy::new(tokio::time::Instant::now() + crate::llm::REQUEST_TIMEOUT);
 
     tokio::select! {
-        response = llm.send_message("", messages, None) => Ok(response?.content),
+        response = crate::llm::complete_response(
+            policy,
+            || llm.send_message("", Arc::clone(&messages), None),
+            |attempt, delay, error| {
+                tracing::warn!(
+                    attempt,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %error,
+                    "ask LLM request failed; retrying"
+                );
+            },
+        ) => Ok(response.map_err(crate::llm::RetryFailure::into_llm_error)?.content),
         _ = tokio::signal::ctrl_c() => Err(EgoPulseError::ShutdownRequested),
     }
 }

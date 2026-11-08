@@ -7,13 +7,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// Total time one request may take, from connect to the last body byte.
+/// Total time one HTTP request may take, from connect to the last body byte.
 ///
 /// The turn path bounds each attempt with its own 300s iteration deadline, so
 /// this cap only matters for callers without one (sleep, compaction, one-shot
 /// ask). A full memory rewrite in sleep can legitimately exceed the turn
 /// budget, so the transport cap is wider than the iteration deadline.
-const REQUEST_TIMEOUT_SECS: u64 = 600;
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Inactivity deadline between reads of one request.
 ///
@@ -35,7 +35,7 @@ fn shared_http_client() -> Result<reqwest::Client, LlmError> {
             reqwest::Client::builder()
                 .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .timeout(REQUEST_TIMEOUT)
                 .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
                 .build()
                 .map_err(|error| error.to_string())
@@ -749,6 +749,109 @@ mod tests {
 
         assert!(error.is_retryable(), "{error}");
         assert!(error.to_string().contains("finish_reason=error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn chat_429_uses_one_http_attempt_per_shared_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+        let policy = crate::llm::RetryPolicy::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let failure = crate::llm::complete_response(
+            policy,
+            || provider.send_message("", message("hello"), None),
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("rate limited");
+
+        assert!(failure.error.expect("provider error").is_retryable());
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn responses_429_uses_one_http_attempt_per_shared_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+        let policy = crate::llm::RetryPolicy::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let failure = crate::llm::complete_response(
+            policy,
+            || provider.send_message("", multimodal_message(), None),
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("rate limited");
+
+        assert!(failure.error.expect("provider error").is_retryable());
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn codex_429_is_not_retried_inside_the_provider() {
+        let codex_dir = tempfile::tempdir().expect("tempdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-token")
+                .also_set("CODEX_HOME", codex_dir.path());
+        crate::llm::codex_auth::clear_auth_cache();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&crate::test_util::llm_config(
+            "openai-codex",
+            "gpt-5.3-codex",
+            format!("{}/v1", server.uri()),
+            None,
+        ))
+        .expect("provider");
+        let policy = crate::llm::RetryPolicy::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let failure = crate::llm::complete_response(
+            policy,
+            || provider.send_message("", message("hello"), None),
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("rate limited");
+
+        assert!(failure.error.expect("provider error").is_retryable());
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
     }
 
     #[tokio::test]

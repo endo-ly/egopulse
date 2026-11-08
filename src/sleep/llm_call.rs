@@ -1,20 +1,19 @@
 //! LLM request helper shared by sleep steps.
 //!
 //! Sleep runs unattended, so one transient provider failure should not cost the
-//! night's step. The retry lives here instead of in the provider so every step
-//! observes the same budget and logging.
+//! night's step. The shared retry policy owns attempts and waits; this module
+//! binds it to the step context, the request budget, and the step log.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::warn;
 
-use crate::llm::{LlmProvider, Message, MessagesResponse};
+use crate::llm::{
+    LlmProvider, MAX_ATTEMPTS, Message, MessagesResponse, RetryPolicy, RetryStop, complete_response,
+};
 
 use super::SleepBatchError;
-
-/// Attempts per request, including the first.
-const MAX_ATTEMPTS: usize = 3;
 
 /// Total time one logical request may take, including all attempts and waits.
 ///
@@ -31,16 +30,15 @@ const MAX_REQUEST_DURATION: Duration = Duration::from_secs(1_200);
 /// arbitrary span by a single header.
 const MAX_RETRY_AFTER_SECS: u64 = 120;
 
-/// Sends one request, retrying transient transport failures.
+/// Sends one request and converts a shared retry failure for the step.
 ///
 /// Retryable failures are network errors/timeouts (before or during the
 /// response body) and 429/5xx responses (`LlmError::is_retryable`). A
 /// `Retry-After` longer than [`MAX_RETRY_AFTER_SECS`] ends the request instead
-/// of retrying early; otherwise the delay backs off exponentially with jitter.
-/// Every attempt and wait shares [`MAX_REQUEST_DURATION`], so a request that
-/// keeps failing cannot occupy the scheduler indefinitely. When the budget is
-/// exhausted, or the failure is deterministic, the error is returned as
-/// [`SleepBatchError::Llm`] for the step to record.
+/// of retrying early. Every attempt and wait shares [`MAX_REQUEST_DURATION`],
+/// so a request that keeps failing cannot occupy the scheduler indefinitely.
+/// When the budget is exhausted, or the failure is deterministic, the error is
+/// returned as [`SleepBatchError::Llm`] for the step to record.
 pub(super) async fn send(
     provider: &Arc<dyn LlmProvider>,
     agent_id: &str,
@@ -48,81 +46,65 @@ pub(super) async fn send(
     messages: Arc<Vec<Message>>,
     step: &'static str,
 ) -> Result<MessagesResponse, SleepBatchError> {
-    let deadline = tokio::time::Instant::now() + MAX_REQUEST_DURATION;
-    let mut attempt = 1;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(SleepBatchError::Llm(format!(
-                "request exceeded the {}s budget",
-                MAX_REQUEST_DURATION.as_secs()
-            )));
-        }
-        let error = match tokio::time::timeout(
-            remaining,
-            provider.send_message(system_prompt, Arc::clone(&messages), None),
-        )
-        .await
-        {
-            Ok(Ok(response)) => return Ok(response),
-            Ok(Err(error)) => error,
-            Err(_elapsed) => {
-                return Err(SleepBatchError::Llm(format!(
-                    "no response within the {}s request budget",
-                    MAX_REQUEST_DURATION.as_secs()
-                )));
-            }
-        };
-
-        if !error.is_retryable() || attempt >= MAX_ATTEMPTS {
-            return Err(SleepBatchError::Llm(error.to_string()));
-        }
-        if let Some(secs) = error.retry_after_secs()
-            && secs > MAX_RETRY_AFTER_SECS
-        {
+    let policy = RetryPolicy {
+        max_retry_after: Some(Duration::from_secs(MAX_RETRY_AFTER_SECS)),
+        ..RetryPolicy::new(tokio::time::Instant::now() + MAX_REQUEST_DURATION)
+    };
+    let provider_name = provider.provider_name();
+    let result = complete_response(
+        policy,
+        || provider.send_message(system_prompt, Arc::clone(&messages), None),
+        |attempt, delay, error| {
             warn!(
                 agent_id = %agent_id,
                 step,
-                provider = provider.provider_name(),
-                attempt,
-                max_attempts = MAX_ATTEMPTS,
-                retry_after_secs = secs,
-                max_retry_after_secs = MAX_RETRY_AFTER_SECS,
-                error = %error,
-                "sleep LLM request asked to wait beyond the retry cap; giving up"
-            );
-            return Err(SleepBatchError::Llm(error.to_string()));
-        }
-
-        let delay = crate::llm::backoff(attempt, error.retry_after_secs());
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if delay >= remaining {
-            warn!(
-                agent_id = %agent_id,
-                step,
-                provider = provider.provider_name(),
+                provider = provider_name,
                 attempt,
                 max_attempts = MAX_ATTEMPTS,
                 delay_ms = delay.as_millis() as u64,
                 error = %error,
+                "sleep LLM request failed; retrying"
+            );
+        },
+    )
+    .await;
+
+    let failure = match result {
+        Ok(response) => return Ok(response),
+        Err(failure) => failure,
+    };
+    let Some(error) = failure.error else {
+        return Err(SleepBatchError::Llm(format!(
+            "no response within the {}s request budget",
+            MAX_REQUEST_DURATION.as_secs()
+        )));
+    };
+    match failure.stop {
+        RetryStop::RetryAfterTooLong => {
+            warn!(
+                agent_id = %agent_id,
+                step,
+                provider = provider_name,
+                max_attempts = MAX_ATTEMPTS,
+                retry_after_secs = error.retry_after_secs(),
+                max_retry_after_secs = MAX_RETRY_AFTER_SECS,
+                error = %error,
+                "sleep LLM request asked to wait beyond the retry cap; giving up"
+            );
+        }
+        RetryStop::DeadlineExceeded => {
+            warn!(
+                agent_id = %agent_id,
+                step,
+                provider = provider_name,
+                max_attempts = MAX_ATTEMPTS,
+                error = %error,
                 "sleep LLM retry budget exhausted; giving up"
             );
-            return Err(SleepBatchError::Llm(error.to_string()));
         }
-
-        warn!(
-            agent_id = %agent_id,
-            step,
-            provider = provider.provider_name(),
-            attempt,
-            max_attempts = MAX_ATTEMPTS,
-            delay_ms = delay.as_millis() as u64,
-            error = %error,
-            "sleep LLM request failed; retrying"
-        );
-        tokio::time::sleep(delay).await;
-        attempt += 1;
+        _ => {}
     }
+    Err(SleepBatchError::Llm(error.to_string()))
 }
 
 #[cfg(test)]
@@ -137,7 +119,9 @@ mod tests {
     use crate::error::LlmError;
     use crate::llm::{LlmProvider, Message, MessagesResponse, ToolDefinition};
 
-    use super::{MAX_ATTEMPTS, MAX_REQUEST_DURATION, send};
+    use crate::llm::MAX_ATTEMPTS;
+
+    use super::{MAX_REQUEST_DURATION, send};
 
     enum Failure {
         Transient { times: usize },
@@ -223,6 +207,45 @@ mod tests {
         }
     }
 
+    struct PartialThenSucceedProvider {
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmProvider for PartialThenSucceedProvider {
+        fn provider_name(&self) -> &str {
+            "partial"
+        }
+
+        fn model_name(&self) -> &str {
+            "partial-model"
+        }
+
+        async fn send_message_streaming(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, LlmError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            on_delta("partial draft".to_string());
+            if attempt == 1 {
+                return Err(LlmError::ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    body_preview: String::new(),
+                    retry_after_secs: None,
+                });
+            }
+            Ok(MessagesResponse {
+                content: "complete answer".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
     fn provider(failure: Failure) -> Arc<ScriptedProvider> {
         Arc::new(ScriptedProvider::new(failure))
     }
@@ -249,6 +272,29 @@ mod tests {
         // Assert
         assert_eq!(result.expect("response").content, "ok");
         assert_eq!(provider.attempts(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discards_a_partial_generation_and_retries() {
+        // Arrange: the first attempt streams text and then fails. Sleep has no
+        // narration target, so only the complete second response may be used.
+        let provider = Arc::new(PartialThenSucceedProvider {
+            attempts: AtomicUsize::new(0),
+        });
+
+        // Act
+        let result = send(
+            &(provider.clone() as Arc<dyn LlmProvider>),
+            "test-agent",
+            "",
+            request(),
+            "test",
+        )
+        .await;
+
+        // Assert
+        assert_eq!(result.expect("response").content, "complete answer");
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test(start_paused = true)]
