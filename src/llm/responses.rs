@@ -1,5 +1,7 @@
 use super::*;
 
+use reqwest::StatusCode;
+
 /// Assembles the final `MessagesResponse` from accumulated Chat Completions
 /// fields, applying raw tool-use rescue when structured tool calls are absent.
 pub(super) fn assemble_response(
@@ -185,17 +187,37 @@ impl ResponsesAccumulator {
     /// Processes one SSE `data:` payload (JSON text without the `data:` prefix).
     ///
     /// Calls `on_delta` for each `response.output_text.delta` event. Returns
-    /// `true` when a terminal event (`response.completed` / `response.done`)
-    /// carrying a valid `response` object has been consumed.
-    pub(super) fn process_event(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> bool {
+    /// `Ok(true)` when a terminal event (`response.completed` / `response.done`)
+    /// carrying a valid `response` object has been consumed. Returns an error
+    /// for explicit failure events (`response.failed` / `error`) so a partially
+    /// streamed generation is never mistaken for a complete response.
+    pub(super) fn process_event(
+        &mut self,
+        payload: &str,
+        on_delta: &dyn Fn(String),
+    ) -> Result<bool, LlmError> {
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            return false;
+            return Ok(false);
         };
 
         let event_type = value
             .get("type")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+
+        match event_type.as_deref() {
+            Some("response.failed") => {
+                let error = value
+                    .get("response")
+                    .and_then(|response| response.get("error"));
+                return Err(stream_api_error(error));
+            }
+            Some("error") => {
+                let error = value.get("error").unwrap_or(&value);
+                return Err(stream_api_error(Some(error)));
+            }
+            _ => {}
+        }
 
         // Only the `done` item is complete; `added` carries an in_progress
         // partial item that would duplicate the finalized one.
@@ -235,10 +257,10 @@ impl ResponsesAccumulator {
                 serde_json::from_value::<ResponsesApiResponse>(response_value.take())
         {
             self.completed_response = Some(parsed);
-            return true;
+            return Ok(true);
         }
 
-        false
+        Ok(false)
     }
 
     /// Assembles the final [`ResponsesApiResponse`] from accumulated state.
@@ -292,6 +314,51 @@ pub(crate) fn preview_body(body: &str) -> String {
         "<empty>".to_string()
     } else {
         preview
+    }
+}
+
+/// Builds an [`LlmError`] for a failure reported inside a streamed response.
+///
+/// The provider has already answered with HTTP 200 when the failure arrives, so
+/// there is no status line to classify. Known transient codes keep their
+/// 429/5xx status so the shared retry policy treats them as retryable; unknown
+/// failures default to 502 because they usually mean the generation was cut
+/// off upstream.
+pub(super) fn stream_api_error(error: Option<&serde_json::Value>) -> LlmError {
+    let message = error
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|message| message.as_str())
+                .or_else(|| value.as_str())
+        })
+        .unwrap_or("stream failed without an error message");
+    let status = error
+        .and_then(|value| value.get("code"))
+        .and_then(stream_error_status)
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    LlmError::ApiError {
+        status,
+        body_preview: preview_body(message),
+        retry_after_secs: None,
+    }
+}
+
+fn stream_error_status(code: &serde_json::Value) -> Option<StatusCode> {
+    if let Some(code) = code
+        .as_u64()
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+    {
+        return Some(code);
+    }
+    match code.as_str()? {
+        "rate_limit_exceeded" | "rate_limit_error" => Some(StatusCode::TOO_MANY_REQUESTS),
+        "overloaded_error" => Some(StatusCode::SERVICE_UNAVAILABLE),
+        "invalid_request_error" | "context_length_exceeded" | "content_filter" => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        _ => None,
     }
 }
 
@@ -576,7 +643,7 @@ mod tests {
             else {
                 continue;
             };
-            if accumulator.process_event(&payload, &|_| {}) {
+            if accumulator.process_event(&payload, &|_| {})? {
                 break;
             }
         }
@@ -705,6 +772,42 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
             text.contains("completion event"),
             "expected completion-event error, got: {text}"
         );
+    }
+
+    #[test]
+    fn fails_on_response_failed_after_partial_text() {
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream disconnected"}}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed event");
+
+        assert!(error.is_retryable());
+        assert!(
+            error.to_string().contains("upstream disconnected"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fails_on_error_event_with_top_level_fields() {
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: error
+data: {"type":"error","code":"rate_limit_exceeded","message":"slow down"}
+"#;
+
+        let error = accumulate(payload).expect_err("error event");
+
+        assert!(error.is_retryable());
+        assert!(error.to_string().contains("slow down"), "{error}");
+        assert!(error.to_string().contains("429"), "{error}");
     }
 
     #[test]

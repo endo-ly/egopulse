@@ -111,52 +111,6 @@ impl OpenAiProvider {
         })
     }
 
-    /// Sends a Codex request with exponential-backoff retry on 429 responses.
-    ///
-    /// On success, returns the streaming `reqwest::Response` so callers can
-    /// iterate its `bytes_stream` for incremental delta emission.
-    /// On non-429 failure, attempts to extract a structured error message from
-    /// the response body before returning.
-    async fn send_codex_with_retry(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response, LlmError> {
-        let max_retries: u32 = 3;
-        let mut retries = 0u32;
-
-        loop {
-            let response = self
-                .http
-                .post(url)
-                .headers(self.build_headers()?)
-                .json(body)
-                .send()
-                .await?;
-
-            let status = response.status();
-            if status.is_success() {
-                return Ok(response);
-            }
-
-            if status.as_u16() == 429 && retries < max_retries {
-                retries += 1;
-                let retry_after = parse_retry_after(response.headers())
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(2u64.pow(retries)));
-                tracing::warn!(
-                    "Codex rate limited, retrying in {retry_after:?} (attempt {retries}/{max_retries})"
-                );
-                tokio::time::sleep(retry_after).await;
-                continue;
-            }
-
-            let retry_after = parse_retry_after(response.headers());
-            let text = response.text().await.unwrap_or_default();
-            return Err(Self::structured_api_error(status, &text, retry_after));
-        }
-    }
-
     fn build_headers(&self) -> Result<HeaderMap, LlmError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -271,7 +225,19 @@ impl OpenAiProvider {
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
 
-        let response = self.send_codex_with_retry(&url, &body).await?;
+        let response = self
+            .http
+            .post(url)
+            .headers(self.build_headers()?)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return Err(Self::structured_api_error(status, &text, retry_after));
+        }
 
         consume_responses_stream(response.bytes_stream(), on_delta).await
     }
@@ -410,11 +376,14 @@ impl ChatCompletionAccumulator {
         }
     }
 
-    fn process_chunk(&mut self, payload: &str, on_delta: &dyn Fn(String)) {
+    fn process_chunk(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> Result<(), LlmError> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
             tracing::warn!("skipping malformed SSE data line");
-            return;
+            return Ok(());
         };
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            return Err(stream_api_error(Some(error)));
+        }
         if let Some(delta) = value
             .get("choices")
             .and_then(|choices| choices.get(0))
@@ -445,11 +414,19 @@ impl ChatCompletionAccumulator {
             .and_then(|v| v.as_str())
             && !finish_reason.is_empty()
         {
+            if finish_reason == "error" {
+                return Err(LlmError::ApiError {
+                    status: StatusCode::BAD_GATEWAY,
+                    body_preview: "stream finished with finish_reason=error".to_string(),
+                    retry_after_secs: None,
+                });
+            }
             self.has_finish = true;
         }
         if let Some(usage_value) = value.get("usage") {
             self.usage = parse_chat_completion_usage(usage_value);
         }
+        Ok(())
     }
 
     fn ingest_tool_call_delta(&mut self, entry: &serde_json::Value) {
@@ -503,7 +480,7 @@ async fn consume_chat_completion_stream(
     while let Some(result) = data_stream.next().await {
         match result {
             Ok(crate::llm::sse::SseItem::Data(payload)) => {
-                accumulator.process_chunk(&payload, on_delta);
+                accumulator.process_chunk(&payload, on_delta)?;
             }
             Ok(crate::llm::sse::SseItem::Done) => {
                 done = true;
@@ -530,7 +507,7 @@ async fn consume_responses_stream(
     while let Some(result) = data_stream.next().await {
         match result {
             Ok(crate::llm::sse::SseItem::Data(payload)) => {
-                if accumulator.process_event(&payload, on_delta) {
+                if accumulator.process_event(&payload, on_delta)? {
                     completed = true;
                     break;
                 }
@@ -707,6 +684,71 @@ mod tests {
                 cached_input_tokens: None,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn fails_when_the_stream_reports_an_error_after_partial_content() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("stream error");
+
+        assert!(error.is_retryable(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Provider disconnected unexpectedly"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_when_finish_reason_is_error_without_an_error_object() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("stream error");
+
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("finish_reason=error"), "{error}");
     }
 
     #[tokio::test]
