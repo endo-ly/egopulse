@@ -320,10 +320,11 @@ pub(crate) fn preview_body(body: &str) -> String {
 /// Builds an [`LlmError`] for a failure reported inside a streamed response.
 ///
 /// The provider has already answered with HTTP 200 when the failure arrives, so
-/// there is no status line to classify. Known transient codes keep their
-/// 429/5xx status so the shared retry policy treats them as retryable; unknown
-/// failures default to 502 because they usually mean the generation was cut
-/// off upstream.
+/// there is no status line to classify. Known codes are mapped to their HTTP
+/// equivalent (rate limits/overloads to 429/5xx, deterministic request
+/// problems to 4xx) so the shared retry policy sees the right classification;
+/// unknown failures default to 502 because they usually mean the generation
+/// was cut off upstream.
 pub(super) fn stream_api_error(error: Option<&serde_json::Value>) -> LlmError {
     let message = error
         .and_then(|value| {
@@ -358,6 +359,9 @@ fn stream_error_status(code: &serde_json::Value) -> Option<StatusCode> {
         "invalid_request_error" | "context_length_exceeded" | "content_filter" => {
             Some(StatusCode::BAD_REQUEST)
         }
+        "authentication_error" => Some(StatusCode::UNAUTHORIZED),
+        "permission_error" => Some(StatusCode::FORBIDDEN),
+        "not_found_error" => Some(StatusCode::NOT_FOUND),
         _ => None,
     }
 }
