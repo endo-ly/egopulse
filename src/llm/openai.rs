@@ -382,7 +382,12 @@ impl ChatCompletionAccumulator {
             return Ok(());
         };
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
-            return Err(stream_api_error(Some(error)));
+            let error_type = error
+                .get("metadata")
+                .and_then(|metadata| metadata.get("error_type"))
+                .and_then(|error_type| error_type.as_str())
+                .or_else(|| error.get("error_type").and_then(|value| value.as_str()));
+            return Err(stream_api_error(Some(error), error_type));
         }
         if let Some(delta) = value
             .get("choices")
@@ -749,6 +754,36 @@ mod tests {
 
         assert!(error.is_retryable(), "{error}");
         assert!(error.to_string().contains("finish_reason=error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fails_when_a_chat_stream_error_reports_a_deterministic_cause() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"error\":{\"code\":\"server_error\",\"message\":\"bad input\",\"metadata\":{\"error_type\":\"invalid_request\"}},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("stream error");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("400"), "{error}");
     }
 
     #[tokio::test]

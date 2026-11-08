@@ -207,14 +207,20 @@ impl ResponsesAccumulator {
 
         match event_type.as_deref() {
             Some("response.failed") => {
-                let error = value
-                    .get("response")
-                    .and_then(|response| response.get("error"));
-                return Err(stream_api_error(error));
+                let response = value.get("response");
+                let error = response.and_then(|response| response.get("error"));
+                let error_type = response
+                    .and_then(|response| response.get("error_type"))
+                    .and_then(|error_type| error_type.as_str());
+                return Err(stream_api_error(error, error_type));
             }
             Some("error") => {
                 let error = value.get("error").unwrap_or(&value);
-                return Err(stream_api_error(Some(error)));
+                let error_type = error
+                    .get("error_type")
+                    .and_then(|error_type| error_type.as_str())
+                    .or_else(|| value.get("error_type").and_then(|value| value.as_str()));
+                return Err(stream_api_error(Some(error), error_type));
             }
             _ => {}
         }
@@ -320,12 +326,17 @@ pub(crate) fn preview_body(body: &str) -> String {
 /// Builds an [`LlmError`] for a failure reported inside a streamed response.
 ///
 /// The provider has already answered with HTTP 200 when the failure arrives, so
-/// there is no status line to classify. Known codes are mapped to their HTTP
-/// equivalent (rate limits/overloads to 429/5xx, deterministic request
-/// problems to 4xx) so the shared retry policy sees the right classification;
-/// unknown failures default to 502 because they usually mean the generation
-/// was cut off upstream.
-pub(super) fn stream_api_error(error: Option<&serde_json::Value>) -> LlmError {
+/// there is no status line to classify. A typed `error_type` is preferred over
+/// the native `code` because the code collapses distinct causes (OpenRouter
+/// reports authentication and overload failures as the same Responses
+/// `server_error`). Both are mapped to their HTTP equivalent so the shared
+/// retry policy can tell transient failures from deterministic ones; unknown
+/// failures default to 502 because they usually mean the generation was cut off
+/// upstream.
+pub(super) fn stream_api_error(
+    error: Option<&serde_json::Value>,
+    error_type: Option<&str>,
+) -> LlmError {
     let message = error
         .and_then(|value| {
             value
@@ -334,9 +345,12 @@ pub(super) fn stream_api_error(error: Option<&serde_json::Value>) -> LlmError {
                 .or_else(|| value.as_str())
         })
         .unwrap_or("stream failed without an error message");
-    let status = error
-        .and_then(|value| value.get("code"))
-        .and_then(stream_error_status)
+    let status = stream_error_status(error_type)
+        .or_else(|| {
+            error
+                .and_then(|value| value.get("code"))
+                .and_then(stream_error_code)
+        })
         .unwrap_or(StatusCode::BAD_GATEWAY);
     LlmError::ApiError {
         status,
@@ -345,7 +359,38 @@ pub(super) fn stream_api_error(error: Option<&serde_json::Value>) -> LlmError {
     }
 }
 
-fn stream_error_status(code: &serde_json::Value) -> Option<StatusCode> {
+/// Maps OpenRouter's typed error vocabulary to the HTTP status it stands for.
+fn stream_error_status(error_type: Option<&str>) -> Option<StatusCode> {
+    Some(match error_type? {
+        "authentication" => StatusCode::UNAUTHORIZED,
+        "permission_denied" | "content_policy_violation" | "refusal" => StatusCode::FORBIDDEN,
+        "payment_required" => StatusCode::PAYMENT_REQUIRED,
+        "rate_limit_exceeded" => StatusCode::TOO_MANY_REQUESTS,
+        "provider_overloaded" => StatusCode::SERVICE_UNAVAILABLE,
+        "provider_unavailable" => StatusCode::BAD_GATEWAY,
+        "server" | "unmapped" => StatusCode::INTERNAL_SERVER_ERROR,
+        "timeout" => StatusCode::GATEWAY_TIMEOUT,
+        "not_found" | "image_not_found" => StatusCode::NOT_FOUND,
+        "precondition_failed" => StatusCode::PRECONDITION_FAILED,
+        "payload_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "unprocessable" => StatusCode::UNPROCESSABLE_ENTITY,
+        "context_length_exceeded"
+        | "max_tokens_exceeded"
+        | "token_limit_exceeded"
+        | "string_too_long"
+        | "invalid_request"
+        | "invalid_prompt"
+        | "invalid_image"
+        | "image_too_large"
+        | "image_too_small"
+        | "unsupported_image_format"
+        | "image_download_failed" => StatusCode::BAD_REQUEST,
+        _ => return None,
+    })
+}
+
+/// Maps native error codes to the HTTP status they stand for.
+fn stream_error_code(code: &serde_json::Value) -> Option<StatusCode> {
     if let Some(code) = code
         .as_u64()
         .and_then(|code| u16::try_from(code).ok())
@@ -355,13 +400,14 @@ fn stream_error_status(code: &serde_json::Value) -> Option<StatusCode> {
     }
     match code.as_str()? {
         "rate_limit_exceeded" | "rate_limit_error" => Some(StatusCode::TOO_MANY_REQUESTS),
+        "insufficient_quota" => Some(StatusCode::PAYMENT_REQUIRED),
         "overloaded_error" => Some(StatusCode::SERVICE_UNAVAILABLE),
         "invalid_request_error" | "context_length_exceeded" | "content_filter" => {
             Some(StatusCode::BAD_REQUEST)
         }
-        "authentication_error" => Some(StatusCode::UNAUTHORIZED),
+        "authentication_error" | "invalid_api_key" => Some(StatusCode::UNAUTHORIZED),
         "permission_error" => Some(StatusCode::FORBIDDEN),
-        "not_found_error" => Some(StatusCode::NOT_FOUND),
+        "not_found_error" | "model_not_found" => Some(StatusCode::NOT_FOUND),
         _ => None,
     }
 }
@@ -812,6 +858,34 @@ data: {"type":"error","code":"rate_limit_exceeded","message":"slow down"}
         assert!(error.is_retryable());
         assert!(error.to_string().contains("slow down"), "{error}");
         assert!(error.to_string().contains("429"), "{error}");
+    }
+
+    #[test]
+    fn typed_authentication_failure_wins_over_a_generic_server_code() {
+        // OpenRouter collapses authentication failures to `server_error` in the
+        // native code; retrying that as a transient 5xx would never recover.
+        let payload = r#"
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"Invalid credentials"},"error_type":"authentication"}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed event");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("401"), "{error}");
+    }
+
+    #[test]
+    fn typed_overload_failure_stays_retryable() {
+        let payload = r#"
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"overloaded"},"error_type":"provider_overloaded"}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed event");
+
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("503"), "{error}");
     }
 
     #[test]
