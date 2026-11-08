@@ -105,58 +105,10 @@ impl OpenAiProvider {
         })
     }
 
-    async fn send_message_via_responses(
-        &self,
-        system: &str,
-        messages: Arc<Vec<Message>>,
-        tools: Option<Arc<Vec<ToolDefinition>>>,
-    ) -> Result<MessagesResponse, LlmError> {
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let mut body = build_responses_request_body(
-            &self.model,
-            system,
-            &messages,
-            tools.as_deref().map(|arc| arc.as_slice()),
-            self.reasoning_effort.as_deref(),
-        );
-        if self.is_codex {
-            body["store"] = serde_json::Value::Bool(false);
-            body["stream"] = serde_json::Value::Bool(true);
-        }
-
-        if self.is_codex {
-            let response = self.send_codex_with_retry(&url, &body).await?;
-            let text = response.text().await.map_err(LlmError::RequestFailed)?;
-            return parse_codex_responses_payload(&text).and_then(parse_responses_response);
-        }
-
-        let response = self
-            .http
-            .post(url)
-            .headers(self.build_headers()?)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = parse_retry_after(response.headers());
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-                retry_after,
-            ));
-        }
-
-        let resp_body: ResponsesApiResponse = response.json().await?;
-        parse_responses_response(resp_body)
-    }
-
     /// Sends a Codex request with exponential-backoff retry on 429 responses.
     ///
     /// On success, returns the streaming `reqwest::Response` so callers can
-    /// either consume the body as text (non-stream path) or iterate its
-    /// `bytes_stream` for incremental delta emission (stream path).
+    /// iterate its `bytes_stream` for incremental delta emission.
     /// On non-429 failure, attempts to extract a structured error message from
     /// the response body before returning.
     async fn send_codex_with_retry(
@@ -336,58 +288,6 @@ impl LlmProvider for OpenAiProvider {
         &self.model
     }
 
-    async fn send_message(
-        &self,
-        system: &str,
-        messages: Arc<Vec<Message>>,
-        tools: Option<Arc<Vec<ToolDefinition>>>,
-    ) -> Result<MessagesResponse, LlmError> {
-        if self.is_codex {
-            crate::llm::codex_auth::refresh_if_needed(&self.http).await;
-            return self
-                .send_message_via_responses(system, messages, tools)
-                .await;
-        }
-
-        if should_use_responses_api(&messages) {
-            return self
-                .send_message_via_responses(system, messages, tools)
-                .await;
-        }
-
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let headers = self.build_headers()?;
-
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&build_request_body(
-                &self.model,
-                system,
-                &messages,
-                tools.as_deref().map(|arc| arc.as_slice()),
-                None,
-                self.reasoning_effort.as_deref(),
-                should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
-            ))
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = parse_retry_after(response.headers());
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-                retry_after,
-            ));
-        }
-
-        let body: OpenAiResponse = response.json().await?;
-        parse_openai_response(body)
-    }
-
     async fn send_message_streaming(
         &self,
         system: &str,
@@ -408,12 +308,11 @@ impl LlmProvider for OpenAiProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let headers = self.build_headers()?;
-        let body = build_request_body(
+        let body = build_streaming_request_body(
             &self.model,
             system,
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
-            Some(true),
             self.reasoning_effort.as_deref(),
             should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
         );
@@ -643,7 +542,10 @@ mod tests {
     use bytes::Bytes;
     use futures_util::stream;
 
-    use super::{OpenAiProvider, consume_chat_completion_stream, consume_responses_stream};
+    use super::{
+        OpenAiProvider, consume_chat_completion_stream, consume_responses_stream,
+        parse_chat_completion_usage,
+    };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
         crate::test_util::llm_config("test", model, base_url, api_key)
@@ -706,6 +608,68 @@ mod tests {
             })
         );
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_chat_completion_usage_requires_both_token_counts() {
+        assert_eq!(
+            parse_chat_completion_usage(&serde_json::json!({"prompt_tokens": 10})),
+            None
+        );
+        assert_eq!(
+            parse_chat_completion_usage(&serde_json::json!({"completion_tokens": 5})),
+            None
+        );
+        assert_eq!(
+            parse_chat_completion_usage(&serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+            })),
+            Some(LlmUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_collects_streamed_response() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"long \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({ "stream": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let response = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect("response");
+
+        assert_eq!(response.content, "long answer");
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 7,
+                output_tokens: 2,
+                cached_input_tokens: None,
+            })
+        );
     }
 
     #[tokio::test]

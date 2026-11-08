@@ -1,12 +1,12 @@
 use super::*;
 use std::collections::HashSet;
 
-pub(crate) fn build_request_body(
+/// Builds a streaming Chat Completions request body.
+pub(crate) fn build_streaming_request_body(
     model: &str,
     system: &str,
     messages: &[Message],
     tools: Option<&[ToolDefinition]>,
-    stream: Option<bool>,
     reasoning_effort: Option<&str>,
     include_reasoning_content: bool,
 ) -> serde_json::Value {
@@ -26,10 +26,8 @@ pub(crate) fn build_request_body(
     let mut body = serde_json::json!({
         "model": model,
         "messages": translated,
+        "stream": true,
     });
-    if let Some(stream) = stream {
-        body["stream"] = serde_json::Value::Bool(stream);
-    }
     if let Some(effort) = reasoning_effort {
         body["reasoning_effort"] = serde_json::Value::String(effort.to_string());
     }
@@ -359,17 +357,17 @@ mod tests {
 
     #[test]
     fn chat_completions_request_includes_reasoning_effort() {
-        let body = build_request_body(
+        let body = build_streaming_request_body(
             "gpt-5.3-codex",
             "",
             &[Message::text("user", "hello")],
-            None,
             None,
             Some("high"),
             false,
         );
 
         assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["stream"], true);
     }
 
     #[test]
@@ -437,7 +435,8 @@ mod tests {
         let mut message = Message::text("assistant", "visible");
         message.reasoning_content = Some("hidden reasoning".to_string());
 
-        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, None, false);
+        let body =
+            build_streaming_request_body("deepseek-reasoner", "", &[message], None, None, false);
 
         assert_eq!(body["messages"][0]["content"], "visible");
         assert!(body["messages"][0]["reasoning_content"].is_null());
@@ -449,7 +448,8 @@ mod tests {
         let mut message = Message::text("assistant", "visible");
         message.reasoning_content = Some("hidden reasoning".to_string());
 
-        let body = build_request_body("deepseek-reasoner", "", &[message], None, None, None, true);
+        let body =
+            build_streaming_request_body("deepseek-reasoner", "", &[message], None, None, true);
 
         assert_eq!(body["messages"][0]["content"], "visible");
         assert_eq!(body["messages"][0]["reasoning_content"], "hidden reasoning");

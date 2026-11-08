@@ -1,44 +1,7 @@
 use super::*;
 
-pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmError> {
-    let choice = body
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
-    let tool_calls = choice
-        .message
-        .tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .map(parse_tool_call)
-        .collect::<Vec<_>>();
-    let content = extract_text(
-        choice
-            .message
-            .content
-            .unwrap_or(OpenAiMessageContent::Text(String::new())),
-    );
-    let reasoning_content = choice.message.reasoning_content;
-    let usage = body.usage.and_then(|u| {
-        let cached_input_tokens = u.prompt_tokens_details.and_then(|d| d.cached_tokens);
-        u.prompt_tokens
-            .zip(u.completion_tokens)
-            .map(|(pt, ct)| LlmUsage {
-                input_tokens: pt,
-                output_tokens: ct,
-                cached_input_tokens,
-            })
-    });
-
-    assemble_response(content, reasoning_content, tool_calls, usage)
-}
-
 /// Assembles the final `MessagesResponse` from accumulated Chat Completions
 /// fields, applying raw tool-use rescue when structured tool calls are absent.
-///
-/// Shared by the non-stream JSON path (`parse_openai_response`) and the SSE
-/// stream path (`ChatCompletionAccumulator`) to keep both consistent.
 pub(super) fn assemble_response(
     content: String,
     reasoning_content: Option<String>,
@@ -162,10 +125,6 @@ impl ResponsesApiResponse {
     }
 }
 
-pub(crate) fn parse_tool_call(raw: OaiToolCall) -> ToolCall {
-    ToolCall::from_raw_arguments(raw.id, raw.function.name, &raw.function.arguments)
-}
-
 fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
     match part {
         ResponsesOutputPart::OutputText { text } => Some(text),
@@ -204,60 +163,10 @@ pub(crate) fn should_use_responses_api(messages: &[Message]) -> bool {
         .any(|message| message.content.is_multimodal())
 }
 
-pub(crate) fn extract_text(content: OpenAiMessageContent) -> String {
-    match content {
-        OpenAiMessageContent::Text(text) => text.trim().to_string(),
-        OpenAiMessageContent::Parts(parts) => parts
-            .into_iter()
-            .filter_map(|part| match part {
-                OpenAiContentPart::Text { text } => Some(text),
-                OpenAiContentPart::Refusal { refusal } => Some(refusal),
-                OpenAiContentPart::Ignored => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string(),
-    }
-}
-
-/// Parses a Codex Responses API payload that may arrive as either plain JSON or
-/// SSE stream text containing `response.done` events.
-///
-/// The Codex endpoint requires `stream: true`, so the response body consists of
-/// newline-delimited SSE events. The final `response.completed` (or
-/// `response.done`) event carries the complete [`ResponsesApiResponse`]
-/// under its `"response"` key.
-pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiResponse, LlmError> {
-    if let Ok(parsed) = serde_json::from_str::<ResponsesApiResponse>(text) {
-        return Ok(parsed);
-    }
-
-    let mut accumulator = ResponsesAccumulator::new();
-    for line in text.lines() {
-        let Some(crate::llm::sse::SseItem::Data(payload)) =
-            crate::llm::sse::classify_line(line.trim())
-        else {
-            continue;
-        };
-        if accumulator.process_event(&payload, &|_| {}) {
-            break;
-        }
-    }
-
-    accumulator.into_api_response().map_err(|error| {
-        LlmError::InvalidResponse(format!(
-            "Failed to parse Codex response payload ({error}). Body: {}",
-            preview_body(text)
-        ))
-    })
-}
-
 /// Accumulates Responses API SSE events into a final [`ResponsesApiResponse`].
 ///
-/// Shared by the non-stream Codex path ([`parse_codex_responses_payload`]) and
-/// the streaming Responses/Codex paths in `send_message_streaming` to keep
-/// delta extraction and final response assembly consistent.
+/// Shared by the streaming Responses and Codex paths in `send_message_streaming`
+/// to keep delta extraction and final response assembly consistent.
 pub(super) struct ResponsesAccumulator {
     streamed_text: String,
     streamed_items: Vec<ResponsesOutputItem>,
@@ -570,29 +479,6 @@ pub(crate) fn find_raw_tool_use_end(text: &str) -> Option<usize> {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiResponse {
-    pub(crate) choices: Vec<Choice>,
-    #[serde(default)]
-    pub(crate) usage: Option<OpenAiUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiUsage {
-    #[serde(default)]
-    pub(crate) prompt_tokens: Option<i64>,
-    #[serde(default)]
-    pub(crate) completion_tokens: Option<i64>,
-    #[serde(default)]
-    pub(crate) prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PromptTokensDetails {
-    #[serde(default)]
-    pub(crate) cached_tokens: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiResponse {
     #[serde(default)]
     pub(crate) status: Option<String>,
@@ -667,51 +553,6 @@ pub(crate) enum ResponsesOutputPart {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Choice {
-    pub(crate) message: AssistantMessage,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AssistantMessage {
-    #[serde(default)]
-    pub(crate) content: Option<OpenAiMessageContent>,
-    #[serde(default)]
-    pub(crate) reasoning_content: Option<String>,
-    #[serde(default)]
-    pub(crate) tool_calls: Option<Vec<OaiToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum OpenAiMessageContent {
-    Text(String),
-    Parts(Vec<OpenAiContentPart>),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub(crate) enum OpenAiContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "refusal")]
-    Refusal { refusal: String },
-    #[serde(other)]
-    Ignored,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OaiToolCall {
-    pub(crate) id: String,
-    pub(crate) function: OaiFunction,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OaiFunction {
-    pub(crate) name: String,
-    pub(crate) arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct OaiErrorResponse {
     pub(crate) error: OaiErrorDetail,
 }
@@ -725,8 +566,25 @@ pub(crate) struct OaiErrorDetail {
 mod tests {
     use super::*;
 
+    /// Feeds `data:` lines from a Codex SSE body through the same accumulator
+    /// the streaming path uses, so the tests exercise production parsing.
+    fn accumulate(sse: &str) -> Result<MessagesResponse, LlmError> {
+        let mut accumulator = ResponsesAccumulator::new();
+        for line in sse.lines() {
+            let Some(crate::llm::sse::SseItem::Data(payload)) =
+                crate::llm::sse::classify_line(line.trim())
+            else {
+                continue;
+            };
+            if accumulator.process_event(&payload, &|_| {}) {
+                break;
+            }
+        }
+        accumulator.finish()
+    }
+
     #[test]
-    fn parses_codex_response_completed_sse_payload() {
+    fn parses_completed_response_sse_payload() {
         let payload = r#"
 event: response.created
 data: {"type":"response.created","response":{"output":[]}}
@@ -735,8 +593,7 @@ event: response.completed
 data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":1}}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.content, "ok");
         assert_eq!(
@@ -750,7 +607,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"message","role
     }
 
     #[test]
-    fn parses_codex_streamed_text_when_completed_output_is_empty() {
+    fn uses_streamed_text_when_completed_output_is_empty() {
         let payload = r#"
 event: response.output_text.delta
 data: {"type":"response.output_text.delta","delta":"hello "}
@@ -762,14 +619,13 @@ event: response.completed
 data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0}}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.content, "hello there");
     }
 
     #[test]
-    fn parses_codex_streamed_output_item_when_completed_output_is_empty() {
+    fn uses_streamed_output_item_when_completed_output_is_empty() {
         let payload = r#"
 event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from item"}]}}
@@ -778,8 +634,7 @@ event: response.completed
 data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.content, "from item");
     }
@@ -810,66 +665,6 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
     }
 
     #[test]
-    fn sse_parse_avoids_value_clone() {
-        let payload = r#"
-event: response.output_item.done
-data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"item-text"}]}}
-
-event: response.output_text.done
-data: {"type":"response.output_text.done","text":"done-text"}
-
-event: response.completed
-data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":10}}}
-"#;
-
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
-
-        assert_eq!(response.content, "item-text");
-        assert_eq!(
-            response.usage,
-            Some(LlmUsage {
-                input_tokens: 5,
-                output_tokens: 10,
-                cached_input_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn sse_parse_preserves_correctness() {
-        let completed = r#"
-event: response.completed
-data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-response"}]}],"usage":{"input_tokens":1,"output_tokens":2}}}
-"#;
-        let parsed = parse_codex_responses_payload(completed).expect("completed");
-        let resp = parse_responses_response(parsed).expect("resp");
-        assert_eq!(resp.content, "from-response");
-
-        let streamed = r#"
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"abc"}
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"def"}
-event: response.completed
-data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":null}}
-"#;
-        let parsed = parse_codex_responses_payload(streamed).expect("streamed");
-        let resp = parse_responses_response(parsed).expect("resp");
-        assert_eq!(resp.content, "abcdef");
-
-        let item = r#"
-event: response.output_item.done
-data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"item-content"}]}}
-event: response.completed
-data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":null}}
-"#;
-        let parsed = parse_codex_responses_payload(item).expect("item");
-        let resp = parse_responses_response(parsed).expect("resp");
-        assert_eq!(resp.content, "item-content");
-    }
-
-    #[test]
     fn dedupes_output_item_across_added_and_done_events() {
         let payload = r#"
 event: response.output_item.added
@@ -882,15 +677,14 @@ event: response.completed
 data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "get_weather");
     }
 
     #[test]
-    fn parse_codex_responses_payload_errors_without_completion_event() {
+    fn rejects_stream_without_completion_event() {
         // `response.created` carries a `response` object but is not terminal;
         // the stream must still be rejected without `response.completed`.
         let payload = r#"
@@ -904,7 +698,7 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
 "#;
 
-        let error = parse_codex_responses_payload(payload).expect_err("incomplete payload");
+        let error = accumulate(payload).expect_err("incomplete payload");
 
         let text = error.to_string();
         assert!(
@@ -914,7 +708,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
     }
 
     #[test]
-    fn sse_streamed_text_capacity() {
+    fn accumulates_long_streamed_text() {
         let mut payload = String::with_capacity(65536);
         let segment = "ABCDEFGHIJ";
         let segments = 2000;
@@ -929,8 +723,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":null}}\n",
         );
 
-        let parsed = parse_codex_responses_payload(&payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(&payload).expect("response");
 
         let expected: String = segment.repeat(segments);
         assert_eq!(response.content, expected);
