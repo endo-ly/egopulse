@@ -7,7 +7,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-const REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Total time one request may take, from connect to the last body byte.
+///
+/// The turn path bounds each attempt with its own 300s iteration deadline, so
+/// this cap only matters for callers without one (sleep, compaction, one-shot
+/// ask). A full memory rewrite in sleep can legitimately exceed the turn
+/// budget, so the transport cap is wider than the iteration deadline.
+const REQUEST_TIMEOUT_SECS: u64 = 600;
 
 /// Inactivity deadline between reads of one request.
 ///
@@ -308,7 +314,7 @@ impl LlmProvider for OpenAiProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let headers = self.build_headers()?;
-        let body = build_streaming_request_body(
+        let mut body = build_streaming_request_body(
             &self.model,
             system,
             &messages,
@@ -316,6 +322,7 @@ impl LlmProvider for OpenAiProvider {
             self.reasoning_effort.as_deref(),
             should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
         );
+        request_stream_usage(&mut body, &self.base_url);
 
         let response = self
             .http
@@ -353,6 +360,21 @@ fn is_deepseek_base_url(base_url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
+}
+
+/// Adds `stream_options.include_usage` when the target is official OpenAI.
+///
+/// OpenAI omits usage from streamed responses unless it is requested. Only the
+/// OpenAI-hosted API is known to accept the field, so compatible endpoints are
+/// left untouched: usage stays best-effort for them rather than risking a 400.
+fn request_stream_usage(body: &mut serde_json::Value, base_url: &str) {
+    let is_openai = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.openai.com");
+    if is_openai {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
 }
 
 fn parse_chat_completion_usage(usage: &serde_json::Value) -> Option<LlmUsage> {
@@ -544,7 +566,7 @@ mod tests {
 
     use super::{
         OpenAiProvider, consume_chat_completion_stream, consume_responses_stream,
-        parse_chat_completion_usage,
+        parse_chat_completion_usage, request_stream_usage,
     };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -608,6 +630,21 @@ mod tests {
             })
         );
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn requests_stream_usage_only_from_official_openai() {
+        let mut openai = serde_json::json!({});
+        request_stream_usage(&mut openai, "https://api.openai.com/v1");
+        assert_eq!(openai["stream_options"]["include_usage"], true);
+
+        let mut openrouter = serde_json::json!({});
+        request_stream_usage(&mut openrouter, "https://openrouter.ai/api/v1");
+        assert!(openrouter.get("stream_options").is_none());
+
+        let mut local = serde_json::json!({});
+        request_stream_usage(&mut local, "http://127.0.0.1:8080/v1");
+        assert!(local.get("stream_options").is_none());
     }
 
     #[test]
