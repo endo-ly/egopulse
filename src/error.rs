@@ -358,8 +358,8 @@ impl LlmError {
     }
 
     /// Returns `true` when the error represents a transient failure that is
-    /// safe to retry without side effects: a network/timeout failure before
-    /// the provider returned any body, or a 429 / 5xx response.
+    /// safe to retry when nothing was published yet: a network/timeout failure
+    /// (before or during the response body), or a 429 / 5xx response.
     ///
     /// Non-retryable variants (`InvalidResponse`, `InitFailed`,
     /// `RequestConstructionFailed`, `DeadlineExceeded`, and 4xx other than 429)
@@ -374,6 +374,20 @@ impl LlmError {
             | Self::InvalidResponse(_)
             | Self::DeadlineExceeded
             | Self::RequestConstructionFailed(_) => false,
+        }
+    }
+
+    /// Returns the `Retry-After` delay reported by the provider, if any.
+    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::ApiError {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            Self::InitFailed(_)
+            | Self::RequestFailed(_)
+            | Self::InvalidResponse(_)
+            | Self::DeadlineExceeded
+            | Self::RequestConstructionFailed(_) => None,
         }
     }
 }

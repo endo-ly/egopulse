@@ -10,6 +10,7 @@ mod headers;
 mod messages;
 mod openai;
 mod responses;
+mod retry;
 mod sse;
 
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub(crate) use messages::*;
 pub(crate) use openai::*;
 #[allow(unused_imports)]
 pub(crate) use responses::*;
+pub(crate) use retry::backoff;
 
 /// A single tool call requested by the LLM.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

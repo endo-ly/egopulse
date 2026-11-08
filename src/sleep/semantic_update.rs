@@ -139,10 +139,14 @@ pub(super) async fn send_semantic_request(
         "user",
         format!("Please process semantic update batch {batch_index} of {total_batches}."),
     );
-    let response = provider
-        .send_message(system_prompt, Arc::new(vec![user_message.clone()]), None)
-        .await
-        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+    let response = super::llm_call::send(
+        provider,
+        agent_id,
+        system_prompt,
+        Arc::new(vec![user_message.clone()]),
+        "semantic_update",
+    )
+    .await?;
 
     let (semantic, response) = match parse_semantic_response(&response.content) {
         Ok(semantic) => (semantic, response),
@@ -163,10 +167,14 @@ pub(super) async fn send_semantic_request(
                 Message::text("assistant", &response.content),
                 Message::text("user", SEMANTIC_RETRY_GUARD),
             ];
-            let retry_response = provider
-                .send_message(system_prompt, Arc::new(retry_messages), None)
-                .await
-                .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+            let retry_response = super::llm_call::send(
+                provider,
+                agent_id,
+                system_prompt,
+                Arc::new(retry_messages),
+                "semantic_update",
+            )
+            .await?;
 
             let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
             let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);

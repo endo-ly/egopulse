@@ -204,7 +204,8 @@ src/
 │   ├── event_extraction.rs # Step 1: イベント抽出
 │   ├── event_rollup.rs  # Step 2: 週次/月次ロールアップ
 │   ├── episodic_renderer.rs # エピソード記憶の描画
-│   ├── memory_update.rs # Step 3: 長期記憶更新
+│   ├── semantic_update.rs # Step 3: 長期記憶更新
+│   ├── llm_call.rs # 一時的な LLM 失敗のリトライ
 │   ├── prompt.rs        # プロンプト構築
 │   └── prompts/         # LLM 用プロンプト本文
 │

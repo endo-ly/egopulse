@@ -30,9 +30,6 @@ pub(crate) const MAX_LLM_RETRIES: usize = 3;
 /// fails.
 const MODEL_ITERATION_DEADLINE: Duration = Duration::from_secs(300);
 
-/// Base backoff (milliseconds) for exponential LLM retry.
-const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
-
 pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
     pub(crate) assistant_preview: String,
@@ -526,19 +523,14 @@ fn model_request_hash(
 /// Calculates the delay before the next LLM transport retry.
 ///
 /// A server-supplied `Retry-After` is honored verbatim. Otherwise the delay is
-/// exponentially backed off and randomized: several conversations can hit the
-/// same rate limit at once, and a fixed delay would retry them in lockstep.
+/// exponentially backed off and randomized so callers that hit the same rate
+/// limit do not retry in lockstep.
 fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
-    if let EgoPulseError::Llm(LlmError::ApiError {
-        retry_after_secs: Some(secs),
-        ..
-    }) = error
-    {
-        return Duration::from_secs(*secs);
-    }
-    let ceiling_ms =
-        LLM_RETRY_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
-    Duration::from_millis(rand::random_range(0..=ceiling_ms))
+    let retry_after_secs = match error {
+        EgoPulseError::Llm(error) => error.retry_after_secs(),
+        _ => None,
+    };
+    crate::llm::backoff(attempt, retry_after_secs)
 }
 
 fn build_assistant_tool_phase(
