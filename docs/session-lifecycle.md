@@ -236,7 +236,7 @@ AgentLoop は final response と最新の session snapshot を `AgentLoopResult`
 
 この無応答期限は HTTP client 共通で、Turn 以外の LLM 呼び出しにも適用される。本文が終端でしか届かない非ストリーム要求では、無応答期限がそのまま生成時間の上限になる。そのためナレーション先を持たない呼び出し（sleep batch、compaction、単発の ask）も本文をストリームで受け取って組み立て、無応答期限が上流の停止だけを検出するようにする。
 
-ストリーム内で provider が `error` / `response.failed` を通知した場合や、`finish_reason` が `error` の場合は、それまでに届いた本文があっても成功として扱わない。HTTP 200 の後に起きた失敗は、`error_type` があれば `code` より優先し、対応する HTTP status（一時的な失敗は 429/5xx、恒久的な失敗は 4xx）に写像する。未知の失敗は 502 とし、再試行可否は共通の判定に委ねる。完了イベントを受け取る前にストリームが終了した場合は `incomplete_stream` として再試行対象にする。
+ストリーム内で provider が `error` / `response.failed` を通知した場合や、`finish_reason` が `error` の場合は、それまでに届いた本文があっても成功として扱わない。HTTP 200 の後に起きた失敗は、`error_type` があれば `code` より優先し、対応する HTTP status（一時的な失敗は 429/5xx、恒久的な失敗は 4xx）に写像する。未知の失敗は 502 とし、再試行可否は共通の判定に委ねる。完了イベントを受け取る前にストリームが終了した場合は `incomplete_stream` として再試行対象にし、SSE の `data:` が JSON として不正な場合は欠落した本文を完成応答にせず失敗させる。
 
 1 リクエストの総時間には別に 600 秒の上限がある。Turn は 300 秒の iteration deadline で各試行を打ち切るため、この差は deadline を持たない呼び出しにだけ効く。再試行と待機を含む総予算は、sleep が 20 分、compaction が `compaction_timeout_secs`、単発 ask が 600 秒である。
 

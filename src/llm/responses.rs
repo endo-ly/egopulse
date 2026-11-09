@@ -196,9 +196,11 @@ impl ResponsesAccumulator {
         payload: &str,
         on_delta: &dyn Fn(String),
     ) -> Result<bool, LlmError> {
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            return Ok(false);
-        };
+        let mut value = serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
+            // A broken event can drop output-text deltas while a later
+            // completion event still makes the partial text look complete.
+            LlmError::InvalidResponse(format!("malformed responses SSE event: {error}"))
+        })?;
 
         let event_type = value
             .get("type")

@@ -377,10 +377,12 @@ impl ChatCompletionAccumulator {
     }
 
     fn process_chunk(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> Result<(), LlmError> {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            tracing::warn!("skipping malformed SSE data line");
-            return Ok(());
-        };
+        let value = serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
+            // The SSE `data:` line of a Chat Completions stream is always JSON.
+            // Skipping a broken chunk would return a response with silently
+            // missing text, so fail the request instead.
+            LlmError::InvalidResponse(format!("malformed chat completions SSE chunk: {error}"))
+        })?;
         if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
             let error_type = error
                 .get("metadata")
@@ -1181,6 +1183,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consume_chat_completion_stream_fails_on_malformed_chunk() {
+        // Arrange: a broken chunk sits between valid content and [DONE].
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: {\"choices\":[\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert: never return the partially assembled text as a response.
+        let error = result.expect_err("malformed chunk");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("malformed chat completions SSE chunk"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
     async fn consume_responses_stream_errors_on_eof_without_completion() {
         // Arrange: stream with a text delta but no response.completed event.
         let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from_static(
@@ -1195,5 +1222,32 @@ mod tests {
         assert!(error.is_retryable(), "{error}");
         assert!(matches!(error, crate::error::LlmError::IncompleteStream(_)));
         assert!(error.to_string().contains("without completion event"));
+    }
+
+    #[tokio::test]
+    async fn consume_responses_stream_fails_on_malformed_event() {
+        // Arrange: a broken event sits between a delta and completion.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"kept\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":null}}\n\n",
+            )),
+        ];
+
+        // Act
+        let result = consume_responses_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert: the malformed event fails the request instead of being skipped.
+        let error = result.expect_err("malformed event");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(
+            error.to_string().contains("malformed responses SSE event"),
+            "{error}"
+        );
     }
 }
