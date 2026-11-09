@@ -10,6 +10,7 @@ mod headers;
 mod messages;
 mod openai;
 mod responses;
+mod retry;
 mod sse;
 
 use std::sync::Arc;
@@ -29,6 +30,9 @@ pub(crate) use messages::*;
 pub(crate) use openai::*;
 #[allow(unused_imports)]
 pub(crate) use responses::*;
+pub(crate) use retry::{
+    MAX_ATTEMPTS, RetryDecision, RetryFailure, RetryPolicy, RetryStop, complete_response, decide,
+};
 
 /// A single tool call requested by the LLM.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,12 +197,25 @@ pub(crate) trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
 
+    /// Sends one request and returns the complete response.
+    ///
+    /// The body is consumed as a stream internally, even when the caller has
+    /// nowhere to narrate progress to (sleep, compaction, one-shot ask).
+    /// The transport's inactivity limit can only tell a stalled provider from
+    /// a long generation while bytes keep arriving, so a non-streaming request
+    /// would be cut off by the same silence a healthy generation produces.
+    ///
+    /// Usage is best-effort: providers that omit it from streamed responses
+    /// yield `None`, and callers treat missing usage as zero.
     async fn send_message(
         &self,
         system: &str,
         messages: Arc<Vec<Message>>,
         tools: Option<Arc<Vec<ToolDefinition>>>,
-    ) -> Result<MessagesResponse, LlmError>;
+    ) -> Result<MessagesResponse, LlmError> {
+        self.send_message_streaming(system, messages, tools, &|_| {})
+            .await
+    }
 
     async fn send_message_streaming(
         &self,
@@ -299,6 +316,48 @@ mod tests {
         crate::test_util::llm_config("test", model, base_url, api_key)
     }
 
+    fn chat_sse(content: &str) -> ResponseTemplate {
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
+            serde_json::to_string(content).expect("json string")
+        );
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
+    fn chat_sse_tool_call(id: &str, name: &str, arguments: &str) -> ResponseTemplate {
+        let delta = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments}
+                    }]
+                }
+            }]
+        });
+        let body = format!("data: {delta}\n\ndata: [DONE]\n\n");
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
+    fn responses_sse(text: &str) -> ResponseTemplate {
+        let payload = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}]
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }
+        });
+        let body = format!("event: response.completed\ndata: {payload}\n\n");
+        ResponseTemplate::new(200).set_body_raw(body, "text/event-stream")
+    }
+
     #[tokio::test]
     async fn sends_openai_request() {
         let server = MockServer::start().await;
@@ -310,13 +369,7 @@ mod tests {
                 "messages": [{"role": "user", "content": "hello"}],
                 "reasoning_effort": "high"
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello back"
-                    }
-                }]
-            })))
+            .respond_with(chat_sse("hello back"))
             .mount(&server)
             .await;
 
@@ -344,13 +397,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("x-opencode-session", "egopulse-musa"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello back"
-                    }
-                }]
-            })))
+            .respond_with(chat_sse("hello back"))
             .mount(&server)
             .await;
 
@@ -380,13 +427,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "hello back"
-                    }
-                }]
-            })))
+            .respond_with(chat_sse("hello back"))
             .mount(&server)
             .await;
 
@@ -470,13 +511,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/chat/completions"))
             .and(header("authorization", "Bearer sk-openrouter"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": [{"type": "text", "text": "through router"}]
-                    }
-                }]
-            })))
+            .respond_with(chat_sse("through router"))
             .mount(&server)
             .await;
 
@@ -503,13 +538,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "local answer"
-                    }
-                }]
-            })))
+            .respond_with(chat_sse("local answer"))
             .mount(&server)
             .await;
 
@@ -540,20 +569,11 @@ mod tests {
                     }
                 }]
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{
-                    "message": {
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "function": {
-                                "name": "read",
-                                "arguments": "{\"path\":\"README.md\"}"
-                            }
-                        }]
-                    }
-                }]
-            })))
+            .respond_with(chat_sse_tool_call(
+                "call_1",
+                "read",
+                "{\"path\":\"README.md\"}",
+            ))
             .mount(&server)
             .await;
 
@@ -599,13 +619,7 @@ mod tests {
             .and(body_string_contains("\"type\":\"function_call_output\""))
             .and(body_string_contains("\"call_id\":\"call_1\""))
             .and(body_string_contains("\"type\":\"input_image\""))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "output": [{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": "I can see the image"}]
-                }]
-            })))
+            .respond_with(responses_sse("I can see the image"))
             .mount(&server)
             .await;
 
@@ -690,46 +704,39 @@ mod tests {
     }
 
     #[test]
-    fn raw_tool_use_rescue_in_parse_openai_response() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "[tool_use: bash({\"command\": \"pwd\"})]",
-                    "tool_calls": null
-                }
-            }]
-        }))
-        .unwrap();
+    fn assemble_response_rescues_raw_tool_use() {
+        let response = super::assemble_response(
+            "[tool_use: bash({\"command\": \"pwd\"})]".to_string(),
+            None,
+            Vec::new(),
+            None,
+        )
+        .expect("response");
 
-        let response = super::parse_openai_response(body).unwrap();
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "bash");
         assert_eq!(
             response.tool_calls[0].arguments,
             serde_json::json!({"command": "pwd"})
         );
-        assert!(response.content.is_empty() || response.content.trim().is_empty());
+        assert!(response.content.trim().is_empty());
     }
 
     #[test]
-    fn explicit_tool_calls_take_priority_over_raw() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "Let me help with that",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\": \"test.txt\"}"
-                        }
-                    }]
-                }
-            }]
-        }))
-        .unwrap();
+    fn assemble_response_prefers_explicit_tool_calls_over_raw() {
+        let response = super::assemble_response(
+            "Let me help with that".to_string(),
+            None,
+            vec![super::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "test.txt"}),
+                invalid_arguments: None,
+            }],
+            None,
+        )
+        .expect("response");
 
-        let response = super::parse_openai_response(body).unwrap();
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "read_file");
         assert_eq!(response.content, "Let me help with that");
@@ -741,103 +748,6 @@ mod tests {
         let blocks = extract_raw_tool_use_blocks(text).unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].name, "bash");
-    }
-
-    #[test]
-    fn parse_openai_response_extracts_usage() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "hello",
-                    "tool_calls": null
-                }
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 20
-            }
-        }))
-        .unwrap();
-
-        let response = super::parse_openai_response(body).unwrap();
-        assert_eq!(
-            response.usage,
-            Some(super::LlmUsage {
-                input_tokens: 10,
-                output_tokens: 20,
-                cached_input_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn parse_openai_response_extracts_cached_tokens() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{"message": {"content": "hello", "tool_calls": null}}],
-            "usage": {
-                "prompt_tokens": 100,
-                "completion_tokens": 20,
-                "prompt_tokens_details": {"cached_tokens": 64}
-            }
-        }))
-        .unwrap();
-
-        let response = super::parse_openai_response(body).unwrap();
-
-        assert_eq!(
-            response.usage.map(|u| u.cached_input_tokens),
-            Some(Some(64))
-        );
-    }
-
-    #[test]
-    fn parse_openai_response_leaves_cached_tokens_unset_when_unreported() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{"message": {"content": "hello", "tool_calls": null}}],
-            "usage": {"prompt_tokens": 100, "completion_tokens": 20, "prompt_tokens_details": {}}
-        }))
-        .unwrap();
-
-        let response = super::parse_openai_response(body).unwrap();
-
-        assert_eq!(response.usage.map(|u| u.cached_input_tokens), Some(None));
-    }
-
-    #[test]
-    fn parse_openai_response_preserves_reasoning_content() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "visible answer",
-                    "reasoning_content": "hidden reasoning"
-                }
-            }]
-        }))
-        .unwrap();
-
-        let response = super::parse_openai_response(body).unwrap();
-
-        assert_eq!(response.content, "visible answer");
-        assert_eq!(
-            response.reasoning_content.as_deref(),
-            Some("hidden reasoning")
-        );
-    }
-
-    #[test]
-    fn parse_openai_response_handles_missing_usage() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "hello",
-                    "tool_calls": null
-                }
-            }]
-        }))
-        .unwrap();
-
-        let response = super::parse_openai_response(body).unwrap();
-        assert_eq!(response.usage, None);
     }
 
     #[test]
@@ -878,25 +788,6 @@ mod tests {
         .unwrap();
 
         let response = super::parse_responses_response(body).unwrap();
-        assert_eq!(response.usage, None);
-    }
-
-    #[test]
-    fn parse_openai_response_handles_partial_usage() {
-        let body: super::OpenAiResponse = serde_json::from_value(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "content": "hello",
-                    "tool_calls": null
-                }
-            }],
-            "usage": {
-                "prompt_tokens": 10
-            }
-        }))
-        .unwrap();
-
-        let response = super::parse_openai_response(body).unwrap();
         assert_eq!(response.usage, None);
     }
 

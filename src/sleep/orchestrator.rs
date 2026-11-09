@@ -390,10 +390,14 @@ async fn call_rollup_llm_with_retry(
     let user_prompt = event_rollup::build_rollup_user_prompt(input_json);
     let user_message = Message::text("user", user_prompt);
 
-    let response = provider
-        .send_message(system_prompt, Arc::new(vec![user_message.clone()]), None)
-        .await
-        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+    let response = super::llm_call::send(
+        provider,
+        agent_id,
+        system_prompt,
+        Arc::new(vec![user_message.clone()]),
+        "episodic_update",
+    )
+    .await?;
 
     let first_input = response.usage.as_ref().map_or(0, |u| u.input_tokens);
     let first_output = response.usage.as_ref().map_or(0, |u| u.output_tokens);
@@ -419,10 +423,14 @@ Output the raw JSON object and nothing else.";
                 Message::text("assistant", &response.content),
                 Message::text("user", ROLLUP_RETRY_GUARD),
             ];
-            let retry_response = provider
-                .send_message(system_prompt, Arc::new(retry_messages), None)
-                .await
-                .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+            let retry_response = super::llm_call::send(
+                provider,
+                agent_id,
+                system_prompt,
+                Arc::new(retry_messages),
+                "episodic_update",
+            )
+            .await?;
 
             let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
             let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);
@@ -2274,6 +2282,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_sleep_batch_completes_with_streaming_only_provider() {
+        // Arrange
+        let (db, dir) = test_db();
+        seed_messages_for_proceed(&db, "test-agent");
+        // The provider implements only the streaming method, so every batch
+        // step relies on `send_message` collecting a streamed body.
+        let llm = Arc::new(StreamingOnlyProvider {
+            inner: Arc::new(SequentialMockProvider::new(all_success_responses())),
+        });
+        let state = build_test_state_with_llm(db, dir.path(), llm);
+
+        // Act
+        run_sleep_batch(&state, Some("test-agent"), SleepRunTrigger::Manual)
+            .await
+            .expect("batch");
+
+        // Assert
+        let runs = state
+            .db
+            .list_sleep_runs("test-agent", &[], None, 10)
+            .expect("list");
+        assert_eq!(runs[0].status, SleepRunStatus::Success);
+    }
+
+    #[tokio::test]
     async fn run_sleep_batch_persists_both_memory_files() {
         let (db, dir) = test_db();
         seed_messages_for_proceed(&db, "test-agent");
@@ -2896,6 +2929,33 @@ mod tests {
         ) -> Result<MessagesResponse, crate::error::LlmError> {
             let _ = on_delta;
             self.send_message(system, messages, tools).await
+        }
+    }
+
+    /// Provider that implements only the streaming path, so batch callers
+    /// exercise the trait's default `send_message`.
+    struct StreamingOnlyProvider {
+        inner: Arc<dyn LlmProvider>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for StreamingOnlyProvider {
+        fn provider_name(&self) -> &str {
+            self.inner.provider_name()
+        }
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<Arc<Vec<ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            self.inner
+                .send_message_streaming(system, messages, tools, on_delta)
+                .await
         }
     }
 

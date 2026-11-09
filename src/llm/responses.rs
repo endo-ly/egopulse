@@ -1,44 +1,9 @@
 use super::*;
 
-pub(crate) fn parse_openai_response(body: OpenAiResponse) -> Result<MessagesResponse, LlmError> {
-    let choice = body
-        .choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| LlmError::InvalidResponse("choices[0] missing".to_string()))?;
-    let tool_calls = choice
-        .message
-        .tool_calls
-        .unwrap_or_default()
-        .into_iter()
-        .map(parse_tool_call)
-        .collect::<Vec<_>>();
-    let content = extract_text(
-        choice
-            .message
-            .content
-            .unwrap_or(OpenAiMessageContent::Text(String::new())),
-    );
-    let reasoning_content = choice.message.reasoning_content;
-    let usage = body.usage.and_then(|u| {
-        let cached_input_tokens = u.prompt_tokens_details.and_then(|d| d.cached_tokens);
-        u.prompt_tokens
-            .zip(u.completion_tokens)
-            .map(|(pt, ct)| LlmUsage {
-                input_tokens: pt,
-                output_tokens: ct,
-                cached_input_tokens,
-            })
-    });
-
-    assemble_response(content, reasoning_content, tool_calls, usage)
-}
+use reqwest::StatusCode;
 
 /// Assembles the final `MessagesResponse` from accumulated Chat Completions
 /// fields, applying raw tool-use rescue when structured tool calls are absent.
-///
-/// Shared by the non-stream JSON path (`parse_openai_response`) and the SSE
-/// stream path (`ChatCompletionAccumulator`) to keep both consistent.
 pub(super) fn assemble_response(
     content: String,
     reasoning_content: Option<String>,
@@ -71,6 +36,7 @@ pub(super) fn assemble_response(
 pub(crate) fn parse_responses_response(
     body: ResponsesApiResponse,
 ) -> Result<MessagesResponse, LlmError> {
+    ensure_response_completed(&body)?;
     let diagnostics = body.diagnostics();
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -162,8 +128,35 @@ impl ResponsesApiResponse {
     }
 }
 
-pub(crate) fn parse_tool_call(raw: OaiToolCall) -> ToolCall {
-    ToolCall::from_raw_arguments(raw.id, raw.function.name, &raw.function.arguments)
+/// Rejects terminal responses that did not complete successfully.
+///
+/// `response.done` is used by some providers instead of `response.completed`,
+/// and its `status` is authoritative: a failed response can still carry output
+/// items (including tool calls), so the status must be checked before the body
+/// is treated as a usable answer. A missing status keeps the previous
+/// behaviour for providers that omit it.
+fn ensure_response_completed(response: &ResponsesApiResponse) -> Result<(), LlmError> {
+    match response.status.as_deref() {
+        None | Some("completed") => Ok(()),
+        Some("incomplete") => Err(incomplete_response_error(response)),
+        Some("failed") => Err(stream_api_error(
+            response.error.as_ref(),
+            response.error_type.as_deref(),
+        )),
+        Some(status) => Err(LlmError::InvalidResponse(format!(
+            "unexpected responses terminal status: {status} ({})",
+            response.diagnostics()
+        ))),
+    }
+}
+
+/// Builds the non-retryable error for a generation cut off at a terminal
+/// boundary (output limit, content filter, or another incomplete reason).
+fn incomplete_response_error(response: &ResponsesApiResponse) -> LlmError {
+    LlmError::IncompleteResponse(format!(
+        "responses generation was incomplete ({})",
+        response.diagnostics()
+    ))
 }
 
 fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
@@ -204,60 +197,10 @@ pub(crate) fn should_use_responses_api(messages: &[Message]) -> bool {
         .any(|message| message.content.is_multimodal())
 }
 
-pub(crate) fn extract_text(content: OpenAiMessageContent) -> String {
-    match content {
-        OpenAiMessageContent::Text(text) => text.trim().to_string(),
-        OpenAiMessageContent::Parts(parts) => parts
-            .into_iter()
-            .filter_map(|part| match part {
-                OpenAiContentPart::Text { text } => Some(text),
-                OpenAiContentPart::Refusal { refusal } => Some(refusal),
-                OpenAiContentPart::Ignored => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string(),
-    }
-}
-
-/// Parses a Codex Responses API payload that may arrive as either plain JSON or
-/// SSE stream text containing `response.done` events.
-///
-/// The Codex endpoint requires `stream: true`, so the response body consists of
-/// newline-delimited SSE events. The final `response.completed` (or
-/// `response.done`) event carries the complete [`ResponsesApiResponse`]
-/// under its `"response"` key.
-pub(crate) fn parse_codex_responses_payload(text: &str) -> Result<ResponsesApiResponse, LlmError> {
-    if let Ok(parsed) = serde_json::from_str::<ResponsesApiResponse>(text) {
-        return Ok(parsed);
-    }
-
-    let mut accumulator = ResponsesAccumulator::new();
-    for line in text.lines() {
-        let Some(crate::llm::sse::SseItem::Data(payload)) =
-            crate::llm::sse::classify_line(line.trim())
-        else {
-            continue;
-        };
-        if accumulator.process_event(&payload, &|_| {}) {
-            break;
-        }
-    }
-
-    accumulator.into_api_response().map_err(|error| {
-        LlmError::InvalidResponse(format!(
-            "Failed to parse Codex response payload ({error}). Body: {}",
-            preview_body(text)
-        ))
-    })
-}
-
 /// Accumulates Responses API SSE events into a final [`ResponsesApiResponse`].
 ///
-/// Shared by the non-stream Codex path ([`parse_codex_responses_payload`]) and
-/// the streaming Responses/Codex paths in `send_message_streaming` to keep
-/// delta extraction and final response assembly consistent.
+/// Shared by the streaming Responses and Codex paths in `send_message_streaming`
+/// to keep delta extraction and final response assembly consistent.
 pub(super) struct ResponsesAccumulator {
     streamed_text: String,
     streamed_items: Vec<ResponsesOutputItem>,
@@ -276,17 +219,54 @@ impl ResponsesAccumulator {
     /// Processes one SSE `data:` payload (JSON text without the `data:` prefix).
     ///
     /// Calls `on_delta` for each `response.output_text.delta` event. Returns
-    /// `true` when a terminal event (`response.completed` / `response.done`)
-    /// carrying a valid `response` object has been consumed.
-    pub(super) fn process_event(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> bool {
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            return false;
-        };
+    /// `Ok(true)` when a terminal event (`response.completed` / `response.done`)
+    /// carrying a valid `response` object has been consumed. Returns an error
+    /// for explicit failure events (`response.failed` / `error`) so a partially
+    /// streamed generation is never mistaken for a complete response.
+    pub(super) fn process_event(
+        &mut self,
+        payload: &str,
+        on_delta: &dyn Fn(String),
+    ) -> Result<bool, LlmError> {
+        let mut value = serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
+            // A broken event can drop output-text deltas while a later
+            // completion event still makes the partial text look complete.
+            LlmError::InvalidResponse(format!("malformed responses SSE event: {error}"))
+        })?;
 
         let event_type = value
             .get("type")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+
+        match event_type.as_deref() {
+            Some("response.failed") => {
+                let response = value.get("response");
+                let error = response.and_then(|response| response.get("error"));
+                let error_type = response
+                    .and_then(|response| response.get("error_type"))
+                    .and_then(|error_type| error_type.as_str());
+                return Err(stream_api_error(error, error_type));
+            }
+            Some("error") => {
+                let error = value.get("error").unwrap_or(&value);
+                let error_type = error
+                    .get("error_type")
+                    .and_then(|error_type| error_type.as_str())
+                    .or_else(|| value.get("error_type").and_then(|value| value.as_str()));
+                return Err(stream_api_error(Some(error), error_type));
+            }
+            Some("response.incomplete") => {
+                let response = value.get("response").and_then(|response| {
+                    serde_json::from_value::<ResponsesApiResponse>(response.clone()).ok()
+                });
+                return Err(response.map_or_else(
+                    || LlmError::IncompleteResponse("response.incomplete".to_string()),
+                    |response| incomplete_response_error(&response),
+                ));
+            }
+            _ => {}
+        }
 
         // Only the `done` item is complete; `added` carries an in_progress
         // partial item that would duplicate the finalized one.
@@ -320,16 +300,19 @@ impl ResponsesAccumulator {
             event_type.as_deref(),
             Some("response.completed" | "response.done")
         );
-        if is_terminal
-            && let Some(response_value) = value.get_mut("response")
-            && let Ok(parsed) =
-                serde_json::from_value::<ResponsesApiResponse>(response_value.take())
-        {
+        if is_terminal && let Some(response_value) = value.get_mut("response") {
+            let parsed = serde_json::from_value::<ResponsesApiResponse>(response_value.take())
+                .map_err(|error| {
+                    LlmError::InvalidResponse(format!(
+                        "malformed responses terminal event: {error}"
+                    ))
+                })?;
+            ensure_response_completed(&parsed)?;
             self.completed_response = Some(parsed);
-            return true;
+            return Ok(true);
         }
 
-        false
+        Ok(false)
     }
 
     /// Assembles the final [`ResponsesApiResponse`] from accumulated state.
@@ -339,12 +322,13 @@ impl ResponsesAccumulator {
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::InvalidResponse`] when no completion event
+    /// Returns [`LlmError::IncompleteStream`] when no completion event
     /// (`response.completed` / `response.done`) was received; partial streamed
-    /// data is rejected rather than synthesized into a success.
+    /// data is rejected rather than synthesized into a success. The caller may
+    /// retry because the generation was cut off, not because it was invalid.
     pub(super) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
         let Some(mut response) = self.completed_response else {
-            return Err(LlmError::InvalidResponse(
+            return Err(LlmError::IncompleteStream(
                 "Responses API stream ended without a completion event".to_string(),
             ));
         };
@@ -383,6 +367,95 @@ pub(crate) fn preview_body(body: &str) -> String {
         "<empty>".to_string()
     } else {
         preview
+    }
+}
+
+/// Builds an [`LlmError`] for a failure reported inside a streamed response.
+///
+/// The provider has already answered with HTTP 200 when the failure arrives, so
+/// there is no status line to classify. A typed `error_type` is preferred over
+/// the native `code` because the code collapses distinct causes (OpenRouter
+/// reports authentication and overload failures as the same Responses
+/// `server_error`). Both are mapped to their HTTP equivalent so the shared
+/// retry policy can tell transient failures from deterministic ones; unknown
+/// failures default to 502 because they usually mean the generation was cut off
+/// upstream.
+pub(super) fn stream_api_error(
+    error: Option<&serde_json::Value>,
+    error_type: Option<&str>,
+) -> LlmError {
+    let message = error
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(|message| message.as_str())
+                .or_else(|| value.as_str())
+        })
+        .unwrap_or("stream failed without an error message");
+    let status = stream_error_status(error_type)
+        .or_else(|| {
+            error
+                .and_then(|value| value.get("code"))
+                .and_then(stream_error_code)
+        })
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    LlmError::ApiError {
+        status,
+        body_preview: preview_body(message),
+        retry_after_secs: None,
+    }
+}
+
+/// Maps OpenRouter's typed error vocabulary to the HTTP status it stands for.
+fn stream_error_status(error_type: Option<&str>) -> Option<StatusCode> {
+    Some(match error_type? {
+        "authentication" => StatusCode::UNAUTHORIZED,
+        "permission_denied" | "content_policy_violation" | "refusal" => StatusCode::FORBIDDEN,
+        "payment_required" => StatusCode::PAYMENT_REQUIRED,
+        "rate_limit_exceeded" => StatusCode::TOO_MANY_REQUESTS,
+        "provider_overloaded" => StatusCode::SERVICE_UNAVAILABLE,
+        "provider_unavailable" => StatusCode::BAD_GATEWAY,
+        "server" | "unmapped" => StatusCode::INTERNAL_SERVER_ERROR,
+        "timeout" => StatusCode::GATEWAY_TIMEOUT,
+        "not_found" | "image_not_found" => StatusCode::NOT_FOUND,
+        "precondition_failed" => StatusCode::PRECONDITION_FAILED,
+        "payload_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+        "unprocessable" => StatusCode::UNPROCESSABLE_ENTITY,
+        "context_length_exceeded"
+        | "max_tokens_exceeded"
+        | "token_limit_exceeded"
+        | "string_too_long"
+        | "invalid_request"
+        | "invalid_prompt"
+        | "invalid_image"
+        | "image_too_large"
+        | "image_too_small"
+        | "unsupported_image_format"
+        | "image_download_failed" => StatusCode::BAD_REQUEST,
+        _ => return None,
+    })
+}
+
+/// Maps native error codes to the HTTP status they stand for.
+fn stream_error_code(code: &serde_json::Value) -> Option<StatusCode> {
+    if let Some(code) = code
+        .as_u64()
+        .and_then(|code| u16::try_from(code).ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+    {
+        return Some(code);
+    }
+    match code.as_str()? {
+        "rate_limit_exceeded" | "rate_limit_error" => Some(StatusCode::TOO_MANY_REQUESTS),
+        "insufficient_quota" => Some(StatusCode::PAYMENT_REQUIRED),
+        "overloaded_error" => Some(StatusCode::SERVICE_UNAVAILABLE),
+        "invalid_request_error" | "context_length_exceeded" | "content_filter" => {
+            Some(StatusCode::BAD_REQUEST)
+        }
+        "authentication_error" | "invalid_api_key" => Some(StatusCode::UNAUTHORIZED),
+        "permission_error" => Some(StatusCode::FORBIDDEN),
+        "not_found_error" | "model_not_found" => Some(StatusCode::NOT_FOUND),
+        _ => None,
     }
 }
 
@@ -570,29 +643,6 @@ pub(crate) fn find_raw_tool_use_end(text: &str) -> Option<usize> {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiResponse {
-    pub(crate) choices: Vec<Choice>,
-    #[serde(default)]
-    pub(crate) usage: Option<OpenAiUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OpenAiUsage {
-    #[serde(default)]
-    pub(crate) prompt_tokens: Option<i64>,
-    #[serde(default)]
-    pub(crate) completion_tokens: Option<i64>,
-    #[serde(default)]
-    pub(crate) prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PromptTokensDetails {
-    #[serde(default)]
-    pub(crate) cached_tokens: Option<i64>,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiResponse {
     #[serde(default)]
     pub(crate) status: Option<String>,
@@ -601,6 +651,10 @@ pub(crate) struct ResponsesApiResponse {
     pub(crate) usage: Option<ResponsesApiUsage>,
     #[serde(default)]
     pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default)]
+    pub(crate) error: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) error_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,51 +721,6 @@ pub(crate) enum ResponsesOutputPart {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Choice {
-    pub(crate) message: AssistantMessage,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct AssistantMessage {
-    #[serde(default)]
-    pub(crate) content: Option<OpenAiMessageContent>,
-    #[serde(default)]
-    pub(crate) reasoning_content: Option<String>,
-    #[serde(default)]
-    pub(crate) tool_calls: Option<Vec<OaiToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum OpenAiMessageContent {
-    Text(String),
-    Parts(Vec<OpenAiContentPart>),
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type")]
-pub(crate) enum OpenAiContentPart {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "refusal")]
-    Refusal { refusal: String },
-    #[serde(other)]
-    Ignored,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OaiToolCall {
-    pub(crate) id: String,
-    pub(crate) function: OaiFunction,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct OaiFunction {
-    pub(crate) name: String,
-    pub(crate) arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub(crate) struct OaiErrorResponse {
     pub(crate) error: OaiErrorDetail,
 }
@@ -725,8 +734,25 @@ pub(crate) struct OaiErrorDetail {
 mod tests {
     use super::*;
 
+    /// Feeds `data:` lines from a Codex SSE body through the same accumulator
+    /// the streaming path uses, so the tests exercise production parsing.
+    fn accumulate(sse: &str) -> Result<MessagesResponse, LlmError> {
+        let mut accumulator = ResponsesAccumulator::new();
+        for line in sse.lines() {
+            let Some(crate::llm::sse::SseItem::Data(payload)) =
+                crate::llm::sse::classify_line(line.trim())
+            else {
+                continue;
+            };
+            if accumulator.process_event(&payload, &|_| {})? {
+                break;
+            }
+        }
+        accumulator.finish()
+    }
+
     #[test]
-    fn parses_codex_response_completed_sse_payload() {
+    fn parses_completed_response_sse_payload() {
         let payload = r#"
 event: response.created
 data: {"type":"response.created","response":{"output":[]}}
@@ -735,8 +761,7 @@ event: response.completed
 data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"input_tokens_details":{"cached_tokens":1}}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.content, "ok");
         assert_eq!(
@@ -750,7 +775,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"message","role
     }
 
     #[test]
-    fn parses_codex_streamed_text_when_completed_output_is_empty() {
+    fn uses_streamed_text_when_completed_output_is_empty() {
         let payload = r#"
 event: response.output_text.delta
 data: {"type":"response.output_text.delta","delta":"hello "}
@@ -762,14 +787,13 @@ event: response.completed
 data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":0}}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.content, "hello there");
     }
 
     #[test]
-    fn parses_codex_streamed_output_item_when_completed_output_is_empty() {
+    fn uses_streamed_output_item_when_completed_output_is_empty() {
         let payload = r#"
 event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from item"}]}}
@@ -778,8 +802,7 @@ event: response.completed
 data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.content, "from item");
     }
@@ -810,66 +833,6 @@ data: {"type":"response.completed","response":{"status":"completed","output":[],
     }
 
     #[test]
-    fn sse_parse_avoids_value_clone() {
-        let payload = r#"
-event: response.output_item.done
-data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"item-text"}]}}
-
-event: response.output_text.done
-data: {"type":"response.output_text.done","text":"done-text"}
-
-event: response.completed
-data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":5,"output_tokens":10}}}
-"#;
-
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
-
-        assert_eq!(response.content, "item-text");
-        assert_eq!(
-            response.usage,
-            Some(LlmUsage {
-                input_tokens: 5,
-                output_tokens: 10,
-                cached_input_tokens: None,
-            })
-        );
-    }
-
-    #[test]
-    fn sse_parse_preserves_correctness() {
-        let completed = r#"
-event: response.completed
-data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"from-response"}]}],"usage":{"input_tokens":1,"output_tokens":2}}}
-"#;
-        let parsed = parse_codex_responses_payload(completed).expect("completed");
-        let resp = parse_responses_response(parsed).expect("resp");
-        assert_eq!(resp.content, "from-response");
-
-        let streamed = r#"
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"abc"}
-event: response.output_text.delta
-data: {"type":"response.output_text.delta","delta":"def"}
-event: response.completed
-data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":null}}
-"#;
-        let parsed = parse_codex_responses_payload(streamed).expect("streamed");
-        let resp = parse_responses_response(parsed).expect("resp");
-        assert_eq!(resp.content, "abcdef");
-
-        let item = r#"
-event: response.output_item.done
-data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"item-content"}]}}
-event: response.completed
-data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":null}}
-"#;
-        let parsed = parse_codex_responses_payload(item).expect("item");
-        let resp = parse_responses_response(parsed).expect("resp");
-        assert_eq!(resp.content, "item-content");
-    }
-
-    #[test]
     fn dedupes_output_item_across_added_and_done_events() {
         let payload = r#"
 event: response.output_item.added
@@ -882,15 +845,14 @@ event: response.completed
 data: {"type":"response.completed","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":2}}}
 "#;
 
-        let parsed = parse_codex_responses_payload(payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(payload).expect("response");
 
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "get_weather");
     }
 
     #[test]
-    fn parse_codex_responses_payload_errors_without_completion_event() {
+    fn rejects_stream_without_completion_event() {
         // `response.created` carries a `response` object but is not terminal;
         // the stream must still be rejected without `response.completed`.
         let payload = r#"
@@ -904,7 +866,7 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}
 "#;
 
-        let error = parse_codex_responses_payload(payload).expect_err("incomplete payload");
+        let error = accumulate(payload).expect_err("incomplete payload");
 
         let text = error.to_string();
         assert!(
@@ -914,7 +876,158 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
     }
 
     #[test]
-    fn sse_streamed_text_capacity() {
+    fn fails_on_response_failed_after_partial_text() {
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream disconnected"}}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed event");
+
+        assert!(error.is_retryable());
+        assert!(
+            error.to_string().contains("upstream disconnected"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn fails_on_error_event_with_top_level_fields() {
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: error
+data: {"type":"error","code":"rate_limit_exceeded","message":"slow down"}
+"#;
+
+        let error = accumulate(payload).expect_err("error event");
+
+        assert!(error.is_retryable());
+        assert!(error.to_string().contains("slow down"), "{error}");
+        assert!(error.to_string().contains("429"), "{error}");
+    }
+
+    #[test]
+    fn typed_authentication_failure_wins_over_a_generic_server_code() {
+        // OpenRouter collapses authentication failures to `server_error` in the
+        // native code; retrying that as a transient 5xx would never recover.
+        let payload = r#"
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"Invalid credentials"},"error_type":"authentication"}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed event");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("401"), "{error}");
+    }
+
+    #[test]
+    fn typed_overload_failure_stays_retryable() {
+        let payload = r#"
+event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"overloaded"},"error_type":"provider_overloaded"}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed event");
+
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[test]
+    fn fails_on_incomplete_response_event() {
+        // `response.incomplete` is a terminal event: the generation hit the
+        // output limit or was filtered, so retrying the same request will not
+        // complete it.
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}
+"#;
+
+        let error = accumulate(payload).expect_err("incomplete response");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("max_output_tokens"), "{error}");
+    }
+
+    #[test]
+    fn fails_on_done_event_with_incomplete_status() {
+        // Some compatible providers end with `response.done` instead of
+        // `response.incomplete`; the response status is authoritative.
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.done
+data: {"type":"response.done","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}
+"#;
+
+        let error = accumulate(payload).expect_err("incomplete status");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[test]
+    fn failed_done_response_is_never_returned_as_tool_calls() {
+        // A failed terminal response can still contain output items. It must
+        // not reach the tool executor as a valid tool-call request.
+        let payload = r#"
+event: response.done
+data: {"type":"response.done","response":{"status":"failed","error":{"code":"server_error","message":"Invalid credentials"},"error_type":"authentication","output":[{"type":"function_call","call_id":"call_1","name":"delete_everything","arguments":"{}"}]}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed status");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("Invalid credentials"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_an_incomplete_response() {
+        // The parser itself must not turn a terminal-but-incomplete body into
+        // a successful response.
+        let body: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]
+        }))
+        .expect("body");
+
+        let error = parse_responses_response(body).expect_err("incomplete response");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("max_output_tokens"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_a_failed_response_with_tool_calls() {
+        let body: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "error": {"code": "server_error", "message": "upstream failed"},
+            "output": [{"type":"function_call","call_id":"call_1","name":"delete_everything","arguments":"{}"}]
+        }))
+        .expect("body");
+
+        let error = parse_responses_response(body).expect_err("failed response");
+
+        assert!(error.to_string().contains("upstream failed"), "{error}");
+    }
+
+    #[test]
+    fn accumulates_long_streamed_text() {
         let mut payload = String::with_capacity(65536);
         let segment = "ABCDEFGHIJ";
         let segments = 2000;
@@ -929,8 +1042,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":null}}\n",
         );
 
-        let parsed = parse_codex_responses_payload(&payload).expect("payload");
-        let response = parse_responses_response(parsed).expect("response");
+        let response = accumulate(&payload).expect("response");
 
         let expected: String = segment.repeat(segments);
         assert_eq!(response.content, expected);

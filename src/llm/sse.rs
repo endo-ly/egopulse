@@ -39,7 +39,8 @@ pub(super) fn classify_line(line: &str) -> Option<SseItem> {
 ///
 /// Yields `Ok(SseItem::Data(payload))` for each complete `data:` line,
 /// `Ok(SseItem::Done)` when the `[DONE]` sentinel is encountered (then stops),
-/// and `Err(LlmError::RequestFailed(e))` when the underlying stream errors.
+/// `Err(LlmError::RequestFailed(e))` when the underlying stream errors, and
+/// `Err(LlmError::InvalidResponse(..))` for a line that is not valid UTF-8.
 ///
 /// At natural EOF without `[DONE]`, only trailing buffered data is flushed —
 /// no `SseItem::Done` is yielded, leaving completion detection to the caller.
@@ -74,7 +75,14 @@ where
                             }
                         }
                     }
-                    Err(_) => tracing::warn!("non-UTF-8 line in SSE stream, skipping"),
+                    Err(_) => {
+                        // Skipping the line could drop part of the generated
+                        // text and still return the rest as a complete answer.
+                        yield Err(LlmError::InvalidResponse(
+                            "non-UTF-8 line in SSE stream".to_string(),
+                        ));
+                        return;
+                    }
                 }
             }
         }
@@ -115,6 +123,24 @@ mod tests {
         assert_data(lines.next().await, r#"{"a":1}"#);
         assert_data(lines.next().await, r#"{"a":2}"#);
         assert!(matches!(lines.next().await, Some(Ok(SseItem::Done))));
+        assert!(lines.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fails_on_non_utf8_line() {
+        // Arrange: a data line that cannot be decoded as UTF-8.
+        let mut lines = data_lines(stream::iter([chunk(b"data: \xff\n\n")]));
+
+        // Act
+        let error = lines
+            .next()
+            .await
+            .expect("error event")
+            .expect_err("non-UTF-8 line");
+
+        // Assert
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("non-UTF-8"), "{error}");
         assert!(lines.next().await.is_none());
     }
 

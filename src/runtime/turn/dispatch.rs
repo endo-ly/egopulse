@@ -1796,7 +1796,7 @@ mod tests {
     async fn retryable_llm_failure_executes_one_turn_and_persists_one_input() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let retry_count = crate::agent_loop::model_step::MAX_LLM_RETRIES;
+        let retry_count = crate::llm::MAX_ATTEMPTS;
         let retry_provider = RecordingProvider::new(
             (0..retry_count)
                 .map(|_| {
@@ -1828,13 +1828,13 @@ mod tests {
         .await;
 
         // Assert: the same model iteration is retried up to
-        // `MAX_LLM_RETRIES` before surfacing the error, but still executes a
+        // `MAX_ATTEMPTS` before surfacing the error, but still executes a
         // single Turn with a single persisted input.
         assert!(result.is_err(), "retryable failure must reach the caller");
         assert_eq!(
             retry_observer.seen_systems().len(),
             retry_count,
-            "LLM must be retried up to MAX_LLM_RETRIES within the same iteration"
+            "LLM must be retried up to MAX_ATTEMPTS within the same iteration"
         );
         let conn = state.db.get_conn().expect("connection");
         let user_messages: i64 = conn
@@ -1886,7 +1886,7 @@ mod tests {
         publish_delta: bool,
     ) -> (tempfile::TempDir, AppState) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let retry_count = crate::agent_loop::model_step::MAX_LLM_RETRIES;
+        let retry_count = crate::llm::MAX_ATTEMPTS;
         let provider = RecordingProvider::new(
             (0..retry_count)
                 .map(|_| {

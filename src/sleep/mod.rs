@@ -7,6 +7,7 @@ pub(crate) mod scheduler;
 mod episodic_renderer;
 mod event_extraction;
 mod event_rollup;
+mod llm_call;
 mod orchestrator;
 mod prompt;
 mod semantic_update;

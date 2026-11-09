@@ -150,10 +150,14 @@ pub(crate) async fn send_extract_events_request(
         "user",
         format!("Extract episode events from chunk {chunk_index} of {total_chunks}."),
     );
-    let response = provider
-        .send_message(system_prompt, Arc::new(vec![user_message.clone()]), None)
-        .await
-        .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+    let response = super::llm_call::send(
+        provider,
+        agent_id,
+        system_prompt,
+        Arc::new(vec![user_message.clone()]),
+        "event_extraction",
+    )
+    .await?;
 
     let (output, response) = match parse_extract_events_response(&response.content) {
         Ok(parsed) => (parsed, response),
@@ -173,10 +177,14 @@ pub(crate) async fn send_extract_events_request(
                 Message::text("assistant", &response.content),
                 Message::text("user", EVENTS_RETRY_GUARD),
             ];
-            let retry_response = provider
-                .send_message(system_prompt, Arc::new(retry_messages), None)
-                .await
-                .map_err(|e| SleepBatchError::Llm(e.to_string()))?;
+            let retry_response = super::llm_call::send(
+                provider,
+                agent_id,
+                system_prompt,
+                Arc::new(retry_messages),
+                "event_extraction",
+            )
+            .await?;
 
             let retry_input = retry_response.usage.as_ref().map_or(0, |u| u.input_tokens);
             let retry_output = retry_response.usage.as_ref().map_or(0, |u| u.output_tokens);

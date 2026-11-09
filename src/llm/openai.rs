@@ -7,7 +7,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-const REQUEST_TIMEOUT_SECS: u64 = 300;
+/// Total time one HTTP request may take, from connect to the last body byte.
+///
+/// Turn and Pulse bound each attempt with their 300s iteration deadline, and
+/// Compaction (180s by default) and one-shot ask (300s) pass tighter budgets.
+/// Sleep's 20 minute budget is the only one wider than this cap, so a single
+/// Sleep attempt is bounded here; a full memory rewrite can legitimately
+/// exceed the turn budget.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Inactivity deadline between reads of one request.
 ///
@@ -29,7 +36,7 @@ fn shared_http_client() -> Result<reqwest::Client, LlmError> {
             reqwest::Client::builder()
                 .user_agent(format!("egopulse/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+                .timeout(REQUEST_TIMEOUT)
                 .read_timeout(Duration::from_secs(READ_TIMEOUT_SECS))
                 .build()
                 .map_err(|error| error.to_string())
@@ -103,100 +110,6 @@ impl OpenAiProvider {
             is_codex,
             extra_headers,
         })
-    }
-
-    async fn send_message_via_responses(
-        &self,
-        system: &str,
-        messages: Arc<Vec<Message>>,
-        tools: Option<Arc<Vec<ToolDefinition>>>,
-    ) -> Result<MessagesResponse, LlmError> {
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-        let mut body = build_responses_request_body(
-            &self.model,
-            system,
-            &messages,
-            tools.as_deref().map(|arc| arc.as_slice()),
-            self.reasoning_effort.as_deref(),
-        );
-        if self.is_codex {
-            body["store"] = serde_json::Value::Bool(false);
-            body["stream"] = serde_json::Value::Bool(true);
-        }
-
-        if self.is_codex {
-            let response = self.send_codex_with_retry(&url, &body).await?;
-            let text = response.text().await.map_err(LlmError::RequestFailed)?;
-            return parse_codex_responses_payload(&text).and_then(parse_responses_response);
-        }
-
-        let response = self
-            .http
-            .post(url)
-            .headers(self.build_headers()?)
-            .json(&body)
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = parse_retry_after(response.headers());
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-                retry_after,
-            ));
-        }
-
-        let resp_body: ResponsesApiResponse = response.json().await?;
-        parse_responses_response(resp_body)
-    }
-
-    /// Sends a Codex request with exponential-backoff retry on 429 responses.
-    ///
-    /// On success, returns the streaming `reqwest::Response` so callers can
-    /// either consume the body as text (non-stream path) or iterate its
-    /// `bytes_stream` for incremental delta emission (stream path).
-    /// On non-429 failure, attempts to extract a structured error message from
-    /// the response body before returning.
-    async fn send_codex_with_retry(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response, LlmError> {
-        let max_retries: u32 = 3;
-        let mut retries = 0u32;
-
-        loop {
-            let response = self
-                .http
-                .post(url)
-                .headers(self.build_headers()?)
-                .json(body)
-                .send()
-                .await?;
-
-            let status = response.status();
-            if status.is_success() {
-                return Ok(response);
-            }
-
-            if status.as_u16() == 429 && retries < max_retries {
-                retries += 1;
-                let retry_after = parse_retry_after(response.headers())
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(2u64.pow(retries)));
-                tracing::warn!(
-                    "Codex rate limited, retrying in {retry_after:?} (attempt {retries}/{max_retries})"
-                );
-                tokio::time::sleep(retry_after).await;
-                continue;
-            }
-
-            let retry_after = parse_retry_after(response.headers());
-            let text = response.text().await.unwrap_or_default();
-            return Err(Self::structured_api_error(status, &text, retry_after));
-        }
     }
 
     fn build_headers(&self) -> Result<HeaderMap, LlmError> {
@@ -313,7 +226,19 @@ impl OpenAiProvider {
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
 
-        let response = self.send_codex_with_retry(&url, &body).await?;
+        let response = self
+            .http
+            .post(url)
+            .headers(self.build_headers()?)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return Err(Self::structured_api_error(status, &text, retry_after));
+        }
 
         consume_responses_stream(response.bytes_stream(), on_delta).await
     }
@@ -336,58 +261,6 @@ impl LlmProvider for OpenAiProvider {
         &self.model
     }
 
-    async fn send_message(
-        &self,
-        system: &str,
-        messages: Arc<Vec<Message>>,
-        tools: Option<Arc<Vec<ToolDefinition>>>,
-    ) -> Result<MessagesResponse, LlmError> {
-        if self.is_codex {
-            crate::llm::codex_auth::refresh_if_needed(&self.http).await;
-            return self
-                .send_message_via_responses(system, messages, tools)
-                .await;
-        }
-
-        if should_use_responses_api(&messages) {
-            return self
-                .send_message_via_responses(system, messages, tools)
-                .await;
-        }
-
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let headers = self.build_headers()?;
-
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&build_request_body(
-                &self.model,
-                system,
-                &messages,
-                tools.as_deref().map(|arc| arc.as_slice()),
-                None,
-                self.reasoning_effort.as_deref(),
-                should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
-            ))
-            .send()
-            .await?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = parse_retry_after(response.headers());
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-                retry_after,
-            ));
-        }
-
-        let body: OpenAiResponse = response.json().await?;
-        parse_openai_response(body)
-    }
-
     async fn send_message_streaming(
         &self,
         system: &str,
@@ -408,15 +281,15 @@ impl LlmProvider for OpenAiProvider {
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let headers = self.build_headers()?;
-        let body = build_request_body(
+        let mut body = build_streaming_request_body(
             &self.model,
             system,
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
-            Some(true),
             self.reasoning_effort.as_deref(),
             should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
         );
+        request_stream_usage(&mut body, &self.base_url);
 
         let response = self
             .http
@@ -456,6 +329,21 @@ fn is_deepseek_base_url(base_url: &str) -> bool {
         .is_some_and(|host| host == "deepseek.com" || host.ends_with(".deepseek.com"))
 }
 
+/// Adds `stream_options.include_usage` when the target is official OpenAI.
+///
+/// OpenAI omits usage from streamed responses unless it is requested. Only the
+/// OpenAI-hosted API is known to accept the field, so compatible endpoints are
+/// left untouched: usage stays best-effort for them rather than risking a 400.
+fn request_stream_usage(body: &mut serde_json::Value, base_url: &str) {
+    let is_openai = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.openai.com");
+    if is_openai {
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
+}
+
 fn parse_chat_completion_usage(usage: &serde_json::Value) -> Option<LlmUsage> {
     let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_i64())?;
     let completion_tokens = usage.get("completion_tokens").and_then(|v| v.as_i64())?;
@@ -489,11 +377,21 @@ impl ChatCompletionAccumulator {
         }
     }
 
-    fn process_chunk(&mut self, payload: &str, on_delta: &dyn Fn(String)) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
-            tracing::warn!("skipping malformed SSE data line");
-            return;
-        };
+    fn process_chunk(&mut self, payload: &str, on_delta: &dyn Fn(String)) -> Result<(), LlmError> {
+        let value = serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
+            // The SSE `data:` line of a Chat Completions stream is always JSON.
+            // Skipping a broken chunk would return a response with silently
+            // missing text, so fail the request instead.
+            LlmError::InvalidResponse(format!("malformed chat completions SSE chunk: {error}"))
+        })?;
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+            let error_type = error
+                .get("metadata")
+                .and_then(|metadata| metadata.get("error_type"))
+                .and_then(|error_type| error_type.as_str())
+                .or_else(|| error.get("error_type").and_then(|value| value.as_str()));
+            return Err(stream_api_error(Some(error), error_type));
+        }
         if let Some(delta) = value
             .get("choices")
             .and_then(|choices| choices.get(0))
@@ -524,11 +422,66 @@ impl ChatCompletionAccumulator {
             .and_then(|v| v.as_str())
             && !finish_reason.is_empty()
         {
-            self.has_finish = true;
+            match finish_reason {
+                "stop" | "tool_calls" | "tool_use" | "function_call" | "end_turn"
+                | "stop_sequence" | "eos" => {
+                    self.has_finish = true;
+                }
+                "length" | "max_tokens" => {
+                    // The generation hit the output token limit. Treating the
+                    // partial text (or a truncated tool call) as a successful
+                    // answer would silently lose information, especially when
+                    // compaction adopts a cut-off summary.
+                    return Err(LlmError::IncompleteResponse(format!(
+                        "chat completions output was truncated (finish_reason={finish_reason})"
+                    )));
+                }
+                "content_filter" | "refusal" => {
+                    return Err(LlmError::IncompleteResponse(format!(
+                        "chat completions output was filtered (finish_reason={finish_reason})"
+                    )));
+                }
+                "insufficient_system_resource" => {
+                    // DeepSeek reports a transient inference-capacity shortage
+                    // as a finish reason. Retrying may succeed, but the partial
+                    // text must never be adopted as a complete answer.
+                    return Err(LlmError::ApiError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body_preview: format!("stream finished with finish_reason={finish_reason}"),
+                        retry_after_secs: None,
+                    });
+                }
+                "aborted" => {
+                    // DeepSeek reports an interrupted generation as a finish
+                    // reason. Treat it like a transport interruption instead of
+                    // returning the partial text.
+                    return Err(LlmError::ApiError {
+                        status: StatusCode::BAD_GATEWAY,
+                        body_preview: format!("stream finished with finish_reason={finish_reason}"),
+                        retry_after_secs: None,
+                    });
+                }
+                "error" => {
+                    return Err(LlmError::ApiError {
+                        status: StatusCode::BAD_GATEWAY,
+                        body_preview: "stream finished with finish_reason=error".to_string(),
+                        retry_after_secs: None,
+                    });
+                }
+                other => {
+                    // A finish reason we do not know may mean a new terminal
+                    // state. Accepting it could turn a cut-off generation into
+                    // a successful answer, so fail without retrying blindly.
+                    return Err(LlmError::IncompleteResponse(format!(
+                        "chat completions finished with an unrecognized reason (finish_reason={other})"
+                    )));
+                }
+            }
         }
         if let Some(usage_value) = value.get("usage") {
             self.usage = parse_chat_completion_usage(usage_value);
         }
+        Ok(())
     }
 
     fn ingest_tool_call_delta(&mut self, entry: &serde_json::Value) {
@@ -582,7 +535,7 @@ async fn consume_chat_completion_stream(
     while let Some(result) = data_stream.next().await {
         match result {
             Ok(crate::llm::sse::SseItem::Data(payload)) => {
-                accumulator.process_chunk(&payload, on_delta);
+                accumulator.process_chunk(&payload, on_delta)?;
             }
             Ok(crate::llm::sse::SseItem::Done) => {
                 done = true;
@@ -592,7 +545,7 @@ async fn consume_chat_completion_stream(
         }
     }
     if !done && !accumulator.has_finish {
-        return Err(LlmError::InvalidResponse(
+        return Err(LlmError::IncompleteStream(
             "chat completions stream ended without [DONE] or finish_reason".into(),
         ));
     }
@@ -609,7 +562,7 @@ async fn consume_responses_stream(
     while let Some(result) = data_stream.next().await {
         match result {
             Ok(crate::llm::sse::SseItem::Data(payload)) => {
-                if accumulator.process_event(&payload, on_delta) {
+                if accumulator.process_event(&payload, on_delta)? {
                     completed = true;
                     break;
                 }
@@ -621,7 +574,7 @@ async fn consume_responses_stream(
         }
     }
     if !completed {
-        return Err(LlmError::InvalidResponse(
+        return Err(LlmError::IncompleteStream(
             "responses stream ended without completion event".into(),
         ));
     }
@@ -643,7 +596,10 @@ mod tests {
     use bytes::Bytes;
     use futures_util::stream;
 
-    use super::{OpenAiProvider, consume_chat_completion_stream, consume_responses_stream};
+    use super::{
+        OpenAiProvider, consume_chat_completion_stream, consume_responses_stream,
+        parse_chat_completion_usage, request_stream_usage,
+    };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
         crate::test_util::llm_config("test", model, base_url, api_key)
@@ -706,6 +662,281 @@ mod tests {
             })
         );
         assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn requests_stream_usage_only_from_official_openai() {
+        let mut openai = serde_json::json!({});
+        request_stream_usage(&mut openai, "https://api.openai.com/v1");
+        assert_eq!(openai["stream_options"]["include_usage"], true);
+
+        let mut openrouter = serde_json::json!({});
+        request_stream_usage(&mut openrouter, "https://openrouter.ai/api/v1");
+        assert!(openrouter.get("stream_options").is_none());
+
+        let mut local = serde_json::json!({});
+        request_stream_usage(&mut local, "http://127.0.0.1:8080/v1");
+        assert!(local.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn parse_chat_completion_usage_requires_both_token_counts() {
+        assert_eq!(
+            parse_chat_completion_usage(&serde_json::json!({"prompt_tokens": 10})),
+            None
+        );
+        assert_eq!(
+            parse_chat_completion_usage(&serde_json::json!({"completion_tokens": 5})),
+            None
+        );
+        assert_eq!(
+            parse_chat_completion_usage(&serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+            })),
+            Some(LlmUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cached_input_tokens: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_collects_streamed_response() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"long \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({ "stream": true })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let response = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect("response");
+
+        assert_eq!(response.content, "long answer");
+        assert_eq!(
+            response.usage,
+            Some(LlmUsage {
+                input_tokens: 7,
+                output_tokens: 2,
+                cached_input_tokens: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_when_the_stream_reports_an_error_after_partial_content() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("stream error");
+
+        assert!(error.is_retryable(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("Provider disconnected unexpectedly"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_when_finish_reason_is_error_without_an_error_object() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("stream error");
+
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("finish_reason=error"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fails_when_a_chat_stream_error_reports_a_deterministic_cause() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial answer\"}}]}\n\n",
+            "data: {\"error\":{\"code\":\"server_error\",\"message\":\"bad input\",\"metadata\":{\"error_type\":\"invalid_request\"}},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("stream error");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("400"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn chat_429_uses_one_http_attempt_per_shared_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+        let policy = crate::llm::RetryPolicy::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let failure = crate::llm::complete_response(
+            policy,
+            || provider.send_message("", message("hello"), None),
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("rate limited");
+
+        assert!(failure.error.expect("provider error").is_retryable());
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn responses_429_uses_one_http_attempt_per_shared_retry() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+        let policy = crate::llm::RetryPolicy::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let failure = crate::llm::complete_response(
+            policy,
+            || provider.send_message("", multimodal_message(), None),
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("rate limited");
+
+        assert!(failure.error.expect("provider error").is_retryable());
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn codex_429_is_not_retried_inside_the_provider() {
+        let codex_dir = tempfile::tempdir().expect("tempdir");
+        let _env =
+            crate::test_env::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-codex-token")
+                .also_set("CODEX_HOME", codex_dir.path());
+        crate::llm::codex_auth::clear_auth_cache();
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiProvider::new(&crate::test_util::llm_config(
+            "openai-codex",
+            "gpt-5.3-codex",
+            format!("{}/v1", server.uri()),
+            None,
+        ))
+        .expect("provider");
+        let policy = crate::llm::RetryPolicy::new(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let failure = crate::llm::complete_response(
+            policy,
+            || provider.send_message("", message("hello"), None),
+            |_, _, _| {},
+        )
+        .await
+        .expect_err("rate limited");
+
+        assert!(failure.error.expect("provider error").is_retryable());
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
     }
 
     #[tokio::test]
@@ -978,6 +1209,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consume_chat_completion_stream_accepts_stop_finish_reason() {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let response = consume_chat_completion_stream(stream::iter(chunks), &|_| {})
+            .await
+            .expect("response");
+
+        assert_eq!(response.content, "done");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_fails_on_length_finish_reason() {
+        // Arrange: the model hit the output token limit after partial text.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert: a truncated generation is not a successful response, and
+        // retrying the same request would only hit the same limit.
+        let error = result.expect_err("truncated response");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("length"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_fails_on_content_filter_finish_reason() {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("filtered response");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_retries_deepseek_resource_interruption() {
+        // DeepSeek reports an inference-capacity shortage as a finish reason.
+        // It is transient, but the partial text must not be returned.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("resource interruption");
+        assert!(error.is_retryable(), "{error}");
+        assert!(
+            error.to_string().contains("insufficient_system_resource"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_retries_an_aborted_generation() {
+        // DeepSeek reports an interrupted generation as a finish reason too.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"aborted\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("aborted generation");
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("aborted"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_rejects_an_unknown_finish_reason() {
+        // A new finish reason may describe a terminal state. It must not be
+        // accepted as a completed answer.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"future_reason\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("unknown finish reason");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("future_reason"), "{error}");
+    }
+
+    #[tokio::test]
     async fn consume_chat_completion_stream_errors_on_eof_without_done_or_finish() {
         // Arrange: stream that ends with a content delta but no [DONE] or
         // finish_reason.
@@ -988,13 +1354,39 @@ mod tests {
         // Act
         let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
 
-        // Assert
-        assert!(result.is_err());
+        // Assert: a truncated stream is retryable, unlike a malformed response.
+        let error = result.expect_err("incomplete stream");
+        assert!(error.is_retryable(), "{error}");
+        assert!(matches!(error, crate::error::LlmError::IncompleteStream(_)));
         assert!(
-            result
-                .unwrap_err()
+            error
                 .to_string()
                 .contains("without [DONE] or finish_reason")
+        );
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_fails_on_malformed_chunk() {
+        // Arrange: a broken chunk sits between valid content and [DONE].
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"kept\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: {\"choices\":[\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert: never return the partially assembled text as a response.
+        let error = result.expect_err("malformed chunk");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("malformed chat completions SSE chunk"),
+            "{error}"
         );
     }
 
@@ -1008,13 +1400,37 @@ mod tests {
         // Act
         let result = consume_responses_stream(stream::iter(chunks), &|_| {}).await;
 
-        // Assert
-        assert!(result.is_err());
+        // Assert: a stream that stops before completion is retryable.
+        let error = result.expect_err("incomplete stream");
+        assert!(error.is_retryable(), "{error}");
+        assert!(matches!(error, crate::error::LlmError::IncompleteStream(_)));
+        assert!(error.to_string().contains("without completion event"));
+    }
+
+    #[tokio::test]
+    async fn consume_responses_stream_fails_on_malformed_event() {
+        // Arrange: a broken event sits between a delta and completion.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"kept\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.output_text.delta\",\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":null}}\n\n",
+            )),
+        ];
+
+        // Act
+        let result = consume_responses_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert: the malformed event fails the request instead of being skipped.
+        let error = result.expect_err("malformed event");
+        assert!(!error.is_retryable(), "{error}");
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("without completion event")
+            error.to_string().contains("malformed responses SSE event"),
+            "{error}"
         );
     }
 }

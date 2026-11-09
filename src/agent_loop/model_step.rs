@@ -16,11 +16,11 @@ use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard
 use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
-use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolCall, ToolDefinition};
+use crate::llm::{
+    LlmProvider, LlmUsage, MAX_ATTEMPTS, Message, MessagesResponse, RetryDecision, RetryPolicy,
+    RetryStop, ToolCall, ToolDefinition, decide,
+};
 use crate::storage::call_blocking;
-
-/// Maximum number of attempts for a single LLM model iteration.
-pub(crate) const MAX_LLM_RETRIES: usize = 3;
 
 /// Wall-clock ceiling for one model iteration across every transport attempt.
 ///
@@ -29,9 +29,6 @@ pub(crate) const MAX_LLM_RETRIES: usize = 3;
 /// Turn can sit without producing anything, regardless of how the provider
 /// fails.
 const MODEL_ITERATION_DEADLINE: Duration = Duration::from_secs(300);
-
-/// Base backoff (milliseconds) for exponential LLM retry.
-const LLM_RETRY_BASE_BACKOFF_MS: u64 = 500;
 
 pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
@@ -146,7 +143,7 @@ impl<'a> ModelRunner<'a> {
             .await
     }
 
-    /// Shared retry loop: retries retryable LLM errors up to [`MAX_LLM_RETRIES`]
+    /// Shared retry loop: retries retryable LLM errors up to [`MAX_ATTEMPTS`]
     /// attempts unless output was already published. `before_retry` runs before
     /// each backoff so callers can record the attempt.
     ///
@@ -170,7 +167,7 @@ impl<'a> ModelRunner<'a> {
         let mut retry_messages = Arc::clone(&self.request.messages);
         let started = Instant::now();
         let deadline = started + MODEL_ITERATION_DEADLINE;
-        for attempt in 1..=MAX_LLM_RETRIES {
+        for attempt in 1..=MAX_ATTEMPTS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let published_flag = Arc::clone(&output_published);
             let caller_on_delta = self.request.on_delta;
@@ -195,7 +192,7 @@ impl<'a> ModelRunner<'a> {
                 Err(_elapsed) => {
                     warn!(
                         attempt,
-                        max = MAX_LLM_RETRIES,
+                        max = MAX_ATTEMPTS,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "llm iteration deadline exhausted"
                     );
@@ -211,18 +208,18 @@ impl<'a> ModelRunner<'a> {
                     let (error, next_retry_messages) = step_error.into_parts();
                     retry_messages = next_retry_messages;
                     let published = output_published.load(Ordering::SeqCst);
-                    let retryable =
-                        matches!(&error, EgoPulseError::Llm(error) if error.is_retryable());
-                    let backoff = llm_retry_backoff(attempt, &error);
-                    let within_backoff_limit = max_backoff.is_none_or(|limit| backoff <= limit);
-                    let before_deadline =
-                        backoff < deadline.saturating_duration_since(Instant::now());
-                    if retryable
-                        && !published
-                        && within_backoff_limit
-                        && before_deadline
-                        && attempt < MAX_LLM_RETRIES
-                    {
+                    let policy = RetryPolicy {
+                        deadline,
+                        max_attempts: MAX_ATTEMPTS,
+                        output_published: published,
+                        max_backoff,
+                        max_retry_after: None,
+                    };
+                    let decision = match &error {
+                        EgoPulseError::Llm(error) => decide(error, attempt, &policy),
+                        _ => RetryDecision::Stop(RetryStop::NotRetryable),
+                    };
+                    if let RetryDecision::Retry(backoff) = decision {
                         // The deadline covers the wait too: recording the
                         // attempt and sleeping are work the provider never
                         // sees, so leaving them outside the bound would let a
@@ -235,7 +232,7 @@ impl<'a> ModelRunner<'a> {
                         if waited.is_err() {
                             warn!(
                                 attempt,
-                                max = MAX_LLM_RETRIES,
+                                max = MAX_ATTEMPTS,
                                 backoff_ms = backoff.as_millis() as u64,
                                 elapsed_ms = started.elapsed().as_millis() as u64,
                                 error = %error,
@@ -248,7 +245,7 @@ impl<'a> ModelRunner<'a> {
                         }
                         warn!(
                             attempt,
-                            max = MAX_LLM_RETRIES,
+                            max = MAX_ATTEMPTS,
                             backoff_ms = backoff.as_millis() as u64,
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             error = %error,
@@ -523,24 +520,6 @@ fn model_request_hash(
     format!("{:x}", hasher.finalize())
 }
 
-/// Calculates the delay before the next LLM transport retry.
-///
-/// A server-supplied `Retry-After` is honored verbatim. Otherwise the delay is
-/// exponentially backed off and randomized: several conversations can hit the
-/// same rate limit at once, and a fixed delay would retry them in lockstep.
-fn llm_retry_backoff(attempt: usize, error: &EgoPulseError) -> Duration {
-    if let EgoPulseError::Llm(LlmError::ApiError {
-        retry_after_secs: Some(secs),
-        ..
-    }) = error
-    {
-        return Duration::from_secs(*secs);
-    }
-    let ceiling_ms =
-        LLM_RETRY_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow((attempt - 1) as u32));
-    Duration::from_millis(rand::random_range(0..=ceiling_ms))
-}
-
 fn build_assistant_tool_phase(
     content: String,
     reasoning_content: Option<String>,
@@ -703,36 +682,13 @@ mod tests {
         assert_eq!(phase.assistant_preview, "Reading notes [tool_call] read");
     }
 
-    #[test]
-    fn llm_retry_backoff_preserves_server_delay() {
-        // Arrange
-        let long_delay = EgoPulseError::Llm(crate::error::LlmError::ApiError {
-            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-            body_preview: "rate limited".to_string(),
-            retry_after_secs: Some(3_600),
-        });
-        let short_delay = EgoPulseError::Llm(crate::error::LlmError::ApiError {
-            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-            body_preview: "rate limited".to_string(),
-            retry_after_secs: Some(7),
-        });
-
-        // Act
-        let long_delay = llm_retry_backoff(1, &long_delay);
-        let preserved = llm_retry_backoff(1, &short_delay);
-
-        // Assert
-        assert_eq!(long_delay, Duration::from_secs(3_600));
-        assert_eq!(preserved, Duration::from_secs(7));
-    }
-
     #[tokio::test]
     #[serial]
     async fn transient_model_retry_stops_at_shared_attempt_limit() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            (0..MAX_LLM_RETRIES)
+            (0..MAX_ATTEMPTS)
                 .map(|_| {
                     Err(crate::error::LlmError::ApiError {
                         status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
@@ -741,7 +697,7 @@ mod tests {
                     })
                 })
                 .collect(),
-            vec![0; MAX_LLM_RETRIES],
+            vec![0; MAX_ATTEMPTS],
         )
         .with_streaming_delta("unpublished partial output");
         let observer = provider.clone();
@@ -756,7 +712,7 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
-        assert_eq!(observer.seen_messages().len(), MAX_LLM_RETRIES);
+        assert_eq!(observer.seen_messages().len(), MAX_ATTEMPTS);
     }
 
     /// Builds a state whose provider answers from `provider`, plus the LLM the
@@ -802,34 +758,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn llm_retry_backoff_stays_within_the_exponential_ceiling() {
-        // Arrange
-        let error = EgoPulseError::Llm(crate::error::LlmError::ApiError {
-            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            body_preview: "provider error".to_string(),
-            retry_after_secs: None,
-        });
-
-        // Act
-        let attempt_two: Vec<Duration> = (0..200).map(|_| llm_retry_backoff(2, &error)).collect();
-
-        // Assert: bounded by the exponential ceiling, and actually randomized so
-        // conversations that hit the same limit do not retry in lockstep.
-        assert!(
-            attempt_two
-                .iter()
-                .all(|delay| *delay <= Duration::from_millis(1_000)),
-            "delay must not exceed the exponential ceiling"
-        );
-        let distinct: std::collections::HashSet<Duration> = attempt_two.iter().copied().collect();
-        assert!(
-            distinct.len() > 1,
-            "delay must vary between retries, got {distinct:?}"
-        );
-        assert!(llm_retry_backoff(4, &error) <= Duration::from_millis(4_000));
-    }
-
     #[tokio::test]
     #[serial]
     async fn iteration_deadline_cuts_a_hanging_attempt() {
@@ -837,7 +765,7 @@ mod tests {
         tokio::time::pause();
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            (0..MAX_LLM_RETRIES)
+            (0..MAX_ATTEMPTS)
                 .map(|_| {
                     Ok(MessagesResponse {
                         content: "never returned".to_string(),
@@ -847,7 +775,7 @@ mod tests {
                     })
                 })
                 .collect(),
-            vec![MODEL_ITERATION_DEADLINE.as_millis() as u64 * 2; MAX_LLM_RETRIES],
+            vec![MODEL_ITERATION_DEADLINE.as_millis() as u64 * 2; MAX_ATTEMPTS],
         );
         let observer = provider.clone();
         let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-hang");
@@ -888,7 +816,7 @@ mod tests {
         tokio::time::pause();
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            (0..MAX_LLM_RETRIES)
+            (0..MAX_ATTEMPTS)
                 .map(|_| {
                     Err(crate::error::LlmError::ApiError {
                         status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -897,7 +825,7 @@ mod tests {
                     })
                 })
                 .collect(),
-            vec![0; MAX_LLM_RETRIES],
+            vec![0; MAX_ATTEMPTS],
         );
         let observer = provider.clone();
         let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-wait");
@@ -940,7 +868,7 @@ mod tests {
         tokio::time::pause();
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            (0..MAX_LLM_RETRIES)
+            (0..MAX_ATTEMPTS)
                 .map(|_| {
                     Err(crate::error::LlmError::ApiError {
                         status: reqwest::StatusCode::TOO_MANY_REQUESTS,
@@ -949,7 +877,7 @@ mod tests {
                     })
                 })
                 .collect(),
-            vec![200_000; MAX_LLM_RETRIES],
+            vec![200_000; MAX_ATTEMPTS],
         );
         let observer = provider.clone();
         let (state, llm) = state_with_provider(&dir, provider, "iteration-deadline-backoff");
