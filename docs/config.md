@@ -413,7 +413,7 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 | `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 初回を含む最大試行回数（1 以上） |
 | `sleep_batch.retry.interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
 
-`retry` は実行全体がエラーで終わったときの再実行設定である。LLM リクエスト単位の一時的な失敗（無応答、429、5xx、ストリーム途中のエラー）は共有の再試行方針で扱う。`Retry-After` を優先し、なければ指数バックオフを使い、初回を含めて最大 3 回試行する。`Retry-After` が 120 秒を超える場合は再試行せず、そのリクエストを失敗として扱う。再試行と待機を含む Sleep の 1 リクエストの総時間は 20 分で打ち切る。Turn / Pulse / Compaction / 単発 ask も同じ方針を使い、期限は呼び出し元が決める。
+`retry` は実行全体がエラーで終わったときの再実行設定である。LLM リクエスト単位の一時的な失敗（無応答、429、5xx、完了イベントなしのストリーム終了）は共有の再試行方針で扱う。`Retry-After` を優先し、なければ指数バックオフを使い、初回を含めて最大 3 回試行する。`Retry-After` が 120 秒を超える場合は再試行せず、そのリクエストを失敗として扱う。出力上限や content filter による確定的な打ち切り（`finish_reason` の `length` / `content_filter`、`response.incomplete` / `failed`）も再試行しない。再試行と待機を含む Sleep の 1 リクエストの総時間は 20 分で打ち切る。Turn / Pulse / Compaction / 単発 ask も同じ方針を使い、期限は呼び出し元が決める。
 
 ### 3.8 Pulse 設定（`pulse`）
 

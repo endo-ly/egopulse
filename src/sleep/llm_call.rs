@@ -128,6 +128,7 @@ mod tests {
         Deterministic,
         RateLimited { retry_after_secs: Option<u64> },
         IncompleteStream,
+        IncompleteResponse,
         Slow { duration: Duration },
     }
 
@@ -188,6 +189,9 @@ mod tests {
                 }),
                 Failure::IncompleteStream => {
                     Err(LlmError::IncompleteStream("ended early".to_string()))
+                }
+                Failure::IncompleteResponse => {
+                    Err(LlmError::IncompleteResponse("output truncated".to_string()))
                 }
                 Failure::Slow { duration } => {
                     tokio::time::sleep(duration).await;
@@ -383,6 +387,27 @@ mod tests {
         // Assert: treat the truncation as transient, not as a final response.
         assert!(result.is_err());
         assert_eq!(provider.attempts(), MAX_ATTEMPTS);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn does_not_retry_a_terminally_incomplete_response() {
+        // Arrange: the provider completed the response but hit the output
+        // limit or a content filter.
+        let provider = provider(Failure::IncompleteResponse);
+
+        // Act
+        let result = send(
+            &(provider.clone() as Arc<dyn LlmProvider>),
+            "test-agent",
+            "",
+            request(),
+            "test",
+        )
+        .await;
+
+        // Assert: retrying the same request would hit the same terminal limit.
+        assert!(result.is_err());
+        assert_eq!(provider.attempts(), 1);
     }
 
     #[tokio::test(start_paused = true)]

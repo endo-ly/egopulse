@@ -1513,6 +1513,54 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn compaction_keeps_original_messages_when_the_summary_was_truncated() {
+        // Arrange: the summarizer reports a terminal output-limit truncation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(LlmError::IncompleteResponse(
+                    "summary output was truncated".to_string(),
+                )),
+                Ok(MessagesResponse {
+                    content: "final answer".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+            ],
+            vec![0, 0],
+        );
+        let config = test_config_with_compaction(dir.path().to_str().expect("utf8").to_string(), 2);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("compaction-truncated-summary");
+        let chat_id = seed_session_with_old_turns(&state, "compaction-truncated-summary").await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("process turn");
+
+        // Assert: a cut-off summary is never adopted as compaction output.
+        assert_eq!(reply, "final answer");
+        assert_eq!(provider.seen_systems().len(), 2);
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("loaded session");
+        assert!(loaded.messages.iter().all(|message| {
+            !message
+                .content
+                .as_text_lossy()
+                .contains(REFERENCE_ONLY_HEADER)
+        }));
+        assert_eq!(loaded.messages[0].content.as_text_lossy(), "old-user-1");
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn force_compact_runs_regardless_of_threshold() {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(

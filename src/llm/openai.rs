@@ -421,14 +421,39 @@ impl ChatCompletionAccumulator {
             .and_then(|v| v.as_str())
             && !finish_reason.is_empty()
         {
-            if finish_reason == "error" {
-                return Err(LlmError::ApiError {
-                    status: StatusCode::BAD_GATEWAY,
-                    body_preview: "stream finished with finish_reason=error".to_string(),
-                    retry_after_secs: None,
-                });
+            match finish_reason {
+                "stop" | "tool_calls" | "function_call" | "end_turn" | "eos" => {
+                    self.has_finish = true;
+                }
+                "length" | "max_tokens" => {
+                    // The generation hit the output token limit. Treating the
+                    // partial text (or a truncated tool call) as a successful
+                    // answer would silently lose information, especially when
+                    // compaction adopts a cut-off summary.
+                    return Err(LlmError::IncompleteResponse(format!(
+                        "chat completions output was truncated (finish_reason={finish_reason})"
+                    )));
+                }
+                "content_filter" | "refusal" => {
+                    return Err(LlmError::IncompleteResponse(format!(
+                        "chat completions output was filtered (finish_reason={finish_reason})"
+                    )));
+                }
+                "error" => {
+                    return Err(LlmError::ApiError {
+                        status: StatusCode::BAD_GATEWAY,
+                        body_preview: "stream finished with finish_reason=error".to_string(),
+                        retry_after_secs: None,
+                    });
+                }
+                other => {
+                    tracing::warn!(
+                        finish_reason = other,
+                        "unknown chat completions finish_reason; accepting response"
+                    );
+                    self.has_finish = true;
+                }
             }
-            self.has_finish = true;
         }
         if let Some(usage_value) = value.get("usage") {
             self.usage = parse_chat_completion_usage(usage_value);
@@ -1158,6 +1183,71 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_accepts_stop_finish_reason() {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let response = consume_chat_completion_stream(stream::iter(chunks), &|_| {})
+            .await
+            .expect("response");
+
+        assert_eq!(response.content, "done");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_fails_on_length_finish_reason() {
+        // Arrange: the model hit the output token limit after partial text.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        // Assert: a truncated generation is not a successful response, and
+        // retrying the same request would only hit the same limit.
+        let error = result.expect_err("truncated response");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("length"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_fails_on_content_filter_finish_reason() {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("filtered response");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("content_filter"), "{error}");
     }
 
     #[tokio::test]

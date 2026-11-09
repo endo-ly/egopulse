@@ -36,6 +36,7 @@ pub(super) fn assemble_response(
 pub(crate) fn parse_responses_response(
     body: ResponsesApiResponse,
 ) -> Result<MessagesResponse, LlmError> {
+    ensure_response_completed(&body)?;
     let diagnostics = body.diagnostics();
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -125,6 +126,37 @@ impl ResponsesApiResponse {
             "status={status}, output_items={output_items}, input_tokens={input_tokens}, output_tokens={output_tokens}, reasoning_tokens={reasoning_tokens}, incomplete_reason={incomplete_reason}"
         )
     }
+}
+
+/// Rejects terminal responses that did not complete successfully.
+///
+/// `response.done` is used by some providers instead of `response.completed`,
+/// and its `status` is authoritative: a failed response can still carry output
+/// items (including tool calls), so the status must be checked before the body
+/// is treated as a usable answer. A missing status keeps the previous
+/// behaviour for providers that omit it.
+fn ensure_response_completed(response: &ResponsesApiResponse) -> Result<(), LlmError> {
+    match response.status.as_deref() {
+        None | Some("completed") => Ok(()),
+        Some("incomplete") => Err(incomplete_response_error(response)),
+        Some("failed") => Err(stream_api_error(
+            response.error.as_ref(),
+            response.error_type.as_deref(),
+        )),
+        Some(status) => Err(LlmError::InvalidResponse(format!(
+            "unexpected responses terminal status: {status} ({})",
+            response.diagnostics()
+        ))),
+    }
+}
+
+/// Builds the non-retryable error for a generation cut off at a terminal
+/// boundary (output limit, content filter, or another incomplete reason).
+fn incomplete_response_error(response: &ResponsesApiResponse) -> LlmError {
+    LlmError::IncompleteResponse(format!(
+        "responses generation was incomplete ({})",
+        response.diagnostics()
+    ))
 }
 
 fn extract_response_content_part(part: ResponsesOutputPart) -> Option<String> {
@@ -224,6 +256,15 @@ impl ResponsesAccumulator {
                     .or_else(|| value.get("error_type").and_then(|value| value.as_str()));
                 return Err(stream_api_error(Some(error), error_type));
             }
+            Some("response.incomplete") => {
+                let response = value.get("response").and_then(|response| {
+                    serde_json::from_value::<ResponsesApiResponse>(response.clone()).ok()
+                });
+                return Err(response.map_or_else(
+                    || LlmError::IncompleteResponse("response.incomplete".to_string()),
+                    |response| incomplete_response_error(&response),
+                ));
+            }
             _ => {}
         }
 
@@ -259,11 +300,14 @@ impl ResponsesAccumulator {
             event_type.as_deref(),
             Some("response.completed" | "response.done")
         );
-        if is_terminal
-            && let Some(response_value) = value.get_mut("response")
-            && let Ok(parsed) =
-                serde_json::from_value::<ResponsesApiResponse>(response_value.take())
-        {
+        if is_terminal && let Some(response_value) = value.get_mut("response") {
+            let parsed = serde_json::from_value::<ResponsesApiResponse>(response_value.take())
+                .map_err(|error| {
+                    LlmError::InvalidResponse(format!(
+                        "malformed responses terminal event: {error}"
+                    ))
+                })?;
+            ensure_response_completed(&parsed)?;
             self.completed_response = Some(parsed);
             return Ok(true);
         }
@@ -607,6 +651,10 @@ pub(crate) struct ResponsesApiResponse {
     pub(crate) usage: Option<ResponsesApiUsage>,
     #[serde(default)]
     pub(crate) incomplete_details: Option<ResponsesIncompleteDetails>,
+    #[serde(default)]
+    pub(crate) error: Option<serde_json::Value>,
+    #[serde(default)]
+    pub(crate) error_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -889,6 +937,93 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"s
 
         assert!(error.is_retryable(), "{error}");
         assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[test]
+    fn fails_on_incomplete_response_event() {
+        // `response.incomplete` is a terminal event: the generation hit the
+        // output limit or was filtered, so retrying the same request will not
+        // complete it.
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}
+"#;
+
+        let error = accumulate(payload).expect_err("incomplete response");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("max_output_tokens"), "{error}");
+    }
+
+    #[test]
+    fn fails_on_done_event_with_incomplete_status() {
+        // Some compatible providers end with `response.done` instead of
+        // `response.incomplete`; the response status is authoritative.
+        let payload = r#"
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"partial"}
+
+event: response.done
+data: {"type":"response.done","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}}
+"#;
+
+        let error = accumulate(payload).expect_err("incomplete status");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[test]
+    fn failed_done_response_is_never_returned_as_tool_calls() {
+        // A failed terminal response can still contain output items. It must
+        // not reach the tool executor as a valid tool-call request.
+        let payload = r#"
+event: response.done
+data: {"type":"response.done","response":{"status":"failed","error":{"code":"server_error","message":"Invalid credentials"},"error_type":"authentication","output":[{"type":"function_call","call_id":"call_1","name":"delete_everything","arguments":"{}"}]}}
+"#;
+
+        let error = accumulate(payload).expect_err("failed status");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("Invalid credentials"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_an_incomplete_response() {
+        // The parser itself must not turn a terminal-but-incomplete body into
+        // a successful response.
+        let body: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}]
+        }))
+        .expect("body");
+
+        let error = parse_responses_response(body).expect_err("incomplete response");
+
+        assert!(!error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("max_output_tokens"), "{error}");
+    }
+
+    #[test]
+    fn parse_rejects_a_failed_response_with_tool_calls() {
+        let body: ResponsesApiResponse = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "error": {"code": "server_error", "message": "upstream failed"},
+            "output": [{"type":"function_call","call_id":"call_1","name":"delete_everything","arguments":"{}"}]
+        }))
+        .expect("body");
+
+        let error = parse_responses_response(body).expect_err("failed response");
+
+        assert!(error.to_string().contains("upstream failed"), "{error}");
     }
 
     #[test]
