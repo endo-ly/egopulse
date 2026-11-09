@@ -121,6 +121,9 @@ impl EgoPulseError {
             Self::Llm(LlmError::RequestFailed(_)) => {
                 "LLM API connection failed. Please try again later.".to_string()
             }
+            Self::Llm(LlmError::IncompleteStream(_)) => {
+                "LLM API stream ended before completion. Please try again later.".to_string()
+            }
             Self::Llm(LlmError::InvalidResponse(_)) => {
                 "LLM returned an invalid response.".to_string()
             }
@@ -331,6 +334,8 @@ pub enum LlmError {
     InitFailed(String),
     #[error("llm_request_failed: {0}")]
     RequestFailed(#[from] reqwest::Error),
+    #[error("llm_incomplete_stream: {0}")]
+    IncompleteStream(String),
     #[error("llm_api_error: status={status} body_preview={body_preview}")]
     ApiError {
         status: reqwest::StatusCode,
@@ -359,7 +364,8 @@ impl LlmError {
 
     /// Returns `true` when the error represents a transient failure that is
     /// safe to retry when nothing was published yet: a network/timeout failure
-    /// (before or during the response body), or a 429 / 5xx response.
+    /// (before or during the response body), a 429 / 5xx response, or a stream
+    /// that ended before its completion event.
     ///
     /// Non-retryable variants (`InvalidResponse`, `InitFailed`,
     /// `RequestConstructionFailed`, `DeadlineExceeded`, and 4xx other than 429)
@@ -368,7 +374,7 @@ impl LlmError {
     /// iteration's time window is gone.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
-            Self::RequestFailed(_) => true,
+            Self::RequestFailed(_) | Self::IncompleteStream(_) => true,
             Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
             Self::InitFailed(_)
             | Self::InvalidResponse(_)
@@ -385,6 +391,7 @@ impl LlmError {
             } => *retry_after_secs,
             Self::InitFailed(_)
             | Self::RequestFailed(_)
+            | Self::IncompleteStream(_)
             | Self::InvalidResponse(_)
             | Self::DeadlineExceeded
             | Self::RequestConstructionFailed(_) => None,

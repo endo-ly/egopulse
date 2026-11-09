@@ -127,6 +127,7 @@ mod tests {
         Transient { times: usize },
         Deterministic,
         RateLimited { retry_after_secs: Option<u64> },
+        IncompleteStream,
         Slow { duration: Duration },
     }
 
@@ -185,6 +186,9 @@ mod tests {
                     body_preview: String::new(),
                     retry_after_secs,
                 }),
+                Failure::IncompleteStream => {
+                    Err(LlmError::IncompleteStream("ended early".to_string()))
+                }
                 Failure::Slow { duration } => {
                     tokio::time::sleep(duration).await;
                     Err(LlmError::ApiError {
@@ -359,6 +363,26 @@ mod tests {
         // Assert
         assert!(result.is_err());
         assert_eq!(provider.attempts(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_an_incomplete_stream() {
+        // Arrange: the provider closes the stream before its completion event.
+        let provider = provider(Failure::IncompleteStream);
+
+        // Act
+        let result = send(
+            &(provider.clone() as Arc<dyn LlmProvider>),
+            "test-agent",
+            "",
+            request(),
+            "test",
+        )
+        .await;
+
+        // Assert: treat the truncation as transient, not as a final response.
+        assert!(result.is_err());
+        assert_eq!(provider.attempts(), MAX_ATTEMPTS);
     }
 
     #[tokio::test(start_paused = true)]

@@ -495,7 +495,7 @@ async fn consume_chat_completion_stream(
         }
     }
     if !done && !accumulator.has_finish {
-        return Err(LlmError::InvalidResponse(
+        return Err(LlmError::IncompleteStream(
             "chat completions stream ended without [DONE] or finish_reason".into(),
         ));
     }
@@ -524,7 +524,7 @@ async fn consume_responses_stream(
         }
     }
     if !completed {
-        return Err(LlmError::InvalidResponse(
+        return Err(LlmError::IncompleteStream(
             "responses stream ended without completion event".into(),
         ));
     }
@@ -1169,11 +1169,12 @@ mod tests {
         // Act
         let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
 
-        // Assert
-        assert!(result.is_err());
+        // Assert: a truncated stream is retryable, unlike a malformed response.
+        let error = result.expect_err("incomplete stream");
+        assert!(error.is_retryable(), "{error}");
+        assert!(matches!(error, crate::error::LlmError::IncompleteStream(_)));
         assert!(
-            result
-                .unwrap_err()
+            error
                 .to_string()
                 .contains("without [DONE] or finish_reason")
         );
@@ -1189,13 +1190,10 @@ mod tests {
         // Act
         let result = consume_responses_stream(stream::iter(chunks), &|_| {}).await;
 
-        // Assert
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("without completion event")
-        );
+        // Assert: a stream that stops before completion is retryable.
+        let error = result.expect_err("incomplete stream");
+        assert!(error.is_retryable(), "{error}");
+        assert!(matches!(error, crate::error::LlmError::IncompleteStream(_)));
+        assert!(error.to_string().contains("without completion event"));
     }
 }

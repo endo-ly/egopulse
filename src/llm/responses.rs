@@ -276,12 +276,13 @@ impl ResponsesAccumulator {
     ///
     /// # Errors
     ///
-    /// Returns [`LlmError::InvalidResponse`] when no completion event
+    /// Returns [`LlmError::IncompleteStream`] when no completion event
     /// (`response.completed` / `response.done`) was received; partial streamed
-    /// data is rejected rather than synthesized into a success.
+    /// data is rejected rather than synthesized into a success. The caller may
+    /// retry because the generation was cut off, not because it was invalid.
     pub(super) fn into_api_response(self) -> Result<ResponsesApiResponse, LlmError> {
         let Some(mut response) = self.completed_response else {
-            return Err(LlmError::InvalidResponse(
+            return Err(LlmError::IncompleteStream(
                 "Responses API stream ended without a completion event".to_string(),
             ));
         };
