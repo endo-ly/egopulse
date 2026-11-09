@@ -30,7 +30,7 @@ htmd = "0.5"
 libc = "0.2"
 include_dir = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "multipart"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 pulldown-cmark = "0.13"
 syntect = {
@@ -57,11 +57,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
 r2d2 = "0.8"
-process-wrap = { version = "9", features = ["tokio1"] }
+process-wrap = { version = "10", features = ["tokio1"] }
 rand = "0.10"
 readability-js = "0.1.5"
 regex = "1"
-rmcp = { version = "1.7", features = [
+rmcp = { version = "3.9", features = [
     "client",
     "reqwest",
     "transport-child-process",

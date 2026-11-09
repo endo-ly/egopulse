@@ -78,8 +78,6 @@ ignore = [
     "RUSTSEC-2026-0346",
     "RUSTSEC-2026-0349",
     "RUSTSEC-2026-0382",
-    # time 0.3.45 transitively pulled by serenity & ratatui
-    "RUSTSEC-2026-0009",
     # teloxide 0.17 -> aquamarine 0.6 -> proc-macro-error2 2.0.1;
     # upstream currently has no maintained upgrade path
     "RUSTSEC-2026-0173",

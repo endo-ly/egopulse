@@ -17,8 +17,8 @@ use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientInfo, Implementation,
-    RawContent, ResourceContents, Tool,
+    CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, ContentBlock,
+    Implementation, ResourceContents, Tool,
 };
 use rmcp::service::{DynService, RoleClient, RunningService, ServiceExt};
 use rmcp::transport::{
@@ -837,11 +837,7 @@ fn truncate_to_max_bytes(output: String) -> String {
 }
 
 fn format_mcp_tool_result(result: CallToolResult) -> String {
-    let mut parts: Vec<String> = result
-        .content
-        .into_iter()
-        .map(|content| format_mcp_content(content.raw))
-        .collect();
+    let mut parts: Vec<String> = result.content.into_iter().map(format_mcp_content).collect();
 
     if let Some(structured) = result.structured_content {
         parts.push(format!(
@@ -862,13 +858,13 @@ fn format_mcp_tool_result(result: CallToolResult) -> String {
     }
 }
 
-fn format_mcp_content(raw: RawContent) -> String {
-    match raw {
-        RawContent::Text(text) => text.text,
-        RawContent::Image(image) => {
+fn format_mcp_content(content: ContentBlock) -> String {
+    match content {
+        ContentBlock::Text(text) => text.text,
+        ContentBlock::Image(image) => {
             format!("[image: {} ({} bytes)]", image.mime_type, image.data.len())
         }
-        RawContent::Resource(resource) => {
+        ContentBlock::Resource(resource) => {
             let description = match resource.resource {
                 ResourceContents::TextResourceContents { uri, mime_type, .. } => {
                     format!(
@@ -882,15 +878,17 @@ fn format_mcp_content(raw: RawContent) -> String {
                         mime_type.as_deref().unwrap_or("unknown")
                     )
                 }
+                _ => "resource (unsupported contents)".to_string(),
             };
             format!("[{description}]")
         }
-        RawContent::Audio(audio) => {
+        ContentBlock::Audio(audio) => {
             format!("[audio: {} ({} bytes)]", audio.mime_type, audio.data.len())
         }
-        RawContent::ResourceLink(link) => {
+        ContentBlock::ResourceLink(link) => {
             format!("[resource_link: {} ({})]", link.uri, link.name)
         }
+        _ => "[unsupported content]".to_string(),
     }
 }
 
@@ -1115,7 +1113,7 @@ async fn connect_stdio(
         detail: error.to_string(),
     })?;
 
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
     );
@@ -1190,7 +1188,7 @@ async fn connect_http(
     }
 
     let transport = StreamableHttpClientTransport::from_config(transport_config);
-    let client_info = ClientInfo::new(
+    let client_info = ClientConfig::new(
         ClientCapabilities::default(),
         Implementation::new("egopulse", env!("CARGO_PKG_VERSION")),
     );
