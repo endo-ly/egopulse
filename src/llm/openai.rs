@@ -9,10 +9,11 @@ use std::time::Duration;
 
 /// Total time one HTTP request may take, from connect to the last body byte.
 ///
-/// The turn path bounds each attempt with its own 300s iteration deadline, so
-/// this cap only matters for callers without one (sleep, compaction, one-shot
-/// ask). A full memory rewrite in sleep can legitimately exceed the turn
-/// budget, so the transport cap is wider than the iteration deadline.
+/// Turn and Pulse bound each attempt with their 300s iteration deadline, and
+/// Compaction (180s by default) and one-shot ask (300s) pass tighter budgets.
+/// Sleep's 20 minute budget is the only one wider than this cap, so a single
+/// Sleep attempt is bounded here; a full memory rewrite can legitimately
+/// exceed the turn budget.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Inactivity deadline between reads of one request.

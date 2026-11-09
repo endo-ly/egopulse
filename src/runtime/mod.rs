@@ -692,6 +692,13 @@ fn build_app_state_dependencies(
 // Public entry points and channel lifecycle
 // ---------------------------------------------------------------------------
 
+/// Total time a one-shot `ask` may take, including retries and waits.
+///
+/// This preserves the command's pre-existing response cap; retries share it
+/// instead of extending the worst case. The transport allows a longer request
+/// for Sleep, so the policy deadline is what bounds ask.
+const ASK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Sends a single prompt to the configured LLM without session state.
 pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> {
     let llm = create_provider(
@@ -699,11 +706,9 @@ pub async fn ask(config: Config, prompt: &str) -> Result<String, EgoPulseError> 
         &crate::llm::HeaderContext::process_global(),
     )?;
     let messages = Arc::new(vec![Message::text("user", prompt)]);
-    // One-shot ask has no Turn deadline: bound the whole request (attempts and
-    // waits included) by the transport's request cap so retries restore
+    // Bound the whole request (attempts and waits included) so retries restore
     // transient failures without extending the command's worst case.
-    let policy =
-        crate::llm::RetryPolicy::new(tokio::time::Instant::now() + crate::llm::REQUEST_TIMEOUT);
+    let policy = crate::llm::RetryPolicy::new(tokio::time::Instant::now() + ASK_REQUEST_TIMEOUT);
 
     tokio::select! {
         response = crate::llm::complete_response(
