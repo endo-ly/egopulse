@@ -423,7 +423,8 @@ impl ChatCompletionAccumulator {
             && !finish_reason.is_empty()
         {
             match finish_reason {
-                "stop" | "tool_calls" | "function_call" | "end_turn" | "eos" => {
+                "stop" | "tool_calls" | "tool_use" | "function_call" | "end_turn"
+                | "stop_sequence" | "eos" => {
                     self.has_finish = true;
                 }
                 "length" | "max_tokens" => {
@@ -440,6 +441,26 @@ impl ChatCompletionAccumulator {
                         "chat completions output was filtered (finish_reason={finish_reason})"
                     )));
                 }
+                "insufficient_system_resource" => {
+                    // DeepSeek reports a transient inference-capacity shortage
+                    // as a finish reason. Retrying may succeed, but the partial
+                    // text must never be adopted as a complete answer.
+                    return Err(LlmError::ApiError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        body_preview: format!("stream finished with finish_reason={finish_reason}"),
+                        retry_after_secs: None,
+                    });
+                }
+                "aborted" => {
+                    // DeepSeek reports an interrupted generation as a finish
+                    // reason. Treat it like a transport interruption instead of
+                    // returning the partial text.
+                    return Err(LlmError::ApiError {
+                        status: StatusCode::BAD_GATEWAY,
+                        body_preview: format!("stream finished with finish_reason={finish_reason}"),
+                        retry_after_secs: None,
+                    });
+                }
                 "error" => {
                     return Err(LlmError::ApiError {
                         status: StatusCode::BAD_GATEWAY,
@@ -448,11 +469,12 @@ impl ChatCompletionAccumulator {
                     });
                 }
                 other => {
-                    tracing::warn!(
-                        finish_reason = other,
-                        "unknown chat completions finish_reason; accepting response"
-                    );
-                    self.has_finish = true;
+                    // A finish reason we do not know may mean a new terminal
+                    // state. Accepting it could turn a cut-off generation into
+                    // a successful answer, so fail without retrying blindly.
+                    return Err(LlmError::IncompleteResponse(format!(
+                        "chat completions finished with an unrecognized reason (finish_reason={other})"
+                    )));
                 }
             }
         }
@@ -1249,6 +1271,76 @@ mod tests {
         let error = result.expect_err("filtered response");
         assert!(!error.is_retryable(), "{error}");
         assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_retries_deepseek_resource_interruption() {
+        // DeepSeek reports an inference-capacity shortage as a finish reason.
+        // It is transient, but the partial text must not be returned.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"insufficient_system_resource\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("resource interruption");
+        assert!(error.is_retryable(), "{error}");
+        assert!(
+            error.to_string().contains("insufficient_system_resource"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("503"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_retries_an_aborted_generation() {
+        // DeepSeek reports an interrupted generation as a finish reason too.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"aborted\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("aborted generation");
+        assert!(error.is_retryable(), "{error}");
+        assert!(error.to_string().contains("aborted"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn consume_chat_completion_stream_rejects_an_unknown_finish_reason() {
+        // A new finish reason may describe a terminal state. It must not be
+        // accepted as a completed answer.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"future_reason\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+
+        let error = result.expect_err("unknown finish reason");
+        assert!(!error.is_retryable(), "{error}");
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("future_reason"), "{error}");
     }
 
     #[tokio::test]
