@@ -898,6 +898,44 @@ mod tests {
         }
     }
 
+    /// Provider that rejects every summarization request.
+    struct FailingSummarizer;
+
+    #[async_trait]
+    impl LlmProvider for FailingSummarizer {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, LlmError> {
+            Err(LlmError::ApiError {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body_preview: "invalid request".to_string(),
+                retry_after_secs: None,
+            })
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
+    }
+
     fn build_test_state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8").to_string());
@@ -1015,6 +1053,38 @@ mod tests {
         // Assert
         let response = result.expect("response");
         assert_eq!(response, "Compacted 3 messages to 2.");
+    }
+
+    #[tokio::test]
+    async fn handle_compact_reports_a_summarization_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8").to_string());
+        let state = build_state(config, Box::new(FailingSummarizer));
+        let chat_id = create_test_chat(&state, "test-compact-failure").await;
+        seed_compactable_session(&state, chat_id).await;
+
+        // Act
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
+
+        // Assert: the failure is reported instead of "Nothing to compact".
+        let response = result.expect("response");
+        assert!(
+            response.starts_with("Compaction failed:"),
+            "response: {response}"
+        );
+        let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
+            db.load_session_snapshot(chat_id, 10)
+        })
+        .await
+        .expect("snapshot");
+        assert!(
+            snapshot
+                .messages_json
+                .as_deref()
+                .is_some_and(|json| json.contains("fresh question")),
+            "a failed compaction must keep the original session"
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,13 @@ pub(crate) struct CompactionCheckpoint {
 }
 
 /// Usage of the last measured model response and the messages it covered.
+///
+/// The provider reports the tokens of a whole request, so the anchor also keeps
+/// the estimated size of everything in that request except the conversation
+/// messages: the system prompt, the tool definitions, the checkpoint, and the
+/// request-only messages (channel context, retry corrections, runtime guards).
+/// Subtracting it turns the measurement into a measurement of the conversation
+/// itself, which stays valid when the request-only part changes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContextUsageAnchor {
@@ -63,6 +70,8 @@ pub(crate) struct ContextUsageAnchor {
     pub(crate) input_tokens: i64,
     /// Provider-reported completion tokens of that request.
     pub(crate) output_tokens: i64,
+    /// Estimated tokens of the non-conversation part of that request.
+    pub(crate) request_overhead_tokens: usize,
     /// `provider/model` that produced the usage.
     pub(crate) model_key: String,
     /// Hash of the request shape (system prompt, tool definitions, model).
@@ -74,6 +83,7 @@ impl ContextUsageAnchor {
     pub(crate) fn for_message(
         after_message_index: usize,
         usage: &crate::llm::LlmUsage,
+        request_overhead_tokens: usize,
         model_key: &str,
         request_shape_hash: &str,
     ) -> Self {
@@ -81,6 +91,7 @@ impl ContextUsageAnchor {
             after_message_index,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            request_overhead_tokens,
             model_key: model_key.to_string(),
             request_shape_hash: request_shape_hash.to_string(),
         }

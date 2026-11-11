@@ -7,13 +7,14 @@ use tracing::warn;
 
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::compaction::{
-    CompactionOutcome, CompactionReason, CompactionRequest, MeasuredUsage, PromptContext, compact,
-    compact_if_needed, model_key, request_shape_hash,
+    CompactionOutcome, CompactionReason, CompactionRequest, MeasuredUsage, PromptContext,
+    RequestMeasurement, compact, compact_if_needed, estimate_request_overhead, model_key,
+    request_shape_hash,
 };
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::strip_thinking;
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
-use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_messages};
+use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_suffix};
 use crate::agent_loop::session_snapshot::{SessionContext, checkpoint_message};
 use crate::agent_loop::tool_execution::{
     ExecutedToolCall, GuardDenialTracker, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks,
@@ -49,7 +50,11 @@ pub(crate) const GUARD_DENIAL_WRAP_GUARD: &str = "[runtime_guard]: The security-
 pub(crate) struct LoopState {
     pub(crate) context: SessionContext,
     pub(crate) session_revision: Option<i64>,
-    retry_messages: Option<Arc<Vec<Message>>>,
+    /// Corrections appended to the next request only, such as the discarded
+    /// declarative reply and its runtime guard. They are never persisted, and
+    /// because they live outside the conversation they survive compaction of
+    /// the conversation itself.
+    retry_suffix: Option<Vec<Message>>,
     declarative_retry_attempted: bool,
 }
 
@@ -58,18 +63,13 @@ impl LoopState {
         Self {
             context,
             session_revision,
-            retry_messages: None,
+            retry_suffix: None,
             declarative_retry_attempted: false,
         }
     }
 
-    fn messages(&mut self) -> Arc<Vec<Message>> {
-        self.retry_messages
-            .take()
-            .unwrap_or_else(|| Arc::clone(&self.context.messages))
-    }
-
-    fn reset_retry_guards_after_tool_phase(&mut self) {
+    fn clear_retry_state(&mut self) {
+        self.retry_suffix = None;
         self.declarative_retry_attempted = false;
     }
 }
@@ -92,7 +92,6 @@ pub(crate) struct AgentLoop<'a> {
     state: &'a TurnDependencies,
     context: &'a SurfaceContext,
     prepared: &'a PreparedTurn,
-    prompt_ctx: PromptContext<'a>,
     channel_context_msg: Option<Message>,
     on_event: EventEmitter,
     lifecycle: TurnLifecycle<'a>,
@@ -105,7 +104,6 @@ impl<'a> AgentLoop<'a> {
         state: &'a TurnDependencies,
         context: &'a SurfaceContext,
         prepared: &'a PreparedTurn,
-        prompt_ctx: PromptContext<'a>,
         channel_context_msg: Option<Message>,
         on_event: EventEmitter,
     ) -> Self {
@@ -116,7 +114,6 @@ impl<'a> AgentLoop<'a> {
             state,
             context,
             prepared,
-            prompt_ctx,
             channel_context_msg,
             on_event,
             lifecycle,
@@ -143,34 +140,36 @@ impl<'a> AgentLoop<'a> {
             let message_id =
                 crate::agent_loop::turn::assistant_message_id(&self.prepared.turn_id, iteration);
 
-            // Compaction runs immediately before the request it protects, so
-            // the decision always describes the context about to be sent.
-            self.compact_before_model(&mut loop_state, iteration)
-                .await?;
+            // Tools and request-only messages are fixed for the whole
+            // iteration, so the compaction decision, the request itself, and
+            // the usage anchor all describe exactly the same request.
+            let tools = apply_guard_denial_state(&self.prepared.tool_defs, &guard_tracker);
+            let tools_json = if tools.is_empty() {
+                None
+            } else {
+                serde_json::to_string(tools.as_ref()).ok()
+            };
+            let prompt = PromptContext {
+                system_prompt: &self.prepared.system_prompt,
+                tools_json: tools_json.as_deref(),
+                has_tools: !tools.is_empty(),
+            };
+            let scope = self.request_scope(&loop_state, iteration, &guard_tracker);
+            self.compact_before_model(&mut loop_state, &scope, &prompt)
+                .await;
 
             let model_key = model_key(self.prepared.channel_llm.as_ref());
             let mut overflow_recovery_attempted = false;
             let output_published = Arc::new(AtomicBool::new(false));
-            let (phase_response, shape_hash) = loop {
-                let tools = apply_guard_denial_state(&self.prepared.tool_defs, &guard_tracker);
-                let tools_json = if tools.is_empty() {
-                    None
-                } else {
-                    serde_json::to_string(tools.as_ref()).ok()
-                };
+            let (phase_response, shape_hash, request_overhead_tokens) = loop {
                 let shape_hash = request_shape_hash(
                     &self.prepared.system_prompt,
                     tools_json.as_deref(),
                     &model_key,
                 );
-                let request_messages = append_guard_denial_wrap(
-                    request_messages_for_iteration(
-                        &mut loop_state,
-                        iteration,
-                        &self.channel_context_msg,
-                    ),
-                    &guard_tracker,
-                );
+                let request_messages = request_messages(&loop_state.context, &scope);
+                let request_overhead_tokens =
+                    estimate_request_overhead(&prompt, &loop_state.context, &scope.request_only());
                 let event_emitter = self.on_event.clone();
                 let emitted_id = message_id.clone();
                 output_published.store(false, Ordering::SeqCst);
@@ -187,7 +186,7 @@ impl<'a> AgentLoop<'a> {
                     llm: self.prepared.channel_llm.as_ref(),
                     system_prompt: &self.prepared.system_prompt,
                     messages: Arc::clone(&request_messages),
-                    tools: Some(tools),
+                    tools: Some(Arc::clone(&tools)),
                     chat_id: self.prepared.chat_id,
                     caller_channel: &self.context.channel,
                     request_kind: "agent_loop",
@@ -208,7 +207,7 @@ impl<'a> AgentLoop<'a> {
                 drop(request_messages);
 
                 match attempt {
-                    Ok(step) => break (step, shape_hash),
+                    Ok(step) => break (step, shape_hash, request_overhead_tokens),
                     Err(error) => {
                         let (error, output_published) = error.into_parts();
                         if output_published {
@@ -222,7 +221,10 @@ impl<'a> AgentLoop<'a> {
                             && !output_published
                             && error.is_context_overflow()
                         {
-                            match self.compact_overflow(&mut loop_state, iteration).await {
+                            match self
+                                .compact_overflow(&mut loop_state, &scope, &prompt)
+                                .await
+                            {
                                 Ok(changed) => changed,
                                 Err(compaction_error) => {
                                     warn!(
@@ -257,9 +259,8 @@ impl<'a> AgentLoop<'a> {
                         &response.content,
                         response.reasoning_content.as_deref(),
                         &mut loop_state.declarative_retry_attempted,
-                        &loop_state.context.messages,
                     )? {
-                        LoopAction::Retry(messages) => {
+                        LoopAction::Retry(suffix) => {
                             // The streamed text will never be persisted; tell
                             // consumers to drop it so the retry starts clean.
                             // Iterations that streamed nothing need no event.
@@ -268,7 +269,7 @@ impl<'a> AgentLoop<'a> {
                                     message_id: message_id.clone(),
                                 });
                             }
-                            loop_state.retry_messages = Some(messages);
+                            loop_state.retry_suffix = Some(suffix);
                         }
                         LoopAction::Done {
                             final_content,
@@ -282,8 +283,11 @@ impl<'a> AgentLoop<'a> {
                                 session_revision: loop_state.session_revision,
                                 usage: usage.clone().map(|usage| MeasuredUsage {
                                     usage,
-                                    model_key: model_key.clone(),
-                                    request_shape_hash: shape_hash.clone(),
+                                    request: RequestMeasurement {
+                                        model_key: model_key.clone(),
+                                        request_shape_hash: shape_hash.clone(),
+                                        request_overhead_tokens,
+                                    },
                                 }),
                             });
                         }
@@ -297,15 +301,14 @@ impl<'a> AgentLoop<'a> {
                         &response.content,
                         response.reasoning_content.as_deref(),
                         &mut loop_state.declarative_retry_attempted,
-                        &loop_state.context.messages,
                     )? {
-                        LoopAction::Retry(messages) => {
+                        LoopAction::Retry(suffix) => {
                             if output_published.load(Ordering::SeqCst) {
                                 self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
                                     message_id: message_id.clone(),
                                 });
                             }
-                            loop_state.retry_messages = Some(messages);
+                            loop_state.retry_suffix = Some(suffix);
                         }
                         LoopAction::Done {
                             final_content,
@@ -319,8 +322,11 @@ impl<'a> AgentLoop<'a> {
                                 session_revision: loop_state.session_revision,
                                 usage: usage.clone().map(|usage| MeasuredUsage {
                                     usage,
-                                    model_key: model_key.clone(),
-                                    request_shape_hash: shape_hash.clone(),
+                                    request: RequestMeasurement {
+                                        model_key: model_key.clone(),
+                                        request_shape_hash: shape_hash.clone(),
+                                        request_overhead_tokens,
+                                    },
                                 }),
                             });
                         }
@@ -334,14 +340,17 @@ impl<'a> AgentLoop<'a> {
                         assistant_phase,
                         &message_id,
                         &guard_tracker,
-                        &model_key,
-                        &shape_hash,
+                        &RequestMeasurement {
+                            model_key: model_key.clone(),
+                            request_shape_hash: shape_hash.clone(),
+                            request_overhead_tokens,
+                        },
                     )
                     .await?;
                 }
             }
 
-            loop_state.reset_retry_guards_after_tool_phase();
+            loop_state.clear_retry_state();
             iteration += 1;
         }
 
@@ -350,44 +359,81 @@ impl<'a> AgentLoop<'a> {
         )))
     }
 
+    /// Builds the messages that belong to the upcoming request but not to the
+    /// persisted conversation.
+    fn request_scope(
+        &self,
+        loop_state: &LoopState,
+        iteration: usize,
+        guard_tracker: &GuardDenialTracker,
+    ) -> RequestScope {
+        let mut suffix = Vec::new();
+        if let Some(retry) = &loop_state.retry_suffix {
+            suffix.extend(retry.iter().cloned());
+        }
+        if let Some(guard) = iteration_guard(iteration) {
+            suffix.push(Message::text("user", guard));
+        }
+        if guard_tracker.limit_reached() {
+            suffix.push(Message::text("user", GUARD_DENIAL_WRAP_GUARD));
+        }
+        RequestScope {
+            prefix: if iteration == 1 {
+                self.channel_context_msg.clone()
+            } else {
+                None
+            },
+            suffix,
+        }
+    }
+
     /// Builds the request-scoped context shared by the compaction entry points.
-    fn compaction_request(&self, iteration: usize) -> CompactionRequest<'_> {
+    fn compaction_request<'s>(
+        &'s self,
+        scope: &'s RequestScope,
+        prompt: PromptContext<'s>,
+    ) -> CompactionRequest<'s>
+    where
+        'a: 's,
+    {
         CompactionRequest {
             state: self.state,
             context: self.context,
             chat_id: self.prepared.chat_id,
             llm: &self.prepared.channel_llm,
-            prompt: PromptContext {
-                system_prompt: self.prompt_ctx.system_prompt,
-                tools_json: self.prompt_ctx.tools_json,
-                has_tools: self.prompt_ctx.has_tools,
-            },
+            prompt,
             config: &self.prepared.config_snapshot.config,
-            request_only_messages: if iteration == 1 {
-                self.channel_context_msg.iter().collect()
-            } else {
-                Vec::new()
-            },
+            request_only_messages: scope.request_only(),
         }
     }
 
     /// Compacts the loop context before a model request when it is too large.
+    ///
+    /// A summarization failure must not end the turn: the request may still
+    /// fit, and a real overflow is recovered by [`Self::compact_overflow`].
     async fn compact_before_model(
         &self,
         loop_state: &mut LoopState,
-        iteration: usize,
-    ) -> Result<(), EgoPulseError> {
+        scope: &RequestScope,
+        prompt: &PromptContext<'_>,
+    ) {
         match compact_if_needed(
-            &self.compaction_request(iteration),
+            &self.compaction_request(scope, *prompt),
             &loop_state.context,
             None,
         )
-        .await?
+        .await
         {
-            CompactionOutcome::Unchanged => Ok(()),
-            CompactionOutcome::Compacted(context) => {
+            Ok(CompactionOutcome::Compacted(context)) => {
                 loop_state.context = context;
-                Ok(())
+            }
+            Ok(CompactionOutcome::Unchanged) => {}
+            Err(error) => {
+                warn!(
+                    turn_id = %self.prepared.turn_id,
+                    error = %error,
+                    "context compaction failed; continuing with the uncompacted context"
+                );
             }
         }
     }
@@ -399,10 +445,11 @@ impl<'a> AgentLoop<'a> {
     async fn compact_overflow(
         &self,
         loop_state: &mut LoopState,
-        iteration: usize,
+        scope: &RequestScope,
+        prompt: &PromptContext<'_>,
     ) -> Result<bool, EgoPulseError> {
         match compact(
-            &self.compaction_request(iteration),
+            &self.compaction_request(scope, *prompt),
             &loop_state.context,
             CompactionReason::Overflow,
             None,
@@ -423,8 +470,7 @@ impl<'a> AgentLoop<'a> {
         assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
         assistant_message_id: &str,
         guard_tracker: &Arc<GuardDenialTracker>,
-        model_key: &str,
-        request_shape_hash: &str,
+        measurement: &RequestMeasurement,
     ) -> Result<(), EgoPulseError> {
         self.lifecycle.complete_model().await?;
         self.lifecycle.begin_tools().await?;
@@ -436,8 +482,7 @@ impl<'a> AgentLoop<'a> {
                 assistant_message_id,
                 &assistant_phase,
                 loop_state.context.clone(),
-                model_key,
-                request_shape_hash,
+                measurement,
                 loop_state.session_revision,
             )
             .await?;
@@ -509,24 +554,36 @@ impl<'a> AgentLoop<'a> {
     }
 }
 
-/// Adds channel context and the iteration-specific guard to a request-only copy.
-fn request_messages_for_iteration(
-    loop_state: &mut LoopState,
-    iteration: usize,
-    channel_context_msg: &Option<Message>,
-) -> Arc<Vec<Message>> {
-    let stored = loop_state.messages();
-    let mut messages = Vec::with_capacity(stored.len() + 2);
-    if iteration == 1 {
-        if let Some(ctx_msg) = channel_context_msg {
-            messages.push(ctx_msg.clone());
-        }
+/// Messages that belong to one model request but not to the conversation.
+///
+/// They are fixed for every attempt of an iteration, so compaction decisions
+/// and the request itself always describe the same context.
+struct RequestScope {
+    /// Channel context prepended before the checkpoint.
+    prefix: Option<Message>,
+    /// Retry corrections and runtime guards appended after the conversation.
+    suffix: Vec<Message>,
+}
+
+impl RequestScope {
+    /// Returns every request-only message, in request order.
+    fn request_only(&self) -> Vec<&Message> {
+        self.prefix.iter().chain(self.suffix.iter()).collect()
     }
-    if let Some(checkpoint) = &loop_state.context.checkpoint {
+}
+
+/// Builds the request messages from the conversation and its request scope.
+fn request_messages(context: &SessionContext, scope: &RequestScope) -> Arc<Vec<Message>> {
+    let mut messages = Vec::with_capacity(
+        context.messages.len() + scope.prefix.iter().count() + scope.suffix.len() + 1,
+    );
+    messages.extend(scope.prefix.iter().cloned());
+    if let Some(checkpoint) = &context.checkpoint {
         messages.push(checkpoint_message(checkpoint));
     }
-    messages.extend(Arc::try_unwrap(stored).unwrap_or_else(|stored| (*stored).clone()));
-    messages_for_iteration(&Arc::new(messages), iteration)
+    messages.extend(context.messages.iter().cloned());
+    messages.extend(scope.suffix.iter().cloned());
+    Arc::new(messages)
 }
 
 /// Applies the same post-denial stop state to Turn and Pulse model requests.
@@ -553,27 +610,31 @@ pub(crate) fn append_guard_denial_wrap(
     Arc::new(messages)
 }
 
+/// Returns the runtime guard that applies to one iteration, if any.
+fn iteration_guard(iteration: usize) -> Option<&'static str> {
+    match iteration {
+        FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_WARNING_GUARD),
+        iteration if iteration > FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_GUARD),
+        _ => None,
+    }
+}
+
 /// Adds the iteration-specific runtime guard to a request-only copy of `messages`.
 pub(crate) fn messages_for_iteration(
     messages: &Arc<Vec<Message>>,
     iteration: usize,
 ) -> Arc<Vec<Message>> {
-    let guard_messages = match iteration {
-        FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_WARNING_GUARD),
-        iteration if iteration > FINAL_RESPONSE_WARNING_ITERATION => Some(FINAL_RESPONSE_GUARD),
-        _ => None,
-    };
-    let Some(guard) = guard_messages else {
+    let Some(guard) = iteration_guard(iteration) else {
         return Arc::clone(messages);
     };
-
     let mut request_messages = (**messages).clone();
     request_messages.push(Message::text("user", guard));
     Arc::new(request_messages)
 }
 
 enum LoopAction {
-    Retry(Arc<Vec<Message>>),
+    /// The messages to append to the next request, not the whole history.
+    Retry(Vec<Message>),
     Done {
         final_content: String,
         reasoning_content: Option<String>,
@@ -584,7 +645,6 @@ fn evaluate_end_turn(
     raw_content: &str,
     reasoning_content: Option<&str>,
     declarative_retry_attempted: &mut bool,
-    messages: &[Message],
 ) -> Result<LoopAction, EgoPulseError> {
     let visible_text = strip_thinking(raw_content.trim());
     let has_displayable_output = !visible_text.trim().is_empty();
@@ -595,12 +655,11 @@ fn evaluate_end_turn(
     {
         *declarative_retry_attempted = true;
         warn!("declarative-only reply detected; injecting corrective prompt and retrying once");
-        return Ok(LoopAction::Retry(Arc::new(runtime_guard_messages(
-            messages,
+        return Ok(LoopAction::Retry(runtime_guard_suffix(
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply only declared what you would do without actually executing any tools. If the user's request requires tool calls, execute them NOW instead of just describing what you plan to do. Then provide the result.",
-        ))));
+        )));
     }
 
     if !has_displayable_output {
@@ -619,7 +678,6 @@ fn evaluate_malformed_response(
     raw_content: &str,
     reasoning_content: Option<&str>,
     declarative_retry_attempted: &mut bool,
-    messages: &[Message],
 ) -> Result<LoopAction, EgoPulseError> {
     let visible_text = strip_thinking(raw_content.trim());
 
@@ -632,12 +690,11 @@ fn evaluate_malformed_response(
     if !*declarative_retry_attempted && is_declarative_only_reply(&visible_text) {
         *declarative_retry_attempted = true;
         warn!("all tool calls were malformed and reply was declarative-only; retrying once");
-        return Ok(LoopAction::Retry(Arc::new(runtime_guard_messages(
-            messages,
+        return Ok(LoopAction::Retry(runtime_guard_suffix(
             raw_content,
             reasoning_content,
             "[runtime_guard]: Your previous reply attempted tool use but did not produce a valid executable tool call. If tools are required, call them now and then provide the result.",
-        ))));
+        )));
     }
 
     Ok(LoopAction::Done {
@@ -769,10 +826,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![
-                Err(crate::error::LlmError::ApiError {
+                Err(crate::error::LlmError::ContextOverflow {
                     status: reqwest::StatusCode::BAD_REQUEST,
-                    body_preview: "This model's maximum context length is 2000 tokens".to_string(),
-                    retry_after_secs: None,
+                    body_preview: "maximum context length is 2000 tokens".to_string(),
                 }),
                 Ok(MessagesResponse {
                     content: "history summary".to_string(),
@@ -843,15 +899,86 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn overflow_during_a_declarative_retry_keeps_the_corrective_messages() {
+        // Arrange: the model only declares what it will do, the corrective
+        // retry overflows, and the compaction must not drop the correction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(final_response("I will inspect the files.")),
+                Err(crate::error::LlmError::ContextOverflow {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    body_preview: "maximum context length is 2000 tokens".to_string(),
+                }),
+                Ok(MessagesResponse {
+                    content: "history summary".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Ok(final_response("recovered answer")),
+            ],
+            vec![0, 0, 0, 0],
+        );
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            2_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("overflow-retry-guard");
+        let runtime = state.turn_dependencies();
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
+            .await
+            .expect("chat id");
+        crate::agent_loop::session::save_test_session(
+            &state.assets,
+            &state.db,
+            chat_id,
+            vec![
+                Message::text("user", "old question"),
+                Message::text("assistant", "old answer"),
+            ],
+        );
+
+        // Act
+        let reply = process_turn(&runtime, &context, "fresh question")
+            .await
+            .expect("overflow recovery should finalize");
+
+        // Assert: the retried request still ends with the discarded reply and
+        // its corrective guard, on top of the compacted conversation.
+        assert_eq!(reply, "recovered answer");
+        let requests = provider.seen_messages();
+        assert_eq!(requests.len(), 4, "retry + summary + retried request");
+        let retried = &requests[3];
+        assert!(
+            retried[0]
+                .content
+                .as_text_lossy()
+                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
+            "the retried request must start with the checkpoint"
+        );
+        let suffix = &retried[retried.len() - 2..];
+        assert_eq!(suffix[0].role, "assistant");
+        assert_eq!(
+            suffix[0].content.as_text_lossy(),
+            "I will inspect the files."
+        );
+        assert!(suffix[1].content.as_text_lossy().contains("runtime_guard"));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn a_second_context_overflow_after_compaction_surfaces_the_error() {
         // Arrange: every model request overflows, so recovery must stop after
         // one attempt instead of looping.
         let dir = tempfile::tempdir().expect("tempdir");
         let overflow = || {
-            Err(crate::error::LlmError::ApiError {
+            Err(crate::error::LlmError::ContextOverflow {
                 status: reqwest::StatusCode::BAD_REQUEST,
                 body_preview: "maximum context length exceeded".to_string(),
-                retry_after_secs: None,
             })
         };
         let provider = RecordingProvider::new(
@@ -1222,23 +1349,19 @@ mod tests {
     #[test]
     fn evaluate_end_turn_retries_declarative_output_once() {
         // Arrange
-        let messages = vec![Message::text("user", "do the work")];
         let mut retry_attempted = false;
 
         // Act
-        let action = evaluate_end_turn(
-            "I will inspect the files.",
-            None,
-            &mut retry_attempted,
-            &messages,
-        )
-        .expect("declarative response should be recoverable");
+        let action = evaluate_end_turn("I will inspect the files.", None, &mut retry_attempted)
+            .expect("declarative response should be recoverable");
 
         // Assert
         assert!(retry_attempted);
         match action {
-            LoopAction::Retry(retry_messages) => {
-                assert!(retry_messages.len() > messages.len());
+            LoopAction::Retry(suffix) => {
+                assert_eq!(suffix.len(), 2);
+                assert_eq!(suffix[0].role, "assistant");
+                assert!(suffix[1].content.as_text_lossy().contains("runtime_guard"));
             }
             LoopAction::Done { .. } => {
                 panic!("declarative response should inject a corrective retry")

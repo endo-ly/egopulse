@@ -6,7 +6,8 @@
 //!
 //! 1. Estimate the context tokens of the request about to be sent, using the
 //!    last measured provider usage plus a calibrated estimate of the messages
-//!    appended after it.
+//!    appended after it. The part of the request that is not conversation
+//!    messages is measured again, so it never goes stale.
 //! 2. Trigger when the estimate exceeds `context_window - reserve_tokens`.
 //! 3. Cut the history backwards from the newest message until at least
 //!    `keep_recent_tokens` are retained. The cut never lands on a tool result.
@@ -130,23 +131,42 @@ can be understood in context.
 
 Only summarize information explicitly present above. Do not infer or reconstruct the later messages.";
 
+/// Identity of the request a provider usage was measured against.
+#[derive(Clone, Debug)]
+pub(crate) struct RequestMeasurement {
+    /// `provider/model` that produced the usage.
+    pub(crate) model_key: String,
+    /// Hash of the request shape (system prompt, tool definitions, model).
+    pub(crate) request_shape_hash: String,
+    /// Estimated tokens of the request that were not conversation messages
+    /// (system prompt, tools, checkpoint, request-only messages).
+    pub(crate) request_overhead_tokens: usize,
+}
+
+impl RequestMeasurement {
+    /// Builds the anchor for `usage` measured at `index`.
+    pub(crate) fn anchor(&self, index: usize, usage: &crate::llm::LlmUsage) -> ContextUsageAnchor {
+        ContextUsageAnchor::for_message(
+            index,
+            usage,
+            self.request_overhead_tokens,
+            &self.model_key,
+            &self.request_shape_hash,
+        )
+    }
+}
+
 /// Provider usage plus the request identity it was measured against.
 #[derive(Clone, Debug)]
 pub(crate) struct MeasuredUsage {
     pub(crate) usage: crate::llm::LlmUsage,
-    pub(crate) model_key: String,
-    pub(crate) request_shape_hash: String,
+    pub(crate) request: RequestMeasurement,
 }
 
 impl MeasuredUsage {
     /// Builds the anchor for the assistant message at `index`.
     pub(crate) fn anchor(&self, index: usize) -> ContextUsageAnchor {
-        ContextUsageAnchor::for_message(
-            index,
-            &self.usage,
-            &self.model_key,
-            &self.request_shape_hash,
-        )
+        self.request.anchor(index, &self.usage)
     }
 }
 
@@ -165,6 +185,7 @@ pub(crate) struct CompactionRequest<'a> {
 }
 
 /// The final request context that the compaction decision is based on.
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct PromptContext<'a> {
     pub(crate) system_prompt: &'a str,
     pub(crate) tools_json: Option<&'a str>,
@@ -360,11 +381,14 @@ pub(crate) fn estimate_prompt_tokens(
 }
 
 fn calibrated_estimate(tokens: usize, factor: f64) -> usize {
-    ((tokens as f64) * factor).ceil().max(1.0) as usize
+    ((tokens as f64) * factor).ceil() as usize
 }
 
-/// Estimates the tokens of a whole request including the checkpoint projection.
-fn estimate_request_tokens(
+/// Estimates the tokens of a request that are not conversation messages.
+///
+/// These are the parts that change between iterations of the same turn, so the
+/// projection has to re-measure them whenever it reuses a usage measurement.
+pub(crate) fn estimate_request_overhead(
     prompt: &PromptContext<'_>,
     session: &SessionContext,
     request_only_messages: &[&Message],
@@ -377,19 +401,30 @@ fn estimate_request_tokens(
         tokens += estimate_message_tokens(&checkpoint_message(checkpoint));
     }
     tokens
-        + estimate_messages_tokens(&session.messages)
         + request_only_messages
             .iter()
             .map(|message| estimate_message_tokens(message))
             .sum::<usize>()
 }
 
+/// Estimates the tokens of a whole request including the checkpoint projection.
+fn estimate_request_tokens(
+    prompt: &PromptContext<'_>,
+    session: &SessionContext,
+    request_only_messages: &[&Message],
+) -> usize {
+    estimate_request_overhead(prompt, session, request_only_messages)
+        + estimate_messages_tokens(&session.messages)
+}
+
 /// Projects the context tokens of the request that would be sent next.
 ///
 /// A usage anchor measured against the same request shape describes the tokens
-/// up to the measured assistant message; the messages appended after it are
-/// estimated. When the anchor is missing or stale, the whole request is
-/// estimated instead.
+/// up to the measured assistant message. The anchor's own overhead is removed
+/// and the current overhead is added again, so channel context, retry
+/// corrections, and runtime guards that changed since the measurement are
+/// always counted. The messages appended after the anchor are estimated. When
+/// the anchor is missing or stale, the whole request is estimated instead.
 pub(crate) fn project_context_tokens(
     prompt: &PromptContext<'_>,
     session: &SessionContext,
@@ -412,8 +447,12 @@ pub(crate) fn project_context_tokens(
     };
 
     let trailing = &session.messages[anchor.after_message_index + 1..];
-    anchor.measured_context_tokens()
-        + calibrated_estimate(estimate_messages_tokens(trailing), factor)
+    let measured_conversation = anchor
+        .measured_context_tokens()
+        .saturating_sub(anchor.request_overhead_tokens);
+    let overhead = estimate_request_overhead(prompt, session, request_only_messages);
+    measured_conversation
+        + calibrated_estimate(estimate_messages_tokens(trailing) + overhead, factor)
 }
 
 /// Returns `true` when the projected context no longer fits the usable window.
@@ -713,13 +752,17 @@ async fn request_summary(
 }
 
 /// Rejects summaries that must never become a checkpoint.
-fn validate_summary(response: &MessagesResponse) -> Result<String, &'static str> {
+fn validate_summary(response: &MessagesResponse) -> Result<String, EgoPulseError> {
     if !response.tool_calls.is_empty() {
-        return Err("the summary contained a tool call");
+        return Err(EgoPulseError::Llm(LlmError::InvalidResponse(
+            "compaction summary contained a tool call".to_string(),
+        )));
     }
     let text = strip_thinking(&response.content);
     if text.trim().is_empty() {
-        return Err("the summary was empty");
+        return Err(EgoPulseError::Llm(LlmError::InvalidResponse(
+            "compaction summary was empty".to_string(),
+        )));
     }
     Ok(text)
 }
@@ -764,17 +807,17 @@ async fn log_summarizer_usage(
     .inspect_err(|error| warn!(error = %error, "compaction usage logging failed"));
 }
 
-async fn generate_summary(
+/// Sends one summarization request, records its usage, and validates the
+/// result.
+///
+/// Every failure is returned: the caller decides whether the original context
+/// is kept (automatic compaction) or reported to the user (`/compact`).
+async fn summarize(
     request: &CompactionRequest<'_>,
-    messages: &[Message],
-    previous_summary: Option<&str>,
-    instructions: Option<&str>,
+    prompt: String,
     label: &str,
-) -> Result<String, ()> {
-    let conversation = serialize_conversation(messages);
-    let prompt = summary_prompt(&conversation, previous_summary, instructions);
+) -> Result<String, EgoPulseError> {
     let estimate = summary_request_estimate(&prompt);
-
     let response = match request_summary(request.llm, prompt).await {
         Ok(response) => response,
         Err(error) => {
@@ -783,9 +826,9 @@ async fn generate_summary(
                 chat_id = request.chat_id,
                 label,
                 error = %error,
-                "context compaction summarization failed; keeping the original context"
+                "context compaction summarization failed"
             );
-            return Err(());
+            return Err(EgoPulseError::Llm(error));
         }
     };
 
@@ -815,84 +858,50 @@ async fn generate_summary(
     )
     .await;
 
-    validate_summary(&response).map_err(|reason| {
+    validate_summary(&response).inspect_err(|error| {
         warn!(
             channel = %request.context.channel,
             chat_id = request.chat_id,
             label,
-            reason,
-            "context compaction summary rejected; keeping the original context"
+            error = %error,
+            "context compaction summary rejected"
         );
     })
+}
+
+async fn generate_summary(
+    request: &CompactionRequest<'_>,
+    messages: &[Message],
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+    label: &str,
+) -> Result<String, EgoPulseError> {
+    let conversation = serialize_conversation(messages);
+    let prompt = summary_prompt(&conversation, previous_summary, instructions);
+    summarize(request, prompt, label).await
 }
 
 async fn generate_turn_prefix_summary(
     request: &CompactionRequest<'_>,
     messages: &[Message],
     instructions: Option<&str>,
-) -> Result<String, ()> {
+) -> Result<String, EgoPulseError> {
     let conversation = serialize_conversation(messages);
     let prompt = turn_prefix_prompt(&conversation, instructions);
-    let estimate = summary_request_estimate(&prompt);
-
-    let response = match request_summary(request.llm, prompt).await {
-        Ok(response) => response,
-        Err(error) => {
-            warn!(
-                channel = %request.context.channel,
-                chat_id = request.chat_id,
-                error = %error,
-                "turn prefix summarization failed; keeping the original context"
-            );
-            return Err(());
-        }
-    };
-
-    if let Some(usage) = &response.usage {
-        request
-            .state
-            .usage_calibrator
-            .record(
-                CalibrationKey::new(
-                    request.llm.provider_name(),
-                    request.llm.model_name(),
-                    "compaction",
-                    false,
-                ),
-                estimate,
-                usage.input_tokens,
-            )
-            .await;
-    }
-    log_summarizer_usage(
-        request.state,
-        request.context,
-        request.chat_id,
-        request.llm,
-        &response,
-        estimate,
-    )
-    .await;
-
-    validate_summary(&response).map_err(|reason| {
-        warn!(
-            channel = %request.context.channel,
-            chat_id = request.chat_id,
-            reason,
-            "turn prefix summary rejected; keeping the original context"
-        );
-    })
+    summarize(request, prompt, "turn prefix").await
 }
 
 /// Compacts the context when it no longer fits the provider window.
 ///
-/// Returns [`CompactionOutcome::Unchanged`] when compaction is disabled or the
-/// projected context still fits.
+/// Returns [`CompactionOutcome::Unchanged`] when compaction is disabled, the
+/// projected context still fits, or nothing is old enough to summarize.
 ///
 /// # Errors
 ///
 /// Returns [`EgoPulseError::Config`] when the resolved context window cannot
-/// hold the configured reserve.
+/// hold the configured reserve, and the summarization error when the summary
+/// could not be produced. Callers decide whether to keep the original context
+/// or surface the failure.
 pub(crate) async fn compact_if_needed(
     request: &CompactionRequest<'_>,
     session: &SessionContext,
@@ -912,7 +921,9 @@ pub(crate) async fn compact_if_needed(
 /// # Errors
 ///
 /// Returns [`EgoPulseError::Config`] when the resolved context window cannot
-/// hold the configured reserve.
+/// hold the configured reserve, and the summarization error when the summary
+/// could not be produced or was unusable. The context is left untouched in
+/// both cases.
 pub(crate) async fn compact(
     request: &CompactionRequest<'_>,
     session: &SessionContext,
@@ -978,10 +989,7 @@ pub(crate) async fn compact(
     };
 
     let started = Instant::now();
-    let mut summary = match build_summary(request, &preparation, instructions).await {
-        Some(summary) => summary,
-        None => return Ok(CompactionOutcome::Unchanged),
-    };
+    let mut summary = build_summary(request, &preparation, instructions).await?;
     // Archive only once the summary exists: a failed attempt keeps the context
     // untruncated, so there is nothing to preserve yet.
     archive_before_compaction(request, session).await;
@@ -1024,12 +1032,12 @@ pub(crate) async fn compact(
     Ok(CompactionOutcome::Compacted(context))
 }
 
-/// Generates the checkpoint text. Returns `None` when the context must be kept.
+/// Generates the checkpoint text.
 async fn build_summary(
     request: &CompactionRequest<'_>,
     preparation: &CompactionPreparation,
     instructions: Option<&str>,
-) -> Option<String> {
+) -> Result<String, EgoPulseError> {
     if !preparation.is_split_turn {
         return generate_summary(
             request,
@@ -1038,8 +1046,7 @@ async fn build_summary(
             instructions,
             "history",
         )
-        .await
-        .ok();
+        .await;
     }
 
     let history = if preparation.messages_to_summarize.is_empty() {
@@ -1055,16 +1062,14 @@ async fn build_summary(
             instructions,
             "history",
         )
-        .await
-        .ok()?
+        .await?
     };
 
     let turn_prefix =
         generate_turn_prefix_summary(request, &preparation.turn_prefix_messages, instructions)
-            .await
-            .ok()?;
+            .await?;
 
-    Some(format!("{history}{SPLIT_TURN_SEPARATOR}{turn_prefix}"))
+    Ok(format!("{history}{SPLIT_TURN_SEPARATOR}{turn_prefix}"))
 }
 
 fn redact_summary_text(text: &str, config: &crate::config::Config) -> String {
@@ -1498,6 +1503,7 @@ mod tests {
 
     #[test]
     fn a_usage_anchor_is_used_until_the_request_shape_changes() {
+        // Arrange
         let mut context = session(vec![
             text("user", &"one ".repeat(1_000)),
             text("assistant", &"two ".repeat(1_000)),
@@ -1507,6 +1513,7 @@ mod tests {
             after_message_index: 1,
             input_tokens: 1_000,
             output_tokens: 100,
+            request_overhead_tokens: 2,
             model_key: "p/m".to_string(),
             request_shape_hash: "shape-a".to_string(),
         });
@@ -1516,12 +1523,44 @@ mod tests {
             has_tools: false,
         };
 
+        // Act
         let matched = project_context_tokens(&prompt, &context, &[], "p/m", "shape-a", 1.0);
+        let reestimated = project_context_tokens(&prompt, &context, &[], "p/m", "shape-b", 1.0);
+
+        // Assert
         let trailing = estimate_message_tokens(&context.messages[2]);
         assert_eq!(matched, 1_100 + trailing);
-
-        let reestimated = project_context_tokens(&prompt, &context, &[], "p/m", "shape-b", 1.0);
         assert!(reestimated > matched);
+    }
+
+    #[test]
+    fn request_only_messages_are_added_to_a_measured_anchor() {
+        // Arrange: the anchor was measured without channel context, and the
+        // next request prepends a large one.
+        let mut context = session(vec![text("user", "hello"), text("assistant", "hi")]);
+        context.last_usage = Some(crate::agent_loop::session_snapshot::ContextUsageAnchor {
+            after_message_index: 1,
+            input_tokens: 1_000,
+            output_tokens: 100,
+            request_overhead_tokens: 0,
+            model_key: "p/m".to_string(),
+            request_shape_hash: "shape".to_string(),
+        });
+        let prompt = PromptContext {
+            system_prompt: "",
+            tools_json: None,
+            has_tools: false,
+        };
+        let channel_context = text("user", &"channel ".repeat(1_000));
+
+        // Act
+        let without = project_context_tokens(&prompt, &context, &[], "p/m", "shape", 1.0);
+        let with =
+            project_context_tokens(&prompt, &context, &[&channel_context], "p/m", "shape", 1.0);
+
+        // Assert
+        assert_eq!(with - without, estimate_message_tokens(&channel_context));
+        assert!(should_compact(with, 2_000, 0));
     }
 
     fn summary_response(text: &str) -> MessagesResponse {
@@ -1680,7 +1719,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn summarization_failure_keeps_the_original_context() {
+    async fn summarization_failure_is_returned_to_the_caller() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
@@ -1721,12 +1760,10 @@ mod tests {
         };
 
         // Act
-        let outcome = compact(&request, &session, CompactionReason::Manual, None)
-            .await
-            .expect("compact");
+        let result = compact(&request, &session, CompactionReason::Manual, None).await;
 
         // Assert
-        assert!(matches!(outcome, CompactionOutcome::Unchanged));
+        assert!(matches!(result, Err(EgoPulseError::Llm(_))));
         assert_eq!(provider.seen_systems().len(), 1, "no retry on a 400");
     }
 

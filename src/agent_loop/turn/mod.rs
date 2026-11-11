@@ -7,9 +7,7 @@ pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::{
-    CompactionOutcome, CompactionRequest, PromptContext, compact_if_needed,
-};
+use crate::agent_loop::compaction::PromptContext;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
@@ -447,15 +445,8 @@ impl TurnExecutor<'_> {
                 let channel_context_msg = load_channel_context(self.state, self.context).await;
 
                 // 段階4: 最終応答が得られるまで、LLM 呼び出しとツール実行を反復する。
-                self.run_agent_loop(
-                    &prepared,
-                    prompt_ctx,
-                    channel_context_msg,
-                    context,
-                    session_revision,
-                    1,
-                )
-                .await
+                self.run_agent_loop(&prepared, channel_context_msg, context, session_revision, 1)
+                    .await
             }
             .await;
 
@@ -505,14 +496,9 @@ impl TurnExecutor<'_> {
                     received_at,
                 )
                 .await?;
-            let prompt_ctx = PromptContext {
-                system_prompt: &prepared.system_prompt,
-                tools_json: prepared.tools_json.as_deref(),
-                has_tools: !prepared.tool_defs.is_empty(),
-            };
             // Reload the persisted session snapshot; do NOT re-persist the user
             // message. Only the tools_completed boundary re-runs the staged
-            // follow-up commit and post-tool compaction.
+            // follow-up commit.
             let loaded = load_messages_for_turn_with_limit(
                 self.state,
                 self.context.scope,
@@ -521,16 +507,10 @@ impl TurnExecutor<'_> {
             )
             .await?;
             let (context, session_revision, start_iteration) = match resume_mode {
-                ResumeMode::InputCommitted => {
-                    (loaded.context, loaded.session_revision, 1)
-                }
+                ResumeMode::InputCommitted => (loaded.context, loaded.session_revision, 1),
                 ResumeMode::ToolsCompleted { start_iteration } => {
-                    let persistence = TurnPersistence::new(
-                        self.state,
-                        self.context,
-                        chat_id,
-                        &turn_run.turn_id,
-                    );
+                    let persistence =
+                        TurnPersistence::new(self.state, self.context, chat_id, &turn_run.turn_id);
                     let persisted = persistence
                         .commit_staged_user_messages(
                             loaded.context,
@@ -539,32 +519,7 @@ impl TurnExecutor<'_> {
                             &self.on_event,
                         )
                         .await?;
-                    let mut context = persisted.context;
-                    let compaction_request = CompactionRequest {
-                        state: self.state,
-                        context: self.context,
-                        chat_id,
-                        llm: &prepared.channel_llm,
-                        prompt: PromptContext {
-                            system_prompt: prompt_ctx.system_prompt,
-                            tools_json: prompt_ctx.tools_json,
-                            has_tools: prompt_ctx.has_tools,
-                        },
-                        config: &snapshot.config,
-                        request_only_messages: Vec::new(),
-                    };
-                    context = match compact_if_needed(&compaction_request, &context, None).await {
-                        Ok(CompactionOutcome::Unchanged) => context,
-                        Ok(CompactionOutcome::Compacted(compacted)) => compacted,
-                        Err(error) => {
-                            warn!(
-                                error = %error,
-                                turn_id = %turn_run.turn_id,
-                                "context compaction failed during tools_completed recovery; continuing with the uncompacted context"
-                            );
-                            context
-                        }
-                    };
+                    let context = persisted.context;
                     let revision = persisted.revision;
                     (context, Some(revision), start_iteration)
                 }
@@ -572,7 +527,6 @@ impl TurnExecutor<'_> {
             let channel_context_msg = load_channel_context(self.state, self.context).await;
             self.run_agent_loop(
                 &prepared,
-                prompt_ctx,
                 channel_context_msg,
                 context,
                 session_revision,
@@ -744,7 +698,6 @@ impl TurnExecutor<'_> {
     async fn run_agent_loop(
         &self,
         prepared: &PreparedTurn,
-        prompt_ctx: PromptContext<'_>,
         channel_context_msg: Option<Message>,
         context: SessionContext,
         session_revision: Option<i64>,
@@ -754,7 +707,6 @@ impl TurnExecutor<'_> {
             self.state,
             self.context,
             prepared,
-            prompt_ctx,
             channel_context_msg,
             self.on_event.clone(),
         )

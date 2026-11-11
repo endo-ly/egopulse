@@ -142,30 +142,18 @@ impl OpenAiProvider {
         Ok(headers)
     }
 
-    fn api_error(status: StatusCode, body: String, retry_after_secs: Option<u64>) -> LlmError {
-        LlmError::ApiError {
-            status,
-            body_preview: preview_body(&body),
-            retry_after_secs,
-        }
-    }
-
-    fn structured_api_error(
-        status: StatusCode,
-        body: &str,
-        retry_after_secs: Option<u64>,
-    ) -> LlmError {
-        if let Ok(err) = serde_json::from_str::<OaiErrorResponse>(body) {
-            return LlmError::ApiError {
+    /// Builds the error for a rejected request, keeping the provider's
+    /// structured code so the caller can classify it without parsing text.
+    fn api_error(status: StatusCode, body: &str, retry_after_secs: Option<u64>) -> LlmError {
+        match serde_json::from_str::<OaiErrorResponse>(body) {
+            Ok(error) => crate::llm::api_error::classify(
                 status,
-                body_preview: err.error.message,
+                error.error.code.as_deref(),
+                error.error.error_type.as_deref(),
+                &error.error.message,
                 retry_after_secs,
-            };
-        }
-        LlmError::ApiError {
-            status,
-            body_preview: preview_body(body),
-            retry_after_secs,
+            ),
+            Err(_) => crate::llm::api_error::classify(status, None, None, body, retry_after_secs),
         }
     }
 
@@ -196,11 +184,8 @@ impl OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             let retry_after = parse_retry_after(response.headers());
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-                retry_after,
-            ));
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body, retry_after));
         }
 
         consume_responses_stream(response.bytes_stream(), on_delta).await
@@ -237,7 +222,7 @@ impl OpenAiProvider {
         if !status.is_success() {
             let retry_after = parse_retry_after(response.headers());
             let text = response.text().await.unwrap_or_default();
-            return Err(Self::structured_api_error(status, &text, retry_after));
+            return Err(Self::api_error(status, &text, retry_after));
         }
 
         consume_responses_stream(response.bytes_stream(), on_delta).await
@@ -301,11 +286,8 @@ impl LlmProvider for OpenAiProvider {
         let status = response.status();
         if !status.is_success() {
             let retry_after = parse_retry_after(response.headers());
-            return Err(Self::api_error(
-                status,
-                response.text().await.unwrap_or_default(),
-                retry_after,
-            ));
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body, retry_after));
         }
 
         consume_chat_completion_stream(response.bytes_stream(), on_delta).await

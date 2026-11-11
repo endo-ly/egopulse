@@ -353,6 +353,11 @@ pub enum LlmError {
         body_preview: String,
         retry_after_secs: Option<u64>,
     },
+    #[error("llm_context_overflow: status={status} body_preview={body_preview}")]
+    ContextOverflow {
+        status: reqwest::StatusCode,
+        body_preview: String,
+    },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
     #[error("llm_deadline_exceeded: no response within the model iteration deadline")]
@@ -376,33 +381,11 @@ impl LlmError {
     /// Returns `true` when the provider rejected the request because the
     /// prompt exceeded the model's context window.
     ///
-    /// A `400` alone is not enough: malformed requests and unsupported
-    /// parameters also return `400`. The provider must name a context limit.
+    /// The classification happens at the provider boundary, which is the only
+    /// place that knows the provider's error vocabulary; callers only react to
+    /// the variant.
     pub(crate) fn is_context_overflow(&self) -> bool {
-        let Self::ApiError {
-            status,
-            body_preview,
-            ..
-        } = self
-        else {
-            return false;
-        };
-        if !matches!(status.as_u16(), 400 | 413 | 422) {
-            return false;
-        }
-        let body = body_preview.to_ascii_lowercase();
-        [
-            "context_length_exceeded",
-            "context window",
-            "context_overflow",
-            "maximum context length",
-            "prompt is too long",
-            "input is too long",
-            "too many tokens",
-            "reduce the length",
-        ]
-        .iter()
-        .any(|marker| body.contains(marker))
+        matches!(self, Self::ContextOverflow { .. })
     }
 
     /// Returns `true` when the error represents a transient failure that is
@@ -411,17 +394,19 @@ impl LlmError {
     /// that ended before its completion event.
     ///
     /// Non-retryable variants (`InvalidResponse`, `IncompleteResponse`,
-    /// `InitFailed`, `RequestConstructionFailed`, `DeadlineExceeded`, and 4xx
-    /// other than 429) either indicate a deterministic problem, mean the
-    /// provider completed the generation but cut it off (output limit or
-    /// content filter), imply the provider already produced a response that
-    /// must not be silently discarded, or mean the iteration's time window is
-    /// gone.
+    /// `ContextOverflow`, `InitFailed`, `RequestConstructionFailed`,
+    /// `DeadlineExceeded`, and 4xx other than 429) either indicate a
+    /// deterministic problem, mean the provider completed the generation but
+    /// cut it off (output limit or content filter), require a smaller request
+    /// instead of an identical retry, imply the provider already produced a
+    /// response that must not be silently discarded, or mean the iteration's
+    /// time window is gone.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::RequestFailed(_) | Self::IncompleteStream(_) => true,
             Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
-            Self::InitFailed(_)
+            Self::ContextOverflow { .. }
+            | Self::InitFailed(_)
             | Self::IncompleteResponse(_)
             | Self::InvalidResponse(_)
             | Self::DeadlineExceeded
@@ -435,7 +420,8 @@ impl LlmError {
             Self::ApiError {
                 retry_after_secs, ..
             } => *retry_after_secs,
-            Self::InitFailed(_)
+            Self::ContextOverflow { .. }
+            | Self::InitFailed(_)
             | Self::RequestFailed(_)
             | Self::IncompleteStream(_)
             | Self::IncompleteResponse(_)

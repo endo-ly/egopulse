@@ -2,9 +2,11 @@
 
 use std::sync::Arc;
 
+use tracing::warn;
+
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::compaction::{
-    CompactionOutcome, CompactionRequest, PromptContext, compact_if_needed,
+    CompactionOutcome, CompactionRequest, PromptContext, RequestMeasurement, compact_if_needed,
 };
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::format_direct_input;
@@ -12,7 +14,7 @@ use crate::agent_loop::model_step::AssistantToolPhase;
 use crate::agent_loop::session::{
     PersistedTurn, persist_phase, persist_phase_messages, serialize_snapshot,
 };
-use crate::agent_loop::session_snapshot::{ContextUsageAnchor, SessionContext};
+use crate::agent_loop::session_snapshot::SessionContext;
 use crate::agent_loop::tool_execution::ToolResultPhase;
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, StorageError};
@@ -102,9 +104,20 @@ impl<'a> TurnPersistence<'a> {
             candidate_messages.push(input.message.clone());
             candidate.messages = Arc::new(candidate_messages);
 
-            candidate = match compact_if_needed(&compaction_request, &candidate, None).await? {
-                CompactionOutcome::Unchanged => candidate,
-                CompactionOutcome::Compacted(compacted) => compacted,
+            candidate = match compact_if_needed(&compaction_request, &candidate, None).await {
+                Ok(CompactionOutcome::Compacted(compacted)) => compacted,
+                Ok(CompactionOutcome::Unchanged) => candidate,
+                // A summarization failure must not reject the user input: the
+                // first model call may still fit, and an overflow is recovered
+                // from the Agent Loop.
+                Err(error) => {
+                    warn!(
+                        turn_id = %self.turn_id,
+                        error = %error,
+                        "context compaction failed; committing the uncompacted context"
+                    );
+                    candidate
+                }
             };
 
             let persist_result = crate::agent_loop::session::commit_user_turn_input(
@@ -202,8 +215,7 @@ impl<'a> TurnPersistence<'a> {
         assistant_message_id: &str,
         assistant_phase: &AssistantToolPhase,
         mut context: SessionContext,
-        model_key: &str,
-        request_shape_hash: &str,
+        measurement: &RequestMeasurement,
         session_revision: Option<i64>,
     ) -> Result<PersistedTurn, EgoPulseError> {
         let assistant_message = assistant_phase.assistant_message.clone();
@@ -211,9 +223,10 @@ impl<'a> TurnPersistence<'a> {
         messages.push(assistant_message.clone());
         let assistant_index = messages.len() - 1;
         context.messages = Arc::new(messages);
-        context.last_usage = assistant_phase.usage.as_ref().map(|usage| {
-            ContextUsageAnchor::for_message(assistant_index, usage, model_key, request_shape_hash)
-        });
+        context.last_usage = assistant_phase
+            .usage
+            .as_ref()
+            .map(|usage| measurement.anchor(assistant_index, usage));
 
         persist_phase(
             self.runtime,

@@ -3,6 +3,7 @@
 //! OpenAI 互換 Chat Completions API および Responses API へのリクエスト構築・送信・
 //! レスポンス解析を行う。ツールコールに対応する。
 
+mod api_error;
 mod cache;
 pub(crate) mod calibration;
 pub(crate) mod codex_auth;

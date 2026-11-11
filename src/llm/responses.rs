@@ -392,6 +392,9 @@ pub(super) fn stream_api_error(
                 .or_else(|| value.as_str())
         })
         .unwrap_or("stream failed without an error message");
+    let code = error
+        .and_then(|value| value.get("code"))
+        .and_then(|value| value.as_str());
     let status = stream_error_status(error_type)
         .or_else(|| {
             error
@@ -399,11 +402,7 @@ pub(super) fn stream_api_error(
                 .and_then(stream_error_code)
         })
         .unwrap_or(StatusCode::BAD_GATEWAY);
-    LlmError::ApiError {
-        status,
-        body_preview: preview_body(message),
-        retry_after_secs: None,
-    }
+    crate::llm::api_error::classify(status, code, error_type, message, None)
 }
 
 /// Maps OpenRouter's typed error vocabulary to the HTTP status it stands for.
@@ -728,6 +727,12 @@ pub(crate) struct OaiErrorResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct OaiErrorDetail {
     pub(crate) message: String,
+    /// Stable provider code for the failure, when the provider sends one.
+    #[serde(default)]
+    pub(crate) code: Option<String>,
+    /// Coarse provider error type, used when `code` is absent.
+    #[serde(default, rename = "type")]
+    pub(crate) error_type: Option<String>,
 }
 
 #[cfg(test)]

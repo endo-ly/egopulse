@@ -13,11 +13,31 @@ pub(crate) fn runtime_guard_messages(
     guard_text: &str,
 ) -> Vec<Message> {
     let mut retry_messages = messages.to_vec();
+    retry_messages.extend(runtime_guard_suffix(
+        assistant_text,
+        assistant_reasoning_content,
+        guard_text,
+    ));
+    retry_messages
+}
+
+/// Builds the messages a runtime guard appends to a request: the discarded
+/// assistant reply and the corrective instruction.
+///
+/// Callers that keep the conversation separate from the request append this
+/// suffix instead of copying the whole history, so the correction survives a
+/// compaction of the conversation.
+pub(crate) fn runtime_guard_suffix(
+    assistant_text: &str,
+    assistant_reasoning_content: Option<&str>,
+    guard_text: &str,
+) -> Vec<Message> {
     let mut assistant_message = Message::text("assistant", assistant_text.to_string());
     assistant_message.reasoning_content = assistant_reasoning_content.map(ToString::to_string);
-    retry_messages.push(assistant_message);
-    retry_messages.push(Message::text("user", guard_text.to_string()));
-    retry_messages
+    vec![
+        assistant_message,
+        Message::text("user", guard_text.to_string()),
+    ]
 }
 
 /// レスポンスが「宣言だけしてツールを実行しない」パターンに一致するか判定する。
