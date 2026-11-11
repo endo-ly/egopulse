@@ -35,10 +35,37 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install test dependencies
+        env:
+          RIPGREP_VERSION: "14.1.1"
+          FD_VERSION: "v10.2.0"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fd-find ripgrep python3
-          sudo ln -sf $(which fdfind) /usr/local/bin/fd
+          set -euo pipefail
+
+          # Static binaries from GitHub Releases: the Ubuntu mirrors are not
+          # reachable on every runner, and the apt install of ripgrep/fd was
+          # failing for that reason.
+          install_tool() {
+            local url="$1" pattern="$2" target="$3"
+            local tmp
+            tmp="$(mktemp -d)"
+            curl -fsSL --retry 5 --retry-all-errors -o "$tmp/tool.tar.gz" "$url"
+            tar -xzf "$tmp/tool.tar.gz" -C "$tmp"
+            local binary
+            binary="$(find "$tmp" -type f -name "$pattern" -perm -u+x -print -quit)"
+            sudo install -m 0755 "$binary" "/usr/local/bin/$target"
+            rm -rf "$tmp"
+          }
+
+          install_tool \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RIPGREP_VERSION}/ripgrep-${RIPGREP_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            rg rg
+          install_tool \
+            "https://github.com/sharkdp/fd/releases/download/${FD_VERSION}/fd-${FD_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+            fd fd
+
+          rg --version
+          fd --version
+          command -v python3
 
       - name: Run tests
         run: cargo test
