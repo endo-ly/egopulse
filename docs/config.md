@@ -259,7 +259,7 @@ web_fetch:
 | `max_history_messages` | `usize` | 任意 | `50` | セッション復元時のフォールバックメッセージ取得数 |
 | `default_context_window_tokens` | `usize` | 任意 | `131072` | context window のトークン数フォールバック値。model 固有の設定がない場合に使用。安全上限 `1,000,000` |
 | `compaction.enabled` | `bool` | 任意 | `true` | 自動 compaction の有効化。`false` でも `/compact` と context overflow 復旧は動作する |
-| `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。`1` 以上 |
+| `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。`1` 以上かつ、使用する context window より小さいこと |
 | `compaction.keep_recent_tokens` | `usize` | 任意 | `20000` | 原文のまま保持する直近履歴の下限 token 数。`1` 以上 |
 
 ### 3.2 プロバイダー定義（`providers.<id>`）
