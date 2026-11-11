@@ -847,7 +847,7 @@ impl Database {
 
     /// Advances the LLM session snapshot without appending a message.
     ///
-    /// Used by compaction and by unconditional session seeds. Bumps
+    /// Used by `/compact` (through the CAS wrapper) and by test seeds. Bumps
     /// `chats.revision` so the change is observable under the same CAS
     /// contract. `snapshot_through_seq` is left at the chat's current maximum
     /// `seq` (no new message was added).

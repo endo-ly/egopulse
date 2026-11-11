@@ -82,9 +82,6 @@ Topic changes, important events, and how the understanding evolved.
 ## 共有された情報
 The user's facts, opinions, preferences, and conditions; agreements; and statements that were later corrected.
 
-## 直近の文脈
-The topic currently being discussed, the exchange right before the retained messages, and open points.
-
 ## 重要な参照情報
 Numbers, dates, proper nouns, file paths, and identifiers needed to continue. Omit when unnecessary.
 
@@ -112,7 +109,6 @@ Use the same format as the previous summary:
 
 ## 会話の経緯
 ## 共有された情報
-## 直近の文脈
 ## 重要な参照情報";
 
 /// Instructions used to summarize the first part of a split turn.
@@ -529,7 +525,10 @@ fn prepare_compaction(
         messages_to_summarize,
         turn_prefix_messages,
         is_split_turn: cut.is_split_turn,
-        previous_summary: session.checkpoint.as_ref().map(|c| c.summary.clone()),
+        previous_summary: session
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| strip_file_operation_suffix(&checkpoint.summary).to_string()),
         file_operations,
     })
 }
@@ -615,6 +614,20 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
         }
     }
     parts.join("\n\n")
+}
+
+/// Removes a previous checkpoint's trailing file-operation blocks.
+///
+/// The lists are carried in the checkpoint fields and re-appended after the
+/// update, so passing the old blocks back to the model would duplicate them.
+fn strip_file_operation_suffix(summary: &str) -> &str {
+    let mut end = summary.len();
+    for marker in ["\n\n<read-files>", "\n\n<modified-files>"] {
+        if let Some(index) = summary.find(marker) {
+            end = end.min(index);
+        }
+    }
+    summary[..end].trim_end()
 }
 
 fn file_operations_suffix(read_files: &[String], modified_files: &[String]) -> String {
@@ -1365,7 +1378,11 @@ mod tests {
 
     #[test]
     fn carries_previous_checkpoint_and_file_operations_forward() {
-        let mut previous = session(vec![text("user", "old"), text("assistant", "old answer")]);
+        let mut previous = session(vec![
+            text("user", "old question"),
+            text("assistant", &"old answer ".repeat(1_000)),
+            text("user", "fresh question"),
+        ]);
         previous.checkpoint = Some(CompactionCheckpoint {
             summary: "previous".to_string(),
             tokens_before: 10,
@@ -1438,6 +1455,28 @@ mod tests {
         let serialized = serialize_conversation(&[message]);
 
         assert_eq!(serialized, "[Assistant]: answer");
+    }
+
+    #[test]
+    fn previous_file_blocks_are_stripped_before_the_update_prompt() {
+        // Arrange: a previous checkpoint whose summary already ends with tags.
+        let mut previous = session(vec![
+            text("user", "old question"),
+            text("assistant", &"old answer ".repeat(1_000)),
+            text("user", "fresh question"),
+        ]);
+        previous.checkpoint = Some(CompactionCheckpoint {
+            summary: "previous\n\n<read-files>\nsrc/a.rs\n</read-files>".to_string(),
+            tokens_before: 10,
+            read_files: vec!["src/a.rs".to_string()],
+            modified_files: Vec::new(),
+        });
+
+        // Act: the summary passed to the model is stripped of the old blocks.
+        let preparation = prepare_compaction(&previous, 100).expect("preparation");
+
+        // Assert
+        assert_eq!(preparation.previous_summary.as_deref(), Some("previous"));
     }
 
     #[test]
@@ -1759,9 +1798,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn automatic_compaction_respects_the_disabled_setting() {
-        // Arrange: no responses, so any summarization call would panic.
+        // Arrange: one response for the manual compaction below; any automatic
+        // summarization call would consume it and fail the assertion.
         let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(Vec::new(), Vec::new());
+        let provider =
+            RecordingProvider::new(vec![Ok(summary_response("manual summary"))], vec![0]);
         let mut config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
             1,
@@ -1791,7 +1832,7 @@ mod tests {
             request_only_messages: Vec::new(),
         };
 
-        // Act
+        // Act: the automatic path stays off.
         let outcome = compact_if_needed(&request, &session, None)
             .await
             .expect("compact");
@@ -1799,6 +1840,15 @@ mod tests {
         // Assert
         assert!(matches!(outcome, CompactionOutcome::Unchanged));
         assert!(provider.seen_systems().is_empty());
+
+        // Act: the manual path still runs while automatic compaction is off.
+        let outcome = compact(&request, &session, CompactionReason::Manual, None)
+            .await
+            .expect("compact");
+
+        // Assert
+        assert!(matches!(outcome, CompactionOutcome::Compacted(_)));
+        assert_eq!(provider.seen_systems().len(), 1);
     }
 
     #[tokio::test]

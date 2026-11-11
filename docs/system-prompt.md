@@ -423,12 +423,11 @@ split turn のターン前半要約だけは次の形になる。
 
 ### 要約本文の形式
 
-`INITIAL_SUMMARY_PROMPT` と `UPDATE_SUMMARY_PROMPT` は次の 4 節を要求する。該当が無い節は省略し、空の箇条書きを作らない。
+`INITIAL_SUMMARY_PROMPT` と `UPDATE_SUMMARY_PROMPT` は次の 3 節を要求する。該当が無い節は省略し、空の箇条書きを作らない。
 
 ```markdown
 ## 会話の経緯
 ## 共有された情報
-## 直近の文脈
 ## 重要な参照情報
 ```
 

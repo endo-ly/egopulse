@@ -185,7 +185,8 @@ struct SerializableDb {
 
 #[derive(Serialize)]
 struct SerializableCompaction {
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// The default is `true`, so only a disabled setting needs persisting.
+    #[serde(skip_serializing_if = "is_default_bool_true")]
     enabled: bool,
     reserve_tokens: usize,
     keep_recent_tokens: usize,

@@ -2759,6 +2759,70 @@ fn persist_preserves_sleep_batch_config() {
     assert!(yaml.contains("reasoning_effort: high"));
 }
 
+#[test]
+#[serial]
+fn persist_round_trips_a_disabled_compaction() {
+    use crate::config::persist::save_config_with_secrets;
+
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let path = temp_dir.path().join("egopulse.config.yaml");
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        super::ProviderId::new("openai"),
+        super::ProviderConfig::new(
+            "OpenAI".to_string(),
+            "https://api.openai.com/v1".to_string(),
+            Some(super::secret_ref::ResolvedValue::Literal(
+                "sk-test".to_string(),
+            )),
+            "gpt-4o-mini".to_string(),
+            HashMap::new(),
+        ),
+    );
+
+    let config = Config {
+        default_provider: super::ProviderId::new("openai"),
+        default_model: None,
+        providers,
+        state_root: temp_dir.path().to_str().expect("path").to_string(),
+        log_level: "info".to_string(),
+        compaction: super::CompactionConfig {
+            enabled: false,
+            reserve_tokens: 4096,
+            keep_recent_tokens: 12_000,
+        },
+        max_history_messages: 50,
+        default_context_window_tokens: 131_072,
+        channels: HashMap::new(),
+        default_agent: super::AgentId::new("default"),
+        agents: HashMap::from([(
+            super::AgentId::new("default"),
+            super::AgentConfig {
+                label: "Default Agent".to_string(),
+                ..Default::default()
+            },
+        )]),
+        timezone: "UTC".to_string(),
+        sleep_batch: super::SleepBatchConfig::default(),
+        pulse: super::PulseConfig::default(),
+        db: super::DatabaseConfig::default(),
+        web_fetch: super::web_fetch::WebFetchConfig::default(),
+        webhooks: super::WebhooksConfig::default(),
+    };
+
+    save_config_with_secrets(&config, &path).expect("save config");
+
+    // Act
+    let reloaded = Config::load(Some(&path)).expect("reload config");
+
+    // Assert: a non-default `enabled: false` must survive the round trip.
+    assert!(!reloaded.compaction.enabled);
+    assert_eq!(reloaded.compaction.reserve_tokens, 4096);
+    assert_eq!(reloaded.compaction.keep_recent_tokens, 12_000);
+}
+
 // --- Step 2: Sleep Batch Scheduler Config tests ---
 
 fn sleep_batch_scheduler_yml(sleep_batch_section: &str) -> String {

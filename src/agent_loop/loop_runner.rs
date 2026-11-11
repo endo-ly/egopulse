@@ -218,14 +218,25 @@ impl<'a> AgentLoop<'a> {
                         // may be retried with a smaller request. Published
                         // output cannot be taken back, and a second overflow
                         // after compaction must surface instead of looping.
-                        if !overflow_recovery_attempted
+                        let recovered = if !overflow_recovery_attempted
                             && !output_published
                             && error.is_context_overflow()
-                            && self
-                                .compact_overflow(&mut loop_state, iteration)
-                                .await
-                                .unwrap_or(false)
                         {
+                            match self.compact_overflow(&mut loop_state, iteration).await {
+                                Ok(changed) => changed,
+                                Err(compaction_error) => {
+                                    warn!(
+                                        iteration,
+                                        error = %compaction_error,
+                                        "context overflow recovery could not compact the context"
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+                        if recovered {
                             overflow_recovery_attempted = true;
                             warn!(
                                 iteration,
