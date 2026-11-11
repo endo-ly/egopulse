@@ -914,6 +914,11 @@ impl Database {
 // ---------------------------------------------------------------------------
 
 impl Database {
+    /// Seeds or replaces a session snapshot unconditionally.
+    ///
+    /// Production paths must use the CAS-aware writers ([`Self::store_message_with_session`],
+    /// [`Self::replace_session_snapshot`], [`Self::truncate_session_messages`]).
+    #[cfg(test)]
     pub(crate) fn save_session(
         &self,
         chat_id: i64,
@@ -985,6 +990,27 @@ impl Database {
         expected_revision: i64,
     ) -> Result<bool, StorageError> {
         match self.update_session_snapshot(chat_id, "[]", Some(expected_revision)) {
+            Ok(_) => Ok(true),
+            Err(StorageError::SessionSnapshotConflict) => Ok(false),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Replaces the session snapshot only when `expected_revision` matches.
+    ///
+    /// `None` seeds the snapshot when the chat has none yet. Returns
+    /// `Ok(false)` when the chat was updated concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the underlying SQLite update fails.
+    pub(crate) fn replace_session_snapshot(
+        &self,
+        chat_id: i64,
+        new_messages_json: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<bool, StorageError> {
+        match self.update_session_snapshot(chat_id, new_messages_json, expected_revision) {
             Ok(_) => Ok(true),
             Err(StorageError::SessionSnapshotConflict) => Ok(false),
             Err(other) => Err(other),

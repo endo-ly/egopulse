@@ -103,26 +103,25 @@ fn secret_payload(value: Option<&ResolvedValue>) -> Value {
 }
 
 fn general_payload(config: &Config) -> Value {
+    let default_compaction = defaults::default_compaction_config();
     json!({
         "default_agent": config.default_agent.as_str(),
         "default_provider": config.default_provider.as_str(),
         "default_model": config.default_model,
         "timezone": config.timezone,
         "max_history_messages": config.max_history_messages,
-        "compaction_timeout_secs": config.compaction_timeout_secs,
+        "compaction_enabled": config.compaction.enabled,
+        "compaction_reserve_tokens": config.compaction.reserve_tokens,
+        "compaction_keep_recent_tokens": config.compaction.keep_recent_tokens,
         "default_context_window_tokens": config.default_context_window_tokens,
-        "compaction_threshold_ratio": config.compaction_threshold_ratio,
-        "compaction_target_ratio": config.compaction_target_ratio,
-        "compact_keep_recent": config.compact_keep_recent,
         "log_level": config.log_level,
         "state_root": config.state_root,
         "defaults": {
             "max_history_messages": defaults::default_max_history_messages(),
-            "compaction_timeout_secs": defaults::default_compaction_timeout_secs(),
+            "compaction_enabled": default_compaction.enabled,
+            "compaction_reserve_tokens": default_compaction.reserve_tokens,
+            "compaction_keep_recent_tokens": default_compaction.keep_recent_tokens,
             "default_context_window_tokens": defaults::default_context_window_tokens(),
-            "compaction_threshold_ratio": defaults::default_compaction_threshold_ratio(),
-            "compaction_target_ratio": defaults::default_compaction_target_ratio(),
-            "compact_keep_recent": defaults::default_compact_keep_recent(),
             "timezone": "UTC",
             "log_level": "info",
         },
@@ -603,11 +602,10 @@ pub(super) struct GeneralPatch {
     default_model: Option<Option<String>>,
     timezone: Option<String>,
     max_history_messages: Option<usize>,
-    compaction_timeout_secs: Option<u64>,
+    compaction_enabled: Option<bool>,
+    compaction_reserve_tokens: Option<usize>,
+    compaction_keep_recent_tokens: Option<usize>,
     default_context_window_tokens: Option<usize>,
-    compaction_threshold_ratio: Option<f64>,
-    compaction_target_ratio: Option<f64>,
-    compact_keep_recent: Option<usize>,
 }
 
 /// Updates global defaults and conversation tuning.
@@ -635,20 +633,17 @@ pub(super) async fn api_patch_general(
         if let Some(v) = patch.max_history_messages {
             config.max_history_messages = v;
         }
-        if let Some(v) = patch.compaction_timeout_secs {
-            config.compaction_timeout_secs = v;
+        if let Some(v) = patch.compaction_enabled {
+            config.compaction.enabled = v;
+        }
+        if let Some(v) = patch.compaction_reserve_tokens {
+            config.compaction.reserve_tokens = v;
+        }
+        if let Some(v) = patch.compaction_keep_recent_tokens {
+            config.compaction.keep_recent_tokens = v;
         }
         if let Some(v) = patch.default_context_window_tokens {
             config.default_context_window_tokens = v;
-        }
-        if let Some(v) = patch.compaction_threshold_ratio {
-            config.compaction_threshold_ratio = v;
-        }
-        if let Some(v) = patch.compaction_target_ratio {
-            config.compaction_target_ratio = v;
-        }
-        if let Some(v) = patch.compact_keep_recent {
-            config.compact_keep_recent = v;
         }
         Ok(Vec::new())
     })

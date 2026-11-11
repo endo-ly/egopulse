@@ -11,6 +11,7 @@ use chrono_tz::OffsetComponents;
 use tracing::{info, warn};
 
 use crate::agent_loop::compaction::archive_conversation_blocking;
+use crate::agent_loop::session_snapshot::SessionContext;
 use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message};
 use crate::memory::{MemoryBundle, MemoryError};
@@ -466,6 +467,7 @@ struct BatchContext {
     candidate_memory: MemoryBundle,
     context_tokens: usize,
     config: Arc<crate::config::Config>,
+    assets: Arc<crate::assets::AssetStore>,
 }
 
 struct ExtractionInput {
@@ -652,6 +654,7 @@ async fn prepare_batch_context(
         candidate_memory: (*memory_before).clone(),
         context_tokens,
         config,
+        assets: std::sync::Arc::clone(&state.assets),
     })
 }
 
@@ -1452,9 +1455,11 @@ async fn finalize_batch(
     // how memory publication is offloaded above and keeps the normal path
     // symmetric with startup recovery, which runs this synchronously in a
     // blocking startup context.
+    let assets = std::sync::Arc::clone(&ctx.assets);
     tokio::task::spawn_blocking(move || {
         finalize_published_run_blocking(
             db_for_finalize.as_ref(),
+            assets.as_ref(),
             &groups_dir,
             &secrets,
             &run,
@@ -1493,6 +1498,7 @@ async fn finalize_batch(
 /// already logged by each step's LLM call).
 fn finalize_published_run_blocking(
     db: &Database,
+    assets: &crate::assets::AssetStore,
     groups_dir: &Path,
     secrets: &[(String, String)],
     run: &SleepRun,
@@ -1534,7 +1540,8 @@ fn finalize_published_run_blocking(
         // Already-archived sessions are naturally skipped on retry: truncation
         // removes the messages, so `get_latest_message_cursor` returns `None`
         // and the session is not re-archived.
-        if let Err(e) = archive_and_clear_session(db, groups_dir, &run.id, session, secrets) {
+        if let Err(e) = archive_and_clear_session(db, assets, groups_dir, &run.id, session, secrets)
+        {
             warn!(
                 agent_id = %agent_id,
                 chat_id = session.chat_id,
@@ -1732,9 +1739,14 @@ fn recover_run_publication(state: &AppState, run: &SleepRun) -> Result<(), EgoPu
             let config = state.config_manager.current_blocking();
             let groups_dir = config.config.groups_dir();
             let secrets = crate::tools::collect_config_secrets(&config.config);
-            if let Err(e) =
-                finalize_published_run_blocking(&state.db, &groups_dir, &secrets, run, None)
-            {
+            if let Err(e) = finalize_published_run_blocking(
+                &state.db,
+                &state.assets,
+                &groups_dir,
+                &secrets,
+                run,
+                None,
+            ) {
                 // ArchivePending is a transient condition (archive I/O
                 // temporarily unavailable), not a consistency violation. The
                 // run stays `Running` and the next scheduler cycle retries —
@@ -1801,6 +1813,7 @@ fn recovery_error(run: &SleepRun, e: MemoryError) -> EgoPulseError {
 
 fn archive_and_clear_session(
     db: &Database,
+    assets: &crate::assets::AssetStore,
     groups_dir: &Path,
     run_id: &str,
     session: &AgentSessionInfo,
@@ -1811,7 +1824,14 @@ fn archive_and_clear_session(
         .map_err(SleepBatchError::Storage)?;
 
     if let Some(json) = &snapshot.messages_json {
-        let messages = parse_messages_json(json);
+        let context = parse_session_context(assets, json)?;
+        let mut messages: Vec<Message> = Vec::new();
+        if let Some(checkpoint) = &context.checkpoint {
+            messages.push(crate::agent_loop::session_snapshot::checkpoint_message(
+                checkpoint,
+            ));
+        }
+        messages.extend(context.messages.iter().cloned());
         if !messages.is_empty() {
             // Deterministic idempotency key: a crash after the archive write but
             // before truncation produces the same file on re-finalization rather
@@ -1843,8 +1863,11 @@ fn archive_and_clear_session(
     // Only truncate after the archive is confirmed on disk, so an archive
     // failure never loses the conversation content.
     if let Some(revision) = snapshot.session_revision {
-        let truncated_json =
-            truncate_messages_json(snapshot.messages_json.as_deref(), SESSION_CLEAR_KEEP_RECENT);
+        let truncated_json = truncate_session_json(
+            assets,
+            snapshot.messages_json.as_deref(),
+            SESSION_CLEAR_KEEP_RECENT,
+        )?;
         let truncated = db
             .truncate_session_messages(session.chat_id, revision, &truncated_json)
             .map_err(SleepBatchError::Storage)?;
@@ -1861,28 +1884,57 @@ fn archive_and_clear_session(
 
 /// Sleep-batch session truncate: keeps the trailing `keep` user/assistant
 /// text messages, dropping any `tool` role and any `assistant` with
-/// `tool_calls`.
-fn truncate_messages_json(messages_json: Option<&str>, keep: usize) -> String {
-    let Some(json) = messages_json else {
-        return "[]".to_string();
+/// `tool_calls`, and clears the checkpoint and the usage anchor so the next
+/// turn starts from a clean context.
+fn truncate_session_json(
+    assets: &crate::assets::AssetStore,
+    messages_json: Option<&str>,
+    keep: usize,
+) -> Result<String, SleepBatchError> {
+    let context = match messages_json {
+        Some(json) => parse_session_context(assets, json)?,
+        None => SessionContext::default(),
     };
-    let messages = parse_messages_json(json);
-    let retained: Vec<&Message> = messages
+    let retained: Vec<Message> = context
+        .messages
         .iter()
         .filter(|message| message.role != "tool" && message.tool_calls.is_empty())
+        .cloned()
         .collect();
     let start = retained.len().saturating_sub(keep);
-    serde_json::to_string(&retained[start..]).unwrap_or_else(|_| "[]".to_string())
+    let truncated = SessionContext {
+        checkpoint: None,
+        messages: std::sync::Arc::new(retained[start..].to_vec()),
+        last_usage: None,
+    };
+    let snapshot = crate::agent_loop::session_snapshot::context_to_snapshot(assets, &truncated)
+        .map_err(SleepBatchError::Storage)?;
+    serde_json::to_string(&snapshot).map_err(|error| {
+        SleepBatchError::Storage(crate::error::StorageError::SessionSerialize(error))
+    })
 }
 
-fn parse_messages_json(json: &str) -> Vec<Message> {
-    serde_json::from_str::<Vec<Message>>(json).unwrap_or_default()
+fn parse_session_context(
+    assets: &crate::assets::AssetStore,
+    json: &str,
+) -> Result<SessionContext, SleepBatchError> {
+    let snapshot: crate::agent_loop::session_snapshot::ContextSnapshot = serde_json::from_str(json)
+        .map_err(|error| {
+            SleepBatchError::Storage(crate::error::StorageError::SessionSerialize(error))
+        })?;
+    crate::agent_loop::session_snapshot::context_from_snapshot(assets, snapshot)
+        .map_err(SleepBatchError::Storage)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::llm::{LlmProvider, LlmUsage, Message, MessagesResponse, ToolDefinition};
+
+    /// Wraps a legacy message-array JSON body in the snapshot envelope.
+    fn session_envelope(messages: &str) -> String {
+        format!(r#"{{"version":1,"messages":{messages}}}"#)
+    }
     use crate::storage::{Database, EpisodeEventKind, SleepRunStatus};
     use async_trait::async_trait;
     use std::sync::Arc;
@@ -2002,8 +2054,11 @@ mod tests {
                 &format!("2025-01-01T00:00:{i:02}Z"),
             );
         }
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
     }
 
     fn seed_sessions_above_threshold(db: &Database, agent_id: &str, n_chats: usize) {
@@ -2016,8 +2071,11 @@ mod tests {
             for j in 0..per_chat {
                 store_msg(db, &format!("m{i}-{j}"), cid, "hi", &ts);
             }
-            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
-                .expect("save session");
+            db.save_session(
+                cid,
+                &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+            )
+            .expect("save session");
         }
     }
 
@@ -2047,8 +2105,11 @@ mod tests {
                 &format!("2025-06-01T00:12:{j:02}Z"),
             );
         }
-        db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            cid,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
         cid
     }
 
@@ -2153,8 +2214,11 @@ mod tests {
                 let ts = format!("2025-06-01T00:{i:02}:{j:02}Z");
                 store_msg(&db, &format!("m{i}-{j}"), cid, "hi", &ts);
             }
-            db.save_session(cid, r#"[{"role":"user","content":"hi"}]"#)
-                .expect("save session");
+            db.save_session(
+                cid,
+                &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+            )
+            .expect("save session");
             chat_ids.push(cid);
         }
 
@@ -2605,7 +2669,7 @@ mod tests {
             .join(",");
         state
             .db
-            .save_session(chat_id, &format!("[{messages_json}]"))
+            .save_session(chat_id, &session_envelope(&format!("[{messages_json}]")))
             .expect("save session");
 
         // Checkpoints at the last message so the session is archivable.
@@ -2674,12 +2738,16 @@ mod tests {
             .db
             .load_session_snapshot(chat_id, 100)
             .expect("snapshot");
-        let kept = parse_messages_json(snap.messages_json.as_deref().unwrap_or("[]"));
+        let kept =
+            parse_session_context(&state.assets, snap.messages_json.as_deref().unwrap_or("{}"))
+                .expect("snapshot")
+                .messages
+                .len();
         assert!(
-            kept.len() <= SESSION_CLEAR_KEEP_RECENT,
+            kept <= SESSION_CLEAR_KEEP_RECENT,
             "session should be truncated to <= {} messages, got {}",
             SESSION_CLEAR_KEEP_RECENT,
-            kept.len()
+            kept
         );
         let archive_dir = state
             .config
@@ -3467,8 +3535,11 @@ mod tests {
                 &format!("2025-01-01T00:00:{:02}Z", i % 60),
             );
         }
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
         let provider = Arc::new(ScenarioProvider::new(
             event_response("Extracted Event Title"),
             vec![semantic_response("# Semantic")],
@@ -3665,6 +3736,22 @@ mod tests {
                     "kind": "decision",
                     "title": "batch event 3",
                     "body_md": "z".repeat(10_000),
+                    "ripple_strength": 3,
+                    "certainty": "stated"
+                },
+                {
+                    "experienced_at": "2025-01-01T00:04:00Z",
+                    "kind": "decision",
+                    "title": "batch event 4",
+                    "body_md": "w".repeat(10_000),
+                    "ripple_strength": 3,
+                    "certainty": "stated"
+                },
+                {
+                    "experienced_at": "2025-01-01T00:05:00Z",
+                    "kind": "decision",
+                    "title": "batch event 5",
+                    "body_md": "v".repeat(10_000),
                     "ripple_strength": 3,
                     "certainty": "stated"
                 }
@@ -3892,8 +3979,11 @@ mod tests {
                 &format!("2025-01-01T00:00:{i:02}Z"),
             );
         }
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         match result {
@@ -3922,8 +4012,11 @@ mod tests {
         store_msg(&db, "old-2", chat_id, "old", "2020-01-01T00:00:02Z");
         store_msg(&db, "old-3", chat_id, "old", "2020-01-01T00:00:03Z");
 
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
 
         let after_cutoff = chrono::Utc::now().to_rfc3339();
         for i in 1..=(SKIP_THRESHOLD + 1) {
@@ -3950,8 +4043,11 @@ mod tests {
                 &format!("2025-01-01T00:00:{i:02}Z"),
             );
         }
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         assert!(
@@ -3987,8 +4083,11 @@ mod tests {
                 &format!("2025-01-01T00:00:{i:02}Z"),
             );
         }
-        db.save_session(chat_id, r#"[{"role":"user","content":"hi"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hi"}]"#),
+        )
+        .expect("save session");
 
         let result = collect_sleep_input(&db, "test-agent").expect("collect");
         let json_str = match &result {
@@ -4030,9 +4129,9 @@ mod tests {
         store_msg(&db, "1", c1, "hi", "2025-01-01T00:00:01Z");
         let c2 = create_chat(&db, "test-agent", "-2");
         store_msg(&db, "1", c2, "hi", "2025-01-01T00:00:02Z");
-        db.save_session(c1, r#"[{"role":"user","content":"hi"}]"#)
+        db.save_session(c1, &session_envelope(r#"[{"role":"user","content":"hi"}]"#))
             .expect("save session");
-        db.save_session(c2, r#"[{"role":"user","content":"hi"}]"#)
+        db.save_session(c2, &session_envelope(r#"[{"role":"user","content":"hi"}]"#))
             .expect("save session");
 
         let count = db
@@ -4180,87 +4279,124 @@ mod tests {
     }
 
     #[test]
-    fn truncate_messages_json_preserves_filtering_and_tail_contract() {
-        let cases = [
-            (
-                Some(
-                    r#"[
-                        {"role":"user","content":"m1"},
-                        {"role":"assistant","content":"m2"},
-                        {"role":"user","content":"m3"},
-                        {"role":"assistant","content":"m4"},
-                        {"role":"user","content":"m5"},
-                        {"role":"assistant","content":"m6"}
-                    ]"#,
-                ),
-                4,
-            ),
-            (Some(r#"[{"role":"user","content":"only"}]"#), 4),
-            (None, 4),
-            (Some("[]"), 4),
-        ];
+    fn truncate_session_json_preserves_filtering_and_tail_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = crate::assets::AssetStore::new(dir.path()).expect("assets");
 
-        let result = truncate_messages_json(cases[0].0, cases[0].1);
-        let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).expect("valid JSON");
-        assert_eq!(parsed.len(), 4);
-        assert_eq!(parsed[0]["content"], "m3");
-        assert_eq!(parsed[3]["content"], "m6");
-
-        assert_eq!(
-            truncate_messages_json(cases[1].0, cases[1].1),
-            cases[1].0.unwrap()
+        let result = truncate_session_json(
+            &assets,
+            Some(&session_envelope(
+                r#"[
+                    {"role":"user","content":"m1"},
+                    {"role":"assistant","content":"m2"},
+                    {"role":"user","content":"m3"},
+                    {"role":"assistant","content":"m4"},
+                    {"role":"user","content":"m5"},
+                    {"role":"assistant","content":"m6"}
+                ]"#,
+            )),
+            4,
+        )
+        .expect("truncate");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert_eq!(parsed["version"], 1);
+        assert!(parsed["checkpoint"].is_null(), "checkpoint must be cleared");
+        assert!(
+            parsed["last_usage"].is_null(),
+            "usage anchor must be cleared"
         );
-        assert_eq!(truncate_messages_json(cases[2].0, cases[2].1), "[]");
-        assert_eq!(truncate_messages_json(cases[3].0, cases[3].1), "[]");
+        let messages = parsed["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], "m3");
+        assert_eq!(messages[3]["content"], "m6");
 
-        let filtered_tool = r#"[
-            {"role":"user","content":"m1"},
-            {"role":"assistant","content":"a1"},
-            {"role":"tool","content":"result","tool_call_id":"call_x"},
-            {"role":"user","content":"m2"},
-            {"role":"assistant","content":"a2"}
-        ]"#;
-        let parsed: Vec<serde_json::Value> =
-            serde_json::from_str(&truncate_messages_json(Some(filtered_tool), 4))
-                .expect("valid JSON");
-        assert_eq!(parsed.len(), 4);
-        assert!(parsed.iter().all(|message| message["role"] != "tool"));
+        for json in [None, Some(session_envelope("[]"))] {
+            let parsed: serde_json::Value = serde_json::from_str(
+                &truncate_session_json(&assets, json.as_deref(), 4).expect("truncate"),
+            )
+            .expect("valid JSON");
+            assert_eq!(parsed["messages"].as_array().expect("messages").len(), 0);
+        }
 
-        let assistant_tool_call = r#"[
-            {"role":"user","content":"m1"},
-            {"role":"assistant","content":"","tool_calls":[{"id":"call_x","name":"read","arguments":{}}]},
-            {"role":"assistant","content":"a1"},
-            {"role":"user","content":"m2"},
-            {"role":"assistant","content":"a2"}
-        ]"#;
-        let parsed: Vec<serde_json::Value> =
-            serde_json::from_str(&truncate_messages_json(Some(assistant_tool_call), 4))
-                .expect("valid JSON");
-        assert_eq!(parsed.len(), 4);
-        assert!(parsed.iter().all(|message| message["tool_calls"].is_null()));
+        let filtered_tool = session_envelope(
+            r#"[
+                {"role":"user","content":"m1"},
+                {"role":"assistant","content":"a1"},
+                {"role":"tool","content":"result","tool_call_id":"call_x"},
+                {"role":"user","content":"m2"},
+                {"role":"assistant","content":"a2"}
+            ]"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(
+            &truncate_session_json(&assets, Some(&filtered_tool), 4).expect("truncate"),
+        )
+        .expect("valid JSON");
+        let messages = parsed["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 4);
+        assert!(messages.iter().all(|message| message["role"] != "tool"));
 
-        let filtered_tail = r#"[
-            {"role":"user","content":"u1"},
-            {"role":"assistant","content":"","tool_calls":[{"id":"c1","name":"read","arguments":{}}]},
-            {"role":"tool","content":"r1","tool_call_id":"c1"},
-            {"role":"assistant","content":"a1"},
-            {"role":"user","content":"u2"},
-            {"role":"assistant","content":"","tool_calls":[{"id":"c2","name":"read","arguments":{}}]},
-            {"role":"tool","content":"r2","tool_call_id":"c2"},
-            {"role":"assistant","content":"a2"},
-            {"role":"user","content":"u3"},
-            {"role":"assistant","content":"a3"}
-        ]"#;
-        let parsed: Vec<serde_json::Value> =
-            serde_json::from_str(&truncate_messages_json(Some(filtered_tail), 4))
-                .expect("valid JSON");
-        assert_eq!(
-            parsed
+        let assistant_tool_call = session_envelope(
+            r#"[
+                {"role":"user","content":"m1"},
+                {"role":"assistant","content":"","tool_calls":[{"id":"call_x","name":"read","arguments":{}}]},
+                {"role":"assistant","content":"a1"},
+                {"role":"user","content":"m2"},
+                {"role":"assistant","content":"a2"}
+            ]"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(
+            &truncate_session_json(&assets, Some(&assistant_tool_call), 4).expect("truncate"),
+        )
+        .expect("valid JSON");
+        let messages = parsed["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 4);
+        assert!(
+            messages
                 .iter()
-                .map(|message| message["content"].as_str().unwrap())
+                .all(|message| message["tool_calls"].is_null())
+        );
+
+        let filtered_tail = session_envelope(
+            r#"[
+                {"role":"user","content":"u1"},
+                {"role":"assistant","content":"","tool_calls":[{"id":"c1","name":"read","arguments":{}}]},
+                {"role":"tool","content":"r1","tool_call_id":"c1"},
+                {"role":"assistant","content":"a1"},
+                {"role":"user","content":"u2"},
+                {"role":"assistant","content":"","tool_calls":[{"id":"c2","name":"read","arguments":{}}]},
+                {"role":"tool","content":"r2","tool_call_id":"c2"},
+                {"role":"assistant","content":"a2"},
+                {"role":"user","content":"u3"},
+                {"role":"assistant","content":"a3"}
+            ]"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(
+            &truncate_session_json(&assets, Some(&filtered_tail), 4).expect("truncate"),
+        )
+        .expect("valid JSON");
+        assert_eq!(
+            parsed["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .map(|message| message["content"].as_str().expect("content"))
                 .collect::<Vec<_>>(),
             ["u2", "a2", "u3", "a3"]
         );
+    }
+
+    #[test]
+    fn session_truncate_rejects_a_corrupt_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let assets = crate::assets::AssetStore::new(dir.path()).expect("assets");
+
+        let error = truncate_session_json(&assets, Some("{not-json"), 4)
+            .expect_err("a corrupt snapshot must not be treated as empty");
+
+        assert!(matches!(
+            error,
+            SleepBatchError::Storage(crate::error::StorageError::SessionSerialize(_))
+        ));
     }
 
     #[test]
@@ -4293,8 +4429,15 @@ mod tests {
         // archive/truncate I/O failure).
         db.fault_inject_next_get_conn(u32::MAX);
 
-        let result =
-            finalize_published_run_blocking(&db, &dir.path().join("groups"), &[], &run, None);
+        let assets = crate::assets::AssetStore::new(dir.path()).expect("assets");
+        let result = finalize_published_run_blocking(
+            &db,
+            &assets,
+            &dir.path().join("groups"),
+            &[],
+            &run,
+            None,
+        );
         assert!(
             result.is_err(),
             "archive/truncate failure must not finalize the run"
@@ -4315,8 +4458,11 @@ mod tests {
         let chat_id = create_chat(&db, "test-agent", "-archive-io");
 
         // Save a session with messages so archive has content to write.
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hello"}]"#),
+        )
+        .expect("save session");
 
         let session = AgentSessionInfo {
             chat_id,
@@ -4333,8 +4479,15 @@ mod tests {
         std::fs::write(&blocking_file, "not a directory").expect("write blocking file");
         let bad_groups_dir = blocking_file.join("groups");
 
-        let result =
-            archive_and_clear_session(&db, &bad_groups_dir, "run-archive-io", &session, &[]);
+        let assets = crate::assets::AssetStore::new(dir.path()).expect("assets");
+        let result = archive_and_clear_session(
+            &db,
+            &assets,
+            &bad_groups_dir,
+            "run-archive-io",
+            &session,
+            &[],
+        );
         assert!(
             matches!(result, Err(SleepBatchError::ArchivePending { .. })),
             "archive I/O failure must propagate as ArchivePending"
@@ -4353,8 +4506,11 @@ mod tests {
         let (db, dir) = test_db();
         let chat_id = create_chat(&db, "test-agent", "-archive-det");
 
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"hello"}]"#),
+        )
+        .expect("save session");
 
         let session = AgentSessionInfo {
             chat_id,
@@ -4368,7 +4524,8 @@ mod tests {
         let groups_dir = dir.path().join("groups");
 
         // First call: archives successfully.
-        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+        let assets = crate::assets::AssetStore::new(dir.path()).expect("assets");
+        archive_and_clear_session(&db, &assets, &groups_dir, "run-det", &session, &[])
             .expect("archive success");
 
         let expected_path = groups_dir
@@ -4392,9 +4549,12 @@ mod tests {
         );
 
         // Simulate post-truncation: session now has different (shorter) content.
-        db.save_session(chat_id, r#"[{"role":"user","content":"truncated-only"}]"#)
-            .expect("re-save truncated session");
-        archive_and_clear_session(&db, &groups_dir, "run-det", &session, &[])
+        db.save_session(
+            chat_id,
+            &session_envelope(r#"[{"role":"user","content":"truncated-only"}]"#),
+        )
+        .expect("re-save truncated session");
+        archive_and_clear_session(&db, &assets, &groups_dir, "run-det", &session, &[])
             .expect("re-archive (skipped)");
         let retry_bytes = std::fs::read_to_string(&expected_path).expect("read retry");
         assert_eq!(

@@ -34,6 +34,8 @@ pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
     pub(crate) assistant_preview: String,
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// Provider usage of the request that produced this phase.
+    pub(crate) usage: Option<LlmUsage>,
 }
 
 pub(crate) fn ignore_delta(_: String) {}
@@ -49,6 +51,16 @@ pub(crate) enum ModelStep {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
     ToolCalls(AssistantToolPhase),
+}
+
+impl ModelStep {
+    /// Returns the provider usage of the step, when the provider reported it.
+    pub(crate) fn usage(&self) -> Option<&LlmUsage> {
+        match self {
+            Self::Final(response) | Self::MalformedToolCalls(response) => response.usage.as_ref(),
+            Self::ToolCalls(phase) => phase.usage.as_ref(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -85,18 +97,9 @@ impl<'a> ModelRunner<'a> {
         &self,
         turn_id: &str,
     ) -> Result<ModelStep, ModelRequestError> {
-        let hash = model_request_hash(
-            self.request.system_prompt,
-            &self.request.messages,
-            self.request
-                .tools
-                .as_deref()
-                .filter(|tools| !tools.is_empty())
-                .and_then(|tools| serde_json::to_string(tools).ok())
-                .as_deref(),
-        );
+        let hash = self.request_hash();
         let turn_id_for_init = turn_id.to_string();
-        let hash_for_init = hash;
+        let hash_for_init = hash.clone();
         let scope = self.request.scope;
         let iteration = self.request.iteration as i64;
         let db = self.request.state.db_for(scope);
@@ -115,6 +118,48 @@ impl<'a> ModelRunner<'a> {
             });
         }
 
+        self.run_attempts(turn_id).await
+    }
+
+    /// Re-issues the same model iteration after the context was compacted.
+    ///
+    /// The durable iteration is already `model_pending`; only the request hash
+    /// changes, because the request itself changed. The transport attempt
+    /// counter is left alone: this is a single recovery attempt, not a retry.
+    pub(crate) async fn retry_after_compaction(
+        &self,
+        turn_id: &str,
+    ) -> Result<ModelStep, ModelRequestError> {
+        let hash = self.request_hash();
+        let turn_id_for_hash = turn_id.to_string();
+        let db = self.request.state.db_for(self.request.scope);
+        call_blocking(db, move |db| {
+            db.refresh_turn_model_hash(&turn_id_for_hash, &hash)
+        })
+        .await
+        .map_err(|error| ModelRequestError {
+            error: EgoPulseError::from(error),
+            output_published: false,
+        })?;
+
+        self.run_attempts(turn_id).await
+    }
+
+    /// Returns the hash that identifies the exact request about to be sent.
+    pub(crate) fn request_hash(&self) -> String {
+        model_request_hash(
+            self.request.system_prompt,
+            &self.request.messages,
+            self.request
+                .tools
+                .as_deref()
+                .filter(|tools| !tools.is_empty())
+                .and_then(|tools| serde_json::to_string(tools).ok())
+                .as_deref(),
+        )
+    }
+
+    async fn run_attempts(&self, turn_id: &str) -> Result<ModelStep, ModelRequestError> {
         let db = self.request.state.db_for(self.request.scope);
         self.retry_transient_failures(DeltaPublication::Published, None, || {
             let db = Arc::clone(&db);
@@ -356,8 +401,8 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         .and_then(|tools| serde_json::to_string(tools).ok());
     let raw_estimate = estimate_prompt_tokens(
         request.system_prompt,
-        &request.messages,
         tools_json.as_deref(),
+        &request.messages,
     );
     let calibration_key = CalibrationKey::new(
         request.llm.provider_name(),
@@ -406,6 +451,7 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         response.content,
         response.reasoning_content,
         valid_tool_calls,
+        response.usage,
     )))
 }
 
@@ -524,6 +570,7 @@ fn build_assistant_tool_phase(
     content: String,
     reasoning_content: Option<String>,
     tool_calls: Vec<ToolCall>,
+    usage: Option<LlmUsage>,
 ) -> AssistantToolPhase {
     let assistant_text = sanitize_assistant_response_text(&content);
     let assistant_preview = summarize_tool_calls_with_content(&assistant_text, &tool_calls);
@@ -539,6 +586,7 @@ fn build_assistant_tool_phase(
         assistant_message,
         assistant_preview,
         tool_calls,
+        usage,
     }
 }
 
@@ -667,6 +715,7 @@ mod tests {
             "<thinking>hidden</thinking>Reading notes".to_string(),
             Some("reasoning".to_string()),
             tool_calls.clone(),
+            None,
         );
 
         // Assert

@@ -195,12 +195,9 @@ mod tests {
             )]),
             state_root: ".egopulse".to_string(),
             log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
+            compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
+            default_context_window_tokens: 131_072,
             channels: std::collections::HashMap::from([(
                 ChannelName::new("web"),
                 ChannelConfig {

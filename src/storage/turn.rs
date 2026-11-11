@@ -675,6 +675,32 @@ impl Database {
         Ok(())
     }
 
+    /// Records the request hash of a re-issued model step.
+    ///
+    /// Used when the context was compacted after a context-overflow failure and
+    /// the same iteration is sent again with a different request. The row must
+    /// still be `model_pending`; the attempt counter is untouched because this
+    /// is not a transport retry.
+    pub(crate) fn refresh_turn_model_hash(
+        &self,
+        turn_id: &str,
+        model_request_hash: &str,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.get_conn()?;
+        let tx = conn.transaction()?;
+        require_state_locked(&tx, turn_id, TurnRunState::ModelPending)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE turn_runs
+             SET model_request_hash = ?2,
+                 updated_at = ?3
+             WHERE turn_id = ?1",
+            params![turn_id, model_request_hash, &now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Advances `model_pending -> model_completed` (the LLM returned a
     /// response).
     ///

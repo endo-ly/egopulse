@@ -138,6 +138,12 @@ impl EgoPulseError {
         }
     }
 
+    /// Returns `true` when the provider rejected the request because the
+    /// prompt exceeded the model's context window.
+    pub(crate) fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::Llm(error) if error.is_context_overflow())
+    }
+
     pub(crate) fn is_codex_auth_error(&self) -> bool {
         matches!(
             self,
@@ -367,6 +373,38 @@ impl LlmError {
         )
     }
 
+    /// Returns `true` when the provider rejected the request because the
+    /// prompt exceeded the model's context window.
+    ///
+    /// A `400` alone is not enough: malformed requests and unsupported
+    /// parameters also return `400`. The provider must name a context limit.
+    pub(crate) fn is_context_overflow(&self) -> bool {
+        let Self::ApiError {
+            status,
+            body_preview,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if !matches!(status.as_u16(), 400 | 413 | 422) {
+            return false;
+        }
+        let body = body_preview.to_ascii_lowercase();
+        [
+            "context_length_exceeded",
+            "context window",
+            "context_overflow",
+            "maximum context length",
+            "prompt is too long",
+            "input is too long",
+            "too many tokens",
+            "reduce the length",
+        ]
+        .iter()
+        .any(|marker| body.contains(marker))
+    }
+
     /// Returns `true` when the error represents a transient failure that is
     /// safe to retry when nothing was published yet: a network/timeout failure
     /// (before or during the response body), a 429 / 5xx response, or a stream
@@ -430,6 +468,8 @@ pub enum StorageError {
     TaskJoin(String),
     #[error("storage_session_serialize_failed: {0}")]
     SessionSerialize(#[from] serde_json::Error),
+    #[error("session_snapshot_invalid: {0}")]
+    InvalidSnapshot(String),
     #[error("storage_session_snapshot_conflict")]
     SessionSnapshotConflict,
     #[error("storage_not_found: {0}")]

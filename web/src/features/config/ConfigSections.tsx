@@ -86,11 +86,19 @@ function GeneralView({ config }: { config: RuntimeConfig }) {
         />
         <Row
           label="Compaction"
-          value={`At ${Math.round(g.compaction_threshold_ratio * 100)}% of the window, down to ${Math.round(g.compaction_target_ratio * 100)}%`}
-          isDefault={g.compaction_threshold_ratio === d.compaction_threshold_ratio && g.compaction_target_ratio === d.compaction_target_ratio}
+          value={g.compaction_enabled ? "Automatic" : "Off"}
+          isDefault={g.compaction_enabled === d.compaction_enabled}
         />
-        <Row label="Keep recent" value={`${g.compact_keep_recent} messages`} isDefault={g.compact_keep_recent === d.compact_keep_recent} />
-        <Row label="Compaction timeout" value={`${g.compaction_timeout_secs}s`} isDefault={g.compaction_timeout_secs === d.compaction_timeout_secs} />
+        <Row
+          label="Reserve tokens"
+          value={`${formatCount(g.compaction_reserve_tokens)} tokens`}
+          isDefault={g.compaction_reserve_tokens === d.compaction_reserve_tokens}
+        />
+        <Row
+          label="Keep recent tokens"
+          value={`${formatCount(g.compaction_keep_recent_tokens)} tokens`}
+          isDefault={g.compaction_keep_recent_tokens === d.compaction_keep_recent_tokens}
+        />
       </Rows>
     </>
   );

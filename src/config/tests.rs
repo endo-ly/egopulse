@@ -626,12 +626,9 @@ fn save_load_round_trip_preserves_agent_profiles() {
         ]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
@@ -975,12 +972,9 @@ fn persists_agents_without_discord_config_surface() {
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels: std::collections::HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
@@ -1796,12 +1790,9 @@ fn discord_bots_preserve_secret_refs_on_save() {
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels,
         default_agent: super::AgentId::new("assistant"),
         agents,
@@ -2161,7 +2152,7 @@ channels:
     );
 }
 
-// --- Safety Compaction config tests ---
+// --- Context compaction config tests ---
 
 #[test]
 #[serial]
@@ -2236,15 +2227,17 @@ channels:
 
 #[test]
 #[serial]
-fn loads_compaction_ratios_from_top_level() {
+fn loads_compaction_settings_from_top_level() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
         &temp_dir,
         r#"default_provider: openai
 default_context_window_tokens: 65536
-compaction_threshold_ratio: 0.90
-compaction_target_ratio: 0.30
+compaction:
+  enabled: false
+  reserve_tokens: 4096
+  keep_recent_tokens: 12000
 providers:
   openai:
     label: OpenAI
@@ -2258,19 +2251,19 @@ channels:
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    assert!((config.compaction_threshold_ratio - 0.90).abs() < f64::EPSILON);
-    assert!((config.compaction_target_ratio - 0.30).abs() < f64::EPSILON);
+    assert!(!config.compaction.enabled);
+    assert_eq!(config.compaction.reserve_tokens, 4096);
+    assert_eq!(config.compaction.keep_recent_tokens, 12_000);
 }
 
 #[test]
 #[serial]
-fn defaults_compaction_ratios_to_issue_values() {
+fn defaults_compaction_settings() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
         &temp_dir,
         r#"default_provider: openai
-default_context_window_tokens: 32768
 providers:
   openai:
     label: OpenAI
@@ -2284,32 +2277,38 @@ channels:
     );
 
     let config = Config::load(Some(&file_path)).expect("load config");
-    assert!((config.compaction_threshold_ratio - 0.80).abs() < f64::EPSILON);
-    assert!((config.compaction_target_ratio - 0.40).abs() < f64::EPSILON);
+    assert!(config.compaction.enabled);
+    assert_eq!(config.compaction.reserve_tokens, 16_384);
+    assert_eq!(config.compaction.keep_recent_tokens, 20_000);
+    assert_eq!(config.default_context_window_tokens, 131_072);
 }
 
 #[test]
 #[serial]
-fn rejects_invalid_compaction_ratios() {
+fn rejects_invalid_compaction_settings() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
 
     let cases = [
-        // (threshold, target, description)
-        (0.0, 0.40, "zero threshold"),
-        (1.01, 0.40, "threshold over 1.0"),
-        (0.80, 0.0, "zero target"),
-        (0.80, 1.01, "target over 1.0"),
-        (0.50, 0.50, "target equals threshold"),
-        (0.40, 0.60, "target greater than threshold"),
+        ("compaction:\n  reserve_tokens: 0", "zero reserve_tokens"),
+        (
+            "compaction:\n  keep_recent_tokens: 0",
+            "zero keep_recent_tokens",
+        ),
+        (
+            "compaction:\n  reserve_tokens: 131072",
+            "reserve_tokens not below the default context window",
+        ),
+        (
+            "compaction:\n  unknown_field: 1",
+            "unknown compaction field",
+        ),
     ];
 
-    for (threshold, target, desc) in cases {
+    for (extra, desc) in cases {
         let yaml = format!(
             r#"default_provider: openai
-default_context_window_tokens: 32768
-compaction_threshold_ratio: {threshold}
-compaction_target_ratio: {target}
+{extra}
 providers:
   openai:
     label: OpenAI
@@ -2324,8 +2323,11 @@ channels:
         let file_path = write_config(&temp_dir, &yaml);
         let error = Config::load(Some(&file_path)).expect_err(desc);
         assert!(
-            matches!(error, ConfigError::InvalidCompactionConfig(_)),
-            "{desc}: expected InvalidCompactionConfig, got {error:?}"
+            matches!(
+                error,
+                ConfigError::InvalidCompactionConfig(_) | ConfigError::ConfigParseFailed { .. }
+            ),
+            "{desc}: expected a compaction config error, got {error:?}"
         );
     }
 }
@@ -2447,12 +2449,9 @@ fn persists_provider_model_contexts_without_secret_leak() {
         )]),
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("default"),
         agents: HashMap::from([(
@@ -2726,12 +2725,9 @@ fn persist_preserves_sleep_batch_config() {
         providers,
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("default"),
         agents: HashMap::from([(
@@ -3016,12 +3012,9 @@ fn persist_preserves_sleep_batch_scheduler_config() {
         providers,
         state_root: temp_dir.path().to_str().expect("path").to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
@@ -3365,12 +3358,9 @@ fn minimal_config_with_channels(
         providers,
         state_root: "/tmp/egopulse".to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels,
         default_agent: super::AgentId::new("default"),
         agents,
@@ -3444,12 +3434,9 @@ fn profile_config(
         providers,
         state_root: "/tmp/egopulse".to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
+        default_context_window_tokens: 131_072,
         channels,
         default_agent,
         agents,

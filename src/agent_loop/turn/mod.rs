@@ -7,7 +7,9 @@ pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
+use crate::agent_loop::compaction::{
+    CompactionOutcome, CompactionRequest, PromptContext, compact_if_needed,
+};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
@@ -19,6 +21,7 @@ use crate::agent_loop::turn::persistence::TurnPersistence;
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::loop_runner::AgentLoop;
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
+use crate::agent_loop::session_snapshot::SessionContext;
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message, ToolDefinition};
@@ -436,7 +439,7 @@ impl TurnExecutor<'_> {
 
                 // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。
                 // user message の保存と input_committed 遷移は同一 transaction で行う。
-                let (messages, session_revision) = self
+                let (context, session_revision) = self
                     .persist_user_input(&prepared, user_input, &prompt_ctx)
                     .await?;
 
@@ -448,7 +451,7 @@ impl TurnExecutor<'_> {
                     &prepared,
                     prompt_ctx,
                     channel_context_msg,
-                    messages,
+                    context,
                     session_revision,
                     1,
                 )
@@ -517,9 +520,9 @@ impl TurnExecutor<'_> {
                 snapshot.config.max_history_messages,
             )
             .await?;
-            let (messages, session_revision, start_iteration) = match resume_mode {
+            let (context, session_revision, start_iteration) = match resume_mode {
                 ResumeMode::InputCommitted => {
-                    (loaded.messages, loaded.session_revision, 1)
+                    (loaded.context, loaded.session_revision, 1)
                 }
                 ResumeMode::ToolsCompleted { start_iteration } => {
                     let persistence = TurnPersistence::new(
@@ -530,34 +533,40 @@ impl TurnExecutor<'_> {
                     );
                     let persisted = persistence
                         .commit_staged_user_messages(
-                            loaded.messages,
+                            loaded.context,
                             loaded.session_revision,
                             snapshot,
                             &self.on_event,
                         )
                         .await?;
-                    let compacted = match maybe_compact_messages(
-                        self.state,
-                        self.context,
+                    let mut context = persisted.context;
+                    let compaction_request = CompactionRequest {
+                        state: self.state,
+                        context: self.context,
                         chat_id,
-                        &persisted.messages,
-                        &prepared.channel_llm,
-                        &prompt_ctx,
-                        &snapshot.config,
-                    )
-                    .await
-                    {
-                        Ok(messages) => messages,
+                        llm: &prepared.channel_llm,
+                        prompt: PromptContext {
+                            system_prompt: prompt_ctx.system_prompt,
+                            tools_json: prompt_ctx.tools_json,
+                            has_tools: prompt_ctx.has_tools,
+                        },
+                        config: &snapshot.config,
+                        request_only_messages: Vec::new(),
+                    };
+                    context = match compact_if_needed(&compaction_request, &context, None).await {
+                        Ok(CompactionOutcome::Unchanged) => context,
+                        Ok(CompactionOutcome::Compacted(compacted)) => compacted,
                         Err(error) => {
                             warn!(
                                 error = %error,
                                 turn_id = %turn_run.turn_id,
-                                "message compaction failed during tools_completed recovery; continuing with uncompacted messages"
+                                "context compaction failed during tools_completed recovery; continuing with the uncompacted context"
                             );
-                            persisted.messages
+                            context
                         }
                     };
-                    (Arc::new(compacted), Some(persisted.revision), start_iteration)
+                    let revision = persisted.revision;
+                    (context, Some(revision), start_iteration)
                 }
             };
             let channel_context_msg = load_channel_context(self.state, self.context).await;
@@ -565,7 +574,7 @@ impl TurnExecutor<'_> {
                 &prepared,
                 prompt_ctx,
                 channel_context_msg,
-                messages,
+                context,
                 session_revision,
                 start_iteration,
             )
@@ -716,7 +725,7 @@ impl TurnExecutor<'_> {
         prepared: &PreparedTurn,
         user_input: &str,
         prompt_ctx: &PromptContext<'_>,
-    ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
+    ) -> Result<(SessionContext, Option<i64>), EgoPulseError> {
         self.persistence(prepared)
             .persist_user_input(
                 persistence::UserInput {
@@ -737,7 +746,7 @@ impl TurnExecutor<'_> {
         prepared: &PreparedTurn,
         prompt_ctx: PromptContext<'_>,
         channel_context_msg: Option<Message>,
-        messages: Arc<Vec<Message>>,
+        context: SessionContext,
         session_revision: Option<i64>,
         start_iteration: usize,
     ) -> Result<String, EgoPulseError> {
@@ -749,7 +758,7 @@ impl TurnExecutor<'_> {
             channel_context_msg,
             self.on_event.clone(),
         )
-        .run(messages, session_revision, start_iteration)
+        .run(context, session_revision, start_iteration)
         .await?;
 
         self.persist_agent_loop_result(prepared, result).await
@@ -760,12 +769,12 @@ impl TurnExecutor<'_> {
         prepared: &PreparedTurn,
         result: crate::agent_loop::loop_runner::AgentLoopResult,
     ) -> Result<String, EgoPulseError> {
-        let messages = result.messages;
         let response = self
             .persistence(prepared)
             .persist_final(
                 &result.final_message_id,
-                messages,
+                result.context,
+                result.usage,
                 result.session_revision,
                 &self.on_event,
                 (result.final_content, result.reasoning_content),
@@ -977,11 +986,15 @@ mod tests {
         };
         let initial_snapshot = crate::agent_loop::session::serialize_snapshot(
             Arc::clone(&state.assets),
-            vec![
-                crate::llm::Message::text("user", "original input"),
-                assistant_tool.clone(),
-                tool_result.clone(),
-            ],
+            crate::agent_loop::session_snapshot::SessionContext {
+                checkpoint: None,
+                messages: Arc::new(vec![
+                    crate::llm::Message::text("user", "original input"),
+                    assistant_tool.clone(),
+                    tool_result.clone(),
+                ]),
+                last_usage: None,
+            },
         )
         .await
         .expect("initial snapshot");
@@ -1044,12 +1057,16 @@ mod tests {
         );
         let recovery_snapshot = crate::agent_loop::session::serialize_snapshot(
             Arc::clone(&state.assets),
-            vec![
-                crate::llm::Message::text("user", "original input"),
-                assistant_tool,
-                tool_result,
-                committed_followup,
-            ],
+            crate::agent_loop::session_snapshot::SessionContext {
+                checkpoint: None,
+                messages: Arc::new(vec![
+                    crate::llm::Message::text("user", "original input"),
+                    assistant_tool,
+                    tool_result,
+                    committed_followup,
+                ]),
+                last_usage: None,
+            },
         )
         .await
         .expect("recovery snapshot");

@@ -6,11 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::warn;
 
 use crate::agent_loop::TurnDependencies;
-use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
+use crate::agent_loop::compaction::{
+    CompactionOutcome, CompactionReason, CompactionRequest, MeasuredUsage, PromptContext, compact,
+    compact_if_needed, model_key, request_shape_hash,
+};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::strip_thinking;
 use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
 use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_messages};
+use crate::agent_loop::session_snapshot::{SessionContext, checkpoint_message};
 use crate::agent_loop::tool_execution::{
     ExecutedToolCall, GuardDenialTracker, MAX_TOOL_RESULT_TEXT_CHARS, ToolExecutionHooks,
     ToolExecutor, build_tool_result_phase,
@@ -43,26 +47,26 @@ pub(crate) const GUARD_DENIAL_WRAP_GUARD: &str = "[runtime_guard]: The security-
 
 /// Mutable conversation state owned by one Agent Loop.
 pub(crate) struct LoopState {
-    pub(crate) messages: Arc<Vec<Message>>,
+    pub(crate) context: SessionContext,
     pub(crate) session_revision: Option<i64>,
     retry_messages: Option<Arc<Vec<Message>>>,
     declarative_retry_attempted: bool,
 }
 
 impl LoopState {
-    pub(crate) fn new(messages: Arc<Vec<Message>>, session_revision: Option<i64>) -> Self {
+    pub(crate) fn new(context: SessionContext, session_revision: Option<i64>) -> Self {
         Self {
-            messages,
+            context,
             session_revision,
             retry_messages: None,
             declarative_retry_attempted: false,
         }
     }
 
-    fn request_messages(&mut self) -> Arc<Vec<Message>> {
+    fn messages(&mut self) -> Arc<Vec<Message>> {
         self.retry_messages
             .take()
-            .unwrap_or_else(|| Arc::clone(&self.messages))
+            .unwrap_or_else(|| Arc::clone(&self.context.messages))
     }
 
     fn reset_retry_guards_after_tool_phase(&mut self) {
@@ -77,8 +81,10 @@ pub(crate) struct AgentLoopResult {
     pub(crate) final_content: String,
     pub(crate) reasoning_content: Option<String>,
     pub(crate) final_message_id: String,
-    pub(crate) messages: Arc<Vec<Message>>,
+    pub(crate) context: SessionContext,
     pub(crate) session_revision: Option<i64>,
+    /// Usage of the request that produced the final response.
+    pub(crate) usage: Option<MeasuredUsage>,
 }
 
 /// Executes the LLM/tool loop for one durable Turn.
@@ -121,70 +127,118 @@ impl<'a> AgentLoop<'a> {
     /// Runs model steps, tool execution, and loop-level compaction.
     pub(crate) async fn run(
         &self,
-        messages: Arc<Vec<Message>>,
+        context: SessionContext,
         session_revision: Option<i64>,
         start_iteration: usize,
     ) -> Result<AgentLoopResult, EgoPulseError> {
-        let mut loop_state = LoopState::new(messages, session_revision);
+        let mut loop_state = LoopState::new(context, session_revision);
         let guard_tracker = Arc::new(GuardDenialTracker::new());
+        let mut iteration = start_iteration;
 
-        for iteration in start_iteration..=MAX_TOOL_ITERATIONS {
+        while iteration <= MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
             // The assistant message id is fixed before the model call, so
             // the streamed deltas, a tool preview, and the final row all
             // share one identity from the start.
             let message_id =
                 crate::agent_loop::turn::assistant_message_id(&self.prepared.turn_id, iteration);
-            let request_messages = append_guard_denial_wrap(
-                request_messages_for_iteration(
-                    &mut loop_state,
-                    iteration,
-                    &self.channel_context_msg,
-                ),
-                &guard_tracker,
-            );
-            let event_emitter = self.on_event.clone();
-            let emitted_id = message_id.clone();
+
+            // Compaction runs immediately before the request it protects, so
+            // the decision always describes the context about to be sent.
+            self.compact_before_model(&mut loop_state, iteration)
+                .await?;
+
+            let model_key = model_key(self.prepared.channel_llm.as_ref());
+            let mut overflow_recovery_attempted = false;
             let output_published = Arc::new(AtomicBool::new(false));
-            let published_flag = Arc::clone(&output_published);
-            let on_delta = move |text: String| {
-                published_flag.store(true, Ordering::SeqCst);
-                event_emitter.emit(AgentEvent::Delta {
-                    message_id: emitted_id.clone(),
-                    text,
-                });
-            };
-            let model_runner = ModelRunner::new(ModelStepRequest {
-                state: self.state,
-                llm: self.prepared.channel_llm.as_ref(),
-                system_prompt: &self.prepared.system_prompt,
-                messages: Arc::clone(&request_messages),
-                tools: Some(apply_guard_denial_state(
-                    &self.prepared.tool_defs,
+            let (phase_response, shape_hash) = loop {
+                let tools = apply_guard_denial_state(&self.prepared.tool_defs, &guard_tracker);
+                let tools_json = if tools.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(tools.as_ref()).ok()
+                };
+                let shape_hash = request_shape_hash(
+                    &self.prepared.system_prompt,
+                    tools_json.as_deref(),
+                    &model_key,
+                );
+                let request_messages = append_guard_denial_wrap(
+                    request_messages_for_iteration(
+                        &mut loop_state,
+                        iteration,
+                        &self.channel_context_msg,
+                    ),
                     &guard_tracker,
-                )),
-                chat_id: self.prepared.chat_id,
-                caller_channel: &self.context.channel,
-                request_kind: "agent_loop",
-                usage_log_failure: "llm usage logging failed",
-                log_scope: "agent_loop",
-                send_failure_log: "LLM send_message failed",
-                iteration,
-                scope: self.context.scope,
-                on_delta: &on_delta,
-            });
-            let phase_response = match model_runner.run_with_retry(&self.prepared.turn_id).await {
-                Ok(response) => response,
-                Err(error) => {
-                    let (error, output_published) = error.into_parts();
-                    if output_published {
-                        self.lifecycle.mark_output_published().await;
+                );
+                let event_emitter = self.on_event.clone();
+                let emitted_id = message_id.clone();
+                output_published.store(false, Ordering::SeqCst);
+                let published_flag = Arc::clone(&output_published);
+                let on_delta = move |text: String| {
+                    published_flag.store(true, Ordering::SeqCst);
+                    event_emitter.emit(AgentEvent::Delta {
+                        message_id: emitted_id.clone(),
+                        text,
+                    });
+                };
+                let model_runner = ModelRunner::new(ModelStepRequest {
+                    state: self.state,
+                    llm: self.prepared.channel_llm.as_ref(),
+                    system_prompt: &self.prepared.system_prompt,
+                    messages: Arc::clone(&request_messages),
+                    tools: Some(tools),
+                    chat_id: self.prepared.chat_id,
+                    caller_channel: &self.context.channel,
+                    request_kind: "agent_loop",
+                    usage_log_failure: "llm usage logging failed",
+                    log_scope: "agent_loop",
+                    send_failure_log: "LLM send_message failed",
+                    iteration,
+                    scope: self.context.scope,
+                    on_delta: &on_delta,
+                });
+                let attempt = if overflow_recovery_attempted {
+                    model_runner
+                        .retry_after_compaction(&self.prepared.turn_id)
+                        .await
+                } else {
+                    model_runner.run_with_retry(&self.prepared.turn_id).await
+                };
+                drop(request_messages);
+
+                match attempt {
+                    Ok(step) => break (step, shape_hash),
+                    Err(error) => {
+                        let (error, output_published) = error.into_parts();
+                        if output_published {
+                            self.lifecycle.mark_output_published().await;
+                        }
+                        // A context-overflow rejection is the only failure that
+                        // may be retried with a smaller request. Published
+                        // output cannot be taken back, and a second overflow
+                        // after compaction must surface instead of looping.
+                        if !overflow_recovery_attempted
+                            && !output_published
+                            && error.is_context_overflow()
+                            && self
+                                .compact_overflow(&mut loop_state, iteration)
+                                .await
+                                .unwrap_or(false)
+                        {
+                            overflow_recovery_attempted = true;
+                            warn!(
+                                iteration,
+                                "context overflow recovery: compacted and retrying the model step once"
+                            );
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    return Err(error);
                 }
             };
-            drop(request_messages);
 
+            let usage = phase_response.usage().cloned();
             match phase_response {
                 ModelStep::Final(response) => {
                     self.lifecycle.complete_model().await?;
@@ -192,7 +246,7 @@ impl<'a> AgentLoop<'a> {
                         &response.content,
                         response.reasoning_content.as_deref(),
                         &mut loop_state.declarative_retry_attempted,
-                        &loop_state.messages,
+                        &loop_state.context.messages,
                     )? {
                         LoopAction::Retry(messages) => {
                             // The streamed text will never be persisted; tell
@@ -213,11 +267,17 @@ impl<'a> AgentLoop<'a> {
                                 final_content,
                                 reasoning_content,
                                 final_message_id: message_id,
-                                messages: loop_state.messages,
+                                context: loop_state.context,
                                 session_revision: loop_state.session_revision,
+                                usage: usage.clone().map(|usage| MeasuredUsage {
+                                    usage,
+                                    model_key: model_key.clone(),
+                                    request_shape_hash: shape_hash.clone(),
+                                }),
                             });
                         }
                     }
+                    iteration += 1;
                     continue;
                 }
                 ModelStep::MalformedToolCalls(response) => {
@@ -226,7 +286,7 @@ impl<'a> AgentLoop<'a> {
                         &response.content,
                         response.reasoning_content.as_deref(),
                         &mut loop_state.declarative_retry_attempted,
-                        &loop_state.messages,
+                        &loop_state.context.messages,
                     )? {
                         LoopAction::Retry(messages) => {
                             if output_published.load(Ordering::SeqCst) {
@@ -244,11 +304,17 @@ impl<'a> AgentLoop<'a> {
                                 final_content,
                                 reasoning_content,
                                 final_message_id: message_id,
-                                messages: loop_state.messages,
+                                context: loop_state.context,
                                 session_revision: loop_state.session_revision,
+                                usage: usage.clone().map(|usage| MeasuredUsage {
+                                    usage,
+                                    model_key: model_key.clone(),
+                                    request_shape_hash: shape_hash.clone(),
+                                }),
                             });
                         }
                     }
+                    iteration += 1;
                     continue;
                 }
                 ModelStep::ToolCalls(assistant_phase) => {
@@ -257,35 +323,87 @@ impl<'a> AgentLoop<'a> {
                         assistant_phase,
                         &message_id,
                         &guard_tracker,
+                        &model_key,
+                        &shape_hash,
                     )
                     .await?;
                 }
             }
 
             loop_state.reset_retry_guards_after_tool_phase();
-            match maybe_compact_messages(
-                self.state,
-                self.context,
-                self.prepared.chat_id,
-                &loop_state.messages,
-                &self.prepared.channel_llm,
-                &self.prompt_ctx,
-                &self.prepared.config_snapshot.config,
-            )
-            .await
-            {
-                Ok(compacted) => loop_state.messages = Arc::new(compacted),
-                Err(error) => warn!(
-                    iteration,
-                    error = %error,
-                    "message compaction failed; continuing with uncompacted messages"
-                ),
-            }
+            iteration += 1;
         }
 
         Err(EgoPulseError::Internal(format!(
             "tool loop exceeded max iterations ({MAX_TOOL_ITERATIONS})"
         )))
+    }
+
+    /// Builds the request-scoped context shared by the compaction entry points.
+    fn compaction_request(&self, iteration: usize) -> CompactionRequest<'_> {
+        CompactionRequest {
+            state: self.state,
+            context: self.context,
+            chat_id: self.prepared.chat_id,
+            llm: &self.prepared.channel_llm,
+            prompt: PromptContext {
+                system_prompt: self.prompt_ctx.system_prompt,
+                tools_json: self.prompt_ctx.tools_json,
+                has_tools: self.prompt_ctx.has_tools,
+            },
+            config: &self.prepared.config_snapshot.config,
+            request_only_messages: if iteration == 1 {
+                self.channel_context_msg.iter().collect()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Compacts the loop context before a model request when it is too large.
+    async fn compact_before_model(
+        &self,
+        loop_state: &mut LoopState,
+        iteration: usize,
+    ) -> Result<(), EgoPulseError> {
+        match compact_if_needed(
+            &self.compaction_request(iteration),
+            &loop_state.context,
+            None,
+        )
+        .await?
+        {
+            CompactionOutcome::Unchanged => Ok(()),
+            CompactionOutcome::Compacted(context) => {
+                loop_state.context = context;
+                Ok(())
+            }
+        }
+    }
+
+    /// Compacts the context after the provider reported a context overflow.
+    ///
+    /// Returns `true` when the context changed and the model step may be sent
+    /// again.
+    async fn compact_overflow(
+        &self,
+        loop_state: &mut LoopState,
+        iteration: usize,
+    ) -> Result<bool, EgoPulseError> {
+        match compact(
+            &self.compaction_request(iteration),
+            &loop_state.context,
+            CompactionReason::Overflow,
+            None,
+        )
+        .await?
+        {
+            CompactionOutcome::Unchanged => Ok(false),
+            CompactionOutcome::Compacted(context) => {
+                loop_state.context = context;
+                Ok(true)
+            }
+        }
     }
 
     async fn execute_tool_phase(
@@ -294,19 +412,21 @@ impl<'a> AgentLoop<'a> {
         assistant_phase: crate::agent_loop::model_step::AssistantToolPhase,
         assistant_message_id: &str,
         guard_tracker: &Arc<GuardDenialTracker>,
+        model_key: &str,
+        request_shape_hash: &str,
     ) -> Result<(), EgoPulseError> {
         self.lifecycle.complete_model().await?;
         self.lifecycle.begin_tools().await?;
         self.lifecycle.mark_output_published().await;
 
-        let messages = std::mem::replace(&mut loop_state.messages, Arc::new(Vec::new()));
-        let messages = Arc::try_unwrap(messages).unwrap_or_else(|messages| (*messages).clone());
         let persisted = self
             .persistence
             .persist_tool_call(
                 assistant_message_id,
                 &assistant_phase,
-                messages,
+                loop_state.context.clone(),
+                model_key,
+                request_shape_hash,
                 loop_state.session_revision,
             )
             .await?;
@@ -321,24 +441,24 @@ impl<'a> AgentLoop<'a> {
             .persistence
             .persist_tool_results(
                 assistant_message_id,
-                persisted.messages,
+                persisted.context,
                 build_tool_result_phase(tool_outcomes),
                 Some(persisted.revision),
             )
             .await?;
-        loop_state.messages = Arc::new(persisted.messages);
+        loop_state.context = persisted.context;
         loop_state.session_revision = Some(persisted.revision);
         self.lifecycle.complete_tools().await?;
         let persisted = self
             .persistence
             .commit_staged_user_messages(
-                Arc::clone(&loop_state.messages),
+                loop_state.context.clone(),
                 loop_state.session_revision,
                 &self.prepared.config_snapshot,
                 &self.on_event,
             )
             .await?;
-        loop_state.messages = Arc::new(persisted.messages);
+        loop_state.context = persisted.context;
         loop_state.session_revision = Some(persisted.revision);
         Ok(())
     }
@@ -384,17 +504,18 @@ fn request_messages_for_iteration(
     iteration: usize,
     channel_context_msg: &Option<Message>,
 ) -> Arc<Vec<Message>> {
-    let mut request_messages = loop_state.request_messages();
+    let stored = loop_state.messages();
+    let mut messages = Vec::with_capacity(stored.len() + 2);
     if iteration == 1 {
         if let Some(ctx_msg) = channel_context_msg {
-            let mut messages =
-                Arc::try_unwrap(request_messages).unwrap_or_else(|messages| (*messages).clone());
-            messages.insert(0, ctx_msg.clone());
-            request_messages = Arc::new(messages);
+            messages.push(ctx_msg.clone());
         }
     }
-
-    messages_for_iteration(&request_messages, iteration)
+    if let Some(checkpoint) = &loop_state.context.checkpoint {
+        messages.push(checkpoint_message(checkpoint));
+    }
+    messages.extend(Arc::try_unwrap(stored).unwrap_or_else(|stored| (*stored).clone()));
+    messages_for_iteration(&Arc::new(messages), iteration)
 }
 
 /// Applies the same post-denial stop state to Turn and Pulse model requests.
@@ -520,7 +641,7 @@ mod tests {
     use crate::agent_loop::process_turn;
     use crate::agent_loop::process_turn_with_events;
     use crate::agent_loop::test_support::{
-        RecordingProvider, build_state_with_provider, cli_context,
+        RecordingProvider, build_state, build_state_with_provider, cli_context,
     };
     use crate::conversation::ConversationScope;
     use crate::llm::{MessagesResponse, ToolCall};
@@ -631,6 +752,142 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn context_overflow_compacts_and_retries_the_model_step_once() {
+        // Arrange: automatic compaction is disabled so the first request is
+        // sent with the oversized context; the provider then rejects it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    body_preview: "This model's maximum context length is 2000 tokens".to_string(),
+                    retry_after_secs: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "history summary".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        cached_input_tokens: None,
+                    }),
+                }),
+                Ok(final_response("recovered answer")),
+            ],
+            vec![0, 0, 0],
+        );
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            2_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("overflow-recovery");
+        let runtime = state.turn_dependencies();
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
+            .await
+            .expect("chat id");
+        crate::agent_loop::session::save_test_session(
+            &state.assets,
+            &state.db,
+            chat_id,
+            vec![
+                Message::text("user", "old question"),
+                Message::text("assistant", "old answer"),
+            ],
+        );
+
+        // Act
+        let reply = process_turn(&runtime, &context, "fresh question")
+            .await
+            .expect("overflow recovery should finalize");
+
+        // Assert: the summary request ran, then the model step was re-issued
+        // with the checkpoint in place.
+        assert_eq!(reply, "recovered answer");
+        let systems = provider.seen_systems();
+        assert_eq!(systems.len(), 3, "summary request + two model requests");
+        assert!(
+            systems[1].contains("context summarization assistant"),
+            "the second call must be the compaction summary request: {}",
+            systems[1]
+        );
+        let retried = &provider.seen_messages()[2];
+        assert!(
+            retried[0]
+                .content
+                .as_text_lossy()
+                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
+            "the retried request must start with the checkpoint"
+        );
+        assert!(
+            retried[0]
+                .content
+                .as_text_lossy()
+                .contains("history summary")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_second_context_overflow_after_compaction_surfaces_the_error() {
+        // Arrange: every model request overflows, so recovery must stop after
+        // one attempt instead of looping.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let overflow = || {
+            Err(crate::error::LlmError::ApiError {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body_preview: "maximum context length exceeded".to_string(),
+                retry_after_secs: None,
+            })
+        };
+        let provider = RecordingProvider::new(
+            vec![
+                overflow(),
+                Ok(MessagesResponse {
+                    content: "history summary".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                overflow(),
+            ],
+            vec![0, 0, 0],
+        );
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            2_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("overflow-twice");
+        let runtime = state.turn_dependencies();
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
+            .await
+            .expect("chat id");
+        crate::agent_loop::session::save_test_session(
+            &state.assets,
+            &state.db,
+            chat_id,
+            vec![
+                Message::text("user", "old question"),
+                Message::text("assistant", "old answer"),
+            ],
+        );
+
+        // Act
+        let result = process_turn(&runtime, &context, "fresh question").await;
+
+        // Assert: only one compaction summary call, then the overflow error.
+        assert!(result.is_err());
+        assert_eq!(provider.seen_systems().len(), 3);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn late_tool_loop_requests_final_response_at_hard_cap() {
         // Arrange: keep the model in the Tool phase until the warning boundary,
         // then return a final response after the shared runtime guards.
@@ -712,7 +969,7 @@ mod tests {
         )
         .await
         .expect("session");
-        assert!(loaded.messages.iter().all(|message| {
+        assert!(loaded.context.messages.iter().all(|message| {
             let text = message.content.as_text_lossy();
             !text.contains(FINAL_RESPONSE_WARNING_GUARD) && !text.contains(FINAL_RESPONSE_GUARD)
         }));

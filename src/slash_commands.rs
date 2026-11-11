@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::compaction::force_compact;
+use crate::agent_loop::compaction::{
+    CompactionOutcome, CompactionReason, CompactionRequest, PromptContext, compact,
+};
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::config::{AgentId, ChannelName, Config, ProviderId};
 use crate::conversation::{ConversationScope, SurfaceContext};
@@ -127,7 +129,7 @@ pub(crate) async fn handle_slash_command(
         .map(|(cmd, _)| cmd)
         .unwrap_or(raw_command);
     let command = bare_command.to_ascii_lowercase();
-    let _args = parts.get(1).copied().unwrap_or("");
+    let args = parts.get(1).copied().unwrap_or("");
 
     if !is_catalog_command(&command) {
         return None;
@@ -135,7 +137,7 @@ pub(crate) async fn handle_slash_command(
 
     match command.as_str() {
         "/new" => handle_new(state, context.scope, chat_id).await,
-        "/compact" => handle_compact(state, chat_id, context).await,
+        "/compact" => handle_compact(state, chat_id, context, args).await,
         "/status" => handle_status(state, chat_id, context, sender_id).await,
         "/skills" => Some(handle_skills(state)),
         "/restart" => Some(handle_restart()),
@@ -221,6 +223,7 @@ async fn handle_compact(
     state: &AppState,
     chat_id: i64,
     context: &SurfaceContext,
+    instructions: &str,
 ) -> Option<String> {
     let config_snapshot = state.config_manager.current_blocking();
     let runtime = state.turn_dependencies();
@@ -235,46 +238,78 @@ async fn handle_compact(
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
-    if loaded.messages.is_empty() {
+    if loaded.context.messages.is_empty() {
         return Some("Session is empty.".to_string());
     }
 
-    let count = loaded.messages.len();
+    let count = loaded.context.messages.len();
     let llm = match runtime.llm_for_context_with_snapshot(context, &config_snapshot) {
         Ok(llm) => llm,
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
-
-    match force_compact(
+    let system_prompt = crate::agent_loop::prompt::build_system_prompt_with_config(
         &runtime,
         context,
-        chat_id,
-        &loaded.messages,
-        &llm,
         &config_snapshot.config,
+    );
+    let mcp_scope =
+        crate::tools::mcp::McpScope::for_agent(&config_snapshot.config, &context.agent_id);
+    let tool_defs = runtime.tools.definitions_async(&mcp_scope).await;
+    let tools_json = serde_json::to_string(&tool_defs).ok();
+    let instructions = instructions.trim();
+    let instructions = (!instructions.is_empty()).then_some(instructions);
+    let request = CompactionRequest {
+        state: &runtime,
+        context,
+        chat_id,
+        llm: &llm,
+        prompt: PromptContext {
+            system_prompt: &system_prompt,
+            tools_json: tools_json.as_deref(),
+            has_tools: !tool_defs.is_empty(),
+        },
+        config: &config_snapshot.config,
+        request_only_messages: Vec::new(),
+    };
+
+    let compacted = match compact(
+        &request,
+        &loaded.context,
+        CompactionReason::Manual,
+        instructions,
     )
     .await
     {
-        Ok(compacted) => {
-            let json = match serde_json::to_string(&compacted) {
-                Ok(j) => j,
-                Err(e) => return Some(format!("Failed to serialize compacted session: {e}")),
-            };
-            match call_blocking(state.db_for(context.scope), move |db| {
-                db.save_session(chat_id, &json)
-            })
-            .await
-            {
-                Ok(_) => Some(format!(
-                    "Compacted {count} messages to {}.",
-                    compacted.len()
-                )),
-                Err(e) => Some(format!(
-                    "Compacted {count} messages but failed to save session: {e}"
-                )),
-            }
+        Ok(CompactionOutcome::Compacted(context)) => context,
+        Ok(CompactionOutcome::Unchanged) => {
+            return Some("Nothing to compact in this session.".to_string());
         }
-        Err(error) => Some(format!("Compaction failed: {error}")),
+        Err(error) => return Some(format!("Compaction failed: {error}")),
+    };
+
+    let kept = compacted.messages.len();
+    let json = match crate::agent_loop::session::serialize_snapshot(
+        std::sync::Arc::clone(&state.assets),
+        compacted,
+    )
+    .await
+    {
+        Ok(json) => json,
+        Err(error) => return Some(format!("Failed to serialize compacted session: {error}")),
+    };
+    let revision = loaded.session_revision;
+    let saved = call_blocking(state.db_for(context.scope), move |db| {
+        db.replace_session_snapshot(chat_id, &json, revision)
+    })
+    .await;
+    match saved {
+        Ok(true) => Some(format!("Compacted {count} messages to {kept}.")),
+        Ok(false) => Some(
+            "Session changed while compacting; nothing was saved. Run /compact again.".to_string(),
+        ),
+        Err(error) => Some(format!(
+            "Compacted {count} messages but failed to save: {error}"
+        )),
     }
 }
 
@@ -870,6 +905,16 @@ mod tests {
         (state, dir)
     }
 
+    /// Seeds a session long enough that manual compaction has a boundary.
+    async fn seed_compactable_session(state: &AppState, chat_id: i64) {
+        let messages = vec![
+            Message::text("user", "old question"),
+            Message::text("assistant", "old answer ".repeat(10_000)),
+            Message::text("user", "fresh question"),
+        ];
+        crate::agent_loop::session::save_test_session(&state.assets, &state.db, chat_id, messages);
+    }
+
     async fn create_test_chat(state: &AppState, key: &str) -> i64 {
         let session_key = format!("cli:{key}");
         call_blocking(Arc::clone(&state.db), move |db| {
@@ -920,7 +965,7 @@ mod tests {
                         turn_id: None,
                         parent_message_id: None,
                     },
-                    r#"[{"role":"user","content":"hello"}]"#,
+                    &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
                     None,
                 )
             }
@@ -962,24 +1007,14 @@ mod tests {
         let (state, _dir) = build_test_state();
         let chat_id = create_test_chat(&state, "test-compact").await;
 
-        let messages = vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "hi"),
-        ];
-        let json = serde_json::to_string(&messages).expect("json");
-        call_blocking(Arc::clone(&state.db), {
-            move |db| db.save_session(chat_id, &json)
-        })
-        .await
-        .expect("save session");
+        seed_compactable_session(&state, chat_id).await;
 
         // Act
         let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
 
         // Assert
         let response = result.expect("response");
-        assert!(response.contains("Compacted"), "response: {response}");
-        assert!(response.contains("2 messages"), "response: {response}");
+        assert_eq!(response, "Compacted 3 messages to 2.");
     }
 
     #[tokio::test]
@@ -1132,16 +1167,7 @@ mod tests {
         let (state, _dir) = build_test_state();
         let chat_id = create_test_chat(&state, "test-compact-agent").await;
 
-        let messages = vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "hi"),
-        ];
-        let json = serde_json::to_string(&messages).expect("json");
-        call_blocking(Arc::clone(&state.db), {
-            move |db| db.save_session(chat_id, &json)
-        })
-        .await
-        .expect("save session");
+        seed_compactable_session(&state, chat_id).await;
 
         // Act
         let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
@@ -1259,16 +1285,7 @@ mod tests {
         let (state, _dir) = build_test_state();
         let chat_id = create_test_chat(&state, "test-compact-surface").await;
 
-        let messages = vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "hi"),
-        ];
-        let json = serde_json::to_string(&messages).expect("json");
-        call_blocking(Arc::clone(&state.db), {
-            move |db| db.save_session(chat_id, &json)
-        })
-        .await
-        .expect("save session");
+        seed_compactable_session(&state, chat_id).await;
 
         let context = SurfaceContext {
             channel: "cli".to_string(),

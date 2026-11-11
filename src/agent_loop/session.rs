@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::session_snapshot::{
-    SnapshotMessage, messages_from_snapshot, messages_to_snapshot,
+    ContextSnapshot, SessionContext, context_from_snapshot, context_to_snapshot,
 };
 use crate::assets::AssetStore;
 use crate::conversation::{ConversationChanged, ConversationScope, SurfaceContext};
@@ -20,9 +20,9 @@ use crate::storage::{
 };
 
 #[derive(Debug, Clone)]
-/// Holds the messages loaded for a turn together with the snapshot version.
+/// Holds the conversation state loaded for a turn together with the snapshot version.
 pub(crate) struct LoadedSession {
-    pub(crate) messages: Arc<Vec<Message>>,
+    pub(crate) context: SessionContext,
     pub(crate) session_revision: Option<i64>,
 }
 
@@ -30,7 +30,7 @@ pub(crate) struct LoadedSession {
 /// Represents the updated snapshot returned after persisting one phase.
 pub(crate) struct PersistedTurn {
     pub(crate) revision: i64,
-    pub(crate) messages: Vec<Message>,
+    pub(crate) context: SessionContext,
 }
 
 /// Resolves or creates the internal chat ID for a conversation surface.
@@ -363,7 +363,7 @@ pub(crate) async fn commit_user_turn_input(
     state: &TurnDependencies,
     scope: ConversationScope,
     message: StoredMessage,
-    messages: &[Message],
+    context: SessionContext,
     session_revision: Option<i64>,
     turn_id: &str,
     config_snapshot: &crate::config::manager::ConfigSnapshot,
@@ -372,7 +372,7 @@ pub(crate) async fn commit_user_turn_input(
         state,
         scope,
         message,
-        messages.to_vec(),
+        context,
         session_revision,
         turn_id,
         config_snapshot,
@@ -387,7 +387,7 @@ pub(crate) async fn persist_phase(
     scope: ConversationScope,
     message: StoredMessage,
     phase_message: Message,
-    messages: &[Message],
+    context: SessionContext,
     session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
     persist_phase_messages(
@@ -395,28 +395,27 @@ pub(crate) async fn persist_phase(
         scope,
         message,
         vec![phase_message],
-        messages,
+        context,
         session_revision,
     )
     .await
 }
 
+/// Persists one phase, keeping the checkpoint and usage anchor of `context`.
+///
+/// When the snapshot was updated by a concurrent writer, the phase messages are
+/// appended to the refreshed conversation. The usage anchor is dropped in that
+/// case because its message index no longer describes the refreshed context.
 pub(crate) async fn persist_phase_messages(
     state: &TurnDependencies,
     scope: ConversationScope,
     message: StoredMessage,
     phase_messages: Vec<Message>,
-    messages: &[Message],
+    context: SessionContext,
     session_revision: Option<i64>,
 ) -> Result<PersistedTurn, EgoPulseError> {
-    let persisted = store_phase_snapshot(
-        state,
-        scope,
-        message.clone(),
-        messages.to_vec(),
-        session_revision,
-    )
-    .await;
+    let persisted =
+        store_phase_snapshot(state, scope, message.clone(), context, session_revision).await;
     if let Some(turn) = persisted_turn_or_retry(persisted)? {
         return Ok(turn);
     }
@@ -424,15 +423,25 @@ pub(crate) async fn persist_phase_messages(
     // 同じ session に別ターンが先に保存された場合は、最新 snapshot を読み直して
     // 今回の phase 群だけを末尾に積み直し、競合解消後の 1 回だけ再試行する。
     let LoadedSession {
-        messages: refreshed_messages,
+        context: refreshed,
         session_revision: refreshed_revision,
     } = load_messages_for_turn(state, scope, message.chat_id).await?;
-    let mut all_messages = Arc::try_unwrap(refreshed_messages).unwrap_or_else(|arc| (*arc).clone());
+    let mut all_messages = Arc::try_unwrap(refreshed.messages).unwrap_or_else(|arc| (*arc).clone());
     all_messages.extend(phase_messages);
 
-    store_phase_snapshot(state, scope, message, all_messages, refreshed_revision)
-        .await
-        .map_err(EgoPulseError::Storage)
+    store_phase_snapshot(
+        state,
+        scope,
+        message,
+        SessionContext {
+            checkpoint: refreshed.checkpoint,
+            messages: Arc::new(all_messages),
+            last_usage: None,
+        },
+        refreshed_revision,
+    )
+    .await
+    .map_err(EgoPulseError::Storage)
 }
 
 fn persisted_turn_or_retry(
@@ -459,29 +468,32 @@ async fn snapshot_to_loaded(
         move || restore_snapshot_messages(&assets, &json)
     })
     .await
-    .map_err(|error| EgoPulseError::Storage(StorageError::TaskJoin(error.to_string())))?;
-
-    let Some(messages) = restored_messages_or_recent(restored) else {
-        return Ok(loaded_from_recent(&snapshot));
-    };
+    .map_err(|error| EgoPulseError::Storage(StorageError::TaskJoin(error.to_string())))?
+    // A snapshot that exists but cannot be read is corrupt persisted data. It
+    // must not be silently replaced with a short history fallback.
+    .map_err(EgoPulseError::Storage)?;
 
     Ok(LoadedSession {
-        messages: Arc::new(repair_orphan_tool_outputs(messages)),
+        context: repair_context(restored),
         session_revision: snapshot.session_revision,
     })
 }
 
-fn restored_messages_or_recent(
-    restored: Result<Vec<Message>, StorageError>,
-) -> Option<Vec<Message>> {
-    let Ok(messages) = restored else {
-        return None;
+/// Repairs orphaned tool outputs and invalidates a usage anchor whose message
+/// indices no longer describe the repaired conversation.
+fn repair_context(context: SessionContext) -> SessionContext {
+    let original_len = context.messages.len();
+    let repaired = repair_orphan_tool_outputs((*context.messages).clone());
+    let last_usage = if repaired.len() == original_len {
+        context.last_usage
+    } else {
+        None
     };
-    if messages.is_empty() {
-        return Some(messages);
+    SessionContext {
+        checkpoint: context.checkpoint,
+        messages: Arc::new(repaired),
+        last_usage,
     }
-
-    Some(messages)
 }
 
 fn repair_orphan_tool_outputs(messages: Vec<Message>) -> Vec<Message> {
@@ -534,56 +546,78 @@ fn orphan_tool_output_message(tool_call_id: String) -> Message {
 
 fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
     LoadedSession {
-        messages: Arc::new(
-            snapshot
-                .recent_messages
-                .iter()
-                .map(|message| {
-                    let role = match message.sender_kind {
-                        SenderKind::Assistant | SenderKind::Tool => "assistant",
-                        SenderKind::User => "user",
-                        SenderKind::System => "system",
-                    };
-                    Message::text(role, message.content.clone())
-                })
-                .collect(),
-        ),
+        context: SessionContext {
+            checkpoint: None,
+            messages: Arc::new(
+                snapshot
+                    .recent_messages
+                    .iter()
+                    .map(|message| {
+                        let role = match message.sender_kind {
+                            SenderKind::Assistant | SenderKind::Tool => "assistant",
+                            SenderKind::User => "user",
+                            SenderKind::System => "system",
+                        };
+                        Message::text(role, message.content.clone())
+                    })
+                    .collect(),
+            ),
+            last_usage: None,
+        },
         session_revision: snapshot.session_revision,
     }
 }
 
-pub(super) async fn serialize_snapshot(
+pub(crate) async fn serialize_snapshot(
     assets: Arc<AssetStore>,
-    messages: Vec<Message>,
+    context: SessionContext,
 ) -> Result<String, EgoPulseError> {
     tokio::task::spawn_blocking(move || {
-        let persisted = messages_to_snapshot(&assets, &messages)?;
-        serde_json::to_string(&persisted).map_err(StorageError::SessionSerialize)
+        let snapshot = context_to_snapshot(&assets, &context)?;
+        serde_json::to_string(&snapshot).map_err(StorageError::SessionSerialize)
     })
     .await
     .map_err(|error| EgoPulseError::Storage(StorageError::TaskJoin(error.to_string())))?
     .map_err(EgoPulseError::Storage)
 }
 
+/// Seeds a session snapshot from hydrated messages (tests only).
+#[cfg(test)]
+pub(crate) fn save_test_session(
+    assets: &AssetStore,
+    db: &crate::storage::Database,
+    chat_id: i64,
+    messages: Vec<Message>,
+) {
+    let context = SessionContext {
+        checkpoint: None,
+        messages: Arc::new(messages),
+        last_usage: None,
+    };
+    let snapshot = context_to_snapshot(assets, &context).expect("snapshot");
+    db.save_session(chat_id, &serde_json::to_string(&snapshot).expect("json"))
+        .expect("save session");
+}
+
 /// Deserialize snapshot JSON and hydrate image references for LLM input.
 fn restore_snapshot_messages(
     assets: &AssetStore,
     json: &str,
-) -> Result<Vec<Message>, StorageError> {
-    let messages: Vec<SnapshotMessage> =
+) -> Result<SessionContext, StorageError> {
+    let snapshot: ContextSnapshot =
         serde_json::from_str(json).map_err(StorageError::SessionSerialize)?;
 
-    Ok(messages_from_snapshot(assets, messages))
+    context_from_snapshot(assets, snapshot)
 }
 
 async fn store_phase_snapshot(
     state: &TurnDependencies,
     scope: ConversationScope,
     message: StoredMessage,
-    snapshot_messages: Vec<Message>,
+    context: SessionContext,
     session_revision: Option<i64>,
 ) -> Result<PersistedTurn, StorageError> {
-    let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
+    let session_json = serialize_snapshot(Arc::clone(&state.assets), context.clone())
         .await
         .map_err(|error| match error {
             EgoPulseError::Storage(storage) => storage,
@@ -597,22 +631,19 @@ async fn store_phase_snapshot(
     state
         .conversation_events
         .publish(ConversationChanged { scope, chat_id });
-    Ok(PersistedTurn {
-        revision,
-        messages: snapshot_messages,
-    })
+    Ok(PersistedTurn { revision, context })
 }
 
 async fn store_phase_snapshot_with_turn_input(
     state: &TurnDependencies,
     scope: ConversationScope,
     message: StoredMessage,
-    snapshot_messages: Vec<Message>,
+    context: SessionContext,
     session_revision: Option<i64>,
     turn_id: &str,
     config_snapshot: &crate::config::manager::ConfigSnapshot,
 ) -> Result<PersistedTurn, StorageError> {
-    let session_json = serialize_snapshot(Arc::clone(&state.assets), snapshot_messages.clone())
+    let session_json = serialize_snapshot(Arc::clone(&state.assets), context.clone())
         .await
         .map_err(|error| match error {
             EgoPulseError::Storage(storage) => storage,
@@ -636,10 +667,7 @@ async fn store_phase_snapshot_with_turn_input(
     state
         .conversation_events
         .publish(ConversationChanged { scope, chat_id });
-    Ok(PersistedTurn {
-        revision,
-        messages: snapshot_messages,
-    })
+    Ok(PersistedTurn { revision, context })
 }
 
 #[cfg(test)]
@@ -652,6 +680,15 @@ mod tests {
         load_messages_for_turn, load_transcript_history, persist_phase, resolve_chat_id,
         stored_history_to_messages,
     };
+    use crate::agent_loop::session_snapshot::SessionContext;
+
+    fn context_of(messages: Vec<Message>) -> SessionContext {
+        SessionContext {
+            checkpoint: None,
+            messages: Arc::new(messages),
+            last_usage: None,
+        }
+    }
     use crate::config::Config;
     use crate::conversation::{ConversationScope, SurfaceContext};
     use crate::error::LlmError;
@@ -997,15 +1034,26 @@ mod tests {
         assistant.id = "history-assistant".to_string();
         call_blocking(Arc::clone(&state.db), {
             let user = user.clone();
-            move |db| db.store_message_with_session(&user, "[]", None).map(|_| ())
+            move |db| {
+                db.store_message_with_session(
+                    &user,
+                    &crate::test_util::session_envelope("[]"),
+                    None,
+                )
+                .map(|_| ())
+            }
         })
         .await
         .expect("seed history");
         call_blocking(Arc::clone(&state.db), {
             let assistant = assistant.clone();
             move |db| {
-                db.store_message_with_session(&assistant, "[]", Some(1))
-                    .map(|_| ())
+                db.store_message_with_session(
+                    &assistant,
+                    &crate::test_util::session_envelope("[]"),
+                    Some(1),
+                )
+                .map(|_| ())
             }
         })
         .await
@@ -1113,7 +1161,7 @@ mod tests {
             move |db| {
                 db.store_message_with_session(
                     &message,
-                    r#"[{"role":"user","content":"hello"}]"#,
+                    &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
                     None,
                 )
                 .map(|_| ())
@@ -1148,7 +1196,9 @@ mod tests {
             move |db| {
                 db.store_message_with_session(
                     &message,
-                    r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#,
+                    &crate::test_util::session_envelope(
+                        r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#,
+                    ),
                     Some(expected_revision),
                 )
                 .map(|_| ())
@@ -1174,15 +1224,18 @@ mod tests {
                 parent_message_id: None,
             },
             Message::text("user", "next"),
-            &[Message::text("user", "hello")],
+            context_of(vec![Message::text("user", "hello")]),
             Some(stale_session_revision),
         )
         .await
         .expect("persist turn");
 
-        assert_eq!(persisted.messages.len(), 3);
-        assert_eq!(persisted.messages[1].content.as_text_lossy(), "hi");
-        assert_eq!(persisted.messages[2].content.as_text_lossy(), "next");
+        assert_eq!(persisted.context.messages.len(), 3);
+        assert_eq!(persisted.context.messages[1].content.as_text_lossy(), "hi");
+        assert_eq!(
+            persisted.context.messages[2].content.as_text_lossy(),
+            "next"
+        );
     }
 
     #[tokio::test]
@@ -1233,7 +1286,7 @@ mod tests {
                 parent_message_id: None,
             },
             messages[0].clone(),
-            &messages,
+            context_of(messages),
             None,
         )
         .await
@@ -1259,7 +1312,7 @@ mod tests {
         )
         .await
         .expect("load messages");
-        match &loaded.messages[0].content {
+        match &loaded.context.messages[0].content {
             MessageContent::Parts(parts) => {
                 assert!(matches!(
                     parts[1],
@@ -1287,7 +1340,9 @@ mod tests {
         call_blocking(Arc::clone(&state.db), move |db| {
             db.save_session(
                 chat_id,
-                r#"[{"role":"tool","content":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image_ref","image_ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mime_type":"image/png","detail":"auto"}],"tool_call_id":"call_1"}]"#,
+                &crate::test_util::session_envelope(
+                    r#"[{"role":"tool","content":[{"type":"input_text","text":"Read image file [image/png]"},{"type":"input_image_ref","image_ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mime_type":"image/png","detail":"auto"}],"tool_call_id":"call_1"}]"#,
+                ),
             )
         })
         .await
@@ -1300,7 +1355,7 @@ mod tests {
         )
         .await
         .expect("load messages");
-        match &loaded.messages[0].content {
+        match &loaded.context.messages[0].content {
             MessageContent::Parts(parts) => {
                 assert!(matches!(
                     parts[1],
@@ -1341,13 +1396,7 @@ mod tests {
             },
             Message::text("user", "what happened?"),
         ];
-        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
-
-        call_blocking(Arc::clone(&state.db), move |db| {
-            db.save_session(chat_id, &snapshot_json)
-        })
-        .await
-        .expect("save snapshot");
+        super::save_test_session(&state.assets, &state.db, chat_id, snapshot);
 
         let loaded = load_messages_for_turn(
             &state.turn_dependencies(),
@@ -1357,19 +1406,22 @@ mod tests {
         .await
         .expect("load messages");
 
-        assert_eq!(loaded.messages.len(), 4);
-        assert_eq!(loaded.messages[2].role, "tool");
+        assert_eq!(loaded.context.messages.len(), 4);
+        assert_eq!(loaded.context.messages[2].role, "tool");
         assert_eq!(
-            loaded.messages[2].tool_call_id.as_deref(),
+            loaded.context.messages[2].tool_call_id.as_deref(),
             Some("call-missing")
         );
         assert!(
-            loaded.messages[2]
+            loaded.context.messages[2]
                 .content
                 .as_text_lossy()
                 .contains("tool output was missing")
         );
-        assert_eq!(loaded.messages[3].content.as_text_lossy(), "what happened?");
+        assert_eq!(
+            loaded.context.messages[3].content.as_text_lossy(),
+            "what happened?"
+        );
     }
 
     #[tokio::test]
@@ -1393,13 +1445,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let snapshot_json = serde_json::to_string(&snapshot).expect("snapshot json");
-
-        call_blocking(Arc::clone(&state.db), move |db| {
-            db.save_session(chat_id, &snapshot_json)
-        })
-        .await
-        .expect("save snapshot");
+        super::save_test_session(&state.assets, &state.db, chat_id, snapshot);
 
         let loaded = load_messages_for_turn(
             &state.turn_dependencies(),
@@ -1408,9 +1454,15 @@ mod tests {
         )
         .await
         .expect("load messages");
-        assert_eq!(loaded.messages.len(), 55);
-        assert_eq!(loaded.messages[0].content.as_text_lossy(), "message-0");
-        assert_eq!(loaded.messages[54].content.as_text_lossy(), "message-54");
+        assert_eq!(loaded.context.messages.len(), 55);
+        assert_eq!(
+            loaded.context.messages[0].content.as_text_lossy(),
+            "message-0"
+        );
+        assert_eq!(
+            loaded.context.messages[54].content.as_text_lossy(),
+            "message-54"
+        );
     }
 
     #[tokio::test]
@@ -1434,14 +1486,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let seed_json = serde_json::to_string(&seed_messages).expect("seed json");
-
-        call_blocking(Arc::clone(&state.db), {
-            let seed_json = seed_json.clone();
-            move |db| db.save_session(chat_id, &seed_json)
-        })
-        .await
-        .expect("save seed snapshot");
+        super::save_test_session(&state.assets, &state.db, chat_id, seed_messages.clone());
 
         let stale_session_revision = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 1)
@@ -1465,7 +1510,9 @@ mod tests {
         };
         let mut latest_messages = seed_messages.clone();
         latest_messages.push(Message::text("assistant", "concurrent"));
-        let latest_json = serde_json::to_string(&latest_messages).expect("latest json");
+        let latest_json = crate::test_util::session_envelope(
+            &serde_json::to_string(&latest_messages).expect("latest json"),
+        );
 
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
@@ -1498,16 +1545,25 @@ mod tests {
                 parent_message_id: None,
             },
             Message::text("user", "next"),
-            &stale_messages,
+            context_of(stale_messages),
             Some(stale_session_revision),
         )
         .await
         .expect("persist turn");
 
-        assert_eq!(persisted.messages.len(), 53);
-        assert_eq!(persisted.messages[0].content.as_text_lossy(), "seed-0");
-        assert_eq!(persisted.messages[51].content.as_text_lossy(), "concurrent");
-        assert_eq!(persisted.messages[52].content.as_text_lossy(), "next");
+        assert_eq!(persisted.context.messages.len(), 53);
+        assert_eq!(
+            persisted.context.messages[0].content.as_text_lossy(),
+            "seed-0"
+        );
+        assert_eq!(
+            persisted.context.messages[51].content.as_text_lossy(),
+            "concurrent"
+        );
+        assert_eq!(
+            persisted.context.messages[52].content.as_text_lossy(),
+            "next"
+        );
     }
 
     #[test]
@@ -1653,30 +1709,6 @@ mod tests {
 
         assert_eq!(web_ctx.session_key(), "web:s1:agent:default");
         assert_eq!(telegram_ctx.session_key(), "telegram:s2:agent:default");
-    }
-
-    #[test]
-    fn restored_messages_or_recent_empty_is_some() {
-        let result = super::restored_messages_or_recent(Ok(vec![]));
-        assert_eq!(result, Some(vec![]));
-
-        let msg = Message {
-            role: "user".into(),
-            content: MessageContent::Text("hello".into()),
-            reasoning_content: None,
-            tool_calls: vec![],
-            tool_call_id: None,
-        };
-        let result = super::restored_messages_or_recent(Ok(vec![msg.clone()]));
-        assert_eq!(result, Some(vec![msg]));
-
-        let err: Result<Vec<Message>, crate::error::StorageError> =
-            Err(crate::error::StorageError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "test",
-            )));
-        let result = super::restored_messages_or_recent(err);
-        assert_eq!(result, None);
     }
 
     #[tokio::test]
@@ -1831,11 +1863,14 @@ mod tests {
         .await
         .expect("load messages");
 
-        assert_eq!(loaded.messages.len(), 2);
-        assert_eq!(loaded.messages[0].role, "user");
-        assert_eq!(loaded.messages[0].content.as_text_lossy(), "hello");
-        assert_eq!(loaded.messages[1].role, "assistant");
-        assert_eq!(loaded.messages[1].content.as_text_lossy(), "response");
+        assert_eq!(loaded.context.messages.len(), 2);
+        assert_eq!(loaded.context.messages[0].role, "user");
+        assert_eq!(loaded.context.messages[0].content.as_text_lossy(), "hello");
+        assert_eq!(loaded.context.messages[1].role, "assistant");
+        assert_eq!(
+            loaded.context.messages[1].content.as_text_lossy(),
+            "response"
+        );
     }
 
     /// Verifies that `persist_phase` borrows `&[Message]` for serialization,
@@ -1876,7 +1911,7 @@ mod tests {
                 parent_message_id: None,
             },
             Message::text("user", "test"),
-            &messages,
+            context_of((*messages).clone()),
             None,
         )
         .await
@@ -1910,7 +1945,7 @@ mod tests {
             ConversationScope::Normal,
             stored,
             Message::text("assistant", "hello"),
-            &[],
+            context_of(Vec::new()),
             None,
         )
         .await

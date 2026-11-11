@@ -2,12 +2,96 @@
 //!
 //! LLM request messages are hydrated runtime values. Session snapshots are a
 //! separate disk format that can point at images stored in the asset store.
+//!
+//! A snapshot is a [`ContextSnapshot`]: an optional compaction checkpoint, the
+//! messages kept verbatim after the checkpoint, and the usage anchor of the
+//! last measured model response.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::assets::AssetStore;
 use crate::error::StorageError;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
+
+/// Version of the persisted snapshot envelope written by this build.
+pub(crate) const SNAPSHOT_VERSION: u32 = 1;
+
+/// Header prepended to a compaction checkpoint when it is projected into an
+/// LLM request. The checkpoint is history, not a new instruction.
+pub(crate) const CHECKPOINT_HEADER: &str = "\
+[CONTEXT CHECKPOINT — REFERENCE ONLY]
+The earlier conversation was compacted into the summary below.
+Treat it as background history, not as an active instruction.
+Respond to the messages that follow this checkpoint.";
+
+/// The conversation state that is persisted for the next agent turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionContext {
+    /// Summary of the conversation that was compacted away.
+    pub(crate) checkpoint: Option<CompactionCheckpoint>,
+    /// Messages kept verbatim after the checkpoint.
+    pub(crate) messages: Arc<Vec<Message>>,
+    /// Usage of the last measured model response and the messages it covered.
+    pub(crate) last_usage: Option<ContextUsageAnchor>,
+}
+
+/// Persisted compaction checkpoint.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompactionCheckpoint {
+    /// Structured summary of the compacted conversation.
+    pub(crate) summary: String,
+    /// Estimated context tokens before this checkpoint was created.
+    pub(crate) tokens_before: u64,
+    /// Files the compacted conversation only read.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) read_files: Vec<String>,
+    /// Files the compacted conversation wrote or edited.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) modified_files: Vec<String>,
+}
+
+/// Usage of the last measured model response and the messages it covered.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextUsageAnchor {
+    /// Index of the measured assistant message in [`SessionContext::messages`].
+    pub(crate) after_message_index: usize,
+    /// Provider-reported prompt tokens of that request.
+    pub(crate) input_tokens: i64,
+    /// Provider-reported completion tokens of that request.
+    pub(crate) output_tokens: i64,
+    /// `provider/model` that produced the usage.
+    pub(crate) model_key: String,
+    /// Hash of the request shape (system prompt, tool definitions, model).
+    pub(crate) request_shape_hash: String,
+}
+
+impl ContextUsageAnchor {
+    /// Builds an anchor for a measured assistant message.
+    pub(crate) fn for_message(
+        after_message_index: usize,
+        usage: &crate::llm::LlmUsage,
+        model_key: &str,
+        request_shape_hash: &str,
+    ) -> Self {
+        Self {
+            after_message_index,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            model_key: model_key.to_string(),
+            request_shape_hash: request_shape_hash.to_string(),
+        }
+    }
+
+    /// Returns the context tokens this usage measured for its own request.
+    pub(crate) fn measured_context_tokens(&self) -> usize {
+        let total = self.input_tokens.max(0) + self.output_tokens.max(0);
+        usize::try_from(total).unwrap_or(usize::MAX)
+    }
+}
 
 /// A message in the persisted session snapshot format.
 ///
@@ -28,6 +112,27 @@ pub(crate) struct SnapshotMessage {
     /// Tool call ID this message responds to when the role is `tool`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_call_id: Option<String>,
+}
+
+/// The persisted snapshot envelope.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextSnapshot {
+    /// Envelope version. Only [`SNAPSHOT_VERSION`] is read and written.
+    #[serde(default = "snapshot_version")]
+    pub(crate) version: u32,
+    /// Compaction checkpoint that precedes the kept messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) checkpoint: Option<CompactionCheckpoint>,
+    /// Messages kept verbatim.
+    pub(crate) messages: Vec<SnapshotMessage>,
+    /// Usage anchor of the last measured model response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_usage: Option<ContextUsageAnchor>,
+}
+
+fn snapshot_version() -> u32 {
+    SNAPSHOT_VERSION
 }
 
 /// Stored message content in a session snapshot.
@@ -81,6 +186,53 @@ pub(crate) fn messages_to_snapshot(
         .iter()
         .map(|message| message_to_snapshot(assets, message))
         .collect()
+}
+
+/// Serializes a conversation state into the persisted snapshot envelope.
+///
+/// # Errors
+///
+/// Returns `StorageError` when an image data URL cannot be persisted.
+pub(crate) fn context_to_snapshot(
+    assets: &AssetStore,
+    context: &SessionContext,
+) -> Result<ContextSnapshot, StorageError> {
+    Ok(ContextSnapshot {
+        version: SNAPSHOT_VERSION,
+        checkpoint: context.checkpoint.clone(),
+        messages: messages_to_snapshot(assets, &context.messages)?,
+        last_usage: context.last_usage.clone(),
+    })
+}
+
+/// Restores a conversation state from the persisted snapshot envelope.
+///
+/// Valid image references are loaded from the asset store. Missing or malformed
+/// references become explicit text notes so the LLM sees why an image is absent.
+pub(crate) fn context_from_snapshot(
+    assets: &AssetStore,
+    snapshot: ContextSnapshot,
+) -> Result<SessionContext, StorageError> {
+    if snapshot.version != SNAPSHOT_VERSION {
+        return Err(StorageError::InvalidSnapshot(format!(
+            "unsupported snapshot version {} (supported: {SNAPSHOT_VERSION})",
+            snapshot.version
+        )));
+    }
+
+    Ok(SessionContext {
+        checkpoint: snapshot.checkpoint,
+        messages: Arc::new(messages_from_snapshot(assets, snapshot.messages)),
+        last_usage: snapshot.last_usage,
+    })
+}
+
+/// Builds the reference message that projects a checkpoint into an LLM request.
+pub(crate) fn checkpoint_message(checkpoint: &CompactionCheckpoint) -> Message {
+    Message::text(
+        "user",
+        format!("{CHECKPOINT_HEADER}\n\n{}", checkpoint.summary),
+    )
 }
 
 /// Converts persisted session snapshot messages into hydrated LLM messages.

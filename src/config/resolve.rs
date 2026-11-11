@@ -530,28 +530,16 @@ pub(super) fn default_web_port() -> u16 {
     10961
 }
 
-pub(crate) fn default_compaction_timeout_secs() -> u64 {
-    180
-}
-
 pub(crate) fn default_max_history_messages() -> usize {
     50
 }
 
 pub(crate) fn default_context_window_tokens() -> usize {
-    32768
+    131_072
 }
 
-pub(crate) fn default_compaction_threshold_ratio() -> f64 {
-    0.80
-}
-
-pub(crate) fn default_compaction_target_ratio() -> f64 {
-    0.40
-}
-
-pub(crate) fn default_compact_keep_recent() -> usize {
-    20
+pub(crate) fn default_compaction_config() -> super::CompactionConfig {
+    super::CompactionConfig::default()
 }
 
 // 64KB ceiling: `model_instructions_file` is re-read on every turn and every

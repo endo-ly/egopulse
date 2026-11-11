@@ -602,6 +602,28 @@ pub(crate) struct WebhooksConfig {
     pub receivers: HashMap<WebhookReceiverId, WebhookReceiverConfig>,
 }
 
+/// Context-window compaction settings for one agent turn.
+///
+/// The values mirror the reference algorithm: compaction triggers when the
+/// projected prompt exceeds `context_window - reserve_tokens`, and the
+/// retained history covers at least `keep_recent_tokens`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompactionConfig {
+    pub(crate) enabled: bool,
+    pub(crate) reserve_tokens: usize,
+    pub(crate) keep_recent_tokens: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reserve_tokens: 16_384,
+            keep_recent_tokens: 20_000,
+        }
+    }
+}
+
 /// Top-level application configuration resolved from file and environment variables.
 #[derive(Clone)]
 pub struct Config {
@@ -610,12 +632,9 @@ pub struct Config {
     pub(crate) providers: HashMap<ProviderId, ProviderConfig>,
     pub(crate) state_root: String,
     pub(crate) log_level: String,
-    pub(crate) compaction_timeout_secs: u64,
+    pub(crate) compaction: CompactionConfig,
     pub(crate) max_history_messages: usize,
-    pub(crate) compact_keep_recent: usize,
     pub(crate) default_context_window_tokens: usize,
-    pub(crate) compaction_threshold_ratio: f64,
-    pub(crate) compaction_target_ratio: f64,
     pub(crate) channels: HashMap<ChannelName, ChannelConfig>,
     pub(crate) default_agent: AgentId,
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
@@ -635,18 +654,12 @@ impl std::fmt::Debug for Config {
             .field("providers", &self.providers)
             .field("state_root", &self.state_root)
             .field("log_level", &self.log_level)
-            .field("compaction_timeout_secs", &self.compaction_timeout_secs)
+            .field("compaction", &self.compaction)
             .field("max_history_messages", &self.max_history_messages)
-            .field("compact_keep_recent", &self.compact_keep_recent)
             .field(
                 "default_context_window_tokens",
                 &self.default_context_window_tokens,
             )
-            .field(
-                "compaction_threshold_ratio",
-                &self.compaction_threshold_ratio,
-            )
-            .field("compaction_target_ratio", &self.compaction_target_ratio)
             .field("channels", &self.channels)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents)

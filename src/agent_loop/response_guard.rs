@@ -188,6 +188,7 @@ mod tests {
         .expect("loaded session");
         assert!(
             loaded
+                .context
                 .messages
                 .iter()
                 .all(|message| !message.content.as_text_lossy().contains("[runtime_guard]"))

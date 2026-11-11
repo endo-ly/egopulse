@@ -194,12 +194,23 @@ pub(crate) fn test_config(state_root: String) -> crate::config::Config {
 
 pub(crate) fn test_config_with_compaction(
     state_root: String,
-    compact_keep_recent: usize,
+    keep_recent_tokens: usize,
 ) -> crate::config::Config {
     let mut config = crate::test_util::test_config(&state_root);
-    config.compact_keep_recent = compact_keep_recent;
-    config.default_context_window_tokens = 9000;
-    config.compaction_threshold_ratio = 0.01;
+    config.compaction.keep_recent_tokens = keep_recent_tokens;
+    config.compaction.reserve_tokens = 512;
+    config.default_context_window_tokens = 9_000;
+    config
+}
+
+/// Returns a config whose compaction window triggers on a small conversation.
+pub(crate) fn test_config_with_compaction_window(
+    state_root: String,
+    keep_recent_tokens: usize,
+    context_window_tokens: usize,
+) -> crate::config::Config {
+    let mut config = test_config_with_compaction(state_root, keep_recent_tokens);
+    config.default_context_window_tokens = context_window_tokens;
     config
 }
 

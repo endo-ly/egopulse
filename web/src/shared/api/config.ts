@@ -18,20 +18,18 @@ export interface GeneralConfig {
   default_model: string | null;
   timezone: string;
   max_history_messages: number;
-  compaction_timeout_secs: number;
+  compaction_enabled: boolean;
+  compaction_reserve_tokens: number;
+  compaction_keep_recent_tokens: number;
   default_context_window_tokens: number;
-  compaction_threshold_ratio: number;
-  compaction_target_ratio: number;
-  compact_keep_recent: number;
   log_level: string;
   state_root: string;
   defaults: {
     max_history_messages: number;
-    compaction_timeout_secs: number;
+    compaction_enabled: boolean;
+    compaction_reserve_tokens: number;
+    compaction_keep_recent_tokens: number;
     default_context_window_tokens: number;
-    compaction_threshold_ratio: number;
-    compaction_target_ratio: number;
-    compact_keep_recent: number;
     timezone: string;
     log_level: string;
   };

@@ -3065,7 +3065,16 @@ mod tests {
         call_blocking(state.db_for(ConversationScope::Normal), {
             let msg = msg.clone();
             let turn_id = turn_id.clone();
-            move |db| db.commit_turn_input_with_conversation(&msg, "[]", None, &turn_id, 0, None)
+            move |db| {
+                db.commit_turn_input_with_conversation(
+                    &msg,
+                    &crate::test_util::session_envelope("[]"),
+                    None,
+                    &turn_id,
+                    0,
+                    None,
+                )
+            }
         })
         .await
         .expect("commit input");
