@@ -107,7 +107,7 @@ Telegram / Discord / TUI / Web チャット のいずれかで `/` から始ま�
 | コマンド | 引数 | 説明 |
 |---|---|---|
 | `/new` | なし | 新規セッションを開始。現在のセッション snapshot とメッセージ履歴をクリア |
-| `/compact` | なし | 手動 Safety Compaction をトリガー。閾値に関わらず現在のセッションを要約 |
+| `/compact` | `[instructions]` | 手動 Context Compaction をトリガー。閾値と `compaction.enabled` に関わらず実行し、追加指示を要約の焦点として渡す |
 | `/sessions` | なし | TUI で保存済みセッションの切替オーバーレイを開く（TUI 専用） |
 
 #### プロバイダー・モデル操作
@@ -154,13 +154,19 @@ Telegram / Discord / TUI / Web チャット のいずれかで `/` から始ま�
 3. 確認メッセージを返信: `"Session cleared."`
 4. 次のメッセージから新しいセッションとして扱われる（同じ `SurfaceContext` で snapshot が空の状態から再構築）
 
-#### `/compact`
+#### `/compact [instructions]`
 
-1. 現在のセッションの全メッセージを読み込み
-2. Safety Compaction の閾値チェックをバイパス（メッセージ数や推定 token に関わらず実行）
-3. old / recent の 2 領域に分割し、old を reference-only summary へ畳み込み（recent はそのまま保持。詳細は [session-lifecycle.md §5](./session-lifecycle.md#5-safety-compaction) 参照）
-4. アーカイブファイル（Markdown）を `<state_root>/runtime/groups/<channel>/<chat_id>/conversations/` に出力
-5. 確認メッセージを返信: `"Compacted N messages to M."`
+1. 現在のセッションの context（checkpoint + 保持メッセージ）を読み込む
+2. 閾値チェックと `compaction.enabled` をバイパスして圧縮する
+3. 保持境界より前を要約し、checkpoint を更新する（保持メッセージはそのまま。詳細は [session-lifecycle.md §5](./session-lifecycle.md#5-context-compaction) 参照）
+4. 追加指示があれば要約プロンプトの focus として渡す
+5. アーカイブファイル（Markdown）を `<state_root>/runtime/groups/<channel>/<chat_id>/conversations/` に出力
+6. `chats.revision` の CAS で snapshot を保存する
+7. 結果を返信する
+   - `"Compacted N messages to M."`
+   - `"Nothing to compact in this session."`（要約対象が無い）
+   - `"Session changed while compacting; nothing was saved. Run /compact again."`（CAS 競合）
+   - `"Compaction failed: ..."`
 
 #### `/status`
 

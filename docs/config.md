@@ -62,12 +62,12 @@ default_model: null
 default_agent: default
 timezone: Asia/Tokyo
 log_level: info
-compaction_timeout_secs: 180
 max_history_messages: 50
-default_context_window_tokens: 32768
-compaction_threshold_ratio: 0.80
-compaction_target_ratio: 0.40
-compact_keep_recent: 20
+default_context_window_tokens: 131072
+compaction:
+  enabled: true
+  reserve_tokens: 16384
+  keep_recent_tokens: 20000
 
 # ========================================
 # エージェント定義（§3.11）
@@ -256,12 +256,11 @@ web_fetch:
 | `state_root` | `string` | 任意 | `~/.egopulse` | Runtime の状態ディレクトリ。絶対パスのみ指定でき、Runtime と TUI は同じディレクトリから Local API endpoint を解決する |
 | `timezone` | `string` | 任意 | `"UTC"` | IANA タイムゾーン（例: `Asia/Tokyo`）。全サブシステム（sleep batch、pulse、会話タイムスタンプ）で使用 |
 | `log_level` | `"info" \| "debug" \| "warn" \| "error"` | 任意 | `"info"` | ログ出力レベル |
-| `compaction_timeout_secs` | `u64` | 任意 | `180` | 履歴圧縮（compaction）時の LLM 呼び出しタイムアウト秒数 |
 | `max_history_messages` | `usize` | 任意 | `50` | セッション復元時のフォールバックメッセージ取得数 |
-| `default_context_window_tokens` | `usize` | 任意 | `32768` | context window のトークン数フォールバック値。model 固有の設定がない場合に使用。安全上限 `1,000,000` |
-| `compaction_threshold_ratio` | `f64` | 任意 | `0.80` | 推定 prompt tokens が usable context のこの割合に達したら compaction を発火。`(0, 1]` |
-| `compaction_target_ratio` | `f64` | 任意 | `0.40` | compaction 後の目標 token 量を usable context に対する割合で指定。threshold 未満 `(0, threshold)` |
-| `compact_keep_recent` | `usize` | 任意 | `20` | compaction 時に Tail としてそのまま保持する直近メッセージ数の下限 |
+| `default_context_window_tokens` | `usize` | 任意 | `131072` | context window のトークン数フォールバック値。model 固有の設定がない場合に使用。安全上限 `1,000,000` |
+| `compaction.enabled` | `bool` | 任意 | `true` | 自動 compaction の有効化。`false` でも `/compact` と context overflow 復旧は動作する |
+| `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。`1` 以上 |
+| `compaction.keep_recent_tokens` | `usize` | 任意 | `20000` | 原文のまま保持する直近履歴の下限 token 数。`1` 以上 |
 
 ### 3.2 プロバイダー定義（`providers.<id>`）
 
@@ -849,7 +848,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 | `agents.<id>.*` | Agent の provider / model / profile / routing / MCP tool 公開範囲と agent_send の宛先 |
 | `providers.<id>.*` | Provider 定義、credential、model、endpoint。Provider cache は revision ごとに分離 |
 | `timezone` | Sleep / Pulse および Turn の時刻解決 |
-| `compaction_*` / `compact_keep_recent` / `max_history_messages` / `default_context_window_tokens` | 新しい Turn の履歴・コンテキスト処理 |
+| `compaction.*` / `max_history_messages` / `default_context_window_tokens` | 新しい Turn の履歴・コンテキスト処理 |
 | `providers.<id>.models.<model>.context_window_tokens` | 新しい Turn のコンテキスト上限 |
 | `providers.<id>.models.<model>.model_instructions` / `model_instructions_file` | 新しい Turn の system prompt |
 | `sleep_batch.*` / `pulse.*` | Sleep / Pulse scheduler の次回判定 |

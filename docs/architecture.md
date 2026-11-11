@@ -102,7 +102,7 @@ src/
 │   ├── loop_runner.rs   # AgentLoop、LoopState、iteration policy
 │   ├── model_step.rs    # 1 回の LLM 呼び出し、分類、retry、usage
 │   ├── tool_execution.rs # Tool 実行、ledger、Tool Result 構築
-│   ├── compaction.rs    # コンテキスト圧縮 + アーカイブ
+│   ├── compaction.rs    # コンテキスト圧縮（checkpoint 要約）+ アーカイブ
 │   ├── response_guard.rs # empty / declarative response guard
 │   ├── message_format.rs # Message / Tool Result の表現変換
 │   ├── event.rs         # AgentEvent 型
@@ -343,7 +343,7 @@ TurnExecutor
       │
       ├─ 5a. chat_id を解決 (chats テーブルを upsert)
       ├─ 5b. session snapshot をロード (sessions テーブル)
-      ├─ 5c. Safety Compaction 判定 (token estimate >= threshold)
+      ├─ 5c. Context Compaction 判定 (context_tokens > context_window - reserve_tokens)
       │
       ├─ 5d. system prompt を構築
       │      ├ SOUL.md (agent → channel → global の順に解決)

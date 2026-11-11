@@ -263,12 +263,13 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | chat_id | INTEGER | PK | chats.chat_id と1:1 |
-| messages_json | TEXT | NOT NULL | シリアライズされた会話全体 |
+| messages_json | TEXT | NOT NULL | `ContextSnapshot` エンベロープ（`version` / `checkpoint` / `messages` / `last_usage`） |
 | updated_at | TEXT | NOT NULL | 監査時刻（RFC3339）。競合判定には使用せず整数 `chats.revision` を使用 |
 | snapshot_through_seq | INTEGER | NOT NULL DEFAULT 0 | `messages_json` へ反映済みの最終 message seq。`base + seq>snapshot_through` でLLM contextを構築 |
 
 **操作**:
-- `save_session(chat_id, messages_json)` — Upsert（`ON CONFLICT DO UPDATE`）
+- `replace_session_snapshot(chat_id, messages_json, expected_revision)` — `chats.revision` の CAS つき Upsert。`/compact` が使用
+- `truncate_session_messages(chat_id, expected_revision, messages_json)` — Sleep Batch の切り詰め
 - `load_session(chat_id)` — JSON と updated_at を取得
 - `load_session_snapshot(chat_id, limit)` — JSON + 最新メッセージレコードをトランザクションで取得
 - `store_message_with_session(msg, json, expected_updated_at)` — メッセージ保存 + セッション更新をトランザクションで楽観排他実行
@@ -276,6 +277,8 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 **設計ポイント**:
 - 楽観排他: `expected_updated_at` と実際の `updated_at` を比較し、競合時は `SessionSnapshotConflict` エラー
 - `messages_json` にはツール呼び出しブロックも含まれるため、セッション再開時に完全なコンテキストを復元可能
+- `checkpoint` は畳んだ履歴の要約、`last_usage` は直近の実測 usage とその適用範囲を持つ。checkpoint はメッセージとして重複保存しない
+- 旧形式（`Message` 配列）は schema v23 / secret v9 のマイグレーションでエンベロープへ包まれる
 
 ---
 
@@ -716,7 +719,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 | `StoredMessage` | messages | id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id, seq, turn_id, parent_message_id |
 | `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
 | `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
-| `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |
+| `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\>（`messages_json` は `ContextSnapshot`） |
 | `AgentSessionInfo` | chats + sessions（JOIN） | chat_id, channel, external_chat_id, updated_at, message_count, estimated_tokens |
 | `ToolCall` | tool_calls | id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp |
 | `LlmUsageSummary` | llm_usage_logs（集計） | requests, input_tokens, output_tokens, total_tokens, last_request_at |
