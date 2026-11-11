@@ -164,7 +164,7 @@ Telegram / Discord / TUI / Web チャット のいずれかで `/` から始ま�
 6. `chats.revision` の CAS で snapshot を保存する
 7. 結果を返信する
    - `"Compacted N messages to M."`
-   - `"Nothing to compact in this session."`（要約対象が無い）
+   - `"Nothing to compact in this session."`（要約対象が無い。要約失敗は含まない）
    - `"Session changed while compacting; nothing was saved. Run /compact again."`（CAS 競合）
    - `"Compaction failed: ..."`
 

@@ -298,7 +298,7 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 |---|---|
 | 通常のユーザー入力 | ユーザーメッセージを積んだ直後、最初の model 呼び出し前 |
 | Tool 実行後 | tool 結果の保存が終わり、次の model 呼び出しを行う直前 |
-| Durable Turn 再開 | `input_committed` / `tools_completed` から再開し、次の model 呼び出しを行う直前 |
+| Durable Turn 再開 | `input_committed` / `tools_completed` から再開し、次の model 呼び出しを行う直前（判定は Agent Loop に集約する） |
 | 手動 | `/compact [instructions]`。閾値と `enabled` を無視する |
 | Context Overflow | Provider が context window 超過を理由に 400/413/422 を返したとき |
 
@@ -309,8 +309,9 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 ```
 
 - `context_window` は実際に使用する provider / model の `context_window_tokens`。未設定時のみ `default_context_window_tokens`（既定 131072）
-- `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）に、その後に追加されたメッセージの推定値を足す
+- `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）から計測時の request overhead を差し引き、現在の system prompt・tool 定義・checkpoint・request-only メッセージ（channel context、retry 修正、runtime guard）と、その後に追加されたメッセージの推定値を足す
 - 実測 usage が無い、または request shape（system prompt / tool 定義 / model）が計測時と変わった場合はリクエスト全体を推定する
+- 判定に使う request-only メッセージは、実際に送るリクエストと同じものを使う
 - `context_window <= reserve_tokens` は設定エラーとして扱う。暗黙に丸めない
 
 ### Token 推定
@@ -373,7 +374,13 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 
 ### 使用量アンカー
 
-`ContextUsageAnchor` に「どのメッセージまでの計測か」（`after_message_index`）、`input_tokens` / `output_tokens`、`model_key`、`request_shape_hash` を保存する。次の場合に破棄し、全体推定へ戻す。
+`ContextUsageAnchor` に「どのメッセージまでの計測か」（`after_message_index`）、`input_tokens` / `output_tokens`、`request_overhead_tokens`、`model_key`、`request_shape_hash` を保存する。
+
+provider の usage はリクエスト全体の token 数である。そのため会話メッセージ以外（system prompt / tool 定義 / checkpoint / request-only メッセージ）の推定値を `request_overhead_tokens` として併せて保存し、投影時はこの値を差し引いて現在の推定値へ置き換える。channel context や retry 修正が計測後に増減しても、その分が判定へ反映される。
+
+`request_shape_hash` は system prompt / tool 定義 / model だけを対象にし、channel context などの一時メッセージは含めない。これらの増減は `request_overhead_tokens` の差で扱うため、hash に含めると毎回アンカーが無効になる。
+
+次の場合に破棄し、全体推定へ戻す。
 
 - checkpoint を新規作成したとき
 - snapshot 競合で保持メッセージを組み直したとき
@@ -388,10 +395,10 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 | 障害パターン | 動作 |
 |---|---|
 | 要約対象なし | No-op。checkpoint と保持メッセージを変更しない |
-| 要約リクエスト失敗（retry 枯渇を含む） | 元の context をそのまま保持 |
-| 要約が空 | 元の context をそのまま保持 |
-| 要約が tool call を返した | 元の context をそのまま保持 |
-| 要約が出力上限で途切れた（`IncompleteResponse`） | 元の context をそのまま保持。再試行しない |
+| 要約リクエスト失敗（retry 枯渇を含む） | 呼び出し元へエラーを返す。自動 compaction は warn を残して元の context のまま続行し、`/compact` は失敗を応答する |
+| 要約が空 | 同上（`LlmError::InvalidResponse`） |
+| 要約が tool call を返した | 同上（`LlmError::InvalidResponse`） |
+| 要約が出力上限で途切れた（`IncompleteResponse`） | 呼び出し元へエラーを返す。再試行しない |
 | split turn の片方だけ成功 | 何も commit しない |
 | 要約中に snapshot が更新された | 古い結果を適用せず、最新 snapshot で選択し直す |
 
@@ -399,11 +406,13 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 
 ### Context Overflow からの復旧
 
-Provider の 400 を一律に context 超過とはみなさない。`LlmError::ApiError` の body が context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ overflow と分類する。
+Provider の 400 を一律に context 超過とはみなさない。Provider 境界（`src/llm/api_error.rs`）で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。Agent Loop はこの variant だけを復旧対象にし、provider 固有の文言を知らない。
 
 1. 出力を公開していない場合に限り、`CompactionReason::Overflow` で圧縮する
 2. 圧縮できたら同じ model iteration を 1 回だけ再送する。`turn_runs.model_request_hash` は新しいリクエストの hash へ更新する
 3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（無限に繰り返さない）
+
+再送するリクエストは、保存済みの会話と request-only メッセージ（宣言のみ応答への修正指示、runtime guard）から組み直す。修正指示は会話の外側にあるため、圧縮で会話が置き換わっても失われない。
 
 Tool 実行済みのターンでも再実行するのは model 推論だけであり、実行済み Tool は再実行しない。公開済みの途中出力がある場合は再送しない。
 
