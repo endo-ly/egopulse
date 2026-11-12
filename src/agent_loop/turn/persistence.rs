@@ -2,12 +2,8 @@
 
 use std::sync::Arc;
 
-use tracing::warn;
-
 use crate::agent_loop::TurnDependencies;
-use crate::agent_loop::compaction::{
-    CompactionOutcome, CompactionRequest, PromptContext, RequestMeasurement, compact_if_needed,
-};
+use crate::agent_loop::compaction::RequestMeasurement;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::format_direct_input;
 use crate::agent_loop::model_step::AssistantToolPhase;
@@ -18,7 +14,7 @@ use crate::agent_loop::session_snapshot::SessionContext;
 use crate::agent_loop::tool_execution::ToolResultPhase;
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, StorageError};
-use crate::llm::{LlmProvider, Message};
+use crate::llm::Message;
 use crate::storage::StoredMessage;
 
 /// Owns Message and Session persistence for one Turn.
@@ -54,13 +50,13 @@ impl<'a> TurnPersistence<'a> {
 
     /// Persists the user input and the resulting session snapshot.
     ///
-    /// Compaction runs before the commit so the persisted snapshot and the
-    /// first model request of the Turn describe the same context.
+    /// Compaction is not part of this step: the Agent Loop compacts right
+    /// before each model request, and only that decision knows the exact
+    /// request (channel context, retry corrections, runtime guards) it is
+    /// sizing.
     pub(super) async fn persist_user_input(
         &self,
         input: UserInput<'_>,
-        llm: &Arc<dyn LlmProvider>,
-        prompt_ctx: &PromptContext<'_>,
         config_snapshot: &crate::config::manager::ConfigSnapshot,
     ) -> Result<(SessionContext, Option<i64>), EgoPulseError> {
         let config = &config_snapshot.config;
@@ -80,20 +76,6 @@ impl<'a> TurnPersistence<'a> {
         stored_message.turn_id = Some(self.turn_id.clone());
         stored_message.timestamp = input.received_at.to_string();
 
-        let compaction_request = CompactionRequest {
-            state: self.runtime,
-            context: self.context,
-            chat_id: self.chat_id,
-            llm,
-            prompt: PromptContext {
-                system_prompt: prompt_ctx.system_prompt,
-                tools_json: prompt_ctx.tools_json,
-                has_tools: prompt_ctx.has_tools,
-            },
-            config,
-            request_only_messages: Vec::new(),
-        };
-
         for attempt in 0..2 {
             let mut candidate = SessionContext {
                 checkpoint: loaded.context.checkpoint.clone(),
@@ -103,22 +85,6 @@ impl<'a> TurnPersistence<'a> {
             let mut candidate_messages = (*candidate.messages).clone();
             candidate_messages.push(input.message.clone());
             candidate.messages = Arc::new(candidate_messages);
-
-            candidate = match compact_if_needed(&compaction_request, &candidate, None).await {
-                Ok(CompactionOutcome::Compacted(compacted)) => compacted,
-                Ok(CompactionOutcome::Unchanged) => candidate,
-                // A summarization failure must not reject the user input: the
-                // first model call may still fit, and an overflow is recovered
-                // from the Agent Loop.
-                Err(error) => {
-                    warn!(
-                        turn_id = %self.turn_id,
-                        error = %error,
-                        "context compaction failed; committing the uncompacted context"
-                    );
-                    candidate
-                }
-            };
 
             let persist_result = crate::agent_loop::session::commit_user_turn_input(
                 self.runtime,

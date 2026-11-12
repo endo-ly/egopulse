@@ -999,7 +999,7 @@ impl Database {
     /// Replaces the session snapshot only when `expected_revision` matches.
     ///
     /// `None` seeds the snapshot when the chat has none yet. Returns
-    /// `Ok(false)` when the chat was updated concurrently.
+    /// `Ok(None)` when the chat was updated concurrently.
     ///
     /// # Errors
     ///
@@ -1009,10 +1009,10 @@ impl Database {
         chat_id: i64,
         new_messages_json: &str,
         expected_revision: Option<i64>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<i64>, StorageError> {
         match self.update_session_snapshot(chat_id, new_messages_json, expected_revision) {
-            Ok(_) => Ok(true),
-            Err(StorageError::SessionSnapshotConflict) => Ok(false),
+            Ok(outcome) => Ok(Some(outcome.revision)),
+            Err(StorageError::SessionSnapshotConflict) => Ok(None),
             Err(other) => Err(other),
         }
     }

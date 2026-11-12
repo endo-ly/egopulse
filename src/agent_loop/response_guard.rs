@@ -6,21 +6,6 @@ use crate::llm::Message;
 /// text and no executable tool call.
 pub(crate) const EMPTY_REPLY_RUNTIME_GUARD: &str = "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.";
 
-pub(crate) fn runtime_guard_messages(
-    messages: &[Message],
-    assistant_text: &str,
-    assistant_reasoning_content: Option<&str>,
-    guard_text: &str,
-) -> Vec<Message> {
-    let mut retry_messages = messages.to_vec();
-    retry_messages.extend(runtime_guard_suffix(
-        assistant_text,
-        assistant_reasoning_content,
-        guard_text,
-    ));
-    retry_messages
-}
-
 /// Builds the messages a runtime guard appends to a request: the discarded
 /// assistant reply and the corrective instruction.
 ///

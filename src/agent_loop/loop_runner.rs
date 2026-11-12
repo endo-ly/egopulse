@@ -56,6 +56,10 @@ pub(crate) struct LoopState {
     /// the conversation itself.
     retry_suffix: Option<Vec<Message>>,
     declarative_retry_attempted: bool,
+    /// Set when a successful response reported a prompt larger than the
+    /// context window. The next model request compacts even if the estimated
+    /// projection would fit.
+    force_compaction: bool,
 }
 
 impl LoopState {
@@ -65,6 +69,7 @@ impl LoopState {
             session_revision,
             retry_suffix: None,
             declarative_retry_attempted: false,
+            force_compaction: false,
         }
     }
 
@@ -130,6 +135,14 @@ impl<'a> AgentLoop<'a> {
     ) -> Result<AgentLoopResult, EgoPulseError> {
         let mut loop_state = LoopState::new(context, session_revision);
         let guard_tracker = Arc::new(GuardDenialTracker::new());
+        let context_window = self
+            .prepared
+            .config_snapshot
+            .config
+            .resolve_context_window_tokens(
+                &crate::config::ProviderId::new(self.prepared.channel_llm.provider_name()),
+                self.prepared.channel_llm.model_name(),
+            );
         let mut iteration = start_iteration;
 
         while iteration <= MAX_TOOL_ITERATIONS {
@@ -155,8 +168,8 @@ impl<'a> AgentLoop<'a> {
                 has_tools: !tools.is_empty(),
             };
             let scope = self.request_scope(&loop_state, iteration, &guard_tracker);
-            self.compact_before_model(&mut loop_state, &scope, &prompt)
-                .await;
+            self.compact_before_model(&mut loop_state, &scope, &prompt, context_window)
+                .await?;
 
             let model_key = model_key(self.prepared.channel_llm.as_ref());
             let mut overflow_recovery_attempted = false;
@@ -168,8 +181,6 @@ impl<'a> AgentLoop<'a> {
                     &model_key,
                 );
                 let request_messages = request_messages(&loop_state.context, &scope);
-                let request_overhead_tokens =
-                    estimate_request_overhead(&prompt, &loop_state.context, &scope.request_only());
                 let event_emitter = self.on_event.clone();
                 let emitted_id = message_id.clone();
                 output_published.store(false, Ordering::SeqCst);
@@ -207,7 +218,17 @@ impl<'a> AgentLoop<'a> {
                 drop(request_messages);
 
                 match attempt {
-                    Ok(step) => break (step, shape_hash, request_overhead_tokens),
+                    Ok(outcome) => {
+                        // The usage describes the request that was actually
+                        // sent: any message an internal recovery appended to it
+                        // belongs to the measured overhead, not to the
+                        // conversation.
+                        let mut request_only = scope.request_only();
+                        request_only.extend(outcome.recovery_suffix.iter());
+                        let request_overhead_tokens =
+                            estimate_request_overhead(&prompt, &loop_state.context, &request_only);
+                        break (outcome.step, shape_hash, request_overhead_tokens);
+                    }
                     Err(error) => {
                         let (error, output_published) = error.into_parts();
                         if output_published {
@@ -252,6 +273,12 @@ impl<'a> AgentLoop<'a> {
             };
 
             let usage = phase_response.usage().cloned();
+            // `input_tokens` already includes cached prompt tokens for
+            // OpenAI-compatible providers, so only the reported prompt size is
+            // compared with the window.
+            let silent_overflow = usage
+                .as_ref()
+                .is_some_and(|usage| usage.input_tokens > context_window as i64);
             match phase_response {
                 ModelStep::Final(response) => {
                     self.lifecycle.complete_model().await?;
@@ -275,20 +302,36 @@ impl<'a> AgentLoop<'a> {
                             final_content,
                             reasoning_content,
                         } => {
+                            let compacted = self
+                                .compact_after_response(
+                                    &mut loop_state,
+                                    &scope,
+                                    &prompt,
+                                    silent_overflow,
+                                )
+                                .await;
                             return Ok(AgentLoopResult {
                                 final_content,
                                 reasoning_content,
                                 final_message_id: message_id,
                                 context: loop_state.context,
                                 session_revision: loop_state.session_revision,
-                                usage: usage.clone().map(|usage| MeasuredUsage {
-                                    usage,
-                                    request: RequestMeasurement {
-                                        model_key: model_key.clone(),
-                                        request_shape_hash: shape_hash.clone(),
-                                        request_overhead_tokens,
-                                    },
-                                }),
+                                // A compacted context no longer matches the
+                                // measured request, so the anchor is dropped
+                                // and the next projection falls back to an
+                                // estimate.
+                                usage: (!compacted)
+                                    .then(|| {
+                                        usage.clone().map(|usage| MeasuredUsage {
+                                            usage,
+                                            request: RequestMeasurement {
+                                                model_key: model_key.clone(),
+                                                request_shape_hash: shape_hash.clone(),
+                                                request_overhead_tokens,
+                                            },
+                                        })
+                                    })
+                                    .flatten(),
                             });
                         }
                     }
@@ -314,20 +357,36 @@ impl<'a> AgentLoop<'a> {
                             final_content,
                             reasoning_content,
                         } => {
+                            let compacted = self
+                                .compact_after_response(
+                                    &mut loop_state,
+                                    &scope,
+                                    &prompt,
+                                    silent_overflow,
+                                )
+                                .await;
                             return Ok(AgentLoopResult {
                                 final_content,
                                 reasoning_content,
                                 final_message_id: message_id,
                                 context: loop_state.context,
                                 session_revision: loop_state.session_revision,
-                                usage: usage.clone().map(|usage| MeasuredUsage {
-                                    usage,
-                                    request: RequestMeasurement {
-                                        model_key: model_key.clone(),
-                                        request_shape_hash: shape_hash.clone(),
-                                        request_overhead_tokens,
-                                    },
-                                }),
+                                // A compacted context no longer matches the
+                                // measured request, so the anchor is dropped
+                                // and the next projection falls back to an
+                                // estimate.
+                                usage: (!compacted)
+                                    .then(|| {
+                                        usage.clone().map(|usage| MeasuredUsage {
+                                            usage,
+                                            request: RequestMeasurement {
+                                                model_key: model_key.clone(),
+                                                request_shape_hash: shape_hash.clone(),
+                                                request_overhead_tokens,
+                                            },
+                                        })
+                                    })
+                                    .flatten(),
                             });
                         }
                     }
@@ -347,6 +406,7 @@ impl<'a> AgentLoop<'a> {
                         },
                     )
                     .await?;
+                    loop_state.force_compaction = silent_overflow;
                 }
             }
 
@@ -411,37 +471,105 @@ impl<'a> AgentLoop<'a> {
     ///
     /// A summarization failure must not end the turn: the request may still
     /// fit, and a real overflow is recovered by [`Self::compact_overflow`].
+    /// A compaction that succeeded is persisted before the request is built,
+    /// so the checkpoint is never only in memory.
     async fn compact_before_model(
         &self,
         loop_state: &mut LoopState,
         scope: &RequestScope,
         prompt: &PromptContext<'_>,
-    ) {
-        match compact_if_needed(
-            &self.compaction_request(scope, *prompt),
-            &loop_state.context,
-            None,
-        )
-        .await
-        {
+        context_window: usize,
+    ) -> Result<(), EgoPulseError> {
+        let request = self.compaction_request(scope, *prompt);
+        // A successful response whose measured prompt already exceeded the
+        // window compacts even when the estimate would fit, matching the
+        // provider's own accounting instead of waiting for a rejection.
+        let forced = std::mem::take(&mut loop_state.force_compaction)
+            && request.config.compaction.enabled
+            && context_window > 0;
+        let outcome = if forced {
+            compact(
+                &request,
+                &loop_state.context,
+                CompactionReason::Overflow,
+                None,
+            )
+            .await
+        } else {
+            compact_if_needed(&request, &loop_state.context, None).await
+        };
+        match outcome {
             Ok(CompactionOutcome::Compacted(context)) => {
-                loop_state.context = context;
+                self.commit_compacted_context(loop_state, context).await
             }
-            Ok(CompactionOutcome::Unchanged) => {}
+            Ok(CompactionOutcome::Unchanged) => Ok(()),
             Err(error) => {
                 warn!(
                     turn_id = %self.prepared.turn_id,
                     error = %error,
                     "context compaction failed; continuing with the uncompacted context"
                 );
+                Ok(())
+            }
+        }
+    }
+
+    /// Compacts the context after a successful response that already exceeded
+    /// the window.
+    ///
+    /// The answer is final, so it is never regenerated: only the stored
+    /// context is reduced for the next request. A summarization or storage
+    /// failure is logged and the original context is kept; the answer stands.
+    ///
+    /// Returns `true` when the context was replaced. The usage measurement of
+    /// the response then describes the previous conversation and must not
+    /// become the next anchor.
+    async fn compact_after_response(
+        &self,
+        loop_state: &mut LoopState,
+        scope: &RequestScope,
+        prompt: &PromptContext<'_>,
+        silent_overflow: bool,
+    ) -> bool {
+        if !silent_overflow || !self.prepared.config_snapshot.config.compaction.enabled {
+            return false;
+        }
+        match compact(
+            &self.compaction_request(scope, *prompt),
+            &loop_state.context,
+            CompactionReason::Overflow,
+            None,
+        )
+        .await
+        {
+            Ok(CompactionOutcome::Compacted(context)) => {
+                if let Err(error) = self.commit_compacted_context(loop_state, context).await {
+                    warn!(
+                        turn_id = %self.prepared.turn_id,
+                        error = %error,
+                        "compacted context could not be saved; returning the response with the original context"
+                    );
+                    return false;
+                }
+                true
+            }
+            Ok(CompactionOutcome::Unchanged) => false,
+            Err(error) => {
+                warn!(
+                    turn_id = %self.prepared.turn_id,
+                    error = %error,
+                    "silent context overflow compaction failed; returning the response"
+                );
+                false
             }
         }
     }
 
     /// Compacts the context after the provider reported a context overflow.
     ///
-    /// Returns `true` when the context changed and the model step may be sent
-    /// again.
+    /// Returns `true` when the compacted context was saved and the model step
+    /// may be sent again. The same model iteration is retried; the Turn itself
+    /// is not restarted.
     async fn compact_overflow(
         &self,
         loop_state: &mut LoopState,
@@ -458,10 +586,37 @@ impl<'a> AgentLoop<'a> {
         {
             CompactionOutcome::Unchanged => Ok(false),
             CompactionOutcome::Compacted(context) => {
-                loop_state.context = context;
+                self.commit_compacted_context(loop_state, context).await?;
                 Ok(true)
             }
         }
+    }
+
+    /// Persists a compacted context as the session snapshot.
+    ///
+    /// The model request must not be built from a context that is not durable:
+    /// a crash would otherwise lose the checkpoint and re-summarize the same
+    /// history. A concurrent writer keeps its own snapshot and this Turn ends
+    /// as a concurrency conflict instead of overwriting it.
+    async fn commit_compacted_context(
+        &self,
+        loop_state: &mut LoopState,
+        context: SessionContext,
+    ) -> Result<(), EgoPulseError> {
+        let revision = crate::agent_loop::session::persist_compacted_context(
+            self.state,
+            self.context.scope,
+            self.prepared.chat_id,
+            context.clone(),
+            loop_state.session_revision,
+        )
+        .await?;
+        let Some(revision) = revision else {
+            return Err(EgoPulseError::TurnConcurrencyConflict);
+        };
+        loop_state.context = context;
+        loop_state.session_revision = Some(revision);
+        Ok(())
     }
 
     async fn execute_tool_phase(
@@ -785,6 +940,81 @@ mod tests {
         )
     }
 
+    /// Reads the persisted session when the model request is built, so the
+    /// test can prove the checkpoint was durable before the request.
+    #[derive(Clone)]
+    struct CheckpointObservingProvider {
+        probe: Arc<std::sync::Mutex<Option<SessionProbe>>>,
+        persisted_before_request: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct SessionProbe {
+        db: Arc<crate::storage::Database>,
+        chat_id: i64,
+    }
+
+    impl CheckpointObservingProvider {
+        fn new() -> Self {
+            Self {
+                probe: Arc::new(std::sync::Mutex::new(None)),
+                persisted_before_request: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+
+        fn watch(&self, db: Arc<crate::storage::Database>, chat_id: i64) {
+            *self.probe.lock().expect("probe") = Some(SessionProbe { db, chat_id });
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for CheckpointObservingProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            Ok(MessagesResponse {
+                content: "history summary".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+
+        async fn send_message_streaming(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            _on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            let persisted = {
+                let probe = self.probe.lock().expect("probe");
+                let probe = probe.as_ref().expect("probe is configured");
+                let snapshot = probe
+                    .db
+                    .load_session_snapshot(probe.chat_id, 50)
+                    .expect("snapshot");
+                snapshot
+                    .messages_json
+                    .as_deref()
+                    .is_some_and(|json| json.contains("history summary"))
+            };
+            self.persisted_before_request
+                .store(persisted, std::sync::atomic::Ordering::SeqCst);
+            Ok(final_response("answer after compaction"))
+        }
+
+        fn provider_name(&self) -> &str {
+            "checkpoint-observing"
+        }
+
+        fn model_name(&self) -> &str {
+            "checkpoint-model"
+        }
+    }
+
     struct BlockingTool {
         started: Arc<std::sync::atomic::AtomicUsize>,
         started_notify: Arc<tokio::sync::Notify>,
@@ -894,6 +1124,143 @@ mod tests {
                 .content
                 .as_text_lossy()
                 .contains("history summary")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_successful_response_above_the_window_is_compacted_before_the_next_request() {
+        // Arrange: the provider accepted a request larger than the window and
+        // reported the usage. The response is a normal answer, so it must not
+        // be generated again; the oversized context is compacted before the
+        // next turn sends anything.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "first answer".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 5_000,
+                        output_tokens: 10,
+                        cached_input_tokens: None,
+                    }),
+                }),
+                Ok(MessagesResponse {
+                    content: "history summary".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Ok(final_response("second answer")),
+            ],
+            vec![0, 0, 0],
+        );
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            2_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("silent-overflow");
+        let runtime = state.turn_dependencies();
+
+        // Act
+        let first = process_turn(&runtime, &context, "first question")
+            .await
+            .expect("first turn");
+        let second = process_turn(&runtime, &context, "second question")
+            .await
+            .expect("second turn");
+
+        // Assert: the oversized response stands, and the next request is
+        // preceded by exactly one compaction summary.
+        assert_eq!(first, "first answer");
+        assert_eq!(second, "second answer");
+        let systems = provider.seen_systems();
+        assert_eq!(systems.len(), 3, "first answer, summary, second answer");
+        assert!(
+            systems[1].contains("context summarization assistant"),
+            "the second turn must compact before sending: {}",
+            systems[1]
+        );
+        let second_request = &provider.seen_messages()[2];
+        assert!(
+            second_request[0]
+                .content
+                .as_text_lossy()
+                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
+            "the second request must carry the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_tool_phase_above_the_window_forces_compaction_before_the_next_request() {
+        // Arrange: the tool-phase response reports a prompt above the window,
+        // so the next iteration must compact even though the estimate fits.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: "Checking the workspace".to_string(),
+                    reasoning_content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "forced-1".to_string(),
+                        name: "ls".to_string(),
+                        arguments: serde_json::json!({}),
+                        invalid_arguments: None,
+                    }],
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 5_000,
+                        output_tokens: 10,
+                        cached_input_tokens: None,
+                    }),
+                }),
+                Ok(MessagesResponse {
+                    content: "history summary".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Ok(final_response("final answer")),
+            ],
+            vec![0, 0, 0],
+        );
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            2_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("forced-compaction");
+
+        // Act
+        let reply = process_turn(
+            &state.turn_dependencies(),
+            &context,
+            "inspect the workspace",
+        )
+        .await
+        .expect("turn should finalize");
+
+        // Assert: one summary, then the next model request with the checkpoint.
+        assert_eq!(reply, "final answer");
+        let systems = provider.seen_systems();
+        assert_eq!(systems.len(), 3, "model, summary, model");
+        assert!(
+            systems[1].contains("context summarization assistant"),
+            "the second call must be the compaction summary: {}",
+            systems[1]
+        );
+        let second_request = &provider.seen_messages()[2];
+        assert!(
+            second_request[0]
+                .content
+                .as_text_lossy()
+                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
+            "the request after the forced compaction must carry the checkpoint"
         );
     }
 
@@ -1022,6 +1389,52 @@ mod tests {
         // Assert: only one compaction summary call, then the overflow error.
         assert!(result.is_err());
         assert_eq!(provider.seen_systems().len(), 3);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_checkpoint_is_persisted_before_the_model_request() {
+        // Arrange: a window of 1 token makes the first request compact.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            1,
+        );
+        config.compaction.reserve_tokens = 0;
+        let provider = CheckpointObservingProvider::new();
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("checkpoint-durable");
+        let runtime = state.turn_dependencies();
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
+            .await
+            .expect("chat id");
+        crate::agent_loop::session::save_test_session(
+            &state.assets,
+            &state.db,
+            chat_id,
+            vec![
+                Message::text("user", "old question"),
+                Message::text("assistant", "old answer"),
+                Message::text("user", "another question"),
+                Message::text("assistant", "another answer"),
+            ],
+        );
+        provider.watch(Arc::clone(&state.db), chat_id);
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("turn should finalize");
+
+        // Assert
+        assert_eq!(reply, "answer after compaction");
+        assert!(
+            provider
+                .persisted_before_request
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the checkpoint must be committed before the model request is sent"
+        );
     }
 
     #[tokio::test]

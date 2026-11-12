@@ -12,7 +12,7 @@ use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::message_format::{
     sanitize_assistant_response_text, strip_thinking, summarize_tool_calls_with_content,
 };
-use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
+use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_suffix};
 use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
@@ -63,6 +63,17 @@ impl ModelStep {
     }
 }
 
+/// A completed model step and the messages that were appended to the request
+/// to obtain it.
+///
+/// The provider usage describes the request that was actually sent, so the
+/// compaction anchor has to account for these extra messages as well. They are
+/// request-only: the empty-reply guard must never enter the conversation.
+pub(crate) struct ModelStepOutcome {
+    pub(crate) step: ModelStep,
+    pub(crate) recovery_suffix: Vec<Message>,
+}
+
 #[derive(Clone)]
 pub(crate) struct ModelStepRequest<'a> {
     pub(crate) state: &'a TurnDependencies,
@@ -96,7 +107,7 @@ impl<'a> ModelRunner<'a> {
     pub(crate) async fn run_with_retry(
         &self,
         turn_id: &str,
-    ) -> Result<ModelStep, ModelRequestError> {
+    ) -> Result<ModelStepOutcome, ModelRequestError> {
         let hash = self.request_hash();
         let turn_id_for_init = turn_id.to_string();
         let hash_for_init = hash.clone();
@@ -129,7 +140,7 @@ impl<'a> ModelRunner<'a> {
     pub(crate) async fn retry_after_compaction(
         &self,
         turn_id: &str,
-    ) -> Result<ModelStep, ModelRequestError> {
+    ) -> Result<ModelStepOutcome, ModelRequestError> {
         let hash = self.request_hash();
         let turn_id_for_hash = turn_id.to_string();
         let db = self.request.state.db_for(self.request.scope);
@@ -159,7 +170,7 @@ impl<'a> ModelRunner<'a> {
         )
     }
 
-    async fn run_attempts(&self, turn_id: &str) -> Result<ModelStep, ModelRequestError> {
+    async fn run_attempts(&self, turn_id: &str) -> Result<ModelStepOutcome, ModelRequestError> {
         let db = self.request.state.db_for(self.request.scope);
         self.retry_transient_failures(DeltaPublication::Published, None, || {
             let db = Arc::clone(&db);
@@ -183,7 +194,7 @@ impl<'a> ModelRunner<'a> {
     pub(crate) async fn run_with_transient_retry(
         &self,
         max_backoff: Duration,
-    ) -> Result<ModelStep, ModelRequestError> {
+    ) -> Result<ModelStepOutcome, ModelRequestError> {
         self.retry_transient_failures(DeltaPublication::Discarded, Some(max_backoff), || async {})
             .await
     }
@@ -202,7 +213,7 @@ impl<'a> ModelRunner<'a> {
         delta_publication: DeltaPublication,
         max_backoff: Option<Duration>,
         mut before_retry: F,
-    ) -> Result<ModelStep, ModelRequestError>
+    ) -> Result<ModelStepOutcome, ModelRequestError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = ()>,
@@ -248,7 +259,21 @@ impl<'a> ModelRunner<'a> {
                 }
             };
             match response {
-                Ok(step) => return Ok(step),
+                Ok(success) => {
+                    // A guard appended by an earlier attempt of this iteration
+                    // is part of the request that produced the usage, even
+                    // when the successful attempt needed no new guard.
+                    let base_len = self.request.messages.len();
+                    let mut recovery_suffix = retry_messages
+                        .get(base_len..)
+                        .map(<[Message]>::to_vec)
+                        .unwrap_or_default();
+                    recovery_suffix.extend(success.recovery_suffix);
+                    return Ok(ModelStepOutcome {
+                        step: success.step,
+                        recovery_suffix,
+                    });
+                }
                 Err(step_error) => {
                     let (error, next_retry_messages) = step_error.into_parts();
                     retry_messages = next_retry_messages;
@@ -314,7 +339,7 @@ impl<'a> ModelRunner<'a> {
         empty_retry_attempted: &mut bool,
         output_published: Option<&AtomicBool>,
         on_delta: &(dyn Fn(String) + Send + Sync),
-    ) -> Result<ModelStep, ModelStepError> {
+    ) -> Result<ModelStepSuccess, ModelStepError> {
         send_model_step_with_empty_retry(
             ModelStepRequest {
                 messages,
@@ -336,6 +361,7 @@ pub(crate) struct ModelStepError {
 }
 
 /// An iteration-level model failure and whether it already published output.
+#[derive(Debug)]
 pub(crate) struct ModelRequestError {
     error: EgoPulseError,
     output_published: bool,
@@ -470,10 +496,14 @@ async fn send_model_step_with_empty_retry(
     request: ModelStepRequest<'_>,
     empty_retry_attempted: &mut bool,
     output_published: Option<&AtomicBool>,
-) -> Result<ModelStep, ModelStepError> {
+) -> Result<ModelStepSuccess, ModelStepError> {
     let first_response = send_model_step(request.clone()).await;
     if !model_step_response_is_empty(&first_response) {
         return first_response
+            .map(|step| ModelStepSuccess {
+                step,
+                recovery_suffix: Vec::new(),
+            })
             .map_err(|error| ModelStepError::new(error, Arc::clone(&request.messages)));
     }
 
@@ -501,12 +531,11 @@ async fn send_model_step_with_empty_retry(
         ),
         _ => ("", None),
     };
-    let retry_messages = Arc::new(runtime_guard_messages(
-        &request.messages,
-        assistant_text,
-        reasoning_content,
-        EMPTY_REPLY_RUNTIME_GUARD,
-    ));
+    let recovery_suffix =
+        runtime_guard_suffix(assistant_text, reasoning_content, EMPTY_REPLY_RUNTIME_GUARD);
+    let mut retry_messages = (*request.messages).clone();
+    retry_messages.extend(recovery_suffix.iter().cloned());
+    let retry_messages = Arc::new(retry_messages);
     let retry_messages_for_error = Arc::clone(&retry_messages);
     let retry_response = send_model_step(ModelStepRequest {
         messages: retry_messages,
@@ -520,8 +549,20 @@ async fn send_model_step_with_empty_retry(
             retry_messages_for_error,
         ))
     } else {
-        retry_response.map_err(|error| ModelStepError::new(error, retry_messages_for_error))
+        retry_response
+            .map(|step| ModelStepSuccess {
+                step,
+                recovery_suffix,
+            })
+            .map_err(|error| ModelStepError::new(error, retry_messages_for_error))
     }
+}
+
+/// A model step and the messages an internal recovery appended to the request
+/// that produced it.
+struct ModelStepSuccess {
+    step: ModelStep,
+    recovery_suffix: Vec<Message>,
 }
 
 fn model_step_response_is_empty(response: &Result<ModelStep, EgoPulseError>) -> bool {
@@ -1151,7 +1192,7 @@ mod tests {
         // Assert
         assert!(retry_attempted);
         assert!(matches!(
-            response,
+            response.step,
             ModelStep::Final(response) if response.content == "recovered response"
         ));
         let seen_messages = observer.seen_messages();
@@ -1159,6 +1200,154 @@ mod tests {
         let retry_message = seen_messages[1].last().expect("runtime guard message");
         assert_eq!(retry_message.role, "user");
         assert!(message_to_text(retry_message).contains("no user-visible text"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_reply_recovery_reports_the_messages_it_appended() {
+        // Arrange: the first response is empty, so the runner re-sends the
+        // request with the runtime guard and returns the recovered answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered response".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 120,
+                        output_tokens: 8,
+                        cached_input_tokens: None,
+                    }),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("empty-response-measurement");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let runtime = state.turn_dependencies();
+        let runner = ModelRunner::new(ModelStepRequest {
+            state: &runtime,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+
+        // Act
+        let outcome = runner
+            .run_with_transient_retry(Duration::from_secs(5))
+            .await
+            .expect("empty response should recover");
+
+        // Assert: the usage was measured on the guarded request, so the caller
+        // receives exactly the messages that request added.
+        assert!(matches!(
+            outcome.step,
+            ModelStep::Final(response) if response.content == "recovered response"
+        ));
+        assert_eq!(outcome.recovery_suffix.len(), 2);
+        assert_eq!(outcome.recovery_suffix[0].role, "assistant");
+        assert_eq!(outcome.recovery_suffix[1].role, "user");
+        assert!(message_to_text(&outcome.recovery_suffix[1]).contains("no user-visible text"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_guard_retry_that_hits_a_transient_failure_still_reports_the_suffix() {
+        // Arrange: the empty response installs the guard, the guarded request
+        // is rate limited, and the retry succeeds.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Err(crate::error::LlmError::ApiError {
+                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+                    body_preview: "rate limited".to_string(),
+                    retry_after_secs: Some(0),
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered response".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 120,
+                        output_tokens: 8,
+                        cached_input_tokens: None,
+                    }),
+                }),
+            ],
+            vec![0, 0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("guard-transient-measurement");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let runtime = state.turn_dependencies();
+        let runner = ModelRunner::new(ModelStepRequest {
+            state: &runtime,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+
+        // Act
+        let outcome = runner
+            .run_with_transient_retry(Duration::from_secs(5))
+            .await
+            .expect("guarded retry should recover");
+
+        // Assert
+        assert!(matches!(
+            outcome.step,
+            ModelStep::Final(response) if response.content == "recovered response"
+        ));
+        assert_eq!(outcome.recovery_suffix.len(), 2);
+        assert!(message_to_text(&outcome.recovery_suffix[1]).contains("no user-visible text"));
     }
 
     #[tokio::test]

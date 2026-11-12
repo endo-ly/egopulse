@@ -288,23 +288,17 @@ async fn handle_compact(
     };
 
     let kept = compacted.messages.len();
-    let json = match crate::agent_loop::session::serialize_snapshot(
-        std::sync::Arc::clone(&state.assets),
+    let saved = crate::agent_loop::session::persist_compacted_context(
+        &runtime,
+        context.scope,
+        chat_id,
         compacted,
+        loaded.session_revision,
     )
-    .await
-    {
-        Ok(json) => json,
-        Err(error) => return Some(format!("Failed to serialize compacted session: {error}")),
-    };
-    let revision = loaded.session_revision;
-    let saved = call_blocking(state.db_for(context.scope), move |db| {
-        db.replace_session_snapshot(chat_id, &json, revision)
-    })
     .await;
     match saved {
-        Ok(true) => Some(format!("Compacted {count} messages to {kept}.")),
-        Ok(false) => Some(
+        Ok(Some(_)) => Some(format!("Compacted {count} messages to {kept}.")),
+        Ok(None) => Some(
             "Session changed while compacting; nothing was saved. Run /compact again.".to_string(),
         ),
         Err(error) => Some(format!(

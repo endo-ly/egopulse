@@ -208,7 +208,7 @@ pub(crate) async fn run_activation_with_snapshot(
             .run_with_transient_retry(PULSE_MAX_LLM_RETRY_BACKOFF)
             .await
         {
-            Ok(response) => response,
+            Ok(outcome) => outcome.step,
             Err(error) if guard_tracker.limit_reached() => {
                 let (error, _) = error.into_parts();
                 warn!(error = %error, "pulse could not generate a report after guard denial limit");

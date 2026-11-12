@@ -568,6 +568,38 @@ fn loaded_from_recent(snapshot: &SessionSnapshot) -> LoadedSession {
     }
 }
 
+/// Persists a context that was compacted before a model request.
+///
+/// The checkpoint and the retained messages replace the snapshot in one CAS
+/// update, so a crash between compaction and the next model call can never
+/// leave a checkpoint that only exists in memory.
+///
+/// Returns the new `chats.revision`, or `None` when another writer changed the
+/// session first.
+///
+/// # Errors
+///
+/// Returns [`EgoPulseError::Storage`] when serialization or the update fails.
+pub(crate) async fn persist_compacted_context(
+    state: &TurnDependencies,
+    scope: ConversationScope,
+    chat_id: i64,
+    context: SessionContext,
+    session_revision: Option<i64>,
+) -> Result<Option<i64>, EgoPulseError> {
+    let session_json = serialize_snapshot(Arc::clone(&state.assets), context).await?;
+    let revision = call_blocking(state.db_for(scope), move |db| {
+        db.replace_session_snapshot(chat_id, &session_json, session_revision)
+    })
+    .await?;
+    if revision.is_some() {
+        state
+            .conversation_events
+            .publish(ConversationChanged { scope, chat_id });
+    }
+    Ok(revision)
+}
+
 pub(crate) async fn serialize_snapshot(
     assets: Arc<AssetStore>,
     context: SessionContext,

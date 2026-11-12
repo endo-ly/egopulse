@@ -15,25 +15,52 @@ const OVERFLOW_STATUSES: &[u16] = &[400, 413, 422];
 ///
 /// Ambiguous codes such as `max_tokens_exceeded` are left out: they also
 /// describe a request whose output limit is too large, which compaction cannot
-/// fix. Those still qualify through the message markers below.
+/// fix. Those still qualify through the message patterns below.
 const CONTEXT_OVERFLOW_CODES: &[&str] = &[
     "context_length_exceeded",
     "context_overflow",
     "request_too_large",
 ];
 
-/// Message fragments providers use instead of a stable code.
-const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
-    "context_length_exceeded",
-    "context window",
-    "context_overflow",
-    "maximum context length",
-    "prompt is too long",
-    "input is too long",
-    "too many tokens",
-    "reduce the length",
-    "request too large",
-];
+/// Error messages providers use for an oversized prompt.
+///
+/// These mirror the reference implementation: they cover OpenAI-compatible
+/// gateways, direct providers, and local servers that report the overflow as
+/// text instead of a structured code.
+const CONTEXT_OVERFLOW_PATTERN: &str = concat!(
+    r"(?i)(",
+    r"prompt (?:is )?too long",
+    r"|prompt exceeds max length",
+    r"|request_too_large",
+    r"|input is too long for requested model",
+    r"|exceeds the context window",
+    r"|exceeds (?:the )?(?:model'?s )?maximum context length",
+    r"|context window exceeded",
+    r"|input token count.*exceeds the maximum",
+    r"|maximum prompt length is \d+",
+    r"|reduce the length of the messages",
+    r"|maximum context length is \d+ tokens",
+    r"|exceeds (?:the )?maximum allowed input length",
+    r"|is longer than the model'?s context length",
+    r"|exceeds the limit of \d+",
+    r"|exceeds the available context size",
+    r"|greater than the context length",
+    r"|context window exceeds limit",
+    r"|exceeded model token limit",
+    r"|too large for model with \d+ maximum context length",
+    r"|configured context size is \d+ tokens",
+    r"|model_context_window_exceeded",
+    r"|range of input length should be",
+    r"|context[_ ]length[_ ]exceeded",
+    r"|too many tokens",
+    r"|token limit exceeded",
+    r"|\(413\)",
+    r")",
+);
+
+/// Errors that mention a token limit but do not ask for a smaller prompt.
+const NON_OVERFLOW_PATTERN: &str =
+    r"(?i)(throttling|rate limit|too many requests|service unavailable)";
 
 /// Classifies a provider rejection into an [`LlmError`].
 ///
@@ -82,10 +109,26 @@ fn is_context_overflow(
     if named_code {
         return true;
     }
-    let message = message.to_ascii_lowercase();
-    CONTEXT_OVERFLOW_MARKERS
-        .iter()
-        .any(|marker| message.contains(marker))
+    // A rate limit or a transient server failure may mention tokens without
+    // asking for a smaller prompt; compacting would hide the real failure.
+    if matches_pattern(NON_OVERFLOW_PATTERN, message) {
+        return false;
+    }
+    matches_pattern(CONTEXT_OVERFLOW_PATTERN, message)
+}
+
+fn matches_pattern(pattern: &'static str, text: &str) -> bool {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, regex::Regex>>,
+    > = std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
+    let regex = cache
+        .entry(pattern)
+        .or_insert_with(|| regex::Regex::new(pattern).expect("overflow pattern compiles"));
+    regex.is_match(text)
 }
 
 #[cfg(test)]

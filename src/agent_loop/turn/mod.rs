@@ -7,7 +7,6 @@ pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::PromptContext;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
@@ -79,7 +78,6 @@ pub(super) struct PreparedTurn {
     pub(super) system_prompt: String,
     pub(super) channel_llm: Arc<dyn LlmProvider>,
     pub(super) tool_defs: Arc<Vec<ToolDefinition>>,
-    pub(super) tools_json: Option<String>,
     pub(super) user_message: Message,
     pub(super) input_message_id: String,
     pub(super) received_at: String,
@@ -429,17 +427,11 @@ impl TurnExecutor<'_> {
                         Some(&received_at),
                     )
                     .await?;
-                let prompt_ctx = PromptContext {
-                    system_prompt: &prepared.system_prompt,
-                    tools_json: prepared.tools_json.as_deref(),
-                    has_tools: !prepared.tool_defs.is_empty(),
-                };
-
-                // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。
-                // user message の保存と input_committed 遷移は同一 transaction で行う。
-                let (context, session_revision) = self
-                    .persist_user_input(&prepared, user_input, &prompt_ctx)
-                    .await?;
+                // 段階2: 直接入力を保存する。user message の保存と
+                // input_committed 遷移は同一 transaction で行う。会話履歴の
+                // 圧縮は Agent Loop が model 送信直前に判断する。
+                let (context, session_revision) =
+                    self.persist_user_input(&prepared, user_input).await?;
 
                 // 段階3: 一時的なチャネル背景情報を、保存済みセッションとは別に読み込む。
                 let channel_context_msg = load_channel_context(self.state, self.context).await;
@@ -652,7 +644,6 @@ impl TurnExecutor<'_> {
         let mcp_scope =
             crate::tools::mcp::McpScope::for_agent(&config_snapshot.config, &self.context.agent_id);
         let tool_defs = self.state.tools.definitions_async(&mcp_scope).await;
-        let tools_json = serde_json::to_string(&tool_defs).ok();
 
         // The Turn's input message keeps the canonical request key as its
         // id, so the persisted row matches the client's optimistic entry by
@@ -666,7 +657,6 @@ impl TurnExecutor<'_> {
             system_prompt,
             channel_llm,
             tool_defs,
-            tools_json,
             user_message,
             input_message_id,
             received_at,
@@ -678,7 +668,6 @@ impl TurnExecutor<'_> {
         &self,
         prepared: &PreparedTurn,
         user_input: &str,
-        prompt_ctx: &PromptContext<'_>,
     ) -> Result<(SessionContext, Option<i64>), EgoPulseError> {
         self.persistence(prepared)
             .persist_user_input(
@@ -688,8 +677,6 @@ impl TurnExecutor<'_> {
                     input: user_input,
                     received_at: &prepared.received_at,
                 },
-                &prepared.channel_llm,
-                prompt_ctx,
                 prepared.config_snapshot.as_ref(),
             )
             .await
