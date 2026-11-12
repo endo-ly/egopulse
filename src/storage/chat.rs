@@ -847,7 +847,7 @@ impl Database {
 
     /// Advances the LLM session snapshot without appending a message.
     ///
-    /// Used by `/compact` (through the CAS wrapper) and by test seeds. Bumps
+    /// Bumps
     /// `chats.revision` so the change is observable under the same CAS
     /// contract. `snapshot_through_seq` is left at the chat's current maximum
     /// `seq` (no new message was added).
@@ -998,8 +998,10 @@ impl Database {
 
     /// Replaces the session snapshot only when `expected_revision` matches.
     ///
-    /// `None` seeds the snapshot when the chat has none yet. Returns
-    /// `Ok(None)` when the chat was updated concurrently.
+    /// Used by `/compact` and by the Agent Loop when it commits a compaction
+    /// checkpoint before a model request. `None` seeds the snapshot when the
+    /// chat has none yet. Returns the new `chats.revision`, or `Ok(None)` when
+    /// the chat was updated concurrently.
     ///
     /// # Errors
     ///
