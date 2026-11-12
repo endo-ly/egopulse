@@ -145,12 +145,15 @@ src/
 │   ├── responses.rs     # Responses API 呼び出し
 │   ├── messages.rs      # Messages API 呼び出し
 │   ├── sse.rs           # SSE ストリーム解析
+│   ├── tokens.rs        # UTF-16 文字数ベースの token 推定、出力上限の clamp
+│   ├── model_catalog.rs # 同梱モデルカタログ（context window / 最大出力）
 │   ├── calibration.rs   # prompt token 推定補正 (EMA)
 │   └── codex_auth.rs    # Codex auth 解決、AUTH_CACHE
 │
 ├── config/              # 設定管理
 │   ├── mod.rs           # 型定義、公開ファサード
 │   ├── types.rs         # Config 型定義
+│   ├── model_metadata.rs # 明示設定・カタログ・既定値からのモデル上限解決
 │   ├── manager.rs       # ConfigManager (snapshot + 更新境界)
 │   ├── loader.rs        # YAML 読み込み、正規化、検証
 │   ├── persist.rs       # YAML 書き出し、アトミック書込

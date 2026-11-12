@@ -63,7 +63,6 @@ default_agent: default
 timezone: Asia/Tokyo
 log_level: info
 max_history_messages: 50
-default_context_window_tokens: 131072
 compaction:
   enabled: true
   reserve_tokens: 16384
@@ -260,8 +259,7 @@ web_fetch:
 | `timezone` | `string` | 任意 | `"UTC"` | IANA タイムゾーン（例: `Asia/Tokyo`）。全サブシステム（sleep batch、pulse、会話タイムスタンプ）で使用 |
 | `log_level` | `"info" \| "debug" \| "warn" \| "error"` | 任意 | `"info"` | ログ出力レベル |
 | `max_history_messages` | `usize` | 任意 | `50` | セッション復元時のフォールバックメッセージ取得数 |
-| `default_context_window_tokens` | `usize` | 任意 | `131072` | context window のトークン数フォールバック値。model 固有の設定がない場合に使用。安全上限 `1,000,000` |
-| `compaction.enabled` | `bool` | 任意 | `true` | 自動 compaction の有効化。`false` でも `/compact` と context overflow 復旧は動作する |
+| `compaction.enabled` | `bool` | 任意 | `true` | 自動 compaction の有効化。`false` では閾値・context overflow・実測超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` は実行できる |
 | `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。0 以上の整数。context window 以上でも設定エラーにせず、実行時に使用可能量 0 として扱う |
 | `compaction.keep_recent_tokens` | `usize` | 任意 | `20000` | 原文のまま保持する直近履歴の下限 token 数。0 以上の整数 |
 | `compaction.model_overrides` | `map` | 任意 | `{}` | `provider/model` の完全一致をキーに、`reserve_tokens` / `keep_recent_tokens` を個別に上書きする。各フィールドは上書き値 → 全体値 → 既定値の順で解決し、`enabled` は上書きしない |
@@ -283,9 +281,24 @@ web_fetch:
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
-| `context_window_tokens` | `usize` | 任意 | `default_context_window_tokens` に従う | このモデルの context window のトークン数。未設定時はグローバルフォールバックを使用 |
+| `context_window_tokens` | `usize` | 任意 | モデルカタログ → 未知モデル既定値 `128000` | このモデルの context window のトークン数。明示設定が最優先 |
+| `max_output_tokens` | `usize` | 任意 | モデルカタログ → 未知モデル既定値 `16384` | このモデルに要求する最大出力トークン数。context window に収まるようリクエスト時に切り下げるが、打ち切り判定はこの意図値を基準にする |
 | `model_instructions` | `string` | 任意 | なし | モデル固有の追加指示（インライン）。system prompt の `<soul>` セクションと Core Instructions の間に `<model-instructions>` タグで注入される。`model_instructions_file` と排他（両立時は起動エラー） |
 | `model_instructions_file` | `string` | 任意 | なし | モデル固有の追加指示を記述したファイルパス。相対パスは設定ファイルのディレクトリ基点で解決（絶対パスも可）。`model_instructions` と排他 |
+
+#### モデルメタデータの解決
+
+context window と最大出力トークンは、次の順で解決する。
+
+1. `providers.<id>.models.<model>` の明示設定（`context_window_tokens` / `max_output_tokens`）
+2. バイナリに同梱したモデルカタログ（`provider/model` の完全一致）
+3. 未知モデル向けの既定値（context window `128000`、最大出力 `16384`）
+
+カタログは起動・通常の Turn・オフライン実行で同じ値を使えるようコンパイル時に埋め込む。モデル情報の取得にネットワークを使わず、Turn の同期処理へ外部問い合わせを入れない。値はプロバイダーが公開するモデル情報を本リポジトリで管理する静的スナップショットであり、外部カタログサービスの応答や再配布条件へ依存しない。モデル情報の更新はリリースごとにこの表を更新する。プロバイダー ID の別名（`azure` / `openai-codex` / `zhipu` / `aliyun-bailian` など）は解決層で吸収する。モデル ID だけで別プロバイダーのモデルへ一致させることはしない。
+
+カタログに無いモデルは「未知モデルの既定値」であり、カタログ照合の失敗としてログ（provider 生成時の debug）と Web UI の表示（`default`）で区別できる。モデルごとの数値を列挙しなくても動作するが、実際の上限が既定値と異なる場合は明示設定で上書きする。
+
+`max_output_tokens` はプロバイダーへ送る出力上限として使う。Chat Completions は OpenAI / Azure では `max_completion_tokens`、その他の互換 API では `max_tokens`、Responses API では `max_output_tokens` を送る。入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 4,096` まで切り下げる。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
 
 `headers` はリクエストヘッダをプロバイダー単位で付与する。値は文字列で、SecretRef は使用できない。
 
@@ -852,8 +865,8 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 | `agents.<id>.*` | Agent の provider / model / profile / routing / MCP tool 公開範囲と agent_send の宛先 |
 | `providers.<id>.*` | Provider 定義、credential、model、endpoint。Provider cache は revision ごとに分離 |
 | `timezone` | Sleep / Pulse および Turn の時刻解決 |
-| `compaction.*` / `max_history_messages` / `default_context_window_tokens` | 新しい Turn の履歴・コンテキスト処理 |
-| `providers.<id>.models.<model>.context_window_tokens` | 新しい Turn のコンテキスト上限 |
+| `compaction.*` / `max_history_messages` | 新しい Turn の履歴・コンテキスト処理 |
+| `providers.<id>.models.<model>.context_window_tokens` / `max_output_tokens` | 新しい Turn のコンテキスト上限と出力上限 |
 | `providers.<id>.models.<model>.model_instructions` / `model_instructions_file` | 新しい Turn の system prompt |
 | `sleep_batch.*` / `pulse.*` | Sleep / Pulse scheduler の次回判定 |
 | `channels.web.auth_token` / `allowed_origins` | Web / WebSocket の認証・Origin 判定 |

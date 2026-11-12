@@ -302,6 +302,9 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 | 手動 | `/compact [instructions]`。閾値と `enabled` を無視する |
 | Context Overflow | Provider が context window 超過を返したとき |
 | 実測の超過 | 正常応答の `input_tokens` が context window を超えたとき。閾値判定を待たずに圧縮し、応答は再生成しない |
+| 出力打ち切り | `length` で意図した出力上限より手前で終わったとき、または入力が窓をほぼ満たして出力 0 で終わったとき |
+
+`compaction.enabled = false` では、閾値・Context Overflow・実測の超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` だけは実行できる。
 
 発火条件は次の 1 式のみ。
 
@@ -309,7 +312,7 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 should_compact = enabled && context_tokens > context_window - reserve_tokens
 ```
 
-- `context_window` は実際に使用する provider / model の `context_window_tokens`。未設定時のみ `default_context_window_tokens`（既定 131072）
+- `context_window` は、明示された `context_window_tokens` → 同梱モデルカタログの `contextWindow` → 未知モデルの既定値 `128000` の順で解決する。ユーザーが全モデル共通の値を設定しないと動かない設計にはしない
 - `reserve_tokens` / `keep_recent_tokens` は、対象モデルの `compaction.model_overrides["provider/model"]` → 全体値 → 既定値の順で解決する。`enabled` は全体設定のみ
 - `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）に、計測時からの request overhead の差分と、その後に追加されたメッセージの推定値を足す
 - 実測 usage が無い、または request shape（system prompt / tool 定義 / model）が計測時と変わった場合はリクエスト全体を推定する
@@ -429,11 +432,24 @@ Provider の 400 を一律に context 超過とはみなさない。Provider 境
 2. 圧縮できたら checkpoint を CAS で保存し、`turn_runs.model_request_hash` を新しいリクエストの hash へ更新して、同じ model iteration を 1 回だけ再送する（Turn は開始し直さない）
 3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（無限に繰り返さない）
 
-出力長による打ち切り（`finish_reason=length`）は、provider が早期終了として識別できる情報を返さないため圧縮・再送の対象にしない。`IncompleteResponse` として扱い、要約の途中打ち切りも同じく checkpoint を確定しない。
+HTTP 413 は本文が空、`Payload Too Large` の HTML、JSON でないプロキシ応答でも context 超過として扱う。400 / 422 は構造化 `code` / `type` か明確な context 超過表現がある場合だけ分類し、任意の 400 を context 超過にしない。429 と rate limit / throttling は token に言及していても除外する。
+
+### 出力打ち切り（`length`）からの復旧
+
+Provider の出力上限で生成が終わった場合、`finish_reason=length` / `response.incomplete(max_output_tokens)` と実測 usage、生成済み本文を保持したまま Agent Loop へ返す（`IncompleteResponse` へ潰さない）。
+
+判定には、モデルメタデータから解決した**意図した最大出力トークン**（`max_output_tokens`）を使う。リクエスト時に context window へ収めるため切り下げても、意図値は維持する。
+
+1. `compaction.enabled = true` かつ復旧未実施で、`output_tokens < max_output_tokens`（または `output_tokens = 0` かつ `input_tokens` が窓の 99% 以上）なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
+2. 意図した上限まで生成し切った `length`、usage が無い場合、`enabled = false`、2 回目の打ち切りでは再送しない
+3. Tool Call を含む打ち切りは、未完成の呼び出しを実行せず応答ごと破棄する。復旧する場合は圧縮後のリクエストを送り直し、Tool の副作用は発生させない
+4. 途中出力を公開済みの場合は `AssistantMessageDiscarded` を通知してから再送し、二重表示・二重永続化を避ける
+
+要約リクエスト自身が `length` で途切れた場合は checkpoint を確定せず、呼び出し元へ失敗を返す。
 
 再送するリクエストは、保存済みの会話と request-only メッセージ（宣言のみ応答への修正指示、runtime guard）から組み直す。修正指示は会話の外側にあるため、圧縮で会話が置き換わっても失われない。
 
-Tool 実行済みのターンでも再実行するのは model 推論だけであり、実行済み Tool は再実行しない。公開済みの途中出力がある場合は再送しない。
+Tool 実行済みのターンでも再実行するのは model 推論だけであり、実行済み Tool は再実行しない。Context Overflow の再送では、公開済みの途中出力がある場合は再送しない（`length` の復旧は破棄イベントを伴って再送する）。
 
 ## 7. Archive
 
@@ -604,12 +620,13 @@ Session Lifecycle に関連する設定フィールドは [config.md §3.1](./co
 
 | 設定 | デフォルト | 役割 |
 |------|-----------:|------|
-| `compaction.enabled` | `true` | 自動 compaction の有効化。`/compact` と overflow 復旧は影響を受けない |
+| `compaction.enabled` | `true` | 自動 compaction の有効化。`false` では閾値・overflow・実測超過・出力打ち切りの自動復旧をすべて停止する（`/compact` は実行可能） |
 | `compaction.reserve_tokens` | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数 |
 | `compaction.keep_recent_tokens` | `20000` | 原文のまま保持する直近履歴の下限 token 数 |
 | `compaction.model_overrides` | `{}` | `provider/model` をキーに `reserve_tokens` / `keep_recent_tokens` を個別に上書きする |
 | `max_history_messages` | `50` | snapshot が使えない時に `messages` テーブルから復元する件数 |
-| `default_context_window_tokens` | `131072` | モデル別 `context_window_tokens` が無い場合の context window |
+| `providers.<id>.models.<model>.context_window_tokens` | モデルカタログ / `128000` | context window の明示上書き |
+| `providers.<id>.models.<model>.max_output_tokens` | モデルカタログ / `16384` | 意図する最大出力トークンの明示上書き |
 
 ### Validation
 
@@ -618,6 +635,6 @@ Session Lifecycle に関連する設定フィールドは [config.md §3.1](./co
 - `compaction.model_overrides` の各値も同じ規則。キーは `provider/model` の完全一致（大文字小文字を区別し、`/` を含むモデル ID もそのまま扱う）
 - `compaction.enabled` は全体設定のみ
 - `max_history_messages >= 1`
-- `default_context_window_tokens >= 1` かつ `<= 1,000,000`
 - `context_window_tokens` はモデルごとに `>= 1`
+- `max_output_tokens` はモデルごとに `>= 1`
 - `reserve_tokens` と `context_window_tokens` の大小関係は検証しない（実行時に `saturating_sub` で 0 として扱う）
