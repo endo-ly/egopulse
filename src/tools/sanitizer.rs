@@ -293,7 +293,6 @@ mod tests {
             log_level: "info".to_string(),
             compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            default_context_window_tokens: 131_072,
             channels: std::collections::HashMap::new(),
             default_agent: crate::config::AgentId::new("default"),
             agents: std::collections::HashMap::new(),

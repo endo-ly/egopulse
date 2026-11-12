@@ -30,7 +30,6 @@ export interface GeneralConfig {
   compaction_keep_recent_tokens: number;
   /** Token settings that apply to one `provider/model` instead of the global ones. */
   compaction_model_overrides: CompactionModelOverride[];
-  default_context_window_tokens: number;
   log_level: string;
   state_root: string;
   defaults: {
@@ -38,7 +37,6 @@ export interface GeneralConfig {
     compaction_enabled: boolean;
     compaction_reserve_tokens: number;
     compaction_keep_recent_tokens: number;
-    default_context_window_tokens: number;
     timezone: string;
     log_level: string;
   };
@@ -67,7 +65,16 @@ export interface ProviderConfigEntry {
   label: string;
   base_url: string;
   default_model: string;
-  models: { name: string; context_window_tokens: number | null; has_instructions: boolean }[];
+  models: {
+    name: string;
+    context_window_tokens: number | null;
+    max_output_tokens: number | null;
+    resolved_context_window_tokens: number;
+    resolved_max_output_tokens: number;
+    context_window_source: "configured" | "catalog" | "default";
+    max_output_tokens_source: "configured" | "catalog" | "default";
+    has_instructions: boolean;
+  }[];
   api_key: SecretStatus;
   /** Providers like local servers or OAuth presets that work without a key. */
   api_key_optional: boolean;

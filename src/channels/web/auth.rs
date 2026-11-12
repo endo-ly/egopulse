@@ -197,7 +197,6 @@ mod tests {
             log_level: "info".to_string(),
             compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            default_context_window_tokens: 131_072,
             channels: std::collections::HashMap::from([(
                 ChannelName::new("web"),
                 ChannelConfig {

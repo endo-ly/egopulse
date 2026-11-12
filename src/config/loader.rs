@@ -231,7 +231,6 @@ struct FileConfig {
     log_level: Option<String>,
     compaction: Option<FileCompactionConfig>,
     max_history_messages: Option<usize>,
-    default_context_window_tokens: Option<usize>,
     channels: Option<HashMap<String, FileChannelConfig>>,
     default_agent: Option<String>,
     agents: Option<HashMap<String, FileAgentConfig>>,
@@ -267,7 +266,6 @@ pub(super) fn build_config(
         log_level: file_log_level,
         compaction: file_compaction,
         max_history_messages: file_max_history_messages,
-        default_context_window_tokens: file_default_context_window_tokens,
         channels: file_channels,
         default_agent: file_default_agent,
         agents: file_agents,
@@ -303,8 +301,6 @@ pub(super) fn build_config(
     let compaction = normalize_compaction(file_compaction);
     let max_history_messages =
         file_max_history_messages.unwrap_or_else(super::resolve::default_max_history_messages);
-    let default_context_window_tokens = file_default_context_window_tokens
-        .unwrap_or_else(super::resolve::default_context_window_tokens);
 
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
     validate_agent_provider_references(&providers, &agents)?;
@@ -346,7 +342,6 @@ pub(super) fn build_config(
         log_level,
         compaction,
         max_history_messages,
-        default_context_window_tokens,
         channels,
         default_agent,
         agents,
@@ -1195,22 +1190,16 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
             "max_history_messages must be at least 1".to_string(),
         ));
     }
-    if config.default_context_window_tokens == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "default_context_window_tokens must be at least 1".to_string(),
-        ));
-    }
-    const MAX_DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
-    if config.default_context_window_tokens > MAX_DEFAULT_CONTEXT_WINDOW_TOKENS {
-        return Err(ConfigError::InvalidCompactionConfig(format!(
-            "default_context_window_tokens must not exceed {MAX_DEFAULT_CONTEXT_WINDOW_TOKENS}"
-        )));
-    }
     for (provider_id, provider) in &config.providers {
         for (model_name, model_config) in &provider.models {
             if model_config.context_window_tokens == Some(0) {
                 return Err(ConfigError::InvalidCompactionConfig(format!(
                     "context_window_tokens for {provider_id}/{model_name} must be at least 1"
+                )));
+            }
+            if model_config.max_output_tokens == Some(0) {
+                return Err(ConfigError::InvalidCompactionConfig(format!(
+                    "max_output_tokens for {provider_id}/{model_name} must be at least 1"
                 )));
             }
         }

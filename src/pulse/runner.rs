@@ -235,6 +235,14 @@ pub(crate) async fn run_activation_with_snapshot(
                 ));
             }
             ModelStep::ToolCalls(assistant_phase) => assistant_phase,
+            ModelStep::Truncated { reason, .. } => {
+                return Err(crate::error::EgoPulseError::Llm(
+                    crate::error::LlmError::IncompleteResponse(format!(
+                        "pulse output was truncated at the output limit ({})",
+                        reason.as_str()
+                    )),
+                ));
+            }
         };
         let assistant_message_id = crate::pulse::message_id::step(pulse_run_id);
 

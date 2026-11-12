@@ -4,11 +4,26 @@ use reqwest::StatusCode;
 
 /// Assembles the final `MessagesResponse` from accumulated Chat Completions
 /// fields, applying raw tool-use rescue when structured tool calls are absent.
+#[cfg(test)]
 pub(super) fn assemble_response(
     content: String,
     reasoning_content: Option<String>,
     tool_calls: Vec<ToolCall>,
     usage: Option<LlmUsage>,
+) -> Result<MessagesResponse, LlmError> {
+    assemble_response_with_required_content(content, reasoning_content, tool_calls, usage, true)
+}
+
+/// Assembles a response, optionally allowing an empty result.
+///
+/// An empty body is unusable as a complete answer but is a valid truncated
+/// result when the model had no room to generate.
+pub(super) fn assemble_response_with_required_content(
+    content: String,
+    reasoning_content: Option<String>,
+    tool_calls: Vec<ToolCall>,
+    usage: Option<LlmUsage>,
+    require_content: bool,
 ) -> Result<MessagesResponse, LlmError> {
     let mut content = content.trim().to_string();
     let mut tool_calls = tool_calls;
@@ -19,7 +34,7 @@ pub(super) fn assemble_response(
         content = stripped_content;
     }
 
-    if content.is_empty() && tool_calls.is_empty() {
+    if require_content && content.is_empty() && tool_calls.is_empty() {
         return Err(LlmError::InvalidResponse(
             "assistant content was empty".to_string(),
         ));
@@ -37,6 +52,14 @@ pub(crate) fn parse_responses_response(
     body: ResponsesApiResponse,
 ) -> Result<MessagesResponse, LlmError> {
     ensure_response_completed(&body)?;
+    parse_completed_response(body, true)
+}
+
+/// Parses a response whose status allows a usable result.
+fn parse_completed_response(
+    body: ResponsesApiResponse,
+    require_content: bool,
+) -> Result<MessagesResponse, LlmError> {
     let diagnostics = body.diagnostics();
     let mut content_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -72,7 +95,7 @@ pub(crate) fn parse_responses_response(
         content = stripped_content;
     }
 
-    if content.is_empty() && tool_calls.is_empty() {
+    if require_content && content.is_empty() && tool_calls.is_empty() {
         return Err(LlmError::InvalidResponse(format!(
             "assistant content was empty ({diagnostics})"
         )));
@@ -136,8 +159,30 @@ impl ResponsesApiResponse {
 /// is treated as a usable answer. A missing status keeps the previous
 /// behaviour for providers that omit it.
 fn ensure_response_completed(response: &ResponsesApiResponse) -> Result<(), LlmError> {
+    match classify_terminal_status(response)? {
+        None => Ok(()),
+        Some(reason) => Err(output_truncated_error(reason)),
+    }
+}
+
+/// Classifies a terminal status and reports an output-limit truncation.
+///
+/// Only `incomplete` with the `max_output_tokens` reason is recoverable: any
+/// other incomplete reason or a failed response must stay an error.
+fn classify_terminal_status(
+    response: &ResponsesApiResponse,
+) -> Result<Option<TruncationReason>, LlmError> {
     match response.status.as_deref() {
-        None | Some("completed") => Ok(()),
+        None | Some("completed") => Ok(None),
+        Some("incomplete")
+            if response
+                .incomplete_details
+                .as_ref()
+                .and_then(|details| details.reason.as_deref())
+                == Some("max_output_tokens") =>
+        {
+            Ok(Some(TruncationReason::MaxOutputTokens))
+        }
         Some("incomplete") => Err(incomplete_response_error(response)),
         Some("failed") => Err(stream_api_error(
             response.error.as_ref(),
@@ -148,6 +193,13 @@ fn ensure_response_completed(response: &ResponsesApiResponse) -> Result<(), LlmE
             response.diagnostics()
         ))),
     }
+}
+
+fn output_truncated_error(reason: TruncationReason) -> LlmError {
+    LlmError::IncompleteResponse(format!(
+        "generation was truncated at the output limit ({})",
+        reason.as_str()
+    ))
 }
 
 /// Builds the non-retryable error for a generation cut off at a terminal
@@ -205,6 +257,7 @@ pub(super) struct ResponsesAccumulator {
     streamed_text: String,
     streamed_items: Vec<ResponsesOutputItem>,
     completed_response: Option<ResponsesApiResponse>,
+    truncation: Option<TruncationReason>,
 }
 
 impl ResponsesAccumulator {
@@ -213,6 +266,7 @@ impl ResponsesAccumulator {
             streamed_text: String::with_capacity(8192),
             streamed_items: Vec::with_capacity(32),
             completed_response: None,
+            truncation: None,
         }
     }
 
@@ -257,13 +311,16 @@ impl ResponsesAccumulator {
                 return Err(stream_api_error(Some(error), error_type));
             }
             Some("response.incomplete") => {
-                let response = value.get("response").and_then(|response| {
+                let Some(response) = value.get("response").and_then(|response| {
                     serde_json::from_value::<ResponsesApiResponse>(response.clone()).ok()
-                });
-                return Err(response.map_or_else(
-                    || LlmError::IncompleteResponse("response.incomplete".to_string()),
-                    |response| incomplete_response_error(&response),
-                ));
+                }) else {
+                    return Err(LlmError::IncompleteResponse(
+                        "response.incomplete".to_string(),
+                    ));
+                };
+                self.truncation = classify_terminal_status(&response)?;
+                self.completed_response = Some(response);
+                return Ok(true);
             }
             _ => {}
         }
@@ -307,7 +364,7 @@ impl ResponsesAccumulator {
                         "malformed responses terminal event: {error}"
                     ))
                 })?;
-            ensure_response_completed(&parsed)?;
+            self.truncation = classify_terminal_status(&parsed)?;
             self.completed_response = Some(parsed);
             return Ok(true);
         }
@@ -352,8 +409,16 @@ impl ResponsesAccumulator {
     /// # Errors
     ///
     /// See [`Self::into_api_response`] and [`parse_responses_response`].
-    pub(super) fn finish(self) -> Result<MessagesResponse, LlmError> {
-        parse_responses_response(self.into_api_response()?)
+    pub(super) fn finish(self) -> Result<StreamedResponse, LlmError> {
+        let truncation = self.truncation;
+        let response = self.into_api_response()?;
+        Ok(match truncation {
+            Some(reason) => StreamedResponse::Truncated {
+                response: parse_completed_response(response, false)?,
+                reason,
+            },
+            None => StreamedResponse::Complete(parse_responses_response(response)?),
+        })
     }
 }
 
@@ -742,6 +807,15 @@ mod tests {
     /// Feeds `data:` lines from a Codex SSE body through the same accumulator
     /// the streaming path uses, so the tests exercise production parsing.
     fn accumulate(sse: &str) -> Result<MessagesResponse, LlmError> {
+        match accumulate_stream(sse)? {
+            StreamedResponse::Complete(response) => Ok(response),
+            StreamedResponse::Truncated { reason, .. } => {
+                panic!("unexpected truncation: {reason:?}")
+            }
+        }
+    }
+
+    fn accumulate_stream(sse: &str) -> Result<StreamedResponse, LlmError> {
         let mut accumulator = ResponsesAccumulator::new();
         for line in sse.lines() {
             let Some(crate::llm::sse::SseItem::Data(payload)) =
@@ -945,26 +1019,27 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"s
     }
 
     #[test]
-    fn fails_on_incomplete_response_event() {
-        // `response.incomplete` is a terminal event: the generation hit the
-        // output limit or was filtered, so retrying the same request will not
-        // complete it.
+    fn reports_an_incomplete_max_output_tokens_response_as_truncated() {
+        // `response.incomplete` with `max_output_tokens` keeps the partial
+        // output so the caller can decide whether to compact and retry.
         let payload = r#"
 event: response.output_text.delta
 data: {"type":"response.output_text.delta","delta":"partial"}
 
 event: response.incomplete
-data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[]}}
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":100,"output_tokens":32}}}
 "#;
 
-        let error = accumulate(payload).expect_err("incomplete response");
+        let outcome = accumulate_stream(payload).expect("truncated response");
 
-        assert!(!error.is_retryable(), "{error}");
-        assert!(matches!(
-            error,
-            crate::error::LlmError::IncompleteResponse(_)
-        ));
-        assert!(error.to_string().contains("max_output_tokens"), "{error}");
+        match outcome {
+            StreamedResponse::Truncated { response, reason } => {
+                assert_eq!(reason, TruncationReason::MaxOutputTokens);
+                assert_eq!(response.content, "partial");
+                assert_eq!(response.usage.expect("usage").output_tokens, 32);
+            }
+            StreamedResponse::Complete(_) => panic!("a max_output_tokens stop must be truncated"),
+        }
     }
 
     #[test]
@@ -998,6 +1073,28 @@ data: {"type":"response.done","response":{"status":"failed","error":{"code":"ser
 
         assert!(!error.is_retryable(), "{error}");
         assert!(error.to_string().contains("Invalid credentials"), "{error}");
+    }
+
+    #[test]
+    fn an_incomplete_empty_response_is_kept_as_truncated() {
+        // Arrange: the model had no room to produce output.
+        let payload = r#"
+event: response.incomplete
+data: {"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":60000,"output_tokens":0}}}
+"#;
+
+        // Act
+        let outcome = accumulate_stream(payload).expect("truncated response");
+
+        // Assert
+        match outcome {
+            StreamedResponse::Truncated { response, reason } => {
+                assert_eq!(reason, TruncationReason::MaxOutputTokens);
+                assert!(response.content.is_empty());
+                assert_eq!(response.usage.expect("usage").output_tokens, 0);
+            }
+            StreamedResponse::Complete(_) => panic!("incomplete response must be truncated"),
+        }
     }
 
     #[test]

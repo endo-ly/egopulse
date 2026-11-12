@@ -8,7 +8,6 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::agent_loop::TurnDependencies;
-use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::message_format::{
     sanitize_assistant_response_text, strip_thinking, summarize_tool_calls_with_content,
 };
@@ -16,6 +15,7 @@ use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard
 use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
+use crate::llm::tokens::estimate_prompt_tokens;
 use crate::llm::{
     LlmProvider, LlmUsage, MAX_ATTEMPTS, Message, MessagesResponse, RetryDecision, RetryPolicy,
     RetryStop, ToolCall, ToolDefinition, decide,
@@ -51,6 +51,13 @@ pub(crate) enum ModelStep {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
     ToolCalls(AssistantToolPhase),
+    /// The provider stopped the generation at the output limit. The partial
+    /// content is preserved, but it must never be executed as a tool phase or
+    /// persisted as a final answer without recovery.
+    Truncated {
+        response: MessagesResponse,
+        reason: crate::llm::TruncationReason,
+    },
 }
 
 impl ModelStep {
@@ -59,6 +66,7 @@ impl ModelStep {
         match self {
             Self::Final(response) | Self::MalformedToolCalls(response) => response.usage.as_ref(),
             Self::ToolCalls(phase) => phase.usage.as_ref(),
+            Self::Truncated { response, .. } => response.usage.as_ref(),
         }
     }
 }
@@ -437,9 +445,9 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         has_tools,
     );
 
-    let response = request
+    let streamed = request
         .llm
-        .send_message_streaming(
+        .send_message_streaming_with_truncation(
             request.system_prompt,
             Arc::clone(&request.messages),
             request.tools.clone(),
@@ -454,6 +462,10 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
                 request.send_failure_log
             );
         })?;
+    let (response, truncation) = match streamed {
+        crate::llm::StreamedResponse::Complete(response) => (response, None),
+        crate::llm::StreamedResponse::Truncated { response, reason } => (response, Some(reason)),
+    };
 
     if let Some(usage) = &response.usage {
         request
@@ -462,6 +474,10 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
             .record(calibration_key, raw_estimate, usage.input_tokens)
             .await;
         log_llm_usage(&request, usage, raw_estimate, has_tools).await;
+    }
+
+    if let Some(reason) = truncation {
+        return Ok(ModelStep::Truncated { response, reason });
     }
 
     if response.tool_calls.is_empty() {
@@ -569,7 +585,9 @@ fn model_step_response_is_empty(response: &Result<ModelStep, EgoPulseError>) -> 
     match response {
         Err(EgoPulseError::Llm(error)) => error.is_empty_response(),
         Ok(ModelStep::Final(response)) => strip_thinking(response.content.trim()).trim().is_empty(),
-        Ok(ModelStep::MalformedToolCalls(_)) | Ok(ModelStep::ToolCalls(_)) => false,
+        Ok(ModelStep::MalformedToolCalls(_))
+        | Ok(ModelStep::ToolCalls(_))
+        | Ok(ModelStep::Truncated { .. }) => false,
         Err(_) => false,
     }
 }
@@ -703,6 +721,106 @@ mod tests {
         let mut context = cli_context(session);
         context.request_key = request_key.to_string();
         context
+    }
+
+    /// Provider that reports a truncated generation carrying a tool call.
+    struct TruncatedToolCallProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for TruncatedToolCallProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            unreachable!("the agent loop uses the streaming path")
+        }
+
+        async fn send_message_streaming(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+            _on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            unreachable!("the test uses the truncation-aware path")
+        }
+
+        async fn send_message_streaming_with_truncation(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<Arc<Vec<ToolDefinition>>>,
+            _on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::StreamedResponse, crate::error::LlmError> {
+            Ok(crate::llm::StreamedResponse::Truncated {
+                response: MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: vec![tool_call("call_1", "read", json!({"path": "a.txt"}))],
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 1_000,
+                        output_tokens: 100,
+                        cached_input_tokens: None,
+                    }),
+                },
+                reason: crate::llm::TruncationReason::MaxOutputTokens,
+            })
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    #[tokio::test]
+    async fn a_truncated_tool_call_is_not_reported_as_a_tool_phase() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(TruncatedToolCallProvider),
+        );
+        let context = cli_context("truncated-tool-call");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+
+        // Act
+        let step = send_model_step(ModelStepRequest {
+            state: &state.turn_dependencies(),
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        })
+        .await
+        .expect("truncated step");
+
+        // Assert: a partial tool call must never reach the tool executor.
+        assert!(matches!(
+            step,
+            ModelStep::Truncated {
+                reason: crate::llm::TruncationReason::MaxOutputTokens,
+                ..
+            }
+        ));
     }
 
     #[test]

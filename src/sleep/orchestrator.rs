@@ -286,10 +286,13 @@ pub async fn run_events_extract(
                     .map_err(|e| SleepBatchError::Llm(e.to_string()))?
             };
 
-        let context_tokens = snapshot.config.resolve_context_window_tokens(
-            &crate::config::ProviderId::new(&resolved.provider),
-            &resolved.model,
-        );
+        let context_tokens = snapshot
+            .config
+            .resolve_model_metadata(
+                &crate::config::ProviderId::new(&resolved.provider),
+                &resolved.model,
+            )
+            .context_window;
         let chunk_session_tokens = chunk_token_budget(context_tokens);
 
         let agent_for_chats = resolved_agent.clone();
@@ -637,10 +640,12 @@ async fn prepare_batch_context(
             .map_err(|e| SleepBatchError::Llm(e.to_string()))?
     };
 
-    let context_tokens = config.resolve_context_window_tokens(
-        &crate::config::ProviderId::new(&resolved.provider),
-        &resolved.model,
-    );
+    let context_tokens = config
+        .resolve_model_metadata(
+            &crate::config::ProviderId::new(&resolved.provider),
+            &resolved.model,
+        )
+        .context_window;
     let memory_before = state
         .memory_loader
         .load_bundle(agent_id)

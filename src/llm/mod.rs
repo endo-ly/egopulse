@@ -9,10 +9,12 @@ pub(crate) mod calibration;
 pub(crate) mod codex_auth;
 mod headers;
 mod messages;
+pub(crate) mod model_catalog;
 mod openai;
 mod responses;
 mod retry;
 mod sse;
+pub(crate) mod tokens;
 
 use std::sync::Arc;
 
@@ -192,6 +194,37 @@ pub(crate) struct MessagesResponse {
     pub usage: Option<LlmUsage>,
 }
 
+/// Why a provider stopped a generation before the model chose to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TruncationReason {
+    /// The generation reached the requested (or context-clamped) output limit.
+    MaxOutputTokens,
+}
+
+impl TruncationReason {
+    /// Stable text used in errors and logs.
+    pub(crate) fn as_str(self) -> &'static str {
+        "max_output_tokens"
+    }
+}
+
+/// Outcome of one streamed request.
+///
+/// A truncated generation keeps its text, tool calls, and usage so the caller
+/// can decide whether a recovery attempt is justified. The strict
+/// [`LlmProvider::send_message_streaming`] contract turns it into an error for
+/// callers that must not act on a partial generation.
+#[derive(Debug)]
+pub(crate) enum StreamedResponse {
+    /// The model finished on its own.
+    Complete(MessagesResponse),
+    /// The provider ended the generation at a limit.
+    Truncated {
+        response: MessagesResponse,
+        reason: TruncationReason,
+    },
+}
+
 /// Trait for LLM providers that send a single request and return a complete message response.
 #[async_trait]
 pub(crate) trait LlmProvider: Send + Sync {
@@ -225,6 +258,23 @@ pub(crate) trait LlmProvider: Send + Sync {
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<MessagesResponse, LlmError>;
+
+    /// Sends one streaming request and preserves a truncated generation.
+    ///
+    /// Only the caller that can compact and retry needs the partial response
+    /// and its usage. The default delegates to the strict method, which turns
+    /// a truncation into an error.
+    async fn send_message_streaming_with_truncation(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<StreamedResponse, LlmError> {
+        self.send_message_streaming(system, messages, tools, on_delta)
+            .await
+            .map(StreamedResponse::Complete)
+    }
 }
 
 /// Creates the LLM provider for `config` and the given conversation.

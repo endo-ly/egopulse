@@ -25,8 +25,8 @@ use crate::agent_loop::turn::lifecycle::TurnLifecycle;
 use crate::agent_loop::turn::persistence::TurnPersistence;
 use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::SurfaceContext;
-use crate::error::EgoPulseError;
-use crate::llm::{Message, ToolCall, ToolDefinition};
+use crate::error::{EgoPulseError, LlmError};
+use crate::llm::{Message, ToolCall, ToolDefinition, TruncationReason};
 
 /// Maximum number of model/tool iterations allowed for one activation.
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
@@ -92,6 +92,15 @@ pub(crate) struct AgentLoopResult {
     pub(crate) usage: Option<MeasuredUsage>,
 }
 
+/// Inputs of one truncation recovery decision.
+struct TruncationRecovery<'a> {
+    usage: Option<&'a crate::llm::LlmUsage>,
+    context_window: usize,
+    recovery_attempted: bool,
+    output_published: bool,
+    message_id: &'a str,
+}
+
 /// Executes the LLM/tool loop for one durable Turn.
 pub(crate) struct AgentLoop<'a> {
     state: &'a TurnDependencies,
@@ -139,10 +148,11 @@ impl<'a> AgentLoop<'a> {
             .prepared
             .config_snapshot
             .config
-            .resolve_context_window_tokens(
+            .resolve_model_metadata(
                 &crate::config::ProviderId::new(self.prepared.channel_llm.provider_name()),
                 self.prepared.channel_llm.model_name(),
-            );
+            )
+            .context_window;
         let mut iteration = start_iteration;
 
         while iteration <= MAX_TOOL_ITERATIONS {
@@ -227,6 +237,54 @@ impl<'a> AgentLoop<'a> {
                         request_only.extend(outcome.recovery_suffix.iter());
                         let request_overhead_tokens =
                             estimate_request_overhead(&prompt, &loop_state.context, &request_only);
+                        if let ModelStep::Truncated { response, reason } = &outcome.step
+                            && matches!(reason, TruncationReason::MaxOutputTokens)
+                        {
+                            let recovered = self
+                                .recover_truncated_response(
+                                    &mut loop_state,
+                                    &scope,
+                                    &prompt,
+                                    TruncationRecovery {
+                                        usage: response.usage.as_ref(),
+                                        context_window,
+                                        recovery_attempted: overflow_recovery_attempted,
+                                        output_published: output_published.load(Ordering::SeqCst),
+                                        message_id: &message_id,
+                                    },
+                                )
+                                .await?;
+                            if recovered {
+                                overflow_recovery_attempted = true;
+                                continue;
+                            }
+                            if output_published.load(Ordering::SeqCst) {
+                                self.lifecycle.mark_output_published().await;
+                                self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
+                                    message_id: message_id.clone(),
+                                });
+                            }
+                            let output_tokens = response
+                                .usage
+                                .as_ref()
+                                .map_or(0, |usage| usage.output_tokens);
+                            let intended_max_output = self
+                                .prepared
+                                .config_snapshot
+                                .config
+                                .resolve_model_metadata(
+                                    &crate::config::ProviderId::new(
+                                        self.prepared.channel_llm.provider_name(),
+                                    ),
+                                    self.prepared.channel_llm.model_name(),
+                                )
+                                .max_output_tokens;
+                            return Err(EgoPulseError::Llm(LlmError::IncompleteResponse(format!(
+                                "model output was truncated at the output limit \
+                                     (output_tokens={output_tokens}, intended_max_output_tokens={intended_max_output}); \
+                                     no automatic recovery applied"
+                            ))));
+                        }
                         break (outcome.step, shape_hash, request_overhead_tokens);
                     }
                     Err(error) => {
@@ -393,6 +451,15 @@ impl<'a> AgentLoop<'a> {
                     iteration += 1;
                     continue;
                 }
+                ModelStep::Truncated { .. } => {
+                    // Truncation is decided in the model-step loop above;
+                    // reaching this point would mean executing a partial answer.
+                    return Err(EgoPulseError::Llm(
+                        crate::error::LlmError::IncompleteResponse(
+                            "model output was truncated".to_string(),
+                        ),
+                    ));
+                }
                 ModelStep::ToolCalls(assistant_phase) => {
                     self.execute_tool_phase(
                         &mut loop_state,
@@ -447,6 +514,14 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
+    /// Whether automatic compaction and recovery are allowed.
+    ///
+    /// Every automatic path asks this one question; a per-path check would
+    /// let one recovery route ignore the setting.
+    fn automatic_compaction_enabled(&self) -> bool {
+        self.prepared.config_snapshot.config.compaction.enabled
+    }
+
     /// Builds the request-scoped context shared by the compaction entry points.
     fn compaction_request<'s>(
         &'s self,
@@ -485,7 +560,7 @@ impl<'a> AgentLoop<'a> {
         // window compacts even when the estimate would fit, matching the
         // provider's own accounting instead of waiting for a rejection.
         let forced = std::mem::take(&mut loop_state.force_compaction)
-            && request.config.compaction.enabled
+            && self.automatic_compaction_enabled()
             && context_window > 0;
         let outcome = if forced {
             compact(
@@ -531,7 +606,7 @@ impl<'a> AgentLoop<'a> {
         prompt: &PromptContext<'_>,
         silent_overflow: bool,
     ) -> bool {
-        if !silent_overflow || !self.prepared.config_snapshot.config.compaction.enabled {
+        if !silent_overflow || !self.automatic_compaction_enabled() {
             return false;
         }
         match compact(
@@ -576,6 +651,11 @@ impl<'a> AgentLoop<'a> {
         scope: &RequestScope,
         prompt: &PromptContext<'_>,
     ) -> Result<bool, EgoPulseError> {
+        // `enabled=false` disables every automatic recovery path. Manual
+        // `/compact` keeps working because it does not pass through here.
+        if !self.automatic_compaction_enabled() {
+            return Ok(false);
+        }
         match compact(
             &self.compaction_request(scope, *prompt),
             &loop_state.context,
@@ -590,6 +670,71 @@ impl<'a> AgentLoop<'a> {
                 Ok(true)
             }
         }
+    }
+
+    /// Attempts the single compaction-and-retry allowed for a truncated
+    /// generation.
+    ///
+    /// A `length` stop is only recoverable when the provider reported usage and
+    /// the generation ended before the intended output limit, or when the input
+    /// itself filled the window and left no room for an answer. Reaching the
+    /// intended limit is not evidence that compacting will produce a complete
+    /// answer, so those cases surface the error. A tool-call response is never
+    /// executed: the partial call is discarded with the response.
+    ///
+    /// Returns `true` when the caller must resend the same model iteration.
+    async fn recover_truncated_response(
+        &self,
+        loop_state: &mut LoopState,
+        scope: &RequestScope,
+        prompt: &PromptContext<'_>,
+        recovery: TruncationRecovery<'_>,
+    ) -> Result<bool, EgoPulseError> {
+        let enabled = self.automatic_compaction_enabled();
+        let TruncationRecovery {
+            usage,
+            context_window,
+            recovery_attempted,
+            output_published,
+            message_id,
+        } = recovery;
+        let Some(usage) = usage else {
+            return Ok(false);
+        };
+        let intended_max_output = self
+            .prepared
+            .config_snapshot
+            .config
+            .resolve_model_metadata(
+                &crate::config::ProviderId::new(self.prepared.channel_llm.provider_name()),
+                self.prepared.channel_llm.model_name(),
+            )
+            .max_output_tokens;
+        let context_pressure = context_window > 0
+            && usage.output_tokens == 0
+            && usage.input_tokens as f64 >= context_window as f64 * 0.99;
+        let early_stop =
+            intended_max_output > 0 && usage.output_tokens < intended_max_output as i64;
+        if !enabled || recovery_attempted || !(context_pressure || early_stop) {
+            return Ok(false);
+        }
+
+        if output_published {
+            self.lifecycle.mark_output_published().await;
+            self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
+                message_id: message_id.to_string(),
+            });
+        }
+        let recovered = self.compact_overflow(loop_state, scope, prompt).await?;
+        if recovered {
+            warn!(
+                turn_id = %self.prepared.turn_id,
+                output_tokens = usage.output_tokens,
+                intended_max_output_tokens = intended_max_output,
+                "truncated generation recovery: compacted and retrying the model step once"
+            );
+        }
+        Ok(recovered)
     }
 
     /// Persists a compacted context as the session snapshot.
@@ -915,11 +1060,11 @@ mod tests {
         }
 
         fn provider_name(&self) -> &str {
-            "scripted-streaming"
+            "test"
         }
 
         fn model_name(&self) -> &str {
-            "scripted-model"
+            "test-model"
         }
     }
 
@@ -1007,11 +1152,11 @@ mod tests {
         }
 
         fn provider_name(&self) -> &str {
-            "checkpoint-observing"
+            "test"
         }
 
         fn model_name(&self) -> &str {
-            "checkpoint-model"
+            "test-model"
         }
     }
 
@@ -1074,12 +1219,14 @@ mod tests {
             ],
             vec![0, 0, 0],
         );
-        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+        // The window is wide enough that the pre-request threshold does not
+        // fire: the provider rejects the request instead, which is the path
+        // under test.
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
             dir.path().to_str().expect("utf8").to_string(),
             1,
-            2_000,
+            60_000,
         );
-        config.compaction.enabled = false;
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("overflow-recovery");
         let runtime = state.turn_dependencies();
@@ -1287,12 +1434,11 @@ mod tests {
             ],
             vec![0, 0, 0, 0],
         );
-        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
             dir.path().to_str().expect("utf8").to_string(),
             1,
-            2_000,
+            60_000,
         );
-        config.compaction.enabled = false;
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("overflow-retry-guard");
         let runtime = state.turn_dependencies();
@@ -1361,12 +1507,11 @@ mod tests {
             ],
             vec![0, 0, 0],
         );
-        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
             dir.path().to_str().expect("utf8").to_string(),
             1,
-            2_000,
+            60_000,
         );
-        config.compaction.enabled = false;
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("overflow-twice");
         let runtime = state.turn_dependencies();
@@ -1389,6 +1534,326 @@ mod tests {
         // Assert: only one compaction summary call, then the overflow error.
         assert!(result.is_err());
         assert_eq!(provider.seen_systems().len(), 3);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_truncated_generation_is_compacted_and_retried_once() {
+        // Arrange: the first generation stops below the intended output limit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![
+            TruncatedScriptStep::Truncated {
+                content: "partial answer",
+                output_tokens: 100,
+                tool_calls: Vec::new(),
+                stream_delta: "",
+            },
+            TruncatedScriptStep::Complete("complete answer"),
+        ]);
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-recovery");
+        seed_short_session(&state, &context).await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("truncated generation should recover");
+
+        // Assert: one summary and one retried model request, with the
+        // checkpoint in front of the retried request.
+        assert_eq!(reply, "complete answer");
+        assert_eq!(provider.model_requests(), 2);
+        assert_eq!(provider.summary_requests(), 1);
+        let requests = provider.seen_messages();
+        assert!(
+            requests[1][0]
+                .content
+                .as_text_lossy()
+                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
+            "the retried request must start with the checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_truncated_generation_with_zero_output_is_recovered() {
+        // Arrange: the model produced nothing before the limit, which is the
+        // context-pressure shape providers report with `length` + 0 output.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![
+            TruncatedScriptStep::Truncated {
+                content: "",
+                output_tokens: 0,
+                tool_calls: Vec::new(),
+                stream_delta: "",
+            },
+            TruncatedScriptStep::Complete("complete answer"),
+        ]);
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-zero-output");
+        seed_short_session(&state, &context).await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("zero-output truncation should recover");
+
+        // Assert
+        assert_eq!(reply, "complete answer");
+        assert_eq!(provider.model_requests(), 2);
+        assert_eq!(provider.summary_requests(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn truncation_recovery_discards_published_partial_output() {
+        // Arrange: deltas are published before the provider reports the limit.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![
+            TruncatedScriptStep::Truncated {
+                content: "partial answer",
+                output_tokens: 100,
+                tool_calls: Vec::new(),
+                stream_delta: "partial ",
+            },
+            TruncatedScriptStep::Complete("complete answer"),
+        ]);
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-discard");
+        let chat_id = seed_short_session(&state, &context).await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+
+        // Act
+        let reply = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "fresh question",
+            move |event| event_log.lock().expect("events").push(event),
+        )
+        .await
+        .expect("turn should finalize after recovery");
+
+        // Assert: the partial streamed text is discarded and never persisted.
+        assert_eq!(reply, "complete answer");
+        let (deltas, discarded, final_id) = collect_loop_events(&events);
+        assert_eq!(discarded, vec![deltas[0].0.clone()]);
+        assert_eq!(final_id, deltas[0].0, "the retry reuses the iteration id");
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("messages");
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("partial answer")),
+            "truncated text must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_generation_that_used_the_whole_intended_output_is_not_retried() {
+        // Arrange: output == intended limit, so compacting is not expected to
+        // produce a complete answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![TruncatedScriptStep::Truncated {
+            content: "partial answer",
+            output_tokens: 100,
+            tool_calls: Vec::new(),
+            stream_delta: "",
+        }]);
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("test"))
+            .expect("test provider")
+            .models
+            .get_mut("test-model")
+            .expect("test model")
+            .max_output_tokens = Some(100);
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-at-limit");
+        seed_short_session(&state, &context).await;
+
+        // Act
+        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(provider.model_requests(), 1);
+        assert_eq!(provider.summary_requests(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_second_truncated_generation_after_recovery_surfaces_the_error() {
+        // Arrange: the retried generation is truncated again.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![
+            TruncatedScriptStep::Truncated {
+                content: "partial answer",
+                output_tokens: 100,
+                tool_calls: Vec::new(),
+                stream_delta: "",
+            },
+            TruncatedScriptStep::Truncated {
+                content: "partial again",
+                output_tokens: 100,
+                tool_calls: Vec::new(),
+                stream_delta: "",
+            },
+        ]);
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-twice");
+        seed_short_session(&state, &context).await;
+
+        // Act
+        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+
+        // Assert: exactly one recovery attempt.
+        assert!(result.is_err());
+        assert_eq!(provider.model_requests(), 2);
+        assert_eq!(provider.summary_requests(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn disabled_compaction_surfaces_a_context_overflow_without_summarizing() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Err(crate::error::LlmError::ContextOverflow {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    body_preview: "maximum context length exceeded".to_string(),
+                }),
+                Ok(final_response("must not be requested")),
+            ],
+            vec![0, 0],
+        );
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("overflow-disabled");
+        seed_short_session(&state, &context).await;
+
+        // Act
+        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+
+        // Assert: no automatic summarization and no retry.
+        assert!(matches!(
+            result,
+            Err(crate::error::EgoPulseError::Llm(
+                crate::error::LlmError::ContextOverflow { .. }
+            ))
+        ));
+        assert_eq!(provider.seen_systems().len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn disabled_compaction_does_not_recover_a_truncated_generation() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![
+            TruncatedScriptStep::Truncated {
+                content: "partial answer",
+                output_tokens: 100,
+                tool_calls: Vec::new(),
+                stream_delta: "",
+            },
+            TruncatedScriptStep::Complete("must not be requested"),
+        ]);
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-disabled");
+        seed_short_session(&state, &context).await;
+
+        // Act
+        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+
+        // Assert
+        assert!(result.is_err());
+        assert_eq!(provider.model_requests(), 1);
+        assert_eq!(provider.summary_requests(), 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn disabled_compaction_keeps_a_response_above_the_window() {
+        // Arrange: a successful response reports a prompt larger than the
+        // window; with compaction disabled it must not be summarized.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut response = final_response("answer");
+        response.usage = Some(crate::llm::LlmUsage {
+            input_tokens: 70_000,
+            output_tokens: 10,
+            cached_input_tokens: None,
+        });
+        let provider = RecordingProvider::new(
+            vec![Ok(response), Ok(final_response("history summary"))],
+            vec![0, 0],
+        );
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("silent-overflow-disabled");
+        let chat_id = seed_short_session(&state, &context).await;
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("turn should finalize");
+
+        // Assert
+        assert_eq!(reply, "answer");
+        assert_eq!(provider.seen_systems().len(), 1);
+        let snapshot = state
+            .db
+            .load_session_snapshot(chat_id, 50)
+            .expect("snapshot")
+            .messages_json
+            .expect("snapshot body");
+        assert!(!snapshot.contains("history summary"));
     }
 
     #[tokio::test]
@@ -1435,6 +1900,172 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             "the checkpoint must be committed before the model request is sent"
         );
+    }
+
+    /// Provider that reports truncated generations and records how often the
+    /// loop asked for a summary.
+    ///
+    /// Every handle shares one script so the test observes the counters that
+    /// the runtime's copy mutated.
+    #[derive(Clone)]
+    struct TruncatedScriptProvider {
+        inner: Arc<TruncatedScriptInner>,
+    }
+
+    struct TruncatedScriptInner {
+        steps: std::sync::Mutex<Vec<TruncatedScriptStep>>,
+        model_requests: std::sync::atomic::AtomicUsize,
+        summary_requests: std::sync::atomic::AtomicUsize,
+        seen_messages: std::sync::Mutex<Vec<Vec<crate::llm::Message>>>,
+    }
+
+    #[derive(Clone)]
+    enum TruncatedScriptStep {
+        Truncated {
+            content: &'static str,
+            output_tokens: i64,
+            tool_calls: Vec<ToolCall>,
+            /// Deltas published before the provider reports the truncation.
+            stream_delta: &'static str,
+        },
+        Complete(&'static str),
+    }
+
+    impl TruncatedScriptProvider {
+        fn new(steps: Vec<TruncatedScriptStep>) -> Self {
+            Self {
+                inner: Arc::new(TruncatedScriptInner {
+                    steps: std::sync::Mutex::new(steps),
+                    model_requests: std::sync::atomic::AtomicUsize::new(0),
+                    summary_requests: std::sync::atomic::AtomicUsize::new(0),
+                    seen_messages: std::sync::Mutex::new(Vec::new()),
+                }),
+            }
+        }
+
+        fn model_requests(&self) -> usize {
+            self.inner
+                .model_requests
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn summary_requests(&self) -> usize {
+            self.inner
+                .summary_requests
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn seen_messages(&self) -> Vec<Vec<crate::llm::Message>> {
+            self.inner.seen_messages.lock().expect("messages").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::LlmProvider for TruncatedScriptProvider {
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            self.inner
+                .summary_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(final_response("history summary"))
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<crate::llm::Message>>,
+            tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, crate::error::LlmError> {
+            match self
+                .send_message_streaming_with_truncation(system, messages, tools, on_delta)
+                .await?
+            {
+                crate::llm::StreamedResponse::Complete(response) => Ok(response),
+                crate::llm::StreamedResponse::Truncated { reason, .. } => {
+                    Err(crate::error::LlmError::IncompleteResponse(format!(
+                        "truncated ({})",
+                        reason.as_str()
+                    )))
+                }
+            }
+        }
+
+        async fn send_message_streaming_with_truncation(
+            &self,
+            _system: &str,
+            messages: Arc<Vec<crate::llm::Message>>,
+            _tools: Option<Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<crate::llm::StreamedResponse, crate::error::LlmError> {
+            self.inner
+                .model_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .seen_messages
+                .lock()
+                .expect("messages")
+                .push((*messages).clone());
+            let step = self.inner.steps.lock().expect("steps").remove(0);
+            Ok(match step {
+                TruncatedScriptStep::Truncated {
+                    content,
+                    output_tokens,
+                    tool_calls,
+                    stream_delta,
+                } => {
+                    if !stream_delta.is_empty() {
+                        on_delta(stream_delta.to_string());
+                    }
+                    crate::llm::StreamedResponse::Truncated {
+                        response: MessagesResponse {
+                            content: content.to_string(),
+                            reasoning_content: None,
+                            tool_calls,
+                            usage: Some(crate::llm::LlmUsage {
+                                input_tokens: 1_000,
+                                output_tokens,
+                                cached_input_tokens: None,
+                            }),
+                        },
+                        reason: crate::llm::TruncationReason::MaxOutputTokens,
+                    }
+                }
+                TruncatedScriptStep::Complete(content) => {
+                    crate::llm::StreamedResponse::Complete(final_response(content))
+                }
+            })
+        }
+
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+    }
+
+    /// Saves a two-message session so compaction has something to summarize.
+    async fn seed_short_session(state: &crate::runtime::AppState, context: &SurfaceContext) -> i64 {
+        let runtime = state.turn_dependencies();
+        let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, context)
+            .await
+            .expect("chat id");
+        crate::agent_loop::session::save_test_session(
+            &state.assets,
+            &state.db,
+            chat_id,
+            vec![
+                crate::llm::Message::text("user", "old question"),
+                crate::llm::Message::text("assistant", "old answer"),
+            ],
+        );
+        chat_id
     }
 
     #[tokio::test]

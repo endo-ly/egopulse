@@ -36,7 +36,6 @@ export function generalTarget(config: RuntimeConfig): EditTarget {
       compaction_enabled: g.compaction_enabled,
       compaction_reserve_tokens: g.compaction_reserve_tokens,
       compaction_keep_recent_tokens: g.compaction_keep_recent_tokens,
-      default_context_window_tokens: g.default_context_window_tokens,
     },
     specs: [
       {
@@ -64,7 +63,6 @@ export function generalTarget(config: RuntimeConfig): EditTarget {
         hint: "IANA name, e.g. Asia/Tokyo. Sleep, Pulse, and timestamps use it.",
       },
       { key: "max_history_messages", label: "History messages", kind: "number", min: 1, hint: `Messages restored when a session has no saved state. Default ${g.defaults.max_history_messages}.` },
-      { key: "default_context_window_tokens", label: "Context window", kind: "number", min: 1, max: 1_000_000, hint: `Tokens, for models without their own setting. Default ${g.defaults.default_context_window_tokens}.` },
       { key: "compaction_enabled", label: "Automatic compaction", kind: "toggle", hint: `Compact long contexts automatically. Default ${g.defaults.compaction_enabled}.` },
       { key: "compaction_reserve_tokens", label: "Reserve tokens", kind: "number", min: 0, hint: `Context window headroom for output, tools, and margin. Default ${g.defaults.compaction_reserve_tokens}.` },
       { key: "compaction_keep_recent_tokens", label: "Keep recent tokens", kind: "number", min: 0, hint: `Recent history kept verbatim. Default ${g.defaults.compaction_keep_recent_tokens}.` },

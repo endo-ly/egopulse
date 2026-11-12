@@ -211,7 +211,6 @@ struct SerializableConfig {
     log_level: String,
     compaction: SerializableCompaction,
     max_history_messages: usize,
-    default_context_window_tokens: usize,
     providers: HashMap<String, SerializableProvider>,
     channels: HashMap<String, SerializableChannel>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -516,7 +515,6 @@ impl From<&Config> for SerializableConfig {
                     .collect(),
             },
             max_history_messages: config.max_history_messages,
-            default_context_window_tokens: config.default_context_window_tokens,
             providers,
             channels,
             default_agent: Some(config.default_agent.to_string()),
@@ -1067,7 +1065,6 @@ mod tests {
             log_level: "info".to_string(),
             compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            default_context_window_tokens: 131_072,
             channels,
             default_agent: AgentId::new("default"),
             agents,

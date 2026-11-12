@@ -132,6 +132,7 @@ mod tests {
             base_url: "https://example.com/v1".to_string(),
             api_key: None,
             model: "model".to_string(),
+            model_metadata: crate::config::ModelMetadata::default(),
             reasoning_effort: None,
             headers,
         }

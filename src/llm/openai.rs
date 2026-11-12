@@ -1,5 +1,6 @@
 use super::*;
 use super::{messages::*, responses::*};
+use crate::config::ModelMetadata;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
@@ -15,6 +16,9 @@ use std::time::Duration;
 /// Sleep attempt is bounded here; a full memory rewrite can legitimately
 /// exceed the turn budget.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Smallest output limit accepted by the Responses API.
+const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: usize = 16;
 
 /// Inactivity deadline between reads of one request.
 ///
@@ -53,6 +57,7 @@ pub(crate) struct OpenAiProvider {
     reasoning_effort: Option<String>,
     base_url: String,
     provider: String,
+    model_metadata: ModelMetadata,
     account_id: Option<String>,
     is_codex: bool,
     extra_headers: Vec<(HeaderName, HeaderValue)>,
@@ -99,6 +104,16 @@ impl OpenAiProvider {
             extra_headers.push((parsed_name, parsed_value));
         }
 
+        if config.model_metadata.uses_custom_defaults() {
+            tracing::debug!(
+                provider = %config.provider,
+                model = %config.model,
+                context_window = config.model_metadata.context_window,
+                max_output_tokens = config.model_metadata.max_output_tokens,
+                "model is not in the bundled catalog; applying custom-model defaults"
+            );
+        }
+
         Ok(Self {
             http,
             api_key,
@@ -106,6 +121,7 @@ impl OpenAiProvider {
             reasoning_effort: config.reasoning_effort.clone(),
             base_url: config.base_url.clone(),
             provider: config.provider.clone(),
+            model_metadata: config.model_metadata,
             account_id,
             is_codex,
             extra_headers,
@@ -163,7 +179,7 @@ impl OpenAiProvider {
         messages: Arc<Vec<Message>>,
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
-    ) -> Result<MessagesResponse, LlmError> {
+    ) -> Result<StreamedResponse, LlmError> {
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let mut body = build_responses_request_body(
             &self.model,
@@ -171,6 +187,14 @@ impl OpenAiProvider {
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
             self.reasoning_effort.as_deref(),
+        );
+        let tools_json = tools
+            .as_deref()
+            .filter(|tools| !tools.is_empty())
+            .and_then(|tools| serde_json::to_string(tools).ok());
+        body["max_output_tokens"] = serde_json::Value::from(
+            self.request_max_output_tokens(system, tools_json.as_deref(), &messages)
+                .max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS),
         );
         body["stream"] = serde_json::Value::Bool(true);
 
@@ -197,7 +221,7 @@ impl OpenAiProvider {
         messages: Arc<Vec<Message>>,
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
-    ) -> Result<MessagesResponse, LlmError> {
+    ) -> Result<StreamedResponse, LlmError> {
         crate::llm::codex_auth::refresh_if_needed(&self.http).await;
 
         let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
@@ -207,6 +231,14 @@ impl OpenAiProvider {
             &messages,
             tools.as_deref().map(|arc| arc.as_slice()),
             self.reasoning_effort.as_deref(),
+        );
+        let tools_json = tools
+            .as_deref()
+            .filter(|tools| !tools.is_empty())
+            .and_then(|tools| serde_json::to_string(tools).ok());
+        body["max_output_tokens"] = serde_json::Value::from(
+            self.request_max_output_tokens(system, tools_json.as_deref(), &messages)
+                .max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS),
         );
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
@@ -227,6 +259,111 @@ impl OpenAiProvider {
 
         consume_responses_stream(response.bytes_stream(), on_delta).await
     }
+
+    /// Sends one request and preserves an output-limit truncation.
+    async fn send_streamed(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<StreamedResponse, LlmError> {
+        if self.is_codex {
+            return self
+                .stream_codex_responses(system, messages, tools, on_delta)
+                .await;
+        }
+        if should_use_responses_api(&messages) {
+            return self
+                .stream_responses_api(system, messages, tools, on_delta)
+                .await;
+        }
+
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let headers = self.build_headers()?;
+        let tools_json = tools
+            .as_deref()
+            .filter(|tools| !tools.is_empty())
+            .and_then(|tools| serde_json::to_string(tools).ok());
+        let max_output_tokens =
+            self.request_max_output_tokens(system, tools_json.as_deref(), &messages);
+        let mut body = build_streaming_request_body(
+            &self.model,
+            system,
+            &messages,
+            tools.as_deref().map(|arc| arc.as_slice()),
+            self.reasoning_effort.as_deref(),
+            should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
+        );
+        body[max_output_tokens_field(&self.provider, &self.base_url)] =
+            serde_json::Value::from(max_output_tokens);
+        request_stream_usage(&mut body, &self.base_url);
+
+        let response = self
+            .http
+            .post(url)
+            .headers(headers)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let body = response.text().await.unwrap_or_default();
+            return Err(Self::api_error(status, &body, retry_after));
+        }
+
+        consume_chat_completion_stream(response.bytes_stream(), on_delta).await
+    }
+
+    /// Output limit for this request after fitting the prompt in the window.
+    ///
+    /// The provider only sees the clamped value; the compaction recovery uses
+    /// the unclamped model limit to decide whether a `length` stop was early.
+    fn request_max_output_tokens(
+        &self,
+        system: &str,
+        tools_json: Option<&str>,
+        messages: &[Message],
+    ) -> usize {
+        let prompt_tokens =
+            crate::llm::tokens::estimate_prompt_tokens(system, tools_json, messages);
+        crate::llm::tokens::clamp_max_output_tokens_to_context(
+            self.model_metadata.context_window,
+            prompt_tokens,
+            self.model_metadata.max_output_tokens,
+        )
+    }
+}
+
+/// Field name that carries the output limit for Chat Completions.
+///
+/// The official OpenAI and Azure endpoints reject the legacy `max_tokens` for
+/// models that require `max_completion_tokens`. Compatible gateways generally
+/// accept `max_tokens`, and some reject the newer field, so the choice is made
+/// per endpoint instead of sending both.
+fn max_output_tokens_field(provider: &str, base_url: &str) -> &'static str {
+    let provider = provider.to_ascii_lowercase();
+    let official_openai = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            host == "api.openai.com"
+                || host == "openai.azure.com"
+                || host.ends_with(".openai.azure.com")
+        });
+    if official_openai || provider == "openai" || provider == "azure" {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    }
+}
+
+fn output_truncated_error(reason: TruncationReason) -> LlmError {
+    LlmError::IncompleteResponse(format!(
+        "generation was truncated at the output limit ({})",
+        reason.as_str()
+    ))
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -253,44 +390,23 @@ impl LlmProvider for OpenAiProvider {
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<MessagesResponse, LlmError> {
-        if self.is_codex {
-            return self
-                .stream_codex_responses(system, messages, tools, on_delta)
-                .await;
+        match self
+            .send_streamed(system, messages, tools, on_delta)
+            .await?
+        {
+            StreamedResponse::Complete(response) => Ok(response),
+            StreamedResponse::Truncated { reason, .. } => Err(output_truncated_error(reason)),
         }
-        if should_use_responses_api(&messages) {
-            return self
-                .stream_responses_api(system, messages, tools, on_delta)
-                .await;
-        }
+    }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let headers = self.build_headers()?;
-        let mut body = build_streaming_request_body(
-            &self.model,
-            system,
-            &messages,
-            tools.as_deref().map(|arc| arc.as_slice()),
-            self.reasoning_effort.as_deref(),
-            should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
-        );
-        request_stream_usage(&mut body, &self.base_url);
-
-        let response = self
-            .http
-            .post(url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = parse_retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
-            return Err(Self::api_error(status, &body, retry_after));
-        }
-
-        consume_chat_completion_stream(response.bytes_stream(), on_delta).await
+    async fn send_message_streaming_with_truncation(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<StreamedResponse, LlmError> {
+        self.send_streamed(system, messages, tools, on_delta).await
     }
 }
 
@@ -346,6 +462,7 @@ struct ChatCompletionAccumulator {
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     usage: Option<LlmUsage>,
     has_finish: bool,
+    truncation: Option<TruncationReason>,
 }
 
 impl ChatCompletionAccumulator {
@@ -356,6 +473,7 @@ impl ChatCompletionAccumulator {
             tool_calls: BTreeMap::new(),
             usage: None,
             has_finish: false,
+            truncation: None,
         }
     }
 
@@ -410,13 +528,12 @@ impl ChatCompletionAccumulator {
                     self.has_finish = true;
                 }
                 "length" | "max_tokens" => {
-                    // The generation hit the output token limit. Treating the
-                    // partial text (or a truncated tool call) as a successful
-                    // answer would silently lose information, especially when
-                    // compaction adopts a cut-off summary.
-                    return Err(LlmError::IncompleteResponse(format!(
-                        "chat completions output was truncated (finish_reason={finish_reason})"
-                    )));
+                    // Keep the partial text and usage: a caller with a
+                    // recovery policy decides whether to compact and retry.
+                    // The strict contract turns this into an error in
+                    // `send_message_streaming`.
+                    self.truncation = Some(TruncationReason::MaxOutputTokens);
+                    self.has_finish = true;
                 }
                 "content_filter" | "refusal" => {
                     return Err(LlmError::IncompleteResponse(format!(
@@ -484,7 +601,19 @@ impl ChatCompletionAccumulator {
         }
     }
 
-    fn finish(self) -> Result<MessagesResponse, LlmError> {
+    fn finish(self) -> Result<StreamedResponse, LlmError> {
+        let truncation = self.truncation;
+        // A truncated generation may legitimately be empty (the input filled
+        // the window and left no room for output). The caller decides whether
+        // that is recoverable; only a complete response must have content.
+        let response = self.assemble(truncation.is_none())?;
+        Ok(match truncation {
+            Some(reason) => StreamedResponse::Truncated { response, reason },
+            None => StreamedResponse::Complete(response),
+        })
+    }
+
+    fn assemble(self, require_content: bool) -> Result<MessagesResponse, LlmError> {
         let tool_calls = self
             .tool_calls
             .into_values()
@@ -496,7 +625,13 @@ impl ChatCompletionAccumulator {
                 )
             })
             .collect::<Vec<_>>();
-        assemble_response(self.content, self.reasoning_content, tool_calls, self.usage)
+        assemble_response_with_required_content(
+            self.content,
+            self.reasoning_content,
+            tool_calls,
+            self.usage,
+            require_content,
+        )
     }
 }
 
@@ -510,7 +645,7 @@ struct StreamingToolCall {
 async fn consume_chat_completion_stream(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     on_delta: &(dyn Fn(String) + Send + Sync),
-) -> Result<MessagesResponse, LlmError> {
+) -> Result<StreamedResponse, LlmError> {
     let mut accumulator = ChatCompletionAccumulator::new();
     let mut data_stream = crate::llm::sse::data_lines(stream);
     let mut done = false;
@@ -537,7 +672,7 @@ async fn consume_chat_completion_stream(
 async fn consume_responses_stream(
     stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
     on_delta: &(dyn Fn(String) + Send + Sync),
-) -> Result<MessagesResponse, LlmError> {
+) -> Result<StreamedResponse, LlmError> {
     let mut accumulator = ResponsesAccumulator::new();
     let mut data_stream = crate::llm::sse::data_lines(stream);
     let mut completed = false;
@@ -572,7 +707,8 @@ mod tests {
 
     use crate::config::ResolvedLlmConfig;
     use crate::llm::{
-        LlmProvider, LlmUsage, Message, MessageContent, MessageContentPart, ToolCall,
+        LlmProvider, LlmUsage, Message, MessageContent, MessageContentPart, StreamedResponse,
+        ToolCall, TruncationReason,
     };
 
     use bytes::Bytes;
@@ -1165,6 +1301,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_requests_carry_the_resolved_output_limit() {
+        // Arrange: a compatible endpoint receives the legacy field name.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_tokens": 16_384,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        // Act
+        let response = provider
+            .send_message_streaming("", message("hello"), None, &|_| {})
+            .await
+            .expect("response");
+
+        // Assert
+        assert_eq!(response.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_small_context_window_clamps_the_request_output_limit() {
+        // Arrange: the prompt leaves less than the intended output room.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({ "max_tokens": 1 })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let mut llm_config = config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        );
+        llm_config.model_metadata = crate::config::ModelMetadata {
+            context_window: 500,
+            max_output_tokens: 16_384,
+            context_window_source: crate::config::ModelValueSource::Configured,
+            max_output_tokens_source: crate::config::ModelValueSource::Configured,
+        };
+        let provider = OpenAiProvider::new(&llm_config).expect("provider");
+
+        // Act
+        let response = provider
+            .send_message_streaming("system", message("hello"), None, &|_| {})
+            .await
+            .expect("response");
+
+        // Assert: the request fits the window while the recovery decision
+        // still uses the unclamped 16,384 intent.
+        assert_eq!(response.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn official_openai_requests_use_max_completion_tokens() {
+        // Arrange: the official provider requires the newer field name even
+        // when the base URL is a test server.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_completion_tokens": 16_384,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(&crate::test_util::llm_config(
+            "openai",
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        // Act
+        let response = provider
+            .send_message_streaming("", message("hello"), None, &|_| {})
+            .await
+            .expect("response");
+
+        // Assert
+        assert_eq!(response.content, "ok");
+    }
+
+    #[tokio::test]
+    async fn send_message_streaming_rejects_a_length_stop() {
+        // Arrange: summarization and other non-recovering callers must never
+        // adopt a cut-off generation.
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse_body, "text/event-stream"))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(&config(
+            "gpt-4o-mini",
+            format!("{}/v1", server.uri()),
+            Some("sk-test"),
+        ))
+        .expect("provider");
+
+        // Act
+        let error = provider
+            .send_message("", message("hello"), None)
+            .await
+            .expect_err("truncated generation");
+
+        // Assert
+        assert!(matches!(
+            error,
+            crate::error::LlmError::IncompleteResponse(_)
+        ));
+        assert!(error.to_string().contains("output limit"), "{error}");
+    }
+
+    #[tokio::test]
     async fn consume_chat_completion_stream_propagates_chunk_error() {
         // Arrange: create a real reqwest::Error by connecting to a closed port.
         let stream_error = reqwest::Client::builder()
@@ -1206,12 +1482,16 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(response.content, "done");
+        match response {
+            StreamedResponse::Complete(response) => assert_eq!(response.content, "done"),
+            StreamedResponse::Truncated { .. } => panic!("unexpected truncation"),
+        }
     }
 
     #[tokio::test]
-    async fn consume_chat_completion_stream_fails_on_length_finish_reason() {
-        // Arrange: the model hit the output token limit after partial text.
+    async fn consume_chat_completion_stream_reports_a_length_stop_with_usage() {
+        // Arrange: the model hit the output token limit after partial text;
+        // the provider reports usage in the chunk after the finish reason.
         let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
             Ok(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
@@ -1219,21 +1499,27 @@ mod tests {
             Ok(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
             )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":32}}\n\n",
+            )),
             Ok(Bytes::from_static(b"data: [DONE]\n\n")),
         ];
 
         // Act
-        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {}).await;
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {})
+            .await
+            .expect("truncated response");
 
-        // Assert: a truncated generation is not a successful response, and
-        // retrying the same request would only hit the same limit.
-        let error = result.expect_err("truncated response");
-        assert!(!error.is_retryable(), "{error}");
-        assert!(matches!(
-            error,
-            crate::error::LlmError::IncompleteResponse(_)
-        ));
-        assert!(error.to_string().contains("length"), "{error}");
+        // Assert: the partial text and usage survive so the caller can decide
+        // whether the stop was early enough to retry.
+        match result {
+            StreamedResponse::Truncated { response, reason } => {
+                assert_eq!(reason, TruncationReason::MaxOutputTokens);
+                assert_eq!(response.content, "partial");
+                assert_eq!(response.usage.expect("usage").output_tokens, 32);
+            }
+            StreamedResponse::Complete(_) => panic!("a length stop must be truncated"),
+        }
     }
 
     #[tokio::test]
@@ -1253,6 +1539,35 @@ mod tests {
         let error = result.expect_err("filtered response");
         assert!(!error.is_retryable(), "{error}");
         assert!(error.to_string().contains("content_filter"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_length_stop_with_no_output_keeps_an_empty_truncated_response() {
+        // Arrange: Xiaomi-style providers can fill the whole window with input
+        // and return `length` with zero output tokens.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":60000,\"completion_tokens\":0}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+
+        // Act
+        let result = consume_chat_completion_stream(stream::iter(chunks), &|_| {})
+            .await
+            .expect("truncated response");
+
+        // Assert: the usage survives so the caller can detect the overflow.
+        match result {
+            StreamedResponse::Truncated { response, .. } => {
+                assert!(response.content.is_empty());
+                assert_eq!(response.usage.expect("usage").output_tokens, 0);
+            }
+            StreamedResponse::Complete(_) => panic!("a length stop must be truncated"),
+        }
     }
 
     #[tokio::test]

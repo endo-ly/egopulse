@@ -126,7 +126,6 @@ fn general_payload(config: &Config) -> Value {
                 })
             })
             .collect::<Vec<_>>(),
-        "default_context_window_tokens": config.default_context_window_tokens,
         "log_level": config.log_level,
         "state_root": config.state_root,
         "defaults": {
@@ -134,11 +133,18 @@ fn general_payload(config: &Config) -> Value {
             "compaction_enabled": default_compaction.enabled,
             "compaction_reserve_tokens": default_compaction.reserve_tokens,
             "compaction_keep_recent_tokens": default_compaction.keep_recent_tokens,
-            "default_context_window_tokens": defaults::default_context_window_tokens(),
             "timezone": "UTC",
             "log_level": "info",
         },
     })
+}
+
+fn model_value_source_name(source: crate::config::ModelValueSource) -> &'static str {
+    match source {
+        crate::config::ModelValueSource::Configured => "configured",
+        crate::config::ModelValueSource::Catalog => "catalog",
+        crate::config::ModelValueSource::Default => "default",
+    }
 }
 
 fn source_name(source: LlmSettingSource) -> &'static str {
@@ -208,9 +214,15 @@ fn providers_payload(config: &Config) -> Vec<Value> {
                 .models
                 .iter()
                 .map(|(name, model)| {
+                    let metadata = config.resolve_model_metadata(id, name);
                     json!({
                         "name": name,
                         "context_window_tokens": model.context_window_tokens,
+                        "max_output_tokens": model.max_output_tokens,
+                        "resolved_context_window_tokens": metadata.context_window,
+                        "resolved_max_output_tokens": metadata.max_output_tokens,
+                        "context_window_source": model_value_source_name(metadata.context_window_source),
+                        "max_output_tokens_source": model_value_source_name(metadata.max_output_tokens_source),
                         "has_instructions": model.model_instructions.is_some() || model.model_instructions_file.is_some(),
                     })
                 })
@@ -619,7 +631,6 @@ pub(super) struct GeneralPatch {
     compaction_reserve_tokens: Option<usize>,
     compaction_keep_recent_tokens: Option<usize>,
     compaction_model_overrides: Option<HashMap<String, CompactionModelOverridePatch>>,
-    default_context_window_tokens: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -675,9 +686,6 @@ pub(super) async fn api_patch_general(
                     )
                 })
                 .collect();
-        }
-        if let Some(v) = patch.default_context_window_tokens {
-            config.default_context_window_tokens = v;
         }
         Ok(Vec::new())
     })

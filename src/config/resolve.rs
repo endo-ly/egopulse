@@ -337,20 +337,21 @@ impl Config {
         Path::new(&self.state_root).join("AGENTS.md")
     }
 
-    /// Resolves the context window for a given provider+model pair.
+    /// Resolves the limits of a provider/model pair.
     ///
-    /// Falls back to `default_context_window_tokens` when the model entry
-    /// has no explicit `context_window_tokens`.
-    pub(crate) fn resolve_context_window_tokens(
+    /// An explicit `providers.<provider>.models.<model>` setting wins, then
+    /// the bundled catalog, then the custom-model defaults.
+    pub(crate) fn resolve_model_metadata(
         &self,
         provider_id: &ProviderId,
         model: &str,
-    ) -> usize {
-        self.providers
-            .get(provider_id)
-            .and_then(|provider| provider.models.get(model))
-            .and_then(|model_config| model_config.context_window_tokens)
-            .unwrap_or(self.default_context_window_tokens)
+    ) -> super::ModelMetadata {
+        match self.providers.get(provider_id) {
+            Some(provider) => {
+                super::model_metadata::resolve_for_provider(provider_id.as_str(), provider, model)
+            }
+            None => super::ModelMetadata::resolve(provider_id, model),
+        }
     }
 
     /// Resolves the model-specific instructions content for a provider+model pair.
@@ -532,10 +533,6 @@ pub(super) fn default_web_port() -> u16 {
 
 pub(crate) fn default_max_history_messages() -> usize {
     50
-}
-
-pub(crate) fn default_context_window_tokens() -> usize {
-    131_072
 }
 
 pub(crate) fn default_compaction_config() -> super::CompactionConfig {

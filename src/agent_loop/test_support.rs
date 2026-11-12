@@ -199,7 +199,7 @@ pub(crate) fn test_config_with_compaction(
     let mut config = crate::test_util::test_config(&state_root);
     config.compaction.keep_recent_tokens = keep_recent_tokens;
     config.compaction.reserve_tokens = 512;
-    config.default_context_window_tokens = 9_000;
+    set_context_window(&mut config, 9_000);
     config
 }
 
@@ -210,8 +210,47 @@ pub(crate) fn test_config_with_compaction_window(
     context_window_tokens: usize,
 ) -> crate::config::Config {
     let mut config = test_config_with_compaction(state_root, keep_recent_tokens);
-    config.default_context_window_tokens = context_window_tokens;
+    set_context_window(&mut config, context_window_tokens);
     config
+}
+
+/// Sets the context window of the model used by the test LLM.
+///
+/// The mock providers report `test/test-model`, so an explicit entry for that
+/// pair is what the loop resolves. The default provider's entry is updated too
+/// so a test that resolves through the configuration sees the same window.
+fn set_context_window(config: &mut crate::config::Config, context_window_tokens: usize) {
+    use crate::config::{ModelConfig, ProviderConfig, ProviderId, secret_ref::ResolvedValue};
+
+    let test_provider = config
+        .providers
+        .entry(ProviderId::new("test"))
+        .or_insert_with(|| {
+            ProviderConfig::new(
+                "Test".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(ResolvedValue::Literal("sk-test".to_string())),
+                "test-model".to_string(),
+                std::collections::HashMap::new(),
+            )
+        });
+    test_provider.models.insert(
+        "test-model".to_string(),
+        ModelConfig {
+            context_window_tokens: Some(context_window_tokens),
+            ..ModelConfig::default()
+        },
+    );
+
+    let provider = config
+        .providers
+        .get_mut(&ProviderId::new("openai"))
+        .expect("test provider");
+    provider
+        .models
+        .get_mut("gpt-4o-mini")
+        .expect("test model")
+        .context_window_tokens = Some(context_window_tokens);
 }
 
 pub(crate) fn cli_context(session: &str) -> SurfaceContext {

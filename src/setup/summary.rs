@@ -240,10 +240,6 @@ pub(crate) fn save_config(
             .as_ref()
             .map(|c| c.max_history_messages)
             .unwrap_or(50),
-        default_context_window_tokens: existing_config
-            .as_ref()
-            .map(|c| c.default_context_window_tokens)
-            .unwrap_or_else(crate::config::resolve::default_context_window_tokens),
         channels,
         default_agent: crate::config::AgentId::new(&agent_id),
         agents,

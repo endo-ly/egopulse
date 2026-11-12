@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::ConfigError;
 
+use super::model_metadata::ModelMetadata;
 use super::secret_ref::ResolvedValue;
 
 // ---------------------------------------------------------------------------
@@ -188,9 +189,18 @@ impl std::fmt::Debug for ChannelConfig {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ModelConfig {
     /// Maximum context window in tokens for this model.
-    /// When `None`, falls back to `Config.default_context_window_tokens`.
+    ///
+    /// When `None`, the bundled model catalog resolves the value, and a model
+    /// the catalog does not know uses the custom-model default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<usize>,
+
+    /// Maximum output tokens for this model.
+    ///
+    /// When `None`, the bundled model catalog resolves the value, and a model
+    /// the catalog does not know uses the custom-model default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<usize>,
 
     /// Optional inline model-specific instructions injected into the system
     /// prompt between SOUL and Core Instructions (wrapped in
@@ -296,6 +306,8 @@ pub(crate) struct ResolvedLlmConfig {
     pub base_url: String,
     pub api_key: Option<SecretString>,
     pub model: String,
+    /// Resolved context window and output limit of `model`.
+    pub model_metadata: ModelMetadata,
     pub reasoning_effort: Option<String>,
     pub headers: BTreeMap<String, ProviderHeaderValue>,
 }
@@ -328,6 +340,7 @@ impl std::fmt::Debug for ResolvedLlmConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &debug_secret(self.api_key.as_ref()))
             .field("model", &self.model)
+            .field("model_metadata", &self.model_metadata)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("headers", &self.headers.keys().collect::<Vec<_>>())
             .finish()
@@ -340,6 +353,7 @@ impl PartialEq for ResolvedLlmConfig {
             && self.label == other.label
             && self.base_url == other.base_url
             && self.model == other.model
+            && self.model_metadata == other.model_metadata
             && self.reasoning_effort == other.reasoning_effort
             && self.headers == other.headers
     }
@@ -355,6 +369,8 @@ impl ResolvedLlmConfig {
         model: String,
         reasoning_effort: Option<String>,
     ) -> Self {
+        let model_metadata =
+            super::model_metadata::resolve_for_provider(&provider_id, provider, &model);
         Self {
             provider: provider_id,
             label: provider.label.clone(),
@@ -364,6 +380,7 @@ impl ResolvedLlmConfig {
                 .as_ref()
                 .map(ResolvedValue::to_secret_string),
             model,
+            model_metadata,
             reasoning_effort,
             headers: provider.headers.clone(),
         }
@@ -678,7 +695,6 @@ pub struct Config {
     pub(crate) log_level: String,
     pub(crate) compaction: CompactionConfig,
     pub(crate) max_history_messages: usize,
-    pub(crate) default_context_window_tokens: usize,
     pub(crate) channels: HashMap<ChannelName, ChannelConfig>,
     pub(crate) default_agent: AgentId,
     pub(crate) agents: HashMap<AgentId, AgentConfig>,
@@ -700,10 +716,6 @@ impl std::fmt::Debug for Config {
             .field("log_level", &self.log_level)
             .field("compaction", &self.compaction)
             .field("max_history_messages", &self.max_history_messages)
-            .field(
-                "default_context_window_tokens",
-                &self.default_context_window_tokens,
-            )
             .field("channels", &self.channels)
             .field("default_agent", &self.default_agent)
             .field("agents", &self.agents)

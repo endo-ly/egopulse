@@ -115,7 +115,6 @@ fn fallback_fingerprint(config: &Config) -> String {
     config.compaction.reserve_tokens.hash(&mut hasher);
     config.compaction.keep_recent_tokens.hash(&mut hasher);
     config.max_history_messages.hash(&mut hasher);
-    config.default_context_window_tokens.hash(&mut hasher);
     config.default_agent.as_str().hash(&mut hasher);
     let mut providers = config.providers.iter().collect::<Vec<_>>();
     providers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));

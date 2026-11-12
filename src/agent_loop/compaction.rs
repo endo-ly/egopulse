@@ -35,19 +35,13 @@ use crate::agent_loop::session_snapshot::{
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
+use crate::llm::tokens::{
+    CHARS_PER_TOKEN_ESTIMATE, estimate_message_tokens, estimate_messages_tokens,
+    estimate_text_tokens,
+};
 use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
 use crate::llm::{RetryPolicy, complete_response};
 use crate::tools::sanitize_output_string;
-
-/// Chars-to-tokens ratio of the reference estimator.
-///
-/// The reference implementation divides the character length of the text by
-/// four and rounds up. CJK text is deliberately not weighted differently: the
-/// provider usage calibration corrects the estimate for the model in use.
-const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
-
-/// Character budget used for one image content part when estimating tokens.
-const ESTIMATED_IMAGE_CHARS: usize = 4_800;
 
 /// Maximum characters of a single tool result inside a summary request.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
@@ -335,71 +329,6 @@ pub(crate) fn request_shape_hash(
     std::hash::Hash::hash(&tools_json.unwrap_or_default(), &mut hasher);
     std::hash::Hash::hash(model_key, &mut hasher);
     format!("{:016x}", std::hash::Hasher::finish(&hasher))
-}
-
-/// Number of characters a text contributes to the token estimate.
-///
-/// The reference implementation measures JavaScript string length, which counts
-/// UTF-16 code units. Counting Rust `char`s instead would undercount astral
-/// characters such as emoji by one unit each.
-fn text_chars(text: &str) -> usize {
-    text.encode_utf16().count()
-}
-
-fn chars_to_tokens(chars: usize) -> usize {
-    chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)
-}
-
-/// Estimates the tokens of one message from its serialized size.
-///
-/// Role names are not part of the estimate: they are fixed per message and the
-/// reference implementation only measures content. Reasoning is counted here
-/// and excluded only when the conversation is serialized for a summary.
-pub(crate) fn estimate_message_tokens(message: &Message) -> usize {
-    let mut chars = content_chars(&message.content);
-    if let Some(reasoning) = &message.reasoning_content {
-        chars += text_chars(reasoning);
-    }
-    for tool_call in &message.tool_calls {
-        chars += text_chars(&tool_call.name);
-        chars += text_chars(&tool_call.arguments.to_string());
-    }
-    chars_to_tokens(chars)
-}
-
-fn content_chars(content: &MessageContent) -> usize {
-    match content {
-        MessageContent::Text(text) => text_chars(text),
-        MessageContent::Parts(parts) => parts
-            .iter()
-            .map(|part| match part {
-                MessageContentPart::InputText { text } => text_chars(text),
-                MessageContentPart::InputImage { .. } => ESTIMATED_IMAGE_CHARS,
-            })
-            .sum(),
-    }
-}
-
-fn estimate_messages_tokens(messages: &[Message]) -> usize {
-    messages.iter().map(estimate_message_tokens).sum()
-}
-
-/// Estimates the tokens of one fixed request part such as a system prompt.
-fn estimate_text_tokens(text: &str) -> usize {
-    chars_to_tokens(text_chars(text))
-}
-
-/// Estimates the raw prompt size of a request without a checkpoint.
-pub(crate) fn estimate_prompt_tokens(
-    system_prompt: &str,
-    tools_json: Option<&str>,
-    messages: &[Message],
-) -> usize {
-    let mut tokens = estimate_text_tokens(system_prompt);
-    if let Some(tools) = tools_json {
-        tokens += estimate_text_tokens(tools);
-    }
-    tokens + estimate_messages_tokens(messages)
 }
 
 /// Applies the usage calibration factor to a token delta.
@@ -967,10 +896,13 @@ pub(crate) async fn compact(
         .config
         .compaction
         .for_model(request.llm.provider_name(), request.llm.model_name());
-    let context_window = request.config.resolve_context_window_tokens(
-        &crate::config::ProviderId::new(request.llm.provider_name()),
-        request.llm.model_name(),
-    );
+    let context_window = request
+        .config
+        .resolve_model_metadata(
+            &crate::config::ProviderId::new(request.llm.provider_name()),
+            request.llm.model_name(),
+        )
+        .context_window;
 
     let model_key = model_key(request.llm.as_ref());
     let shape_hash = request_shape_hash(
@@ -2033,27 +1965,6 @@ mod tests {
     }
 
     #[test]
-    fn token_estimation_matches_the_reference_heuristic() {
-        // Arrange: the reference implementation divides JavaScript string
-        // length (UTF-16 code units) by four and rounds up.
-        let mut assistant = Message::text("assistant", "abcdefgh".to_string());
-        assistant.reasoning_content = Some("ijkl".to_string());
-        assistant.tool_calls = vec![ToolCall {
-            id: "1".to_string(),
-            name: "read".to_string(),
-            arguments: serde_json::json!({ "path": "/tmp/a" }),
-            invalid_arguments: None,
-        }];
-
-        // Act & Assert
-        assert_eq!(estimate_message_tokens(&text("user", "hello world")), 3);
-        assert_eq!(estimate_message_tokens(&text("user", "こんにちは世界")), 2);
-        assert_eq!(estimate_message_tokens(&text("user", "😀😀")), 1);
-        // 8 text + 4 reasoning + 4 name + 17 JSON argument characters.
-        assert_eq!(estimate_message_tokens(&assistant), 9);
-    }
-
-    #[test]
     fn a_measured_context_is_not_rescaled_when_the_request_is_unchanged() {
         // Arrange: the anchor describes exactly the current request overhead.
         let mut context = session(vec![text("user", "hello"), text("assistant", "hi")]);
@@ -2129,7 +2040,8 @@ mod tests {
 
         assert!(estimate_message_tokens(&call) >= 2);
         assert!(
-            estimate_message_tokens(&image) >= (ESTIMATED_IMAGE_CHARS / CHARS_PER_TOKEN_ESTIMATE)
+            estimate_message_tokens(&image)
+                >= (crate::llm::tokens::ESTIMATED_IMAGE_CHARS / CHARS_PER_TOKEN_ESTIMATE)
         );
     }
 }

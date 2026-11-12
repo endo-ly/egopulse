@@ -628,7 +628,6 @@ fn save_load_round_trip_preserves_agent_profiles() {
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
@@ -974,7 +973,6 @@ fn persists_agents_without_discord_config_surface() {
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels: std::collections::HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
@@ -1792,7 +1790,6 @@ fn discord_bots_preserve_secret_refs_on_save() {
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels,
         default_agent: super::AgentId::new("assistant"),
         agents,
@@ -2162,7 +2159,6 @@ fn loads_provider_models_with_context_windows() {
     let file_path = write_config(
         &temp_dir,
         r#"default_provider: openai
-default_context_window_tokens: 32768
 providers:
   openai:
     label: OpenAI
@@ -2195,13 +2191,12 @@ channels:
 
 #[test]
 #[serial]
-fn uses_default_context_window_when_model_context_missing() {
+fn resolves_catalog_context_window_when_model_context_missing() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
         &temp_dir,
         r#"default_provider: openai
-default_context_window_tokens: 32768
 providers:
   openai:
     label: OpenAI
@@ -2218,10 +2213,13 @@ channels:
 
     let config = Config::load(Some(&file_path)).expect("load config");
 
-    // Model has no explicit context_window_tokens → falls back to default
+    // The model has no explicit context_window_tokens: the bundled catalog
+    // value applies, not a global default.
+    let metadata = config.resolve_model_metadata(&super::ProviderId::new("openai"), "gpt-4o-mini");
+    assert_eq!(metadata.context_window, 128_000);
     assert_eq!(
-        config.resolve_context_window_tokens(&super::ProviderId::new("openai"), "gpt-4o-mini"),
-        32768
+        metadata.context_window_source,
+        super::model_metadata::ModelValueSource::Catalog
     );
 }
 
@@ -2233,7 +2231,6 @@ fn loads_compaction_settings_from_top_level() {
     let file_path = write_config(
         &temp_dir,
         r#"default_provider: openai
-default_context_window_tokens: 65536
 compaction:
   enabled: false
   reserve_tokens: 4096
@@ -2280,7 +2277,6 @@ channels:
     assert!(config.compaction.enabled);
     assert_eq!(config.compaction.reserve_tokens, 16_384);
     assert_eq!(config.compaction.keep_recent_tokens, 20_000);
-    assert_eq!(config.default_context_window_tokens, 131_072);
 }
 
 #[test]
@@ -2422,37 +2418,16 @@ channels:
 
 #[test]
 #[serial]
-fn rejects_zero_context_window_tokens() {
+fn rejects_zero_model_token_limits() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
 
-    // default_context_window_tokens = 0
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-default_context_window_tokens: 0
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-test
-    default_model: gpt-4o-mini
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret"#,
-    );
-    let error = Config::load(Some(&file_path)).expect_err("zero default");
-    assert!(
-        matches!(error, ConfigError::InvalidCompactionConfig(_)),
-        "expected InvalidCompactionConfig for zero default, got {error:?}"
-    );
-
-    // model context_window_tokens = 0
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-default_context_window_tokens: 32768
+    for (desc, key) in [
+        ("zero model context", "context_window_tokens: 0"),
+        ("zero model output", "max_output_tokens: 0"),
+    ] {
+        let yaml = format!(
+            r#"default_provider: openai
 providers:
   openai:
     label: OpenAI
@@ -2461,22 +2436,24 @@ providers:
     default_model: gpt-4o-mini
     models:
       gpt-4o-mini:
-        context_window_tokens: 0
+        {key}
 channels:
   web:
     enabled: true
-    auth_token: web-secret"#,
-    );
-    let error = Config::load(Some(&file_path)).expect_err("zero model context");
-    assert!(
-        matches!(error, ConfigError::InvalidCompactionConfig(_)),
-        "expected InvalidCompactionConfig for zero model context, got {error:?}"
-    );
+    auth_token: web-secret"#
+        );
+        let file_path = write_config(&temp_dir, &yaml);
+        let error = Config::load(Some(&file_path)).expect_err(desc);
+        assert!(
+            matches!(error, ConfigError::InvalidCompactionConfig(_)),
+            "{desc}: expected InvalidCompactionConfig, got {error:?}"
+        );
+    }
 }
 
 #[test]
 #[serial]
-fn rejects_unsafe_default_context_window_tokens() {
+fn rejects_the_removed_global_context_window_setting() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let file_path = write_config(
@@ -2495,10 +2472,12 @@ channels:
     auth_token: web-secret"#,
     );
 
-    let error = Config::load(Some(&file_path)).expect_err("unsafe default");
+    // The global setting is gone: a config that still carries it must not be
+    // silently accepted with the value ignored.
+    let error = Config::load(Some(&file_path)).expect_err("removed setting");
     assert!(
-        matches!(error, ConfigError::InvalidCompactionConfig(_)),
-        "expected InvalidCompactionConfig for unsafe default, got {error:?}"
+        matches!(error, ConfigError::ConfigParseFailed { .. }),
+        "expected ConfigParseFailed, got {error:?}"
     );
 }
 
@@ -2528,6 +2507,7 @@ fn persists_provider_model_contexts_without_secret_leak() {
                         "gpt-5".to_string(),
                         ModelConfig {
                             context_window_tokens: Some(200000),
+                            max_output_tokens: Some(32_768),
                             ..Default::default()
                         },
                     ),
@@ -2539,7 +2519,6 @@ fn persists_provider_model_contexts_without_secret_leak() {
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("default"),
         agents: HashMap::from([(
@@ -2560,8 +2539,9 @@ fn persists_provider_model_contexts_without_secret_leak() {
     save_config_with_secrets(&config, &path).expect("save config");
 
     let yaml = std::fs::read_to_string(&path).expect("yaml");
-    // Model context_window_tokens should be present
+    // Explicit model limits round-trip with the model entry.
     assert!(yaml.contains("context_window_tokens: 200000"));
+    assert!(yaml.contains("max_output_tokens: 32768"));
     // Secret must NOT appear in YAML
     assert!(!yaml.contains("sk-secret-key-12345"));
     // SecretRef should be used instead
@@ -2815,7 +2795,6 @@ fn persist_preserves_sleep_batch_config() {
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("default"),
         agents: HashMap::from([(
@@ -2883,7 +2862,6 @@ fn persist_round_trips_a_disabled_compaction() {
             model_overrides: HashMap::new(),
         },
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("default"),
         agents: HashMap::from([(
@@ -3179,7 +3157,6 @@ fn persist_preserves_sleep_batch_scheduler_config() {
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels: HashMap::new(),
         default_agent: super::AgentId::new("alice"),
         agents,
@@ -3525,7 +3502,6 @@ fn minimal_config_with_channels(
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels,
         default_agent: super::AgentId::new("default"),
         agents,
@@ -3601,7 +3577,6 @@ fn profile_config(
         log_level: "info".to_string(),
         compaction: super::CompactionConfig::default(),
         max_history_messages: 50,
-        default_context_window_tokens: 131_072,
         channels,
         default_agent,
         agents,

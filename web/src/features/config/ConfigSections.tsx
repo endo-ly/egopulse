@@ -80,10 +80,9 @@ function GeneralView({ config }: { config: RuntimeConfig }) {
       <Rows>
         <Row label="History messages" value={g.max_history_messages} isDefault={g.max_history_messages === d.max_history_messages} />
         <Row
-          label="Context window"
-          value={`${formatCount(g.default_context_window_tokens)} tokens`}
-          sub="For models without their own setting"
-          isDefault={g.default_context_window_tokens === d.default_context_window_tokens}
+          label="Model limits"
+          value="Bundled catalog"
+          sub="Unknown models use 128K context / 16K output"
         />
         <Row
           label="Compaction"
@@ -256,7 +255,14 @@ function ProviderView({ provider, config }: { provider: ProviderConfigEntry; con
             {provider.models.map((model) => (
               <li key={model.name}>
                 <code>{model.name}</code>
-                {model.context_window_tokens !== null && <span className="model-meta">{formatCount(model.context_window_tokens)} context</span>}
+                <span className="model-meta">
+                  {formatCount(model.resolved_context_window_tokens)} context
+                  {model.context_window_source === "default" ? " (default)" : ""}
+                </span>
+                <span className="model-meta">
+                  {formatCount(model.resolved_max_output_tokens)} max output
+                  {model.max_output_tokens_source === "default" ? " (default)" : ""}
+                </span>
                 {model.has_instructions && <span className="model-meta">custom instructions</span>}
               </li>
             ))}

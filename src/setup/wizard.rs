@@ -84,7 +84,7 @@ pub(crate) fn build_additional_options_text() -> String {
         "System:",
         "  - timezone (default: UTC)",
         "  - log_level (default: info)",
-        "  - default_context_window_tokens (default: 131072)",
+        "  - providers.<id>.models.<model>.context_window_tokens / max_output_tokens",
         "  - compaction.enabled / compaction.reserve_tokens / compaction.keep_recent_tokens",
         "  - max_history_messages",
         "",

@@ -4,12 +4,19 @@
 //! `code`/`type` and a human-readable message. Classifying the failure here
 //! keeps provider vocabulary out of the callers that react to it.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
 use reqwest::StatusCode;
 
 use crate::error::LlmError;
 
 /// Statuses a provider may use to reject an oversized prompt.
 const OVERFLOW_STATUSES: &[u16] = &[400, 413, 422];
+
+/// HTTP 413 is request-size overflow regardless of the body: proxies in front
+/// of a provider often drop the JSON body or replace it with a generic page.
+const PAYLOAD_TOO_LARGE_STATUS: u16 = 413;
 
 /// Stable provider codes that mean the prompt exceeded the context window.
 ///
@@ -62,6 +69,11 @@ const CONTEXT_OVERFLOW_PATTERN: &str = concat!(
 const NON_OVERFLOW_PATTERN: &str =
     r"(?i)(throttling|rate limit|too many requests|service unavailable)";
 
+static OVERFLOW_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(CONTEXT_OVERFLOW_PATTERN).expect("overflow pattern compiles"));
+static NON_OVERFLOW_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(NON_OVERFLOW_PATTERN).expect("non-overflow pattern compiles"));
+
 /// Classifies a provider rejection into an [`LlmError`].
 ///
 /// Used for both an HTTP error response and a failure reported inside a
@@ -98,6 +110,9 @@ fn is_context_overflow(
     error_type: Option<&str>,
     message: &str,
 ) -> bool {
+    if status.as_u16() == PAYLOAD_TOO_LARGE_STATUS {
+        return true;
+    }
     if !OVERFLOW_STATUSES.contains(&status.as_u16()) {
         return false;
     }
@@ -111,24 +126,10 @@ fn is_context_overflow(
     }
     // A rate limit or a transient server failure may mention tokens without
     // asking for a smaller prompt; compacting would hide the real failure.
-    if matches_pattern(NON_OVERFLOW_PATTERN, message) {
+    if NON_OVERFLOW_REGEX.is_match(message) {
         return false;
     }
-    matches_pattern(CONTEXT_OVERFLOW_PATTERN, message)
-}
-
-fn matches_pattern(pattern: &'static str, text: &str) -> bool {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<&'static str, regex::Regex>>,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let Ok(mut cache) = cache.lock() else {
-        return false;
-    };
-    let regex = cache
-        .entry(pattern)
-        .or_insert_with(|| regex::Regex::new(pattern).expect("overflow pattern compiles"));
-    regex.is_match(text)
+    OVERFLOW_REGEX.is_match(message)
 }
 
 #[cfg(test)]
@@ -173,6 +174,56 @@ mod tests {
 
         // Assert
         assert!(error.is_context_overflow());
+    }
+
+    #[test]
+    fn a_bodyless_payload_too_large_is_an_overflow() {
+        // Arrange: a proxy rejected the request size without a provider body.
+        let status = StatusCode::PAYLOAD_TOO_LARGE;
+
+        // Act
+        let error = classify(status, None, None, "", None);
+
+        // Assert
+        assert!(error.is_context_overflow());
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn a_payload_too_large_with_a_generic_body_is_an_overflow() {
+        // Arrange
+        let status = StatusCode::PAYLOAD_TOO_LARGE;
+
+        // Act
+        let error = classify(
+            status,
+            None,
+            None,
+            "<html><body><h1>413 Payload Too Large</h1></body></html>",
+            None,
+        );
+
+        // Assert
+        assert!(error.is_context_overflow());
+    }
+
+    #[test]
+    fn throttling_mentions_of_tokens_stay_api_errors() {
+        // Arrange: Bedrock formats throttling with a token-limit phrase.
+        let status = StatusCode::TOO_MANY_REQUESTS;
+
+        // Act
+        let error = classify(
+            status,
+            None,
+            None,
+            "ThrottlingException: Too many tokens, please wait before trying again.",
+            Some(5),
+        );
+
+        // Assert
+        assert!(!error.is_context_overflow());
+        assert!(error.is_retryable());
     }
 
     #[test]
