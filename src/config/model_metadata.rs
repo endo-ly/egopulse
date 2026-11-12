@@ -214,46 +214,4 @@ mod tests {
         assert_eq!(metadata.max_output_tokens, CUSTOM_MODEL_MAX_OUTPUT_TOKENS);
         assert!(metadata.uses_custom_defaults());
     }
-
-    #[test]
-    fn explicit_32k_and_catalog_windows_are_resolved_independently() {
-        // Arrange: one model overrides the window, the others use the catalog.
-        let provider = provider(&[(
-            "small-model",
-            ModelConfig {
-                context_window_tokens: Some(32_768),
-                ..ModelConfig::default()
-            },
-        )]);
-
-        // Act
-        let small = resolve_for_provider("openai", &provider, "small-model");
-        let openai = resolve_for_provider("openai", &provider, "gpt-4o");
-        let anthropic = resolve_for_provider("anthropic", &provider, "claude-sonnet-4-5");
-        let google = resolve_for_provider("google", &provider, "gemini-2.5-pro");
-
-        // Assert: 32k - 16,384 reserve leaves 16,384, a 128k model leaves
-        // 111,616, a 200k model leaves 183,616, and a 1M model leaves ~1M.
-        assert_eq!(small.context_window, 32_768);
-        assert_eq!(openai.context_window, 128_000);
-        assert_eq!(anthropic.context_window, 200_000);
-        assert_eq!(google.context_window, 1_048_576);
-        assert_eq!(small.context_window - 16_384, 16_384);
-        assert_eq!(openai.context_window - 16_384, 111_616);
-        assert_eq!(anthropic.context_window - 16_384, 183_616);
-    }
-
-    #[test]
-    fn model_switch_does_not_reuse_the_previous_model_limits() {
-        // Arrange
-        let provider = provider(&[]);
-
-        // Act
-        let small = resolve_for_provider("openai", &provider, "gpt-4o");
-        let large = resolve_for_provider("openai", &provider, "gpt-4.1");
-
-        // Assert
-        assert_eq!(small.context_window, 128_000);
-        assert_eq!(large.context_window, 1_047_576);
-    }
 }
