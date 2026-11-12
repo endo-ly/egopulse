@@ -1811,7 +1811,8 @@ mod tests {
             .expect("test model")
             .max_output_tokens = Some(100);
         let state = build_state(config, Box::new(provider.clone()));
-        let context = cli_context("truncation-at-limit");
+        let mut context = cli_context("truncation-at-limit");
+        context.request_key = "cli:truncation-at-limit:1".to_string();
         seed_short_session(&state, &context).await;
         let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
         let event_log = Arc::clone(&events);
@@ -1858,12 +1859,38 @@ mod tests {
         })
         .await
         .expect("messages");
-        assert!(
-            history
-                .iter()
-                .any(|message| message.content == "partial answer"),
-            "the partial answer must be persisted in the transcript"
+        let persisted = history
+            .iter()
+            .find(|message| message.content == "partial answer")
+            .expect("the partial answer must be persisted in the transcript");
+        assert_eq!(
+            persisted.finish_reason.as_deref(),
+            Some("max_output_tokens")
         );
+
+        // A re-accepted request replays the persisted answer with the same
+        // truncation state instead of presenting it as a complete one.
+        let replay_events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let replay_log = Arc::clone(&replay_events);
+        let replay = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "fresh question",
+            move |event| replay_log.lock().expect("events").push(event),
+        )
+        .await
+        .expect("replayed turn");
+        assert_eq!(replay, "partial answer");
+        let replay_reason = replay_events
+            .lock()
+            .expect("events")
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::FinalResponse { finish_reason, .. } => *finish_reason,
+                _ => None,
+            });
+        assert_eq!(replay_reason, Some(TruncationReason::MaxOutputTokens));
+        assert_eq!(provider.model_requests(), 1);
     }
 
     #[tokio::test]

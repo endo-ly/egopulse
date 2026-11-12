@@ -156,6 +156,23 @@ describe("chatReducer assistant identity", () => {
     expect(state.messages[0].content).toBe("Hello world");
   });
 
+  it("done_records_the_model_finish_reason", () => {
+    // Arrange: the gateway marks the final frame as an output-limit stop.
+    let state = initialChatState();
+    state = reduceChatEvent(state, delta("run-1", 1, ASSISTANT_1, "partial"), "lyre");
+    const event = done("run-1", 2, ASSISTANT_1, "partial");
+    if (event.state === "done" && event.message) {
+      event.message.finish_reason = "max_output_tokens";
+    }
+
+    // Act
+    state = reduceChatEvent(state, event, "lyre");
+
+    // Assert
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0].finish_reason).toBe("max_output_tokens");
+  });
+
   it("done_without_prior_delta_inserts_by_id", () => {
     let state = initialChatState();
 

@@ -214,6 +214,14 @@ impl TruncationReason {
     pub(crate) fn as_str(self) -> &'static str {
         "max_output_tokens"
     }
+
+    /// Parses the persisted form; unknown values read as "no reason".
+    pub(crate) fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "max_output_tokens" => Some(Self::MaxOutputTokens),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome of one streamed request.

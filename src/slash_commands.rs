@@ -996,6 +996,7 @@ mod tests {
                         seq: None,
                         turn_id: None,
                         parent_message_id: None,
+                        finish_reason: None,
                     },
                     &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
                     None,

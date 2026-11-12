@@ -1142,6 +1142,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         assert_eq!(msg.sender_kind, SenderKind::User);
         assert_eq!(msg.sender_id, "pulse");

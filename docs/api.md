@@ -277,6 +277,7 @@ GET /api/history?session_key=main&limit=300&before_seq=6524
       "content": "{\"tool\":\"read\",\"status\":\"success\",\"result\":\"...\",\"input\":{\"path\":\"a.txt\"}}",
       "timestamp": "2026-04-12T14:00:06Z",
       "message_kind": "tool_call",
+      "finish_reason": null,
       "pulse": null
     }
   ],
@@ -289,7 +290,7 @@ GET /api/history?session_key=main&limit=300&before_seq=6524
 
 `session_key` は `chat:{id}` を指定するとそのままチャットを特定できる。新規セッション（未永続）の `session_key` を指定した場合はメッセージなし（空配列）で返る。
 
-メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call` / `turn_failure`。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input, attachments}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。`message_kind: "turn_failure"` のメッセージは Turn が応答を返さず終了した記録で、`content` はユーザー向けサマリ。WebUI はエラー項目として描画する。
+メッセージの `sender_kind` は `user` / `assistant` / `system`。`message_kind` は `message` / `agent_send` / `system_event` / `tool_call` / `turn_failure`。`finish_reason` はモデルが出力上限で停止した場合に `"max_output_tokens"`、それ以外は `null`。WebUI はこの値がある回答に途中終了の注記を表示する。`message_kind: "tool_call"` のメッセージはツール実行結果で、`content` に JSON 文字列（`{tool, status, result, input, attachments}`）を持ち、WebUI は折りたたみ可能なツールカードとして描画する。`status` は `tool_calls.state` から導出される: `succeeded` は `success`、`failed` は `error`（`result` にサニタイズ済みエラーメッセージ）、`uncertain` は `error`（結果は記録されなかったことを示す文言）、`pending` / `running` は `pending`。`message_kind: "turn_failure"` のメッセージは Turn が応答を返さず終了した記録で、`content` はユーザー向けサマリ。WebUI はエラー項目として描画する。
 
 `attachments` は `send_attachment` が Web へ配信したファイルの配列で、各要素は `{id, filename, content_type, size_bytes}` を持つ。通常のツールでは空配列。WebUI は成功した `send_attachment` に `attachments` がある場合、ツールカードの代わりに添付カード（音声プレイヤーまたはダウンロード）を描画する。
 
@@ -346,7 +347,7 @@ GET /api/stream?run_id=550e8400-e29b-41d4-a716-446655440000&last_event_id=0
 | `delta` | LLM からのストリーミングテキスト差分（安定メッセージIDつき） |
 | `user_input` | staged follow-up のcommit（canonicalメッセージIDつき） |
 | `assistant_discarded` | retryで置換されたstream済み応答の破棄（メッセージIDつき） |
-| `done` | 最終応答。完全なアシスタントメッセージ（安定メッセージIDつき） |
+| `done` | 最終応答。完全なアシスタントメッセージ（安定メッセージIDつき）。出力上限で停止した場合は `finishReason: "max_output_tokens"` を付ける |
 | `error` | エラー発生時 |
 
 ##### イベント例
@@ -356,7 +357,7 @@ event: delta
 data: {"messageId": "turn:<turn-id>:assistant:1", "delta": "今日の東京の天気は"}
 
 event: done
-data: {"response": "今日の東京の天気は晴れです。...", "messageId": "turn:<turn-id>:assistant:1"}
+data: {"response": "今日の東京の天気は晴れです。...", "messageId": "turn:<turn-id>:assistant:1", "finishReason": "max_output_tokens"}
 ```
 
 ##### 再接続
@@ -1004,7 +1005,7 @@ Message identity は end-to-end で安定している。ユーザーメッセー
 | state | 説明 |
 |-------|------|
 | `delta` | テキストの差分。`message`（安定IDつき）を含む。同じIDへ追記する |
-| `done` | 1 Turnの完了。`message.id` は応答がstreamした安定IDで、`message` に確定内容を含む（authoritative置換）。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。永続finalを持たない通知（重複受付など）はイベント生成側で確定した `turn:{turnId}:notice` という安定IDで届く |
+| `done` | 1 Turnの完了。`message.id` は応答がstreamした安定IDで、`message` に確定内容を含む（authoritative置換）。出力上限で停止した回答は `message.finish_reason: "max_output_tokens"` を持つ。`terminal: false` なら同じinteractionの後続Turnが続き、`terminal: true` でinteraction全体が完了する。新規セッションの場合は `sessionKey` が永続化された `chat:{id}` に切り替わる。永続finalを持たない通知（重複受付など）はイベント生成側で確定した `turn:{turnId}:notice` という安定IDで届く |
 | `error` | エラー。`errorMessage` を含む。`terminal: false` の場合は staged follow-up が同じ interaction で続くため、クライアントは stream を閉じない。`terminal: true` の場合だけ run 全体が終了する。partial出力はstreamしたIDのまま残し、ID解決は行わない |
 
 クライアントは live 表示を message ID でupsertし、履歴とはID一致でのみ突き合わせる（history優先）。内容比較はしない。bareのTool preview・result summaryは履歴投影に現れず、Tool Cardは `call_id` で突き合わせる。narration付きpreviewはnarration部分のみで返却されるため、liveの表示内容と一致する。staged follow-upで1つのrunが複数Turnに跨る場合、各 `done` はそれを発行したTurn自身のfinal IDを運ぶため、親TurnのIDが子Turnに再送されることはない。

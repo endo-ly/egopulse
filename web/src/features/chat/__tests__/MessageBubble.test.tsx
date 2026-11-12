@@ -64,6 +64,27 @@ describe("MessageBubble", () => {
     );
   });
 
+  it("truncated_answer_shows_an_output_limit_notice", () => {
+    // Act
+    const { container } = render(
+      <MessageBubble
+        message={msg({ content: "partial", finish_reason: "max_output_tokens" })}
+      />,
+    );
+
+    // Assert
+    const notice = container.querySelector(".message-truncation-notice");
+    expect(notice?.textContent).toContain("output limit");
+  });
+
+  it("complete_answer_has_no_output_limit_notice", () => {
+    // Act
+    const { container } = render(<MessageBubble message={msg({ content: "done" })} />);
+
+    // Assert
+    expect(container.querySelector(".message-truncation-notice")).toBeNull();
+  });
+
   it("assistant_message_renders_content_without_stream_markers", () => {
     // Message identity is stable, so bubbles carry no draft/cursor state:
     // progress is a separate indicator row owned by ChatTab.

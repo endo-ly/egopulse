@@ -166,6 +166,7 @@ impl<'a> TurnPersistence<'a> {
         );
         stored.id = final_message_id.to_string();
         stored.turn_id = Some(self.turn_id.clone());
+        stored.finish_reason = finish_reason.map(|reason| reason.as_str().to_string());
         let _persisted = persist_phase(
             self.runtime,
             self.context.scope,
@@ -183,6 +184,7 @@ impl<'a> TurnPersistence<'a> {
             // streamed under — delivery adopts nothing.
             assistant_message_id: final_message_id.to_string(),
             text: final_content.clone(),
+            finish_reason,
             terminal: false,
         });
         Ok(final_content)
@@ -207,18 +209,22 @@ impl<'a> TurnPersistence<'a> {
             .as_ref()
             .map(|usage| measurement.anchor(assistant_index, usage));
 
+        let mut stored = StoredMessage {
+            id: assistant_message_id.to_string(),
+            turn_id: Some(self.turn_id.clone()),
+            ..StoredMessage::assistant(
+                self.chat_id,
+                self.context.agent_id.clone(),
+                assistant_phase.assistant_preview.clone(),
+            )
+        };
+        stored.finish_reason = assistant_message
+            .finish_reason
+            .map(|reason| reason.as_str().to_string());
         persist_phase(
             self.runtime,
             self.context.scope,
-            StoredMessage {
-                id: assistant_message_id.to_string(),
-                turn_id: Some(self.turn_id.clone()),
-                ..StoredMessage::assistant(
-                    self.chat_id,
-                    self.context.agent_id.clone(),
-                    assistant_phase.assistant_preview.clone(),
-                )
-            },
+            stored,
             assistant_message,
             context,
             session_revision,

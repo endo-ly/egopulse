@@ -106,7 +106,7 @@ pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun, turn_failure_mes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StageToolFollowupOutcome {
     /// The message is durably present in `messages`.
-    Accepted(StoredMessage),
+    Accepted(Box<StoredMessage>),
     /// There is no unique `tools_pending` Turn for this chat.
     NoToolPhase,
 }
@@ -235,6 +235,9 @@ pub(crate) struct StoredMessage {
     /// Parent message referenced by this row (e.g. a Tool Result to its
     /// issuing assistant message).
     pub parent_message_id: Option<String>,
+    /// Why the model stopped early, when this row is a truncated answer.
+    /// A NULL means the message ended on its own (or predates the column).
+    pub finish_reason: Option<String>,
 }
 
 impl StoredMessage {
@@ -257,6 +260,7 @@ impl StoredMessage {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         }
     }
 

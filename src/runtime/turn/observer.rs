@@ -33,6 +33,7 @@ struct PendingFinalResponse {
     turn_id: String,
     assistant_message_id: String,
     text: String,
+    finish_reason: Option<crate::llm::TruncationReason>,
 }
 
 /// How a Turn finished, as reported to the observer.
@@ -211,6 +212,7 @@ impl TurnObserverRegistry {
             turn_id,
             assistant_message_id,
             text,
+            finish_reason,
             ..
         } = event
         {
@@ -221,6 +223,7 @@ impl TurnObserverRegistry {
                 turn_id,
                 assistant_message_id,
                 text,
+                finish_reason,
             });
             return;
         }
@@ -272,6 +275,7 @@ impl TurnObserverRegistry {
                         turn_id: final_response.turn_id,
                         assistant_message_id: final_response.assistant_message_id,
                         text: final_response.text,
+                        finish_reason: final_response.finish_reason,
                         terminal,
                     });
                 }
@@ -368,6 +372,7 @@ mod tests {
                 assistant_message_id: "turn:turn-a:assistant:2".to_string(),
                 text: "response A".to_string(),
                 terminal: false,
+                finish_reason: None,
             },
         );
         registry.finish("follow-up-a", "turn-a", TurnOutcome::Completed);
@@ -378,6 +383,7 @@ mod tests {
                 assistant_message_id: "turn:turn-b:assistant:1".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
+                finish_reason: None,
             },
         );
         registry.finish("follow-up-b", "turn-b", TurnOutcome::Completed);
@@ -441,6 +447,7 @@ mod tests {
                 assistant_message_id: "turn:turn-b:assistant:1".to_string(),
                 text: "response B".to_string(),
                 terminal: false,
+                finish_reason: None,
             },
         );
         registry.finish("follow-up-b", "turn-b", TurnOutcome::Completed);

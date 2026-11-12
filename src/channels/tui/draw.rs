@@ -90,6 +90,12 @@ pub(super) fn render_block(block: &TranscriptBlock, width: usize) -> Vec<Line<'s
             lines
         }
         TranscriptBlock::Tool(tool) => render_tool(tool),
+        TranscriptBlock::Notice(text) => vec![Line::from(Span::styled(
+            text.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::ITALIC),
+        ))],
         TranscriptBlock::Error(text) => vec![Line::from(Span::styled(
             format!("Error: {text}"),
             Style::default().fg(Color::Red),

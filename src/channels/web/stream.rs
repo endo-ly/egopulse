@@ -61,6 +61,8 @@ struct ToolResultPayload {
 struct DonePayload {
     response: String,
     message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,6 +463,7 @@ pub(super) async fn publish_agent_event(run_hub: &RunHub, run_id: &str, event: A
             turn_id: _,
             assistant_message_id,
             text,
+            finish_reason,
             terminal,
         } => {
             // The final id is the stable id the response streamed under, so
@@ -473,6 +476,7 @@ pub(super) async fn publish_agent_event(run_hub: &RunHub, run_id: &str, event: A
                     serde_json::to_string(&DonePayload {
                         response: text,
                         message_id: assistant_message_id,
+                        finish_reason: finish_reason.map(|reason| reason.as_str().to_string()),
                     })
                     .unwrap_or_default(),
                     terminal,
@@ -678,22 +682,24 @@ async fn publish_terminal_web_run(
                 )
             })?;
             let lookup_id = message_id.clone();
-            let response = call_blocking(state.app_state.db_for(scope), move |db| {
-                db.get_message_content(&lookup_id)
-            })
-            .await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "completed turn final response is missing".to_string(),
-                )
-            })?;
+            let (response, finish_reason) =
+                call_blocking(state.app_state.db_for(scope), move |db| {
+                    db.get_message_delivery(&lookup_id)
+                })
+                .await
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "completed turn final response is missing".to_string(),
+                    )
+                })?;
             (
                 "done",
                 serde_json::to_string(&DonePayload {
                     response,
                     message_id,
+                    finish_reason,
                 })
                 .unwrap_or_default(),
                 "completed",
@@ -767,6 +773,7 @@ async fn execute_web_slash_command(
                     serde_json::to_string(&DonePayload {
                         response,
                         message_id,
+                        finish_reason: None,
                     })
                     .unwrap_or_default(),
                 )
@@ -1041,11 +1048,13 @@ mod tests {
         let done_json = serde_json::to_string(&DonePayload {
             response: "hello".to_string(),
             message_id: "turn:t1:assistant:2".to_string(),
+            finish_reason: Some("max_output_tokens".to_string()),
         })
         .unwrap();
         let done_parsed: serde_json::Value = serde_json::from_str(&done_json).unwrap();
         assert_eq!(done_parsed["response"], "hello");
         assert_eq!(done_parsed["messageId"], "turn:t1:assistant:2");
+        assert_eq!(done_parsed["finishReason"], "max_output_tokens");
 
         let error_json = serde_json::to_string(&ErrorPayload {
             error: "oops".to_string(),
@@ -1130,6 +1139,7 @@ mod tests {
         let done_data = serde_json::to_string(&DonePayload {
             response: "final".to_string(),
             message_id: "turn:t1:assistant:1".to_string(),
+            finish_reason: None,
         })
         .unwrap();
         hub.publish("test-run", "done", done_data).await;
@@ -1183,6 +1193,7 @@ mod tests {
                 assistant_message_id: "turn:turn-tool:assistant:2".to_string(),
                 text: "done".to_string(),
                 terminal: true,
+                finish_reason: None,
             },
         )
         .await;
@@ -1234,6 +1245,7 @@ mod tests {
                 assistant_message_id: "turn:turn-child:assistant:1".to_string(),
                 text: "continued".to_string(),
                 terminal: true,
+                finish_reason: None,
             },
         )
         .await;

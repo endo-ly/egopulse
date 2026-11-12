@@ -27,6 +27,8 @@ pub(crate) fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result
         seq: row.get(8).ok(),
         turn_id: row.get(9).ok(),
         parent_message_id: row.get(10).ok(),
+        // Queries that do not project the column simply read NULL.
+        finish_reason: row.get(11).ok().flatten(),
     })
 }
 
@@ -216,7 +218,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1 AND seq IS NOT NULL AND seq < ?2
              ORDER BY seq DESC
@@ -300,7 +303,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1 AND seq IS NOT NULL
              ORDER BY seq ASC",
@@ -308,6 +312,25 @@ impl Database {
         stmt.query_map(params![chat_id], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Loads one message's content and model finish reason by id.
+    ///
+    /// Replay paths rebuild the final delivery from the persisted row, so a
+    /// truncated answer is reported as truncated on re-acceptance too.
+    pub(crate) fn get_message_delivery(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, StorageError> {
+        let conn = self.get_conn()?;
+        let delivery = conn
+            .query_row(
+                "SELECT content, finish_reason FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(delivery)
     }
 
     /// Loads the `content` column of a single message by its id.
@@ -369,7 +392,7 @@ impl Database {
                 )));
             }
             tx.commit()?;
-            return Ok(StageToolFollowupOutcome::Accepted(message));
+            return Ok(StageToolFollowupOutcome::Accepted(Box::new(message)));
         }
 
         let existing_turn_hash: Option<String> = tx
@@ -446,6 +469,7 @@ impl Database {
             seq: None,
             turn_id: Some(turn_id),
             parent_message_id: None,
+            finish_reason: None,
         };
         tx.execute(
             "INSERT INTO messages
@@ -466,7 +490,7 @@ impl Database {
             ],
         )?;
         tx.commit()?;
-        Ok(StageToolFollowupOutcome::Accepted(message))
+        Ok(StageToolFollowupOutcome::Accepted(Box::new(message)))
     }
 
     /// Lists staged user messages owned by one Turn in acceptance order.
@@ -754,8 +778,9 @@ pub(super) fn commit_message_locked(
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO messages
              (id, chat_id, sender_id, content, sender_kind, timestamp,
-              message_kind, recipient_agent_id, seq, turn_id, parent_message_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+              finish_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             &message.id,
             message.chat_id,
@@ -768,6 +793,7 @@ pub(super) fn commit_message_locked(
             seq,
             message.turn_id.as_deref(),
             message.parent_message_id.as_deref(),
+            message.finish_reason.as_deref(),
         ],
     )?;
 
@@ -1239,6 +1265,7 @@ impl Database {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         self.store_channel_log_message(&message).map(|_| ())
     }
@@ -1264,6 +1291,37 @@ mod tests {
                 rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
             )
             .expect("store message");
+    }
+
+    #[test]
+    fn finish_reason_round_trips_through_the_messages_table() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let mut message =
+            StoredMessage::assistant(100, "lyre".to_string(), "partial answer".to_string());
+        message.id = "truncated-1".to_string();
+        message.finish_reason = Some("max_output_tokens".to_string());
+
+        // Act
+        db.store_message_only(&message).expect("store message");
+        let loaded = db.get_all_messages(100).expect("history");
+        let delivery = db
+            .get_message_delivery("truncated-1")
+            .expect("delivery")
+            .expect("row");
+
+        // Assert
+        assert_eq!(
+            loaded[0].finish_reason.as_deref(),
+            Some("max_output_tokens")
+        );
+        assert_eq!(
+            delivery,
+            (
+                "partial answer".to_string(),
+                Some("max_output_tokens".to_string())
+            )
+        );
     }
 
     #[test]
@@ -1600,6 +1658,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
 
         db.store_message_with_session(&message, r#"[{"role":"user","content":"hello"}]"#, None)
@@ -1618,6 +1677,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             r#"[{"role":"user","content":"hello again"}]"#,
             None,

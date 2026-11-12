@@ -166,6 +166,8 @@ pub(crate) enum TurnEvent {
     AssistantDiscarded,
     FinalResponse {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<crate::llm::TruncationReason>,
     },
     Error {
         message: String,

@@ -228,6 +228,7 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 | seq | INTEGER | nullable | chat 内の単調増加 sequence。因果順序の根拠。未割当は NULL |
 | turn_id | TEXT | nullable | 所属 Turn（`turn_runs`）。legacy 行は NULL |
 | parent_message_id | TEXT | nullable | Tool Result 等が参照する親 message |
+| finish_reason | TEXT | nullable | モデルが出力上限で停止した理由（`max_output_tokens`）。正常完了・対象外の行は NULL |
 
 **制約**:
 - `(chat_id, seq)` の部分 UNIQUE インデックス（`WHERE seq IS NOT NULL`）
@@ -282,6 +283,7 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 - `last_usage` は `after_message_index` / `input_tokens` / `output_tokens` / `request_overhead_tokens` / `model_key` / `request_shape_hash` を持つ。`request_overhead_tokens` は計測したリクエストのうち会話メッセージ以外（system prompt・tool 定義・checkpoint・request-only メッセージ）の推定値
 - 自動 compaction の checkpoint は model 送信前に `chats.revision` の CAS で保存する。`/compact` も同じ経路を使う
 - 旧形式（`Message` 配列）は schema v23 / secret v9 のマイグレーションでエンベロープへ包まれる
+- `messages.finish_reason` は schema v24 / secret v10 で追加。打ち切り状態は Session snapshot だけでなく履歴行にも保存され、`GET /api/history` と SSE / WebSocket の最終応答が同じ値を返す
 
 ---
 

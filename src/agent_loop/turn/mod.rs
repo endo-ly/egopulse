@@ -373,11 +373,13 @@ impl TurnExecutor<'_> {
                     turn_id,
                     assistant_message_id,
                     text,
+                    finish_reason,
                 } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
                         assistant_message_id,
                         text: text.clone(),
+                        finish_reason,
                         terminal: false,
                     });
                     return Ok(text);
@@ -392,6 +394,7 @@ impl TurnExecutor<'_> {
                         assistant_message_id: assistant_message_id
                             .unwrap_or_else(|| notice_message_id(&turn_id)),
                         text: text.clone(),
+                        finish_reason: None,
                         terminal: false,
                     });
                     return Ok(text);
@@ -409,6 +412,7 @@ impl TurnExecutor<'_> {
                         assistant_message_id: assistant_message_id
                             .unwrap_or_else(|| notice_message_id(&turn_id)),
                         text: text.clone(),
+                        finish_reason: None,
                         terminal: false,
                     });
                     return Ok(text);

@@ -1189,6 +1189,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = seed_message.clone();
@@ -1223,6 +1224,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         call_blocking(Arc::clone(&state.db), {
             let message = concurrent_message.clone();
@@ -1256,6 +1258,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             Message::text("user", "next"),
             context_of(vec![Message::text("user", "hello")]),
@@ -1319,6 +1322,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             messages[0].clone(),
             context_of(messages),
@@ -1543,6 +1547,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         let mut latest_messages = seed_messages.clone();
         latest_messages.push(Message::text("assistant", "concurrent"));
@@ -1579,6 +1584,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             Message::text("user", "next"),
             context_of(stale_messages),
@@ -1865,6 +1871,7 @@ mod tests {
                     seq: None,
                     turn_id: None,
                     parent_message_id: None,
+                    finish_reason: None,
                 })
             }
         })
@@ -1885,6 +1892,7 @@ mod tests {
                     seq: None,
                     turn_id: None,
                     parent_message_id: None,
+                    finish_reason: None,
                 })
             }
         })
@@ -1945,6 +1953,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             Message::text("user", "test"),
             context_of((*messages).clone()),

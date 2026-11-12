@@ -2,12 +2,18 @@
 
 use crate::runtime::local_api::protocol::{TranscriptEntry, TurnEvent};
 
+/// Shown under a model answer that stopped at its output limit.
+pub(crate) const TRUNCATED_RESPONSE_NOTICE: &str =
+    "Response stopped at the output limit; it may be incomplete.";
+
 /// A committed conversation block that can be sent to terminal scrollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Block {
     User(String),
     Assistant(String),
     Tool(ToolBlock),
+    /// A non-error status line, such as a truncated answer's notice.
+    Notice(String),
     Error(String),
 }
 
@@ -166,12 +172,18 @@ impl Transcript {
                     active.buffer.clear();
                 }
             }
-            TurnEvent::FinalResponse { text } => {
+            TurnEvent::FinalResponse {
+                text,
+                finish_reason,
+            } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
                     self.commit(Block::Tool(card));
                 }
                 self.commit(Block::Assistant(text));
+                if finish_reason.is_some() {
+                    self.commit(Block::Notice(TRUNCATED_RESPONSE_NOTICE.to_string()));
+                }
             }
             TurnEvent::Error { message } => {
                 let active = self.active.take().unwrap_or_default();
@@ -273,6 +285,10 @@ fn summarize_json(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::runtime::local_api::protocol::TurnEvent;
+
+    /// Shown under a model answer that stopped at its output limit.
+    pub(crate) const TRUNCATED_RESPONSE_NOTICE: &str =
+        "Response stopped at the output limit; it may be incomplete.";
     use serde_json::json;
 
     #[test]
@@ -395,6 +411,7 @@ mod tests {
 
         // Act
         transcript.apply_turn_event(TurnEvent::FinalResponse {
+            finish_reason: None,
             text: "**final**".to_string(),
         });
 
@@ -405,6 +422,28 @@ mod tests {
         assert_eq!(
             pending.last(),
             Some(&Block::Assistant("**final**".to_string()))
+        );
+    }
+
+    #[test]
+    fn truncated_final_response_commits_a_notice_after_the_answer() {
+        // Arrange
+        let mut transcript = Transcript::new();
+        transcript.begin_turn("hello");
+
+        // Act
+        transcript.apply_turn_event(TurnEvent::FinalResponse {
+            text: "partial".to_string(),
+            finish_reason: Some(crate::llm::TruncationReason::MaxOutputTokens),
+        });
+
+        // Assert
+        let pending = transcript.drain_pending();
+        assert_eq!(
+            pending.last().map(
+                |block| matches!(block, Block::Notice(text) if text == TRUNCATED_RESPONSE_NOTICE)
+            ),
+            Some(true)
         );
     }
 
@@ -440,6 +479,7 @@ mod tests {
             text: "after".to_string(),
         });
         transcript.apply_turn_event(TurnEvent::FinalResponse {
+            finish_reason: None,
             text: "after".to_string(),
         });
 
@@ -487,6 +527,7 @@ mod tests {
             text: "done".to_string(),
         });
         transcript.apply_turn_event(TurnEvent::FinalResponse {
+            finish_reason: None,
             text: "done".to_string(),
         });
 

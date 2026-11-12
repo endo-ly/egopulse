@@ -70,6 +70,8 @@ pub(crate) enum AgentEvent {
         turn_id: String,
         assistant_message_id: String,
         text: String,
+        /// Why the model stopped early, when this is a truncated answer.
+        finish_reason: Option<crate::llm::TruncationReason>,
         terminal: bool,
     },
     /// Error occurred. `terminal` is false when the shared interaction still

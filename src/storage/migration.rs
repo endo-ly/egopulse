@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 23;
+pub(super) const SCHEMA_VERSION: i64 = 24;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1204,6 +1204,18 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 23;
     }
 
+    if version < 24 {
+        let tx = conn.unchecked_transaction()?;
+        // Why the model stopped, when it stopped at a limit. NULL for every
+        // message that ended on its own and for rows written before this
+        // column existed; the transcript and the Web history expose it so a
+        // truncated answer is not indistinguishable from a complete one.
+        add_column_if_missing(&tx, "messages", "finish_reason", "TEXT")?;
+        set_schema_version_in_tx(&tx, 24, "record the model finish reason on messages")?;
+        tx.commit()?;
+        version = 24;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -1259,7 +1271,7 @@ fn migrate_session_snapshots_to_envelope(
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 9;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 10;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1612,6 +1624,19 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         )?;
         tx.commit()?;
         version = 9;
+    }
+
+    if version < 10 {
+        let tx = conn.unchecked_transaction()?;
+        // Mirrored from the primary DB so history stays scope agnostic.
+        add_column_if_missing(&tx, "messages", "finish_reason", "TEXT")?;
+        set_schema_version_in_tx(
+            &tx,
+            10,
+            "record the model finish reason on messages (secret db)",
+        )?;
+        tx.commit()?;
+        version = 10;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
@@ -2841,7 +2866,7 @@ mod tests {
             .is_err()
         );
 
-        assert_eq!(schema_version_of(&db), 23);
+        assert_eq!(schema_version_of(&db), super::SCHEMA_VERSION);
     }
 
     #[test]
@@ -2875,7 +2900,7 @@ mod tests {
             })
             .expect("count snapshots");
         assert_eq!(snapshot_count, 2);
-        assert_eq!(schema_version_of(&db), 23);
+        assert_eq!(schema_version_of(&db), super::SCHEMA_VERSION);
     }
 
     // --- v9: memory_snapshots constraints -------------------------------------
@@ -3148,7 +3173,7 @@ mod tests {
             )
             .expect("legacy snapshot");
         assert_eq!(legacy_after, legacy_again);
-        assert_eq!(schema_version_of(&db), 23);
+        assert_eq!(schema_version_of(&db), super::SCHEMA_VERSION);
     }
 
     #[test]
