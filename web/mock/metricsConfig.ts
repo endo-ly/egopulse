@@ -312,6 +312,7 @@ const config = {
     compaction_enabled: true,
     compaction_reserve_tokens: 16384,
     compaction_keep_recent_tokens: 20000,
+    compaction_model_overrides: [{ model: "openrouter/large-model", reserve_tokens: 400000, keep_recent_tokens: null }],
     default_context_window_tokens: 128000,
     log_level: "info",
     state_root: "/home/user/.egopulse",

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -190,6 +190,16 @@ struct SerializableCompaction {
     enabled: bool,
     reserve_tokens: usize,
     keep_recent_tokens: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    model_overrides: BTreeMap<String, SerializableCompactionModelOverride>,
+}
+
+#[derive(Serialize)]
+struct SerializableCompactionModelOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reserve_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_recent_tokens: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -490,6 +500,20 @@ impl From<&Config> for SerializableConfig {
                 enabled: config.compaction.enabled,
                 reserve_tokens: config.compaction.reserve_tokens,
                 keep_recent_tokens: config.compaction.keep_recent_tokens,
+                model_overrides: config
+                    .compaction
+                    .model_overrides
+                    .iter()
+                    .map(|(key, settings)| {
+                        (
+                            key.clone(),
+                            SerializableCompactionModelOverride {
+                                reserve_tokens: settings.reserve_tokens,
+                                keep_recent_tokens: settings.keep_recent_tokens,
+                            },
+                        )
+                    })
+                    .collect(),
             },
             max_history_messages: config.max_history_messages,
             default_context_window_tokens: config.default_context_window_tokens,

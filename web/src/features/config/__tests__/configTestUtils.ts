@@ -25,6 +25,7 @@ export function runtimeConfig(): RuntimeConfig {
       compaction_enabled: true,
       compaction_reserve_tokens: 16384,
       compaction_keep_recent_tokens: 20000,
+      compaction_model_overrides: [],
       default_context_window_tokens: 131072,
       log_level: "info",
       state_root: "/home/user/.egopulse",

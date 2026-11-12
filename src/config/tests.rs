@@ -2285,19 +2285,107 @@ channels:
 
 #[test]
 #[serial]
+fn accepts_zero_and_oversized_compaction_token_settings() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let yaml = r#"default_provider: openai
+compaction:
+  reserve_tokens: 0
+  keep_recent_tokens: 0
+  model_overrides:
+    "openai/gpt-4o-mini":
+      reserve_tokens: 131072
+      keep_recent_tokens: 0
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, yaml);
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+
+    // Assert: zero is a valid non-negative value, and a reserve larger than the
+    // context window is a runtime concern rather than a configuration error.
+    assert_eq!(config.compaction.reserve_tokens, 0);
+    assert_eq!(config.compaction.keep_recent_tokens, 0);
+    let settings = config.compaction.for_model("openai", "gpt-4o-mini");
+    assert_eq!(settings.reserve_tokens, 131_072);
+    assert_eq!(settings.keep_recent_tokens, 0);
+}
+
+#[test]
+#[serial]
+fn resolves_compaction_token_settings_per_model() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let yaml = r#"default_provider: openai
+compaction:
+  enabled: false
+  reserve_tokens: 4096
+  keep_recent_tokens: 12000
+  model_overrides:
+    "openai/gpt-4o-mini":
+      reserve_tokens: 1000
+    "router/vendor/model":
+      keep_recent_tokens: 500
+providers:
+  openai:
+    label: OpenAI
+    base_url: https://api.openai.com/v1
+    api_key: sk-test
+    default_model: gpt-4o-mini
+channels:
+  web:
+    enabled: true
+    auth_token: web-secret"#;
+    let file_path = write_config(&temp_dir, yaml);
+
+    // Act
+    let config = Config::load(Some(&file_path)).expect("load config");
+    let overridden = config.compaction.for_model("openai", "gpt-4o-mini");
+    let nested = config.compaction.for_model("router", "vendor/model");
+    let untouched = config.compaction.for_model("openai", "other");
+
+    // Assert: each field resolves independently, keys are exact, and
+    // `enabled` stays global.
+    assert_eq!(overridden.reserve_tokens, 1_000);
+    assert_eq!(overridden.keep_recent_tokens, 12_000);
+    assert_eq!(nested.reserve_tokens, 4_096);
+    assert_eq!(nested.keep_recent_tokens, 500);
+    assert_eq!(untouched.reserve_tokens, 4_096);
+    assert_eq!(untouched.keep_recent_tokens, 12_000);
+    assert!(!config.compaction.enabled);
+}
+
+#[test]
+#[serial]
 fn rejects_invalid_compaction_settings() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
 
     let cases = [
-        ("compaction:\n  reserve_tokens: 0", "zero reserve_tokens"),
         (
-            "compaction:\n  keep_recent_tokens: 0",
-            "zero keep_recent_tokens",
+            "compaction:\n  reserve_tokens: -1",
+            "negative reserve_tokens",
         ),
         (
-            "compaction:\n  reserve_tokens: 131072",
-            "reserve_tokens not below the default context window",
+            "compaction:\n  keep_recent_tokens: -1",
+            "negative keep_recent_tokens",
+        ),
+        (
+            "compaction:\n  model_overrides:\n    \"openai/gpt-4o-mini\":\n      reserve_tokens: -1",
+            "negative model override",
+        ),
+        (
+            "compaction:\n  model_overrides:\n    \"openai/gpt-4o-mini\":\n      unknown_field: 1",
+            "unknown model override field",
         ),
         (
             "compaction:\n  unknown_field: 1",
@@ -2782,7 +2870,7 @@ fn persist_round_trips_a_disabled_compaction() {
         ),
     );
 
-    let config = Config {
+    let mut config = Config {
         default_provider: super::ProviderId::new("openai"),
         default_model: None,
         providers,
@@ -2792,6 +2880,7 @@ fn persist_round_trips_a_disabled_compaction() {
             enabled: false,
             reserve_tokens: 4096,
             keep_recent_tokens: 12_000,
+            model_overrides: HashMap::new(),
         },
         max_history_messages: 50,
         default_context_window_tokens: 131_072,
@@ -2811,16 +2900,28 @@ fn persist_round_trips_a_disabled_compaction() {
         web_fetch: super::web_fetch::WebFetchConfig::default(),
         webhooks: super::WebhooksConfig::default(),
     };
+    config.compaction.model_overrides.insert(
+        "openai/gpt-4o-mini".to_string(),
+        super::CompactionModelOverride {
+            reserve_tokens: Some(1_000),
+            keep_recent_tokens: None,
+        },
+    );
 
     save_config_with_secrets(&config, &path).expect("save config");
 
     // Act
     let reloaded = Config::load(Some(&path)).expect("reload config");
 
-    // Assert: a non-default `enabled: false` must survive the round trip.
+    // Assert: a non-default `enabled: false` and the per-model overrides must
+    // survive the round trip.
     assert!(!reloaded.compaction.enabled);
     assert_eq!(reloaded.compaction.reserve_tokens, 4096);
     assert_eq!(reloaded.compaction.keep_recent_tokens, 12_000);
+    assert_eq!(
+        reloaded.compaction.model_overrides,
+        config.compaction.model_overrides
+    );
 }
 
 // --- Step 2: Sleep Batch Scheduler Config tests ---

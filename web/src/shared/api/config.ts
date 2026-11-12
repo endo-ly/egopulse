@@ -12,6 +12,13 @@ export interface SecretStatus {
 
 export type LlmSource = "profile" | "agent" | "global_default" | "provider_default";
 
+/** Compaction token settings for a single model. */
+export interface CompactionModelOverride {
+  model: string;
+  reserve_tokens: number | null;
+  keep_recent_tokens: number | null;
+}
+
 export interface GeneralConfig {
   default_agent: string;
   default_provider: string;
@@ -21,6 +28,8 @@ export interface GeneralConfig {
   compaction_enabled: boolean;
   compaction_reserve_tokens: number;
   compaction_keep_recent_tokens: number;
+  /** Token settings that apply to one `provider/model` instead of the global ones. */
+  compaction_model_overrides: CompactionModelOverride[];
   default_context_window_tokens: number;
   log_level: string;
   state_root: string;

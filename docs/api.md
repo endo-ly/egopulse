@@ -186,7 +186,7 @@ GET /api/config/yaml
 
 | API | 本文のフィールド |
 |-----|------|
-| `PATCH /api/config/general` | `default_agent`, `default_provider`, `default_model`, `timezone`, `max_history_messages`, `compaction_enabled`, `compaction_reserve_tokens`, `compaction_keep_recent_tokens`, `default_context_window_tokens` |
+| `PATCH /api/config/general` | `default_agent`, `default_provider`, `default_model`, `timezone`, `max_history_messages`, `compaction_enabled`, `compaction_reserve_tokens`, `compaction_keep_recent_tokens`, `compaction_model_overrides`, `default_context_window_tokens` |
 | `PATCH /api/config/agents/{agent_id}` | `label`, `provider`, `model`, `reasoning_effort`, `discord_bot`, `telegram_bot` |
 | `PATCH /api/config/providers/{provider_id}` | `label`, `base_url`, `default_model`, `models`（モデル ID の配列。既存モデルのメタデータは維持）, `api_key`（`{"action": "replace", "value": "..."}` または `{"action": "remove"}`） |
 | `PATCH /api/config/sleep` | `enabled`, `schedule`, `agents`（`null` は全 agent）, `provider`, `model`, `reasoning_effort`, `retry_max_attempts`（初回を含む最大試行回数、1 以上）, `retry_interval_minutes` |

@@ -68,6 +68,9 @@ compaction:
   enabled: true
   reserve_tokens: 16384
   keep_recent_tokens: 20000
+  model_overrides:
+    "openrouter/large-context-model":
+      reserve_tokens: 400000
 
 # ========================================
 # エージェント定義（§3.11）
@@ -259,8 +262,9 @@ web_fetch:
 | `max_history_messages` | `usize` | 任意 | `50` | セッション復元時のフォールバックメッセージ取得数 |
 | `default_context_window_tokens` | `usize` | 任意 | `131072` | context window のトークン数フォールバック値。model 固有の設定がない場合に使用。安全上限 `1,000,000` |
 | `compaction.enabled` | `bool` | 任意 | `true` | 自動 compaction の有効化。`false` でも `/compact` と context overflow 復旧は動作する |
-| `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。`1` 以上かつ、使用する context window より小さいこと |
-| `compaction.keep_recent_tokens` | `usize` | 任意 | `20000` | 原文のまま保持する直近履歴の下限 token 数。`1` 以上 |
+| `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。0 以上の整数。context window 以上でも設定エラーにせず、実行時に使用可能量 0 として扱う |
+| `compaction.keep_recent_tokens` | `usize` | 任意 | `20000` | 原文のまま保持する直近履歴の下限 token 数。0 以上の整数 |
+| `compaction.model_overrides` | `map` | 任意 | `{}` | `provider/model` の完全一致をキーに、`reserve_tokens` / `keep_recent_tokens` を個別に上書きする。各フィールドは上書き値 → 全体値 → 既定値の順で解決し、`enabled` は上書きしない |
 
 ### 3.2 プロバイダー定義（`providers.<id>`）
 

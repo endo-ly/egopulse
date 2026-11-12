@@ -609,9 +609,52 @@ pub(crate) struct WebhooksConfig {
 /// retained history covers at least `keep_recent_tokens`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompactionConfig {
+    /// Whether automatic compaction runs. Manual and overflow compaction do
+    /// not depend on it.
     pub(crate) enabled: bool,
+    /// Context window headroom that must stay unused by the conversation.
+    pub(crate) reserve_tokens: usize,
+    /// Recent history kept verbatim after compaction.
+    pub(crate) keep_recent_tokens: usize,
+    /// Per-model token settings, keyed by exact `provider/model`.
+    pub(crate) model_overrides: HashMap<String, CompactionModelOverride>,
+}
+
+/// Token settings one model may override.
+///
+/// Each field is resolved independently: the model override wins, then the
+/// top-level value. `enabled` is deliberately not part of this type because it
+/// controls the runtime, not one model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CompactionModelOverride {
+    pub(crate) reserve_tokens: Option<usize>,
+    pub(crate) keep_recent_tokens: Option<usize>,
+}
+
+/// Token settings resolved for the model that is about to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CompactionTokenSettings {
     pub(crate) reserve_tokens: usize,
     pub(crate) keep_recent_tokens: usize,
+}
+
+impl CompactionConfig {
+    /// Resolves the token settings that apply to one model.
+    ///
+    /// The key is the exact `provider/model` string, so a model identifier
+    /// that contains `/` is not split further.
+    pub(crate) fn for_model(&self, provider: &str, model: &str) -> CompactionTokenSettings {
+        let key = format!("{provider}/{model}");
+        let override_settings = self.model_overrides.get(&key);
+        CompactionTokenSettings {
+            reserve_tokens: override_settings
+                .and_then(|settings| settings.reserve_tokens)
+                .unwrap_or(self.reserve_tokens),
+            keep_recent_tokens: override_settings
+                .and_then(|settings| settings.keep_recent_tokens)
+                .unwrap_or(self.keep_recent_tokens),
+        }
+    }
 }
 
 impl Default for CompactionConfig {
@@ -620,6 +663,7 @@ impl Default for CompactionConfig {
             enabled: true,
             reserve_tokens: 16_384,
             keep_recent_tokens: 20_000,
+            model_overrides: HashMap::new(),
         }
     }
 }

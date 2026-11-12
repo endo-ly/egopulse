@@ -6,6 +6,7 @@
 //! which validates, persists, and enforces `expected_fingerprint`.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use axum::Json;
@@ -113,6 +114,18 @@ fn general_payload(config: &Config) -> Value {
         "compaction_enabled": config.compaction.enabled,
         "compaction_reserve_tokens": config.compaction.reserve_tokens,
         "compaction_keep_recent_tokens": config.compaction.keep_recent_tokens,
+        "compaction_model_overrides": config
+            .compaction
+            .model_overrides
+            .iter()
+            .map(|(key, override_settings)| {
+                json!({
+                    "model": key,
+                    "reserve_tokens": override_settings.reserve_tokens,
+                    "keep_recent_tokens": override_settings.keep_recent_tokens,
+                })
+            })
+            .collect::<Vec<_>>(),
         "default_context_window_tokens": config.default_context_window_tokens,
         "log_level": config.log_level,
         "state_root": config.state_root,
@@ -605,7 +618,14 @@ pub(super) struct GeneralPatch {
     compaction_enabled: Option<bool>,
     compaction_reserve_tokens: Option<usize>,
     compaction_keep_recent_tokens: Option<usize>,
+    compaction_model_overrides: Option<HashMap<String, CompactionModelOverridePatch>>,
     default_context_window_tokens: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct CompactionModelOverridePatch {
+    reserve_tokens: Option<usize>,
+    keep_recent_tokens: Option<usize>,
 }
 
 /// Updates global defaults and conversation tuning.
@@ -641,6 +661,20 @@ pub(super) async fn api_patch_general(
         }
         if let Some(v) = patch.compaction_keep_recent_tokens {
             config.compaction.keep_recent_tokens = v;
+        }
+        if let Some(v) = patch.compaction_model_overrides {
+            config.compaction.model_overrides = v
+                .into_iter()
+                .map(|(key, override_settings)| {
+                    (
+                        key,
+                        crate::config::CompactionModelOverride {
+                            reserve_tokens: override_settings.reserve_tokens,
+                            keep_recent_tokens: override_settings.keep_recent_tokens,
+                        },
+                    )
+                })
+                .collect();
         }
         if let Some(v) = patch.default_context_window_tokens {
             config.default_context_window_tokens = v;

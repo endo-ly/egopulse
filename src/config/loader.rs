@@ -211,6 +211,14 @@ struct FileCompactionConfig {
     enabled: Option<bool>,
     reserve_tokens: Option<usize>,
     keep_recent_tokens: Option<usize>,
+    model_overrides: Option<HashMap<String, FileCompactionModelOverride>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileCompactionModelOverride {
+    reserve_tokens: Option<usize>,
+    keep_recent_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1160,20 +1168,28 @@ fn normalize_compaction(file: Option<FileCompactionConfig>) -> CompactionConfig 
         keep_recent_tokens: file
             .keep_recent_tokens
             .unwrap_or(defaults.keep_recent_tokens),
+        model_overrides: file
+            .model_overrides
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, settings)| {
+                (
+                    key,
+                    crate::config::CompactionModelOverride {
+                        reserve_tokens: settings.reserve_tokens,
+                        keep_recent_tokens: settings.keep_recent_tokens,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
 fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
-    if config.compaction.reserve_tokens == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compaction.reserve_tokens must be at least 1".to_string(),
-        ));
-    }
-    if config.compaction.keep_recent_tokens == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compaction.keep_recent_tokens must be at least 1".to_string(),
-        ));
-    }
+    // `reserve_tokens` and `keep_recent_tokens` accept any non-negative value,
+    // including zero. A reserve larger than the context window is not a
+    // configuration error either: compaction then simply keeps history at or
+    // above the headroom it was given.
     if config.max_history_messages == 0 {
         return Err(ConfigError::InvalidCompactionConfig(
             "max_history_messages must be at least 1".to_string(),
@@ -1190,25 +1206,12 @@ fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
             "default_context_window_tokens must not exceed {MAX_DEFAULT_CONTEXT_WINDOW_TOKENS}"
         )));
     }
-    if config.default_context_window_tokens <= config.compaction.reserve_tokens {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "default_context_window_tokens must exceed compaction.reserve_tokens".to_string(),
-        ));
-    }
     for (provider_id, provider) in &config.providers {
         for (model_name, model_config) in &provider.models {
-            if let Some(tokens) = model_config.context_window_tokens {
-                if tokens == 0 {
-                    return Err(ConfigError::InvalidCompactionConfig(format!(
-                        "context_window_tokens for {provider_id}/{model_name} must be at least 1"
-                    )));
-                }
-                if tokens <= config.compaction.reserve_tokens {
-                    return Err(ConfigError::InvalidCompactionConfig(format!(
-                        "context_window_tokens for {provider_id}/{model_name} must exceed compaction.reserve_tokens ({})",
-                        config.compaction.reserve_tokens
-                    )));
-                }
+            if model_config.context_window_tokens == Some(0) {
+                return Err(ConfigError::InvalidCompactionConfig(format!(
+                    "context_window_tokens for {provider_id}/{model_name} must be at least 1"
+                )));
             }
         }
     }

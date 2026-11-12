@@ -4,6 +4,7 @@ import type {
   AgentConfigEntry,
   BotEntry,
   ChatChannelEntry,
+  CompactionModelOverride,
   LlmSource,
   McpDefinitions,
   ProviderConfigEntry,
@@ -100,8 +101,30 @@ function GeneralView({ config }: { config: RuntimeConfig }) {
           isDefault={g.compaction_keep_recent_tokens === d.compaction_keep_recent_tokens}
         />
       </Rows>
+      {g.compaction_model_overrides.length > 0 && (
+        <>
+          <h4 className="config-subhead">Compaction overrides</h4>
+          <Rows>
+            {g.compaction_model_overrides.map((entry) => (
+              <Row
+                key={entry.model}
+                label={entry.model}
+                value={compactionOverrideValue(entry)}
+              />
+            ))}
+          </Rows>
+        </>
+      )}
     </>
   );
+}
+
+function compactionOverrideValue(entry: CompactionModelOverride): string {
+  const parts = [
+    entry.reserve_tokens === null ? null : `reserve ${formatCount(entry.reserve_tokens)}`,
+    entry.keep_recent_tokens === null ? null : `keep ${formatCount(entry.keep_recent_tokens)}`,
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? `${parts.join(" · ")} tokens` : "Inherits the global values";
 }
 
 // ---------------------------------------------------------------------------
