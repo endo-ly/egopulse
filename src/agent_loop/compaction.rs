@@ -4,11 +4,12 @@
 //! request fits the provider's context window. The algorithm follows the
 //! reference implementation:
 //!
-//! 1. Estimate the context tokens of the request about to be sent, using the
-//!    last measured provider usage plus a calibrated estimate of the messages
-//!    appended after it. The part of the request that is not conversation
-//!    messages is measured again, so it never goes stale.
+//! 1. Estimate the context tokens of the request about to be sent. The last
+//!    measured provider usage is the base; only the difference in the request
+//!    overhead and the messages appended after the measurement are estimated.
+//!    An unchanged request therefore projects to exactly the measured value.
 //! 2. Trigger when the estimate exceeds `context_window - reserve_tokens`.
+//!    The token settings are resolved for the model that is about to run.
 //! 3. Cut the history backwards from the newest message until at least
 //!    `keep_recent_tokens` are retained. The cut never lands on a tool result.
 //! 4. Summarize the compacted range, updating the previous checkpoint when one
@@ -32,18 +33,18 @@ use crate::agent_loop::session_snapshot::{
     CompactionCheckpoint, ContextUsageAnchor, SessionContext, checkpoint_message,
 };
 use crate::conversation::SurfaceContext;
-use crate::error::{ConfigError, EgoPulseError, LlmError};
+use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
 use crate::llm::{RetryPolicy, complete_response};
 use crate::tools::sanitize_output_string;
 
-/// Conservative chars-to-tokens ratio.
+/// Chars-to-tokens ratio of the reference estimator.
 ///
-/// English text tokenizes to roughly one token per four characters; CJK text
-/// tokenizes close to one token per character. Dividing by three over-estimates
-/// English and starts the runtime calibration from the safe side.
-const CHARS_PER_TOKEN_ESTIMATE: usize = 3;
+/// The reference implementation divides the character length of the text by
+/// four and rounds up. CJK text is deliberately not weighted differently: the
+/// provider usage calibration corrects the estimate for the model in use.
+const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 /// Character budget used for one image content part when estimating tokens.
 const ESTIMATED_IMAGE_CHARS: usize = 4_800;
@@ -336,27 +337,43 @@ pub(crate) fn request_shape_hash(
     format!("{:016x}", std::hash::Hasher::finish(&hasher))
 }
 
+/// Number of characters a text contributes to the token estimate.
+///
+/// The reference implementation measures JavaScript string length, which counts
+/// UTF-16 code units. Counting Rust `char`s instead would undercount astral
+/// characters such as emoji by one unit each.
+fn text_chars(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+fn chars_to_tokens(chars: usize) -> usize {
+    chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+}
+
 /// Estimates the tokens of one message from its serialized size.
+///
+/// Role names are not part of the estimate: they are fixed per message and the
+/// reference implementation only measures content. Reasoning is counted here
+/// and excluded only when the conversation is serialized for a summary.
 pub(crate) fn estimate_message_tokens(message: &Message) -> usize {
-    let mut chars = message.role.len();
-    chars += content_chars(&message.content);
+    let mut chars = content_chars(&message.content);
     if let Some(reasoning) = &message.reasoning_content {
-        chars += reasoning.chars().count();
+        chars += text_chars(reasoning);
     }
     for tool_call in &message.tool_calls {
-        chars += tool_call.name.chars().count();
-        chars += tool_call.arguments.to_string().chars().count();
+        chars += text_chars(&tool_call.name);
+        chars += text_chars(&tool_call.arguments.to_string());
     }
-    chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE).max(1)
+    chars_to_tokens(chars)
 }
 
 fn content_chars(content: &MessageContent) -> usize {
     match content {
-        MessageContent::Text(text) => text.chars().count(),
+        MessageContent::Text(text) => text_chars(text),
         MessageContent::Parts(parts) => parts
             .iter()
             .map(|part| match part {
-                MessageContentPart::InputText { text } => text.chars().count(),
+                MessageContentPart::InputText { text } => text_chars(text),
                 MessageContentPart::InputImage { .. } => ESTIMATED_IMAGE_CHARS,
             })
             .sum(),
@@ -367,21 +384,32 @@ fn estimate_messages_tokens(messages: &[Message]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+/// Estimates the tokens of one fixed request part such as a system prompt.
+fn estimate_text_tokens(text: &str) -> usize {
+    chars_to_tokens(text_chars(text))
+}
+
 /// Estimates the raw prompt size of a request without a checkpoint.
 pub(crate) fn estimate_prompt_tokens(
     system_prompt: &str,
     tools_json: Option<&str>,
     messages: &[Message],
 ) -> usize {
-    let mut tokens = system_prompt.chars().count() / CHARS_PER_TOKEN_ESTIMATE;
+    let mut tokens = estimate_text_tokens(system_prompt);
     if let Some(tools) = tools_json {
-        tokens += tools.chars().count() / CHARS_PER_TOKEN_ESTIMATE;
+        tokens += estimate_text_tokens(tools);
     }
     tokens + estimate_messages_tokens(messages)
 }
 
-fn calibrated_estimate(tokens: usize, factor: f64) -> usize {
-    ((tokens as f64) * factor).ceil() as usize
+/// Applies the usage calibration factor to a token delta.
+///
+/// The delta may be negative: the request overhead of the current request can
+/// be smaller than the one that was measured. Converting it to an unsigned type
+/// before scaling would wrap, so the sign is kept until the caller clamps the
+/// final projection.
+fn calibrated_estimate(tokens: i64, factor: f64) -> i64 {
+    ((tokens as f64) * factor).ceil() as i64
 }
 
 /// Estimates the tokens of a request that are not conversation messages.
@@ -393,9 +421,9 @@ pub(crate) fn estimate_request_overhead(
     session: &SessionContext,
     request_only_messages: &[&Message],
 ) -> usize {
-    let mut tokens = prompt.system_prompt.chars().count() / CHARS_PER_TOKEN_ESTIMATE;
+    let mut tokens = estimate_text_tokens(prompt.system_prompt);
     if let Some(tools) = prompt.tools_json {
-        tokens += tools.chars().count() / CHARS_PER_TOKEN_ESTIMATE;
+        tokens += estimate_text_tokens(tools);
     }
     if let Some(checkpoint) = &session.checkpoint {
         tokens += estimate_message_tokens(&checkpoint_message(checkpoint));
@@ -440,19 +468,24 @@ pub(crate) fn project_context_tokens(
     });
 
     let Some(anchor) = anchor_matches else {
-        return calibrated_estimate(
-            estimate_request_tokens(prompt, session, request_only_messages),
+        return clamp_tokens(calibrated_estimate(
+            estimate_request_tokens(prompt, session, request_only_messages) as i64,
             factor,
-        );
+        ));
     };
 
+    // The provider measured the whole request. Remove the overhead it was
+    // measured with and add the current one again, so the conversation part
+    // stays measured and only the difference is estimated.
     let trailing = &session.messages[anchor.after_message_index + 1..];
-    let measured_conversation = anchor
-        .measured_context_tokens()
-        .saturating_sub(anchor.request_overhead_tokens);
-    let overhead = estimate_request_overhead(prompt, session, request_only_messages);
-    measured_conversation
-        + calibrated_estimate(estimate_messages_tokens(trailing) + overhead, factor)
+    let delta = estimate_messages_tokens(trailing) as i64
+        + estimate_request_overhead(prompt, session, request_only_messages) as i64
+        - anchor.request_overhead_tokens as i64;
+    clamp_tokens(anchor.measured_context_tokens() as i64 + calibrated_estimate(delta, factor))
+}
+
+fn clamp_tokens(tokens: i64) -> usize {
+    usize::try_from(tokens.max(0)).unwrap_or(usize::MAX)
 }
 
 /// Returns `true` when the projected context no longer fits the usable window.
@@ -898,10 +931,8 @@ async fn generate_turn_prefix_summary(
 ///
 /// # Errors
 ///
-/// Returns [`EgoPulseError::Config`] when the resolved context window cannot
-/// hold the configured reserve, and the summarization error when the summary
-/// could not be produced. Callers decide whether to keep the original context
-/// or surface the failure.
+/// Returns the summarization error when the summary could not be produced.
+/// Callers decide whether to keep the original context or surface the failure.
 pub(crate) async fn compact_if_needed(
     request: &CompactionRequest<'_>,
     session: &SessionContext,
@@ -918,33 +949,28 @@ pub(crate) async fn compact_if_needed(
 /// Manual and overflow compaction still run when `compaction.enabled` is
 /// false: the setting controls automatic compaction only.
 ///
+/// The token settings are resolved for the model of this request exactly once,
+/// so the trigger decision and the retained boundary cannot disagree when a
+/// model override applies.
+///
 /// # Errors
 ///
-/// Returns [`EgoPulseError::Config`] when the resolved context window cannot
-/// hold the configured reserve, and the summarization error when the summary
-/// could not be produced or was unusable. The context is left untouched in
-/// both cases.
+/// Returns the summarization error when the summary could not be produced or
+/// was unusable. The context is left untouched in that case.
 pub(crate) async fn compact(
     request: &CompactionRequest<'_>,
     session: &SessionContext,
     reason: CompactionReason,
     instructions: Option<&str>,
 ) -> Result<CompactionOutcome, EgoPulseError> {
-    let settings = &request.config.compaction;
+    let settings = request
+        .config
+        .compaction
+        .for_model(request.llm.provider_name(), request.llm.model_name());
     let context_window = request.config.resolve_context_window_tokens(
         &crate::config::ProviderId::new(request.llm.provider_name()),
         request.llm.model_name(),
     );
-    if context_window <= settings.reserve_tokens {
-        return Err(EgoPulseError::Config(ConfigError::InvalidCompactionConfig(
-            format!(
-                "context_window_tokens ({context_window}) for {}/{} must exceed compaction.reserve_tokens ({})",
-                request.llm.provider_name(),
-                request.llm.model_name(),
-                settings.reserve_tokens
-            ),
-        )));
-    }
 
     let model_key = model_key(request.llm.as_ref());
     let shape_hash = request_shape_hash(
@@ -1009,10 +1035,10 @@ pub(crate) async fn compact(
         last_usage: None,
     };
 
-    let tokens_after = calibrated_estimate(
-        estimate_request_tokens(&request.prompt, &context, &request.request_only_messages),
+    let tokens_after = clamp_tokens(calibrated_estimate(
+        estimate_request_tokens(&request.prompt, &context, &request.request_only_messages) as i64,
         factor,
-    );
+    ));
     info!(
         channel = %request.context.channel,
         chat_id = request.chat_id,
@@ -1297,6 +1323,33 @@ mod tests {
     }
 
     #[test]
+    fn zero_and_oversized_reserves_do_not_break_the_trigger() {
+        // A zero reserve only leaves the context window itself.
+        assert!(!should_compact(1_000, 1_000, 0));
+        assert!(should_compact(1_001, 1_000, 0));
+
+        // A reserve at or above the window leaves no headroom instead of
+        // becoming a configuration error: any context triggers compaction.
+        assert!(should_compact(1, 1_000, 1_000));
+        assert!(should_compact(1, 1_000, 2_000));
+        assert!(!should_compact(0, 1_000, 2_000));
+    }
+
+    #[test]
+    fn zero_keep_recent_keeps_only_the_last_turn_boundary() {
+        let messages = vec![
+            text("user", "first question"),
+            text("assistant", "first answer"),
+            text("user", "second question"),
+        ];
+
+        let cut = find_cut_point(&messages, 0);
+
+        assert_eq!(cut.first_kept_index, 2);
+        assert!(prepare_compaction(&session(messages), 0).is_some());
+    }
+
+    #[test]
     fn keeps_the_whole_history_when_it_fits_the_budget() {
         let messages = vec![
             text("user", "hello"),
@@ -1317,11 +1370,11 @@ mod tests {
         for index in 0..10 {
             messages.push(text(
                 "user",
-                &format!("question {index} {}", "x".repeat(3_000)),
+                &format!("question {index} {}", "x".repeat(5_000)),
             ));
             messages.push(text(
                 "assistant",
-                &format!("answer {index} {}", "y".repeat(3_000)),
+                &format!("answer {index} {}", "y".repeat(5_000)),
             ));
         }
 
@@ -1977,6 +2030,82 @@ mod tests {
         };
         assert!(compacted.checkpoint.is_some());
         assert_eq!(provider.seen_systems().len(), 1);
+    }
+
+    #[test]
+    fn token_estimation_matches_the_reference_heuristic() {
+        // Arrange: the reference implementation divides JavaScript string
+        // length (UTF-16 code units) by four and rounds up.
+        let mut assistant = Message::text("assistant", "abcdefgh".to_string());
+        assistant.reasoning_content = Some("ijkl".to_string());
+        assistant.tool_calls = vec![ToolCall {
+            id: "1".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({ "path": "/tmp/a" }),
+            invalid_arguments: None,
+        }];
+
+        // Act & Assert
+        assert_eq!(estimate_message_tokens(&text("user", "hello world")), 3);
+        assert_eq!(estimate_message_tokens(&text("user", "こんにちは世界")), 2);
+        assert_eq!(estimate_message_tokens(&text("user", "😀😀")), 1);
+        // 8 text + 4 reasoning + 4 name + 17 JSON argument characters.
+        assert_eq!(estimate_message_tokens(&assistant), 9);
+    }
+
+    #[test]
+    fn a_measured_context_is_not_rescaled_when_the_request_is_unchanged() {
+        // Arrange: the anchor describes exactly the current request overhead.
+        let mut context = session(vec![text("user", "hello"), text("assistant", "hi")]);
+        let prompt = PromptContext {
+            system_prompt: "system prompt",
+            tools_json: Some("[{\"name\":\"read\"}]"),
+            has_tools: true,
+        };
+        context.last_usage = Some(crate::agent_loop::session_snapshot::ContextUsageAnchor {
+            after_message_index: 1,
+            input_tokens: 1_000,
+            output_tokens: 100,
+            request_overhead_tokens: estimate_request_overhead(&prompt, &context, &[]),
+            model_key: "p/m".to_string(),
+            request_shape_hash: "shape".to_string(),
+        });
+
+        // Act & Assert: the calibration factor only scales the delta.
+        assert_eq!(
+            project_context_tokens(&prompt, &context, &[], "p/m", "shape", 0.75),
+            1_100
+        );
+        assert_eq!(
+            project_context_tokens(&prompt, &context, &[], "p/m", "shape", 2.0),
+            1_100
+        );
+    }
+
+    #[test]
+    fn a_smaller_request_overhead_reduces_the_projection() {
+        // Arrange: the measured request carried a much larger channel context.
+        let mut context = session(vec![text("user", "hello"), text("assistant", "hi")]);
+        let prompt = PromptContext {
+            system_prompt: "",
+            tools_json: None,
+            has_tools: false,
+        };
+        let larger_overhead = estimate_request_overhead(&prompt, &context, &[]) + 500;
+        context.last_usage = Some(crate::agent_loop::session_snapshot::ContextUsageAnchor {
+            after_message_index: 1,
+            input_tokens: 1_000,
+            output_tokens: 100,
+            request_overhead_tokens: larger_overhead,
+            model_key: "p/m".to_string(),
+            request_shape_hash: "shape".to_string(),
+        });
+
+        // Act
+        let projected = project_context_tokens(&prompt, &context, &[], "p/m", "shape", 1.0);
+
+        // Assert
+        assert_eq!(projected, 1_100 - 500);
     }
 
     #[test]
