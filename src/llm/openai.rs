@@ -20,6 +20,9 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Smallest output limit accepted by the Responses API.
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: usize = 16;
 
+/// Smallest output limit accepted by Chat Completions.
+const OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS: usize = 1;
+
 /// Inactivity deadline between reads of one request.
 ///
 /// A provider that accepts the connection but never produces a byte (a
@@ -192,10 +195,12 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|tools| !tools.is_empty())
             .and_then(|tools| serde_json::to_string(tools).ok());
-        body["max_output_tokens"] = serde_json::Value::from(
-            self.request_max_output_tokens(system, tools_json.as_deref(), &messages)
-                .max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS),
-        );
+        body["max_output_tokens"] = serde_json::Value::from(self.request_max_output_tokens(
+            system,
+            tools_json.as_deref(),
+            &messages,
+            OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
+        )?);
         body["stream"] = serde_json::Value::Bool(true);
 
         let response = self
@@ -236,10 +241,12 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|tools| !tools.is_empty())
             .and_then(|tools| serde_json::to_string(tools).ok());
-        body["max_output_tokens"] = serde_json::Value::from(
-            self.request_max_output_tokens(system, tools_json.as_deref(), &messages)
-                .max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS),
-        );
+        body["max_output_tokens"] = serde_json::Value::from(self.request_max_output_tokens(
+            system,
+            tools_json.as_deref(),
+            &messages,
+            OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
+        )?);
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
 
@@ -285,8 +292,12 @@ impl OpenAiProvider {
             .as_deref()
             .filter(|tools| !tools.is_empty())
             .and_then(|tools| serde_json::to_string(tools).ok());
-        let max_output_tokens =
-            self.request_max_output_tokens(system, tools_json.as_deref(), &messages);
+        let max_output_tokens = self.request_max_output_tokens(
+            system,
+            tools_json.as_deref(),
+            &messages,
+            OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS,
+        )?;
         let mut body = build_streaming_request_body(
             &self.model,
             system,
@@ -295,8 +306,7 @@ impl OpenAiProvider {
             self.reasoning_effort.as_deref(),
             should_preserve_reasoning_content(&self.provider, &self.base_url, &self.model),
         );
-        body[max_output_tokens_field(&self.provider, &self.base_url)] =
-            serde_json::Value::from(max_output_tokens);
+        body[max_output_tokens_field(&self.base_url)] = serde_json::Value::from(max_output_tokens);
         request_stream_usage(&mut body, &self.base_url);
 
         let response = self
@@ -325,14 +335,21 @@ impl OpenAiProvider {
         system: &str,
         tools_json: Option<&str>,
         messages: &[Message],
-    ) -> usize {
+        minimum_output_tokens: usize,
+    ) -> Result<usize, LlmError> {
         let prompt_tokens =
             crate::llm::tokens::estimate_prompt_tokens(system, tools_json, messages);
-        crate::llm::tokens::clamp_max_output_tokens_to_context(
+        crate::llm::tokens::max_output_tokens_for_request(
             self.model_metadata.context_window,
             prompt_tokens,
             self.model_metadata.max_output_tokens,
+            minimum_output_tokens,
         )
+        .map_err(|error| LlmError::OutputCapacityExceeded {
+            context_window: error.context_window,
+            prompt_tokens: error.prompt_tokens,
+            minimum_output_tokens: error.minimum_output_tokens,
+        })
     }
 }
 
@@ -340,10 +357,11 @@ impl OpenAiProvider {
 ///
 /// The official OpenAI and Azure endpoints reject the legacy `max_tokens` for
 /// models that require `max_completion_tokens`. Compatible gateways generally
-/// accept `max_tokens`, and some reject the newer field, so the choice is made
-/// per endpoint instead of sending both.
-fn max_output_tokens_field(provider: &str, base_url: &str) -> &'static str {
-    let provider = provider.to_ascii_lowercase();
+/// accept `max_tokens`, and some reject the newer field, so the choice follows
+/// the connection endpoint instead of the configured provider id. A custom
+/// gateway keeps the legacy field; its operator can front the official API with
+/// an endpoint that is recognized here if needed.
+fn max_output_tokens_field(base_url: &str) -> &'static str {
     let official_openai = reqwest::Url::parse(base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
@@ -352,7 +370,7 @@ fn max_output_tokens_field(provider: &str, base_url: &str) -> &'static str {
                 || host == "openai.azure.com"
                 || host.ends_with(".openai.azure.com")
         });
-    if official_openai || provider == "openai" || provider == "azure" {
+    if official_openai {
         "max_completion_tokens"
     } else {
         "max_tokens"
@@ -716,7 +734,7 @@ mod tests {
 
     use super::{
         OpenAiProvider, consume_chat_completion_stream, consume_responses_stream,
-        parse_chat_completion_usage, request_stream_usage,
+        max_output_tokens_field, parse_chat_completion_usage, request_stream_usage,
     };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -1182,6 +1200,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            finish_reason: None,
         }])
     }
 
@@ -1338,7 +1357,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .and(body_partial_json(serde_json::json!({ "max_tokens": 1 })))
+            .and(body_partial_json(serde_json::json!({ "max_tokens": 2_498 })))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
                 "text/event-stream",
@@ -1351,7 +1370,7 @@ mod tests {
             Some("sk-test"),
         );
         llm_config.model_metadata = crate::config::ModelMetadata {
-            context_window: 500,
+            context_window: 5_000,
             max_output_tokens: 16_384,
             context_window_source: crate::config::ModelValueSource::Configured,
             max_output_tokens_source: crate::config::ModelValueSource::Configured,
@@ -1369,38 +1388,60 @@ mod tests {
         assert_eq!(response.content, "ok");
     }
 
+    #[test]
+    fn official_openai_endpoints_use_max_completion_tokens() {
+        // The field follows the connection endpoint, not the configured
+        // provider id; a gateway keeps the legacy field.
+        assert_eq!(
+            max_output_tokens_field("https://api.openai.com/v1"),
+            "max_completion_tokens"
+        );
+        assert_eq!(
+            max_output_tokens_field("https://resource.openai.azure.com/openai/deployments/chat"),
+            "max_completion_tokens"
+        );
+        assert_eq!(
+            max_output_tokens_field("https://gateway.example.com/v1"),
+            "max_tokens"
+        );
+    }
+
     #[tokio::test]
-    async fn official_openai_requests_use_max_completion_tokens() {
-        // Arrange: the official provider requires the newer field name even
-        // when the base URL is a test server.
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .and(body_partial_json(serde_json::json!({
-                "max_completion_tokens": 16_384,
-            })))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(
-                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-                "text/event-stream",
-            ))
-            .mount(&server)
-            .await;
-        let provider = OpenAiProvider::new(&crate::test_util::llm_config(
-            "openai",
+    async fn a_full_window_is_rejected_before_sending_the_request() {
+        // Arrange: the context window is smaller than the prompt, so no
+        // output minimum can be met. The unreachable URL proves that the
+        // request is not sent.
+        let mut llm_config = config(
             "gpt-4o-mini",
-            format!("{}/v1", server.uri()),
+            "http://127.0.0.1:1/v1".to_string(),
             Some("sk-test"),
-        ))
-        .expect("provider");
+        );
+        llm_config.model_metadata = crate::config::ModelMetadata {
+            context_window: 1,
+            max_output_tokens: 16_384,
+            context_window_source: crate::config::ModelValueSource::Configured,
+            max_output_tokens_source: crate::config::ModelValueSource::Configured,
+        };
+        let provider = OpenAiProvider::new(&llm_config).expect("provider");
 
         // Act
-        let response = provider
-            .send_message_streaming("", message("hello"), None, &|_| {})
+        let error = provider
+            .send_message_streaming("system", message("hello"), None, &|_| {})
             .await
-            .expect("response");
+            .expect_err("no output room");
 
         // Assert
-        assert_eq!(response.content, "ok");
+        match error {
+            crate::error::LlmError::OutputCapacityExceeded {
+                context_window,
+                minimum_output_tokens,
+                ..
+            } => {
+                assert_eq!(context_window, 1);
+                assert_eq!(minimum_output_tokens, 1);
+            }
+            other => panic!("expected OutputCapacityExceeded, got {other:?}"),
+        }
     }
 
     #[tokio::test]

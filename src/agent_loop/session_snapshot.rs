@@ -123,6 +123,9 @@ pub(crate) struct SnapshotMessage {
     /// Tool call ID this message responds to when the role is `tool`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tool_call_id: Option<String>,
+    /// Why an assistant message ended before the model chose to stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) finish_reason: Option<crate::llm::TruncationReason>,
 }
 
 /// The persisted snapshot envelope.
@@ -270,6 +273,7 @@ fn message_to_snapshot(
         reasoning_content: message.reasoning_content.clone(),
         tool_calls: message.tool_calls.clone(),
         tool_call_id: message.tool_call_id.clone(),
+        finish_reason: message.finish_reason,
     })
 }
 
@@ -314,6 +318,7 @@ fn message_from_snapshot(assets: &AssetStore, message: SnapshotMessage) -> Messa
         reasoning_content: message.reasoning_content,
         tool_calls: message.tool_calls,
         tool_call_id: message.tool_call_id,
+        finish_reason: message.finish_reason,
     }
 }
 
@@ -385,6 +390,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                finish_reason: None,
             },
             SnapshotMessage {
                 role: "assistant".to_string(),
@@ -392,6 +398,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                finish_reason: None,
             },
         ];
 
@@ -426,6 +433,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call_1".to_string()),
+            finish_reason: None,
         }];
 
         let messages = messages_from_snapshot(&assets, snapshot);
@@ -457,6 +465,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                finish_reason: None,
             },
             SnapshotMessage {
                 role: "tool".to_string(),
@@ -473,6 +482,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_img".to_string()),
+                finish_reason: None,
             },
             SnapshotMessage {
                 role: "assistant".to_string(),
@@ -480,6 +490,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                finish_reason: None,
             },
         ];
 
@@ -518,6 +529,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call_bad_ref".to_string()),
+            finish_reason: None,
         }];
 
         let restored = messages_from_snapshot(&assets, snapshot);
@@ -547,6 +559,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
+                finish_reason: None,
             })
             .collect();
 

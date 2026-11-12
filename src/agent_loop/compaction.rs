@@ -1228,6 +1228,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         }
     }
 
@@ -1238,6 +1239,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(id.to_string()),
+            finish_reason: None,
         }
     }
 
@@ -2037,6 +2039,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            finish_reason: None,
         };
 
         assert!(estimate_message_tokens(&call) >= 2);

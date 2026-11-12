@@ -88,23 +88,57 @@ pub(crate) fn estimate_prompt_tokens(
     tokens + estimate_messages_tokens(messages)
 }
 
-/// Caps the requested output limit so the prompt and the answer fit together.
+/// Why a request cannot be sized within the model's context window.
+///
+/// The provider boundary turns this into a request error instead of sending a
+/// generation limit that the API would reject or that guarantees an empty
+/// answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputCapacityError {
+    /// Context window of the model, in tokens.
+    pub(crate) context_window: usize,
+    /// Estimated prompt size of the request, in tokens.
+    pub(crate) prompt_tokens: usize,
+    /// Minimum output limit required by the API surface.
+    pub(crate) minimum_output_tokens: usize,
+}
+
+/// Fits the requested output limit into the room left by the prompt.
 ///
 /// `intended` is the model's output limit before this clamp; callers must keep
 /// using it when deciding whether a truncated generation was cut short, because
-/// the provider only knows the clamped value.
-pub(crate) fn clamp_max_output_tokens_to_context(
+/// the provider only knows the clamped value. `minimum_output_tokens` is the
+/// smallest limit the API surface accepts (Responses requires more than one
+/// token, Chat Completions accepts one).
+///
+/// Returns an error when the prompt leaves less than the API minimum. Sending a
+/// request in that state cannot produce a valid answer, and the caller is
+/// expected to compact the context before retrying.
+///
+/// # Errors
+///
+/// Returns [`OutputCapacityError`] when the remaining room is below
+/// `minimum_output_tokens`.
+pub(crate) fn max_output_tokens_for_request(
     context_window: usize,
-    context_tokens: usize,
+    prompt_tokens: usize,
     intended: usize,
-) -> usize {
-    if context_window == 0 {
-        return intended.max(1);
+    minimum_output_tokens: usize,
+) -> Result<usize, OutputCapacityError> {
+    let minimum = minimum_output_tokens.max(1);
+    let remaining = context_window.saturating_sub(prompt_tokens);
+    // Reserve room for estimation error, but never more than half of what is
+    // left: a small window must still be able to answer.
+    let safety = CONTEXT_SAFETY_TOKENS.min(remaining / 2);
+    let available = remaining.saturating_sub(safety);
+    if available < minimum {
+        return Err(OutputCapacityError {
+            context_window,
+            prompt_tokens,
+            minimum_output_tokens: minimum,
+        });
     }
-    let available = context_window
-        .saturating_sub(context_tokens)
-        .saturating_sub(CONTEXT_SAFETY_TOKENS);
-    intended.min(available.max(1))
+    Ok(intended.max(minimum).min(available))
 }
 
 #[cfg(test)]
@@ -131,6 +165,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
 
         // Act & Assert
@@ -152,6 +187,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            finish_reason: None,
         };
 
         // Act
@@ -166,32 +202,53 @@ mod tests {
 
     #[test]
     fn output_limit_is_clamped_to_the_remaining_context() {
-        // Arrange
-        let window = 32_768;
-        let prompt = 20_000;
+        // Arrange: 32,768 - 20,000 leaves 12,768; the 4,096 safety reserve
+        // leaves 8,672 for the answer.
 
         // Act
-        let clamped = clamp_max_output_tokens_to_context(window, prompt, 16_384);
+        let limit = max_output_tokens_for_request(32_768, 20_000, 16_384, 1)
+            .expect("there is room for the answer");
 
-        // Assert: window - prompt - safety leaves 8,768 tokens for the answer.
-        assert_eq!(clamped, 8_672);
+        // Assert
+        assert_eq!(limit, 8_672);
     }
 
     #[test]
-    fn a_full_context_leaves_one_output_token() {
+    fn an_exhausted_context_is_rejected_instead_of_requesting_one_token() {
+        // Arrange: the prompt already fills the window.
+
         // Act
-        let clamped = clamp_max_output_tokens_to_context(32_768, 40_000, 16_384);
+        let error =
+            max_output_tokens_for_request(32_768, 40_000, 16_384, 1).expect_err("no output room");
 
         // Assert
-        assert_eq!(clamped, 1);
+        assert_eq!(error.context_window, 32_768);
+        assert_eq!(error.prompt_tokens, 40_000);
+        assert_eq!(error.minimum_output_tokens, 1);
     }
 
     #[test]
-    fn an_unknown_window_keeps_the_intended_limit() {
+    fn the_api_minimum_is_honored_and_never_exceeded() {
+        // Arrange: the Responses API requires at least 16 tokens, and the
+        // caller's intended limit is smaller than that.
+
         // Act
-        let clamped = clamp_max_output_tokens_to_context(0, 10_000, 16_384);
+        let limit = max_output_tokens_for_request(32_768, 20_000, 8, 16)
+            .expect("there is room for the minimum");
 
         // Assert
-        assert_eq!(clamped, 16_384);
+        assert_eq!(limit, 16);
+    }
+
+    #[test]
+    fn a_small_window_keeps_half_of_its_remaining_room() {
+        // Arrange: the fixed safety reserve would consume this window.
+
+        // Act
+        let limit = max_output_tokens_for_request(1_000, 800, 500, 1)
+            .expect("half of the remaining room is usable");
+
+        // Assert
+        assert_eq!(limit, 100);
     }
 }

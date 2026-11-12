@@ -839,6 +839,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
         let tool_message = Message {
             role: "tool".to_string(),
@@ -846,6 +847,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call-read".to_string()),
+            finish_reason: None,
         };
         let activation = ActivationResult {
             output_text: notification_text.to_string(),

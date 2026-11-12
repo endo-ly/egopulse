@@ -267,6 +267,7 @@ impl<'a> ToolExecutor<'a> {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call.id.clone()),
+            finish_reason: None,
         };
         let outcome = ExecutedToolCall {
             tool_call,
@@ -593,6 +594,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-1".to_string()),
+                finish_reason: None,
             },
             duration_ms: 1,
         };
@@ -608,6 +610,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-2".to_string()),
+                finish_reason: None,
             },
             duration_ms: 2,
         };

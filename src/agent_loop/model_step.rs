@@ -625,7 +625,7 @@ fn model_request_hash(
     format!("{:x}", hasher.finalize())
 }
 
-fn build_assistant_tool_phase(
+pub(crate) fn build_assistant_tool_phase(
     content: String,
     reasoning_content: Option<String>,
     tool_calls: Vec<ToolCall>,
@@ -639,6 +639,7 @@ fn build_assistant_tool_phase(
         reasoning_content,
         tool_calls: tool_calls.clone(),
         tool_call_id: None,
+        finish_reason: None,
     };
 
     AssistantToolPhase {

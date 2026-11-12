@@ -95,6 +95,12 @@ pub(crate) struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Why an assistant message ended before the model chose to stop.
+    ///
+    /// The field is persisted with the session message and never sent to the
+    /// provider: request translation reads the content and tool calls only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<TruncationReason>,
 }
 
 /// Message content: either plain text or multimodal parts.
@@ -172,6 +178,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            finish_reason: None,
         }
     }
 }
@@ -195,7 +202,8 @@ pub(crate) struct MessagesResponse {
 }
 
 /// Why a provider stopped a generation before the model chose to stop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TruncationReason {
     /// The generation reached the requested (or context-clamped) output limit.
     MaxOutputTokens,
@@ -699,6 +707,7 @@ mod tests {
                             invalid_arguments: None,
                         }],
                         tool_call_id: None,
+                        finish_reason: None,
                     },
                     Message {
                         role: "tool".to_string(),
@@ -714,6 +723,7 @@ mod tests {
                         reasoning_content: None,
                         tool_calls: Vec::new(),
                         tool_call_id: Some("call_1".to_string()),
+                        finish_reason: None,
                     },
                 ]),
                 Some(Arc::new(vec![ToolDefinition {

@@ -271,6 +271,7 @@ fn tool_result_message(call_id: &str, output: &str) -> Message {
         reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(call_id.to_string()),
+        finish_reason: None,
     }
 }
 
@@ -541,6 +542,7 @@ fn orphan_tool_output_message(tool_call_id: String) -> Message {
         reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call_id),
+        finish_reason: None,
     }
 }
 
@@ -1299,6 +1301,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call_1".to_string()),
+            finish_reason: None,
         }];
 
         persist_phase(
@@ -1425,6 +1428,7 @@ mod tests {
                     invalid_arguments: None,
                 }],
                 tool_call_id: None,
+                finish_reason: None,
             },
             Message::text("user", "what happened?"),
         ];

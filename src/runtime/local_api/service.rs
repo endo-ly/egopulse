@@ -1238,6 +1238,7 @@ mod tests {
                     invalid_arguments: None,
                 }],
                 tool_call_id: None,
+                finish_reason: None,
             },
             Message {
                 role: "tool".to_string(),
@@ -1247,6 +1248,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-1".to_string()),
+                finish_reason: None,
             },
         ];
 

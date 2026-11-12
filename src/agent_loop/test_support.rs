@@ -271,6 +271,7 @@ pub(crate) fn tool_result_message(status: &str, result: &str) -> Message {
         reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some("call-1".to_string()),
+        finish_reason: None,
     }
 }
 

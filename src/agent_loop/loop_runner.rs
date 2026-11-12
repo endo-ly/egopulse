@@ -13,7 +13,9 @@ use crate::agent_loop::compaction::{
 };
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::strip_thinking;
-use crate::agent_loop::model_step::{ModelRunner, ModelStep, ModelStepRequest};
+use crate::agent_loop::model_step::{
+    ModelRunner, ModelStep, ModelStepRequest, build_assistant_tool_phase,
+};
 use crate::agent_loop::response_guard::{is_declarative_only_reply, runtime_guard_suffix};
 use crate::agent_loop::session_snapshot::{SessionContext, checkpoint_message};
 use crate::agent_loop::tool_execution::{
@@ -30,6 +32,10 @@ use crate::llm::{Message, ToolCall, ToolDefinition, TruncationReason};
 
 /// Maximum number of model/tool iterations allowed for one activation.
 pub(crate) const MAX_TOOL_ITERATIONS: usize = 50;
+
+/// Reason recorded on a Tool Call that the output limit cut before completion.
+const TRUNCATED_TOOL_CALL_REASON: &str =
+    "the output limit truncated the tool arguments before they were complete";
 
 /// The iteration at which the model is warned that the hard loop limit is near.
 pub(crate) const FINAL_RESPONSE_WARNING_ITERATION: usize = MAX_TOOL_ITERATIONS - 2;
@@ -88,6 +94,8 @@ pub(crate) struct AgentLoopResult {
     pub(crate) final_message_id: String,
     pub(crate) context: SessionContext,
     pub(crate) session_revision: Option<i64>,
+    /// Why the response ended before the model chose to stop.
+    pub(crate) finish_reason: Option<TruncationReason>,
     /// Usage of the request that produced the final response.
     pub(crate) usage: Option<MeasuredUsage>,
 }
@@ -97,8 +105,6 @@ struct TruncationRecovery<'a> {
     usage: Option<&'a crate::llm::LlmUsage>,
     context_window: usize,
     recovery_attempted: bool,
-    output_published: bool,
-    message_id: &'a str,
 }
 
 /// Executes the LLM/tool loop for one durable Turn.
@@ -154,8 +160,12 @@ impl<'a> AgentLoop<'a> {
             )
             .context_window;
         let mut iteration = start_iteration;
+        // A truncated tool phase is converted into failure results once; a
+        // second one ends the turn instead of feeding another unusable call
+        // back to the model.
+        let mut truncated_tool_phase_continued = false;
 
-        while iteration <= MAX_TOOL_ITERATIONS {
+        'turns: while iteration <= MAX_TOOL_ITERATIONS {
             self.on_event.emit(AgentEvent::Iteration { iteration });
             // The assistant message id is fixed before the model call, so
             // the streamed deltas, a tool preview, and the final row all
@@ -237,9 +247,14 @@ impl<'a> AgentLoop<'a> {
                         request_only.extend(outcome.recovery_suffix.iter());
                         let request_overhead_tokens =
                             estimate_request_overhead(&prompt, &loop_state.context, &request_only);
-                        if let ModelStep::Truncated { response, reason } = &outcome.step
-                            && matches!(reason, TruncationReason::MaxOutputTokens)
-                        {
+                        if let ModelStep::Truncated { response, reason } = &outcome.step {
+                            let published = output_published.load(Ordering::SeqCst);
+                            if published {
+                                // The partial output cannot be withdrawn from a
+                                // crash-recovery perspective; record that it was
+                                // visible before deciding what to do with it.
+                                self.lifecycle.mark_output_published().await;
+                            }
                             let recovered = self
                                 .recover_truncated_response(
                                     &mut loop_state,
@@ -249,41 +264,137 @@ impl<'a> AgentLoop<'a> {
                                         usage: response.usage.as_ref(),
                                         context_window,
                                         recovery_attempted: overflow_recovery_attempted,
-                                        output_published: output_published.load(Ordering::SeqCst),
-                                        message_id: &message_id,
                                     },
                                 )
                                 .await?;
                             if recovered {
                                 overflow_recovery_attempted = true;
+                                if published {
+                                    // The retry regenerates the answer under
+                                    // the same message id.
+                                    self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
+                                        message_id: message_id.clone(),
+                                    });
+                                }
                                 continue;
                             }
-                            if output_published.load(Ordering::SeqCst) {
-                                self.lifecycle.mark_output_published().await;
-                                self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
-                                    message_id: message_id.clone(),
+
+                            let partial_text =
+                                strip_thinking(response.content.trim()).trim().to_string();
+                            if response.tool_calls.is_empty() {
+                                // Keep the generated text even when recovery is
+                                // impossible, and complete the Turn with the
+                                // truncation recorded on the message.
+                                if partial_text.is_empty() {
+                                    return Err(EgoPulseError::Llm(LlmError::IncompleteResponse(
+                                        "model output was truncated before any text was generated"
+                                            .to_string(),
+                                    )));
+                                }
+                                self.lifecycle.complete_model().await?;
+                                let silent_overflow =
+                                    response.usage.as_ref().is_some_and(|usage| {
+                                        usage.input_tokens > context_window as i64
+                                    });
+                                let compacted = self
+                                    .compact_after_response(
+                                        &mut loop_state,
+                                        &scope,
+                                        &prompt,
+                                        silent_overflow,
+                                    )
+                                    .await;
+                                let usage = response.usage.clone();
+                                return Ok(AgentLoopResult {
+                                    final_content: partial_text,
+                                    reasoning_content: response.reasoning_content.clone(),
+                                    final_message_id: message_id,
+                                    context: loop_state.context,
+                                    session_revision: loop_state.session_revision,
+                                    finish_reason: Some(*reason),
+                                    usage: (!compacted)
+                                        .then(|| {
+                                            usage.map(|usage| MeasuredUsage {
+                                                usage,
+                                                request: RequestMeasurement {
+                                                    model_key: model_key.clone(),
+                                                    request_shape_hash: shape_hash.clone(),
+                                                    request_overhead_tokens,
+                                                },
+                                            })
+                                        })
+                                        .flatten(),
                                 });
                             }
-                            let output_tokens = response
-                                .usage
-                                .as_ref()
-                                .map_or(0, |usage| usage.output_tokens);
-                            let intended_max_output = self
-                                .prepared
-                                .config_snapshot
-                                .config
-                                .resolve_model_metadata(
-                                    &crate::config::ProviderId::new(
-                                        self.prepared.channel_llm.provider_name(),
-                                    ),
-                                    self.prepared.channel_llm.model_name(),
-                                )
-                                .max_output_tokens;
-                            return Err(EgoPulseError::Llm(LlmError::IncompleteResponse(format!(
-                                "model output was truncated at the output limit \
-                                     (output_tokens={output_tokens}, intended_max_output_tokens={intended_max_output}); \
-                                     no automatic recovery applied"
-                            ))));
+
+                            if truncated_tool_phase_continued {
+                                // Do not feed a second unusable call back. Keep
+                                // the text if there is one; otherwise the Turn
+                                // has nothing to persist.
+                                if partial_text.is_empty() {
+                                    return Err(EgoPulseError::Llm(LlmError::IncompleteResponse(
+                                        "model output was truncated inside a tool call".to_string(),
+                                    )));
+                                }
+                                self.lifecycle.complete_model().await?;
+                                let compacted = self
+                                    .compact_after_response(&mut loop_state, &scope, &prompt, false)
+                                    .await;
+                                let usage = response.usage.clone();
+                                return Ok(AgentLoopResult {
+                                    final_content: partial_text,
+                                    reasoning_content: response.reasoning_content.clone(),
+                                    final_message_id: message_id,
+                                    context: loop_state.context,
+                                    session_revision: loop_state.session_revision,
+                                    finish_reason: Some(*reason),
+                                    usage: (!compacted)
+                                        .then(|| {
+                                            usage.map(|usage| MeasuredUsage {
+                                                usage,
+                                                request: RequestMeasurement {
+                                                    model_key: model_key.clone(),
+                                                    request_shape_hash: shape_hash.clone(),
+                                                    request_overhead_tokens,
+                                                },
+                                            })
+                                        })
+                                        .flatten(),
+                                });
+                            }
+
+                            // The call was cut inside its arguments. The normal
+                            // Tool executor reports the invalid arguments as a
+                            // failure without running the Tool, so the model
+                            // receives the call/result pair on the next step.
+                            truncated_tool_phase_continued = true;
+                            let mut tool_calls = response.tool_calls.clone();
+                            for tool_call in &mut tool_calls {
+                                tool_call.invalid_arguments =
+                                    Some(TRUNCATED_TOOL_CALL_REASON.to_string());
+                            }
+                            let mut phase = build_assistant_tool_phase(
+                                response.content.clone(),
+                                response.reasoning_content.clone(),
+                                tool_calls,
+                                response.usage.clone(),
+                            );
+                            phase.assistant_message.finish_reason = Some(*reason);
+                            self.execute_tool_phase(
+                                &mut loop_state,
+                                phase,
+                                &message_id,
+                                &guard_tracker,
+                                &RequestMeasurement {
+                                    model_key: model_key.clone(),
+                                    request_shape_hash: shape_hash.clone(),
+                                    request_overhead_tokens,
+                                },
+                            )
+                            .await?;
+                            loop_state.clear_retry_state();
+                            iteration += 1;
+                            continue 'turns;
                         }
                         break (outcome.step, shape_hash, request_overhead_tokens);
                     }
@@ -298,7 +409,7 @@ impl<'a> AgentLoop<'a> {
                         // after compaction must surface instead of looping.
                         let recovered = if !overflow_recovery_attempted
                             && !output_published
-                            && error.is_context_overflow()
+                            && (error.is_context_overflow() || error.is_output_capacity_exceeded())
                         {
                             match self
                                 .compact_overflow(&mut loop_state, &scope, &prompt)
@@ -309,7 +420,7 @@ impl<'a> AgentLoop<'a> {
                                     warn!(
                                         iteration,
                                         error = %compaction_error,
-                                        "context overflow recovery could not compact the context"
+                                        "context overflow or output capacity recovery could not compact the context"
                                     );
                                     false
                                 }
@@ -321,7 +432,7 @@ impl<'a> AgentLoop<'a> {
                             overflow_recovery_attempted = true;
                             warn!(
                                 iteration,
-                                "context overflow recovery: compacted and retrying the model step once"
+                                "context overflow or output capacity recovery: compacted and retrying the model step once"
                             );
                             continue;
                         }
@@ -374,6 +485,7 @@ impl<'a> AgentLoop<'a> {
                                 final_message_id: message_id,
                                 context: loop_state.context,
                                 session_revision: loop_state.session_revision,
+                                finish_reason: None,
                                 // A compacted context no longer matches the
                                 // measured request, so the anchor is dropped
                                 // and the next projection falls back to an
@@ -429,6 +541,7 @@ impl<'a> AgentLoop<'a> {
                                 final_message_id: message_id,
                                 context: loop_state.context,
                                 session_revision: loop_state.session_revision,
+                                finish_reason: None,
                                 // A compacted context no longer matches the
                                 // measured request, so the anchor is dropped
                                 // and the next projection falls back to an
@@ -695,8 +808,6 @@ impl<'a> AgentLoop<'a> {
             usage,
             context_window,
             recovery_attempted,
-            output_published,
-            message_id,
         } = recovery;
         let Some(usage) = usage else {
             return Ok(false);
@@ -719,12 +830,6 @@ impl<'a> AgentLoop<'a> {
             return Ok(false);
         }
 
-        if output_published {
-            self.lifecycle.mark_output_published().await;
-            self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
-                message_id: message_id.to_string(),
-            });
-        }
         let recovered = self.compact_overflow(loop_state, scope, prompt).await?;
         if recovered {
             warn!(
@@ -1677,7 +1782,7 @@ mod tests {
             content: "partial answer",
             output_tokens: 100,
             tool_calls: Vec::new(),
-            stream_delta: "",
+            stream_delta: "partial ",
         }]);
         let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
             dir.path().to_str().expect("utf8").to_string(),
@@ -1695,19 +1800,105 @@ mod tests {
         let state = build_state(config, Box::new(provider.clone()));
         let context = cli_context("truncation-at-limit");
         seed_short_session(&state, &context).await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
 
         // Act
-        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+        let reply = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "fresh question",
+            move |event| event_log.lock().expect("events").push(event),
+        )
+        .await
+        .expect("the partial answer is kept");
 
-        // Assert
-        assert!(result.is_err());
+        // Assert: no retry, no summary, and the truncation is recorded on the
+        // persisted final message. The published partial text is kept, so it
+        // must not be discarded.
+        assert_eq!(reply, "partial answer");
+        let (deltas, discarded, final_id) = collect_loop_events(&events);
+        assert!(discarded.is_empty(), "kept output must not be discarded");
+        assert_eq!(
+            final_id, deltas[0].0,
+            "the final row adopts the streamed id"
+        );
         assert_eq!(provider.model_requests(), 1);
         assert_eq!(provider.summary_requests(), 0);
+        let chat_id =
+            crate::agent_loop::session::resolve_chat_id(&state.turn_dependencies(), &context)
+                .await
+                .expect("chat id");
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            context.scope,
+            chat_id,
+        )
+        .await
+        .expect("session");
+        assert_eq!(
+            loaded.context.messages.last().and_then(|m| m.finish_reason),
+            Some(TruncationReason::MaxOutputTokens)
+        );
     }
 
     #[tokio::test]
     #[serial]
-    async fn a_second_truncated_generation_after_recovery_surfaces_the_error() {
+    async fn a_truncated_tool_call_is_persisted_as_a_failed_result() {
+        // Arrange: the generation stops inside a tool call. The call must not
+        // run, and its failure must be visible to the next model request.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = format!("tests/{}/truncated-write.txt", uuid::Uuid::new_v4());
+        let provider = TruncatedScriptProvider::new(vec![
+            TruncatedScriptStep::Truncated {
+                content: "Writing the file",
+                output_tokens: 100,
+                tool_calls: vec![ToolCall {
+                    id: "truncated-write".to_string(),
+                    name: "write".to_string(),
+                    arguments: serde_json::json!({"path": target, "content": "hello"}),
+                    invalid_arguments: None,
+                }],
+                stream_delta: "",
+            },
+            TruncatedScriptStep::Complete("I could not write the file"),
+        ]);
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncated-tool-call");
+        seed_short_session(&state, &context).await;
+        let workspace = state.config.workspace_dir().expect("workspace_dir");
+
+        // Act
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("the failure result is fed back to the model");
+
+        // Assert: the model saw the failed call, the Tool did not run, and the
+        // turn ends with the model's next answer.
+        assert_eq!(reply, "I could not write the file");
+        assert_eq!(provider.model_requests(), 2);
+        assert_eq!(provider.summary_requests(), 0);
+        let requests = provider.seen_messages();
+        assert!(
+            requests[1].iter().any(|message| {
+                message.role == "tool"
+                    && message.tool_call_id.as_deref() == Some("truncated-write")
+                    && message.content.as_text_lossy().contains("truncated")
+            }),
+            "the retried request must carry the failed tool result"
+        );
+        assert!(!workspace.join(&target).exists());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_second_truncated_generation_keeps_the_retried_partial_text() {
         // Arrange: the retried generation is truncated again.
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = TruncatedScriptProvider::new(vec![
@@ -1734,10 +1925,12 @@ mod tests {
         seed_short_session(&state, &context).await;
 
         // Act
-        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("the second partial answer is kept");
 
-        // Assert: exactly one recovery attempt.
-        assert!(result.is_err());
+        // Assert: exactly one recovery attempt, then the retried text is final.
+        assert_eq!(reply, "partial again");
         assert_eq!(provider.model_requests(), 2);
         assert_eq!(provider.summary_requests(), 1);
     }
@@ -1805,10 +1998,12 @@ mod tests {
         seed_short_session(&state, &context).await;
 
         // Act
-        let result = process_turn(&state.turn_dependencies(), &context, "fresh question").await;
+        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
+            .await
+            .expect("disabled compaction keeps the partial answer");
 
-        // Assert
-        assert!(result.is_err());
+        // Assert: no summary and no retry, but the generated text survives.
+        assert_eq!(reply, "partial answer");
         assert_eq!(provider.model_requests(), 1);
         assert_eq!(provider.summary_requests(), 0);
     }

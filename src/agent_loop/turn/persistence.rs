@@ -25,6 +25,14 @@ pub(crate) struct TurnPersistence<'a> {
     turn_id: String,
 }
 
+/// The final assistant answer persisted by [`TurnPersistence::persist_final`].
+pub(crate) struct FinalAnswer {
+    pub(crate) content: String,
+    pub(crate) reasoning_content: Option<String>,
+    /// Why the model stopped early, when the answer is a truncated partial one.
+    pub(crate) finish_reason: Option<crate::llm::TruncationReason>,
+}
+
 pub(super) struct UserInput<'a> {
     pub(super) message_id: &'a str,
     pub(super) message: &'a Message,
@@ -133,11 +141,16 @@ impl<'a> TurnPersistence<'a> {
         measured: Option<crate::agent_loop::compaction::MeasuredUsage>,
         session_revision: Option<i64>,
         on_event: &EventEmitter,
-        response: (String, Option<String>),
+        answer: FinalAnswer,
     ) -> Result<String, EgoPulseError> {
-        let (final_content, reasoning_content) = response;
+        let FinalAnswer {
+            content: final_content,
+            reasoning_content,
+            finish_reason,
+        } = answer;
         let mut assistant_message = Message::text("assistant", final_content.clone());
         assistant_message.reasoning_content = reasoning_content;
+        assistant_message.finish_reason = finish_reason;
         let mut updated = (*context.messages).clone();
         updated.push(assistant_message.clone());
         let assistant_index = updated.len() - 1;
@@ -363,6 +376,7 @@ impl<'a> TurnPersistence<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::FinalAnswer;
     use crate::agent_loop::event::{AgentEvent, EventEmitter};
     use crate::agent_loop::process_turn;
     use crate::agent_loop::test_support::{
@@ -566,7 +580,11 @@ mod tests {
                 &EventEmitter::new(move |event| {
                     event_log.lock().expect("events").push(event);
                 }),
-                ("done".to_string(), None),
+                FinalAnswer {
+                    content: "done".to_string(),
+                    reasoning_content: None,
+                    finish_reason: None,
+                },
             )
             .await
             .expect("persist final");

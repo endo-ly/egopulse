@@ -716,7 +716,11 @@ impl TurnExecutor<'_> {
                 result.usage,
                 result.session_revision,
                 &self.on_event,
-                (result.final_content, result.reasoning_content),
+                persistence::FinalAnswer {
+                    content: result.final_content,
+                    reasoning_content: result.reasoning_content,
+                    finish_reason: result.finish_reason,
+                },
             )
             .await?;
         let lifecycle = self.lifecycle(&prepared.turn_id);
@@ -915,6 +919,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
         let tool_result = crate::llm::Message {
             role: "tool".to_string(),
@@ -922,6 +927,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("recovery-tool".to_string()),
+            finish_reason: None,
         };
         let initial_snapshot = crate::agent_loop::session::serialize_snapshot(
             Arc::clone(&state.assets),

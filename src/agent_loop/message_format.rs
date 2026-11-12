@@ -406,6 +406,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            finish_reason: None,
         };
 
         assert_eq!(message_to_text(&message), "hello\n[image]");
@@ -421,6 +422,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call-1".to_string()),
+            finish_reason: None,
         };
 
         assert_eq!(message_to_text(&message), "[tool_result]: prefix  suffix");
@@ -439,6 +441,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
 
         assert_eq!(
@@ -510,6 +513,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
 
         assert_eq!(
@@ -536,6 +540,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call-1".to_string()),
+            finish_reason: None,
         };
 
         assert_eq!(
