@@ -333,6 +333,28 @@ impl Database {
         Ok(delivery)
     }
 
+    /// Loads the finish reason persisted for a Turn's final message.
+    ///
+    /// Channel delivery uses it to mark a truncated answer on transports that
+    /// carry only text.
+    pub(crate) fn get_turn_final_finish_reason(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.get_conn()?;
+        let reason = conn
+            .query_row(
+                "SELECT m.finish_reason
+                 FROM turn_runs t
+                 JOIN messages m ON m.id = t.final_message_id
+                 WHERE t.turn_id = ?1",
+                params![turn_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(reason.flatten())
+    }
+
     /// Loads the `content` column of a single message by its id.
     ///
     /// Used by the durable Turn path to return the saved final response of a
@@ -1321,6 +1343,25 @@ mod tests {
                 "partial answer".to_string(),
                 Some("max_output_tokens".to_string())
             )
+        );
+
+        // The channel delivery path resolves the reason from the Turn row.
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO turn_runs
+                 (turn_id, chat_id, request_key, state, config_revision,
+                  final_message_id, accepted_at, updated_at)
+             VALUES ('turn-1', 100, 'req-1', 'completed', 1, 'truncated-1', 't', 't')",
+            [],
+        )
+        .expect("seed turn");
+        assert_eq!(
+            db.get_turn_final_finish_reason("turn-1").expect("reason"),
+            Some("max_output_tokens".to_string())
+        );
+        assert_eq!(
+            db.get_turn_final_finish_reason("missing").expect("missing"),
+            None
         );
     }
 

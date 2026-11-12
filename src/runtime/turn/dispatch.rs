@@ -856,6 +856,22 @@ async fn begin_scheduled_turn(
     }
 }
 
+/// Why the Turn's final message stopped early, when it did.
+async fn truncated_finish_reason(
+    state: &AppState,
+    turn: &ScheduledTurn,
+) -> Option<crate::llm::TruncationReason> {
+    let turn_id = turn.turn_id.clone();
+    call_blocking(state.db_for(turn.context.scope), move |db| {
+        db.get_turn_final_finish_reason(&turn_id)
+    })
+    .await
+    .ok()
+    .flatten()
+    .as_deref()
+    .and_then(crate::llm::TruncationReason::from_stored)
+}
+
 fn observer_key(turn: &ScheduledTurn) -> Option<&str> {
     matches!(&turn.response_delivery, ResponseDelivery::ClientOwned)
         .then_some(turn.context.request_key.as_str())
@@ -971,7 +987,11 @@ async fn execute_and_publish_scheduled_turn(
                     .turn_observers
                     .finish(observer_key, &turn.turn_id, TurnOutcome::Completed);
             } else if let Some(adapter) = adapter.as_ref() {
-                if let Err(error) = adapter.send_text(&external_chat_id, &response).await {
+                let delivery = match truncated_finish_reason(state, turn).await {
+                    Some(reason) => format!("{response}\n\n{}", reason.notice()),
+                    None => response.clone(),
+                };
+                if let Err(error) = adapter.send_text(&external_chat_id, &delivery).await {
                     tracing::warn!(
                         agent_id = %turn.context.agent_id,
                         error = %error,

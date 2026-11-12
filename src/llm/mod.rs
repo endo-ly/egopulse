@@ -222,6 +222,11 @@ impl TruncationReason {
             _ => None,
         }
     }
+
+    /// Text shown next to a truncated answer on text-only channels.
+    pub(crate) fn notice(self) -> &'static str {
+        "The response stopped at the output limit, so it may be incomplete."
+    }
 }
 
 /// Outcome of one streamed request.

@@ -2,10 +2,6 @@
 
 use crate::runtime::local_api::protocol::{TranscriptEntry, TurnEvent};
 
-/// Shown under a model answer that stopped at its output limit.
-pub(crate) const TRUNCATED_RESPONSE_NOTICE: &str =
-    "Response stopped at the output limit; it may be incomplete.";
-
 /// A committed conversation block that can be sent to terminal scrollback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Block {
@@ -181,8 +177,8 @@ impl Transcript {
                     self.commit(Block::Tool(card));
                 }
                 self.commit(Block::Assistant(text));
-                if finish_reason.is_some() {
-                    self.commit(Block::Notice(TRUNCATED_RESPONSE_NOTICE.to_string()));
+                if let Some(reason) = finish_reason {
+                    self.commit(Block::Notice(reason.notice().to_string()));
                 }
             }
             TurnEvent::Error { message } => {
@@ -286,9 +282,6 @@ mod tests {
     use super::*;
     use crate::runtime::local_api::protocol::TurnEvent;
 
-    /// Shown under a model answer that stopped at its output limit.
-    pub(crate) const TRUNCATED_RESPONSE_NOTICE: &str =
-        "Response stopped at the output limit; it may be incomplete.";
     use serde_json::json;
 
     #[test]
@@ -441,7 +434,7 @@ mod tests {
         let pending = transcript.drain_pending();
         assert_eq!(
             pending.last().map(
-                |block| matches!(block, Block::Notice(text) if text == TRUNCATED_RESPONSE_NOTICE)
+                |block| matches!(block, Block::Notice(text) if text == crate::llm::TruncationReason::MaxOutputTokens.notice())
             ),
             Some(true)
         );
