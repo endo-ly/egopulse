@@ -278,6 +278,8 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 - 楽観排他: `expected_updated_at` と実際の `updated_at` を比較し、競合時は `SessionSnapshotConflict` エラー
 - `messages_json` にはツール呼び出しブロックも含まれるため、セッション再開時に完全なコンテキストを復元可能
 - `checkpoint` は畳んだ履歴の要約、`last_usage` は直近の実測 usage とその適用範囲を持つ。checkpoint はメッセージとして重複保存しない
+- `last_usage` は `after_message_index` / `input_tokens` / `output_tokens` / `request_overhead_tokens` / `model_key` / `request_shape_hash` を持つ。`request_overhead_tokens` は計測したリクエストのうち会話メッセージ以外（system prompt・tool 定義・checkpoint・request-only メッセージ）の推定値
+- 自動 compaction の checkpoint は model 送信前に `chats.revision` の CAS で保存する。`/compact` も同じ経路を使う
 - 旧形式（`Message` 配列）は schema v23 / secret v9 のマイグレーションでエンベロープへ包まれる
 
 ---

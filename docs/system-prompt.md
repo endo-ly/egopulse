@@ -412,6 +412,8 @@ split turn のターン前半要約だけは次の形になる。
 [Additional focus: ...]
 ```
 
+要約リクエストは通常の model 呼び出しと同じ出力上限の扱いを共有する。compaction 専用の固定出力上限や切り詰めは設けず、モデルの出力上限に任せる。`finish_reason=length` などで要約が途中終了した場合は checkpoint として確定しない。
+
 | 用途 | 定数 |
 |---|---|
 | 要約システム | `SUMMARIZATION_SYSTEM_PROMPT` |

@@ -314,16 +314,18 @@ TurnExecutor
   ├─ Turn preparation
   ├─ TurnPersistence::persist_user_input
   ├─ AgentLoop::run
+  │    ├─ compaction decision for the request about to be sent
+  │    ├─ checkpoint persistence (CAS) before the model call
   │    ├─ ModelRunner::run_with_retry
   │    ├─ TurnPersistence::persist_tool_call
   │    ├─ ToolExecutor::execute
   │    ├─ TurnPersistence::persist_tool_results
-  │    └─ compaction and next iteration
+  │    └─ next iteration
   ├─ TurnPersistence::persist_final
   └─ TurnLifecycle::complete
 ```
 
-`AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
+`AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。compaction の判定と checkpoint の永続化は `AgentLoop` が model 送信直前に行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
 
 ---
 

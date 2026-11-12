@@ -292,15 +292,16 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 
 ### Trigger
 
-次の 5 箇所で判定する。通常・Tool 後・再開はいずれも「これから送るリクエスト」の直前に判定し、判定に使う文脈と実送信の文脈を一致させる。
+自動判定は Agent Loop の model 送信直前の 1 箇所に集約する。入力の保存（`TurnPersistence::persist_user_input`）は判定を行わない。どの経路でも「これから送るリクエスト」に対して判定し、判定に使う文脈と実送信の文脈を一致させる。
 
 | 契機 | タイミング |
 |---|---|
-| 通常のユーザー入力 | ユーザーメッセージを積んだ直後、最初の model 呼び出し前 |
+| 通常のユーザー入力 | 入力の原子的保存が終わった後、Agent Loop が最初の model 呼び出しを行う直前 |
 | Tool 実行後 | tool 結果の保存が終わり、次の model 呼び出しを行う直前 |
-| Durable Turn 再開 | `input_committed` / `tools_completed` から再開し、次の model 呼び出しを行う直前（判定は Agent Loop に集約する） |
+| Durable Turn 再開 | `input_committed` / `tools_completed` から再開し、次の model 呼び出しを行う直前 |
 | 手動 | `/compact [instructions]`。閾値と `enabled` を無視する |
-| Context Overflow | Provider が context window 超過を理由に 400/413/422 を返したとき |
+| Context Overflow | Provider が context window 超過を返したとき |
+| 実測の超過 | 正常応答の `input_tokens` が context window を超えたとき。閾値判定を待たずに圧縮し、応答は再生成しない |
 
 発火条件は次の 1 式のみ。
 
@@ -309,16 +310,22 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 ```
 
 - `context_window` は実際に使用する provider / model の `context_window_tokens`。未設定時のみ `default_context_window_tokens`（既定 131072）
-- `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）から計測時の request overhead を差し引き、現在の system prompt・tool 定義・checkpoint・request-only メッセージ（channel context、retry 修正、runtime guard）と、その後に追加されたメッセージの推定値を足す
+- `reserve_tokens` / `keep_recent_tokens` は、対象モデルの `compaction.model_overrides["provider/model"]` → 全体値 → 既定値の順で解決する。`enabled` は全体設定のみ
+- `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）に、計測時からの request overhead の差分と、その後に追加されたメッセージの推定値を足す
 - 実測 usage が無い、または request shape（system prompt / tool 定義 / model）が計測時と変わった場合はリクエスト全体を推定する
 - 判定に使う request-only メッセージは、実際に送るリクエストと同じものを使う
-- `context_window <= reserve_tokens` は設定エラーとして扱う。暗黙に丸めない
+- `reserve_tokens` は 0 を含む非負整数を受け付ける。`context_window <= reserve_tokens` でも設定エラーにしない。その場合 `context_window - reserve_tokens` は 0 として扱う
+- Provider が正常終了しても、報告された `input_tokens` が `context_window` を超えていれば、閾値判定を待たずに圧縮する。最終応答なら応答を確定した直後、Tool 呼び出しなら次の model 呼び出しの直前に行い、その応答を作り直すことはしない。圧縮に失敗しても応答は破棄しない
 
 ### Token 推定
 
-外部 tokenizer は使わない。メッセージ 1 件の文字数（role / content / reasoning / tool call 引数。画像は 1 枚 4,800 文字相当）を `CHARS_PER_TOKEN_ESTIMATE = 3` で割り、`usage_calibrator` の補正係数を掛ける。推定は常に過大評価側へ倒す。
+外部 tokenizer は使わない。メッセージ 1 件の文字数（content / reasoning / tool call 名・引数。画像は 1 枚 4,800 文字相当）を `CHARS_PER_TOKEN_ESTIMATE = 4` で割り、切り上げる。role 名は数えない。文字数は UTF-16 コード単位で数える（絵文字などの補助平面文字を 1 文字として扱う）。
+
+system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
 
 補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
+
+補正係数は実測値からの差分にだけ掛ける。リクエストが計測時と同じで追加メッセージも無ければ、係数の値に関係なく投影値は実測値と一致する。
 
 ### 保持範囲の選択
 
@@ -367,6 +374,8 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 ### Checkpoint と保持メッセージ
 
 - checkpoint は `summary` / `tokens_before` / `read_files` / `modified_files` を持つ
+- 圧縮に成功したら、model へ送る前に checkpoint・保持メッセージ・`last_usage = None` を `chats.revision` の CAS で 1 回の snapshot 更新として確定する。永続化に失敗した場合は未保存の圧縮結果で model を呼ばない
+- snapshot が同時更新されていた場合は上書きせず、Turn を競合として終了する。Tool を再実行する自動リトライは行わない
 - 次のリクエストでは checkpoint を参照用の 1 メッセージへ投影し、その後ろに保持メッセージを連結する
 - 投影メッセージの先頭には `[CONTEXT CHECKPOINT — REFERENCE ONLY]` ヘッダーを付け、過去の指示を現在の指示へ昇格させない
 - 保持メッセージの結合・並べ替え・末尾 assistant の削除は行わない
@@ -376,7 +385,15 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 
 `ContextUsageAnchor` に「どのメッセージまでの計測か」（`after_message_index`）、`input_tokens` / `output_tokens`、`request_overhead_tokens`、`model_key`、`request_shape_hash` を保存する。
 
-provider の usage はリクエスト全体の token 数である。そのため会話メッセージ以外（system prompt / tool 定義 / checkpoint / request-only メッセージ）の推定値を `request_overhead_tokens` として併せて保存し、投影時はこの値を差し引いて現在の推定値へ置き換える。channel context や retry 修正が計測後に増減しても、その分が判定へ反映される。
+provider の usage はリクエスト全体の token 数である。そのため会話メッセージ以外（system prompt / tool 定義 / checkpoint / request-only メッセージ）の推定値を `request_overhead_tokens` として併せて保存する。投影は次の差分化で行う。
+
+```text
+projected = measured + calibrated(trailing + current_overhead - measured_overhead)
+```
+
+`current_overhead - measured_overhead` は負になり得るため、符号付きで計算し、最終値だけ 0 で clamp する。channel context や retry 修正が計測後に増減しても、その差分が判定へ反映される。
+
+空応答の再試行で runtime guard を足して再送した場合、usage はその再送リクエストのものになる。`ModelRunner` は実際に送った追加メッセージを呼び出し元へ返し、その分を `request_overhead_tokens` に含める。対応が取れない usage はアンカーとして採用しない。
 
 `request_shape_hash` は system prompt / tool 定義 / model だけを対象にし、channel context などの一時メッセージは含めない。これらの増減は `request_overhead_tokens` の差で扱うため、hash に含めると毎回アンカーが無効になる。
 
@@ -406,11 +423,13 @@ provider の usage はリクエスト全体の token 数である。そのため
 
 ### Context Overflow からの復旧
 
-Provider の 400 を一律に context 超過とはみなさない。Provider 境界（`src/llm/api_error.rs`）で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。Agent Loop はこの variant だけを復旧対象にし、provider 固有の文言を知らない。
+Provider の 400 を一律に context 超過とはみなさない。Provider 境界（`src/llm/api_error.rs`）で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。rate limit・throttling・`too many requests` は、token に言及していても除外する。Agent Loop はこの variant だけを復旧対象にし、provider 固有の文言を知らない。
 
 1. 出力を公開していない場合に限り、`CompactionReason::Overflow` で圧縮する
-2. 圧縮できたら同じ model iteration を 1 回だけ再送する。`turn_runs.model_request_hash` は新しいリクエストの hash へ更新する
+2. 圧縮できたら checkpoint を CAS で保存し、`turn_runs.model_request_hash` を新しいリクエストの hash へ更新して、同じ model iteration を 1 回だけ再送する（Turn は開始し直さない）
 3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（無限に繰り返さない）
+
+出力長による打ち切り（`finish_reason=length`）は、provider が早期終了として識別できる情報を返さないため圧縮・再送の対象にしない。`IncompleteResponse` として扱い、要約の途中打ち切りも同じく checkpoint を確定しない。
 
 再送するリクエストは、保存済みの会話と request-only メッセージ（宣言のみ応答への修正指示、runtime guard）から組み直す。修正指示は会話の外側にあるため、圧縮で会話が置き換わっても失われない。
 
@@ -588,14 +607,17 @@ Session Lifecycle に関連する設定フィールドは [config.md §3.1](./co
 | `compaction.enabled` | `true` | 自動 compaction の有効化。`/compact` と overflow 復旧は影響を受けない |
 | `compaction.reserve_tokens` | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数 |
 | `compaction.keep_recent_tokens` | `20000` | 原文のまま保持する直近履歴の下限 token 数 |
+| `compaction.model_overrides` | `{}` | `provider/model` をキーに `reserve_tokens` / `keep_recent_tokens` を個別に上書きする |
 | `max_history_messages` | `50` | snapshot が使えない時に `messages` テーブルから復元する件数 |
 | `default_context_window_tokens` | `131072` | モデル別 `context_window_tokens` が無い場合の context window |
 
 ### Validation
 
-- `compaction.reserve_tokens >= 1`
-- `compaction.keep_recent_tokens >= 1`
+- `compaction.reserve_tokens` は 0 を含む非負整数
+- `compaction.keep_recent_tokens` は 0 を含む非負整数
+- `compaction.model_overrides` の各値も同じ規則。キーは `provider/model` の完全一致（大文字小文字を区別し、`/` を含むモデル ID もそのまま扱う）
+- `compaction.enabled` は全体設定のみ
 - `max_history_messages >= 1`
 - `default_context_window_tokens >= 1` かつ `<= 1,000,000`
-- `default_context_window_tokens > compaction.reserve_tokens`
-- モデル別 `context_window_tokens > compaction.reserve_tokens`
+- `context_window_tokens` はモデルごとに `>= 1`
+- `reserve_tokens` と `context_window_tokens` の大小関係は検証しない（実行時に `saturating_sub` で 0 として扱う）
