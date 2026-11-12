@@ -263,7 +263,7 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | chat_id | INTEGER | PK | chats.chat_id と1:1 |
-| messages_json | TEXT | NOT NULL | `ContextSnapshot` エンベロープ（`version` / `checkpoint` / `messages` / `last_usage`） |
+| messages_json | TEXT | NOT NULL | `ContextSnapshot` エンベロープ（`version` / `checkpoint` / `messages` / `last_usage`）。`messages` の各要素は `finish_reason`（`max_output_tokens` など）を任意で持つ |
 | updated_at | TEXT | NOT NULL | 監査時刻（RFC3339）。競合判定には使用せず整数 `chats.revision` を使用 |
 | snapshot_through_seq | INTEGER | NOT NULL DEFAULT 0 | `messages_json` へ反映済みの最終 message seq。`base + seq>snapshot_through` でLLM contextを構築 |
 
@@ -277,6 +277,7 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 **設計ポイント**:
 - 楽観排他: `expected_updated_at` と実際の `updated_at` を比較し、競合時は `SessionSnapshotConflict` エラー
 - `messages_json` にはツール呼び出しブロックも含まれるため、セッション再開時に完全なコンテキストを復元可能
+- 出力上限で打ち切られた final message は `finish_reason` を保持し、通常完了と区別できる。復旧不能な打ち切り Tool Call は失敗結果として同じ snapshot に保存され、次の Turn で実行対象にならない
 - `checkpoint` は畳んだ履歴の要約、`last_usage` は直近の実測 usage とその適用範囲を持つ。checkpoint はメッセージとして重複保存しない
 - `last_usage` は `after_message_index` / `input_tokens` / `output_tokens` / `request_overhead_tokens` / `model_key` / `request_shape_hash` を持つ。`request_overhead_tokens` は計測したリクエストのうち会話メッセージ以外（system prompt・tool 定義・checkpoint・request-only メッセージ）の推定値
 - 自動 compaction の checkpoint は model 送信前に `chats.revision` の CAS で保存する。`/compact` も同じ経路を使う

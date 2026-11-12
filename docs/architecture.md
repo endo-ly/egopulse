@@ -146,7 +146,7 @@ src/
 │   ├── messages.rs      # Messages API 呼び出し
 │   ├── sse.rs           # SSE ストリーム解析
 │   ├── tokens.rs        # UTF-16 文字数ベースの token 推定、出力上限の clamp
-│   ├── model_catalog.rs # 同梱モデルカタログ（context window / 最大出力）
+│   ├── model_catalog.rs # 生成済みモデルカタログの読込（context window / 最大出力）
 │   ├── calibration.rs   # prompt token 推定補正 (EMA)
 │   └── codex_auth.rs    # Codex auth 解決、AUTH_CACHE
 │

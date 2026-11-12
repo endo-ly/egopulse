@@ -301,10 +301,11 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 | Durable Turn 再開 | `input_committed` / `tools_completed` から再開し、次の model 呼び出しを行う直前 |
 | 手動 | `/compact [instructions]`。閾値と `enabled` を無視する |
 | Context Overflow | Provider が context window 超過を返したとき |
+| 容量不足 | 推定入力が context window を埋め、API の最小出力すら確保できないとき。リクエストは送信しない |
 | 実測の超過 | 正常応答の `input_tokens` が context window を超えたとき。閾値判定を待たずに圧縮し、応答は再生成しない |
 | 出力打ち切り | `length` で意図した出力上限より手前で終わったとき、または入力が窓をほぼ満たして出力 0 で終わったとき |
 
-`compaction.enabled = false` では、閾値・Context Overflow・実測の超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` だけは実行できる。
+`compaction.enabled = false` では、閾値・Context Overflow・容量不足・実測の超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` だけは実行できる。
 
 発火条件は次の 1 式のみ。
 
@@ -312,7 +313,7 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 should_compact = enabled && context_tokens > context_window - reserve_tokens
 ```
 
-- `context_window` は、明示された `context_window_tokens` → 同梱モデルカタログの `contextWindow` → 未知モデルの既定値 `128000` の順で解決する。ユーザーが全モデル共通の値を設定しないと動かない設計にはしない
+- `context_window` は、明示された `context_window_tokens` → 同梱モデルカタログの `contextWindow` → 未知モデルの既定値 `128000` の順で解決する。カタログは参照実装が公開するプロバイダーデータから生成し、全モデル共通の値をユーザーが設定しないと動かない設計にはしない
 - `reserve_tokens` / `keep_recent_tokens` は、対象モデルの `compaction.model_overrides["provider/model"]` → 全体値 → 既定値の順で解決する。`enabled` は全体設定のみ
 - `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）に、計測時からの request overhead の差分と、その後に追加されたメッセージの推定値を足す
 - 実測 usage が無い、または request shape（system prompt / tool 定義 / model）が計測時と変わった場合はリクエスト全体を推定する
@@ -325,6 +326,8 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 外部 tokenizer は使わない。メッセージ 1 件の文字数（content / reasoning / tool call 名・引数。画像は 1 枚 4,800 文字相当）を `CHARS_PER_TOKEN_ESTIMATE = 4` で割り、切り上げる。role 名は数えない。文字数は UTF-16 コード単位で数える（絵文字などの補助平面文字を 1 文字として扱う）。
 
 system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
+
+出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。
 
 補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
 
@@ -424,13 +427,15 @@ projected = measured + calibrated(trailing + current_overhead - measured_overhea
 
 要約リクエストは LLM client のリクエスト上限（600 秒）と試行回数上限（3 回）を共有し、backoff と `Retry-After` 待機もその内側で行う。
 
-### Context Overflow からの復旧
+### Context Overflow と容量不足からの復旧
 
 Provider の 400 を一律に context 超過とはみなさない。Provider 境界（`src/llm/api_error.rs`）で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。rate limit・throttling・`too many requests` は、token に言及していても除外する。Agent Loop はこの variant だけを復旧対象にし、provider 固有の文言を知らない。
 
 1. 出力を公開していない場合に限り、`CompactionReason::Overflow` で圧縮する
 2. 圧縮できたら checkpoint を CAS で保存し、`turn_runs.model_request_hash` を新しいリクエストの hash へ更新して、同じ model iteration を 1 回だけ再送する（Turn は開始し直さない）
 3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（無限に繰り返さない）
+
+送信前の容量不足（`LlmError::OutputCapacityExceeded`）も同じ 1 回の復旧対象にする。推定入力が窓を埋めているため、API の最小出力を確保できないリクエストは送らず、compaction 後の再送で解消を試みる。解消できなければ容量不足として終了する。
 
 HTTP 413 は本文が空、`Payload Too Large` の HTML、JSON でないプロキシ応答でも context 超過として扱う。400 / 422 は構造化 `code` / `type` か明確な context 超過表現がある場合だけ分類し、任意の 400 を context 超過にしない。429 と rate limit / throttling は token に言及していても除外する。
 
@@ -442,14 +447,15 @@ Provider の出力上限で生成が終わった場合、`finish_reason=length` 
 
 1. `compaction.enabled = true` かつ復旧未実施で、`output_tokens < max_output_tokens`（または `output_tokens = 0` かつ `input_tokens` が窓の 99% 以上）なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
 2. 意図した上限まで生成し切った `length`、usage が無い場合、`enabled = false`、2 回目の打ち切りでは再送しない
-3. Tool Call を含む打ち切りは、未完成の呼び出しを実行せず応答ごと破棄する。復旧する場合は圧縮後のリクエストを送り直し、Tool の副作用は発生させない
-4. 途中出力を公開済みの場合は `AssistantMessageDiscarded` を通知してから再送し、二重表示・二重永続化を避ける
+3. 復旧しない場合も、生成済みの通常テキストは破棄せず final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
+4. Tool Call を含む打ち切りは、未完成の呼び出しを実行しない。復旧する場合は圧縮後のリクエストを送り直し、Tool の副作用は発生させない。復旧しない場合は、既存の Tool 結果経路で各呼び出しを失敗結果として保存し、Tool Call と結果の対応を保ったまま次の model step へ渡す。同じターンで 2 回目の打ち切り Tool Call が発生した場合は失敗結果を追加せず、本文があれば final として保存する
+5. 復旧して再送する場合は、途中出力を公開済みのときだけ `AssistantMessageDiscarded` を 1 回通知する。復旧せず部分応答を保持する場合は破棄通知を送らない
 
 要約リクエスト自身が `length` で途切れた場合は checkpoint を確定せず、呼び出し元へ失敗を返す。
 
 再送するリクエストは、保存済みの会話と request-only メッセージ（宣言のみ応答への修正指示、runtime guard）から組み直す。修正指示は会話の外側にあるため、圧縮で会話が置き換わっても失われない。
 
-Tool 実行済みのターンでも再実行するのは model 推論だけであり、実行済み Tool は再実行しない。Context Overflow の再送では、公開済みの途中出力がある場合は再送しない（`length` の復旧は破棄イベントを伴って再送する）。
+Tool 実行済みのターンでも再実行するのは model 推論だけであり、実行済み Tool は再実行しない。Context Overflow の再送では、公開済みの途中出力がある場合は再送しない（`length` の復旧は、途中出力を公開済みの場合だけ破棄イベントを伴って再送する）。
 
 ## 7. Archive
 

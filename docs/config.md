@@ -294,11 +294,24 @@ context window と最大出力トークンは、次の順で解決する。
 2. バイナリに同梱したモデルカタログ（`provider/model` の完全一致）
 3. 未知モデル向けの既定値（context window `128000`、最大出力 `16384`）
 
-カタログは起動・通常の Turn・オフライン実行で同じ値を使えるようコンパイル時に埋め込む。モデル情報の取得にネットワークを使わず、Turn の同期処理へ外部問い合わせを入れない。値はプロバイダーが公開するモデル情報を本リポジトリで管理する静的スナップショットであり、外部カタログサービスの応答や再配布条件へ依存しない。モデル情報の更新はリリースごとにこの表を更新する。プロバイダー ID の別名（`azure` / `openai-codex` / `zhipu` / `aliyun-bailian` など）は解決層で吸収する。モデル ID だけで別プロバイダーのモデルへ一致させることはしない。
+カタログは起動・通常の Turn・オフライン実行で同じ値を使えるよう、生成済み JSON をコンパイル時に埋め込む。モデル情報の取得にネットワークを使わず、Turn の同期処理へ外部問い合わせを入れない。
+
+カタログは pi（MIT）が公開するプロバイダーデータから生成する。モデルごとの数値を本リポジトリで手作業管理しない。更新は次の 1 コマンドで行い、生成された `src/llm/model_catalog.json` をコミットする。
+
+```bash
+npm install -g @earendil-works/pi-coding-agent   # データ取得元を更新
+node scripts/import-model-catalog.mjs
+```
+
+スクリプトは各プロバイダーの JSON から Chat モデルの `contextWindow` / `maxTokens` だけを取り出し、`provider/model` の組で重複を排除する。転送先が動的に変わるルーティングモデル（`openrouter/auto`）は固定値を設定できないため除外し、未知モデルの既定値として扱う。元データに無いモデル（提供終了したモデルなど）も同じ既定値になる。実際の上限が既定値と異なる場合は、モデル設定で明示的に上書きする。
+
+プロバイダー ID の別名（`azure` / `openai-codex` / `zhipu` / `aliyun-bailian` など）は解決層で吸収する。モデル ID だけで別プロバイダーのモデルへ一致させることはしない。
 
 カタログに無いモデルは「未知モデルの既定値」であり、カタログ照合の失敗としてログ（provider 生成時の debug）と Web UI の表示（`default`）で区別できる。モデルごとの数値を列挙しなくても動作するが、実際の上限が既定値と異なる場合は明示設定で上書きする。
 
-`max_output_tokens` はプロバイダーへ送る出力上限として使う。Chat Completions は OpenAI / Azure では `max_completion_tokens`、その他の互換 API では `max_tokens`、Responses API では `max_output_tokens` を送る。入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 4,096` まで切り下げる。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
+`max_output_tokens` はプロバイダーへ送る出力上限として使う。Chat Completions は接続先が公式 OpenAI / Azure の場合は `max_completion_tokens`、それ以外の OpenAI 互換 API は `max_tokens` を送る。Responses API は `max_output_tokens` を送る。フィールドは設定上のプロバイダー ID ではなく接続先で決める。
+
+入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 安全余裕` まで切り下げる。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API ごとの最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合はリクエストを送らず、容量不足として Agent Loop の 1 回の compaction・再送対象にする。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
 
 `headers` はリクエストヘッダをプロバイダー単位で付与する。値は文字列で、SecretRef は使用できない。
 
