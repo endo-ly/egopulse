@@ -337,8 +337,17 @@ impl<'a> AgentLoop<'a> {
                                     )));
                                 }
                                 self.lifecycle.complete_model().await?;
+                                let silent_overflow =
+                                    response.usage.as_ref().is_some_and(|usage| {
+                                        usage.input_tokens > context_window as i64
+                                    });
                                 let compacted = self
-                                    .compact_after_response(&mut loop_state, &scope, &prompt, false)
+                                    .compact_after_response(
+                                        &mut loop_state,
+                                        &scope,
+                                        &prompt,
+                                        silent_overflow,
+                                    )
                                     .await;
                                 let usage = response.usage.clone();
                                 return Ok(AgentLoopResult {
@@ -392,6 +401,10 @@ impl<'a> AgentLoop<'a> {
                                 },
                             )
                             .await?;
+                            loop_state.force_compaction = response
+                                .usage
+                                .as_ref()
+                                .is_some_and(|usage| usage.input_tokens > context_window as i64);
                             loop_state.clear_retry_state();
                             iteration += 1;
                             continue 'turns;
@@ -1839,6 +1852,17 @@ mod tests {
         assert_eq!(
             loaded.context.messages.last().and_then(|m| m.finish_reason),
             Some(TruncationReason::MaxOutputTokens)
+        );
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("messages");
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "partial answer"),
+            "the partial answer must be persisted in the transcript"
         );
     }
 
