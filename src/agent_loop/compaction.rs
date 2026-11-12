@@ -684,9 +684,10 @@ fn turn_prefix_prompt(conversation: &str, instructions: Option<&str>) -> String 
 }
 
 fn summary_request_estimate(prompt: &str) -> usize {
-    (prompt.chars().count() + SUMMARIZATION_SYSTEM_PROMPT.chars().count())
-        .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
-        .max(1)
+    (crate::llm::tokens::text_chars(prompt)
+        + crate::llm::tokens::text_chars(SUMMARIZATION_SYSTEM_PROMPT))
+    .div_ceil(CHARS_PER_TOKEN_ESTIMATE)
+    .max(1)
 }
 
 async fn request_summary(
