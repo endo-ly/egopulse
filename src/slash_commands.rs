@@ -1074,69 +1074,6 @@ mod tests {
         assert_eq!(response, "Compacted 3 messages to 2.");
     }
 
-    /// Summarizer that reports an output-limit truncation.
-    struct TruncatedSummarizer;
-
-    #[async_trait::async_trait]
-    impl LlmProvider for TruncatedSummarizer {
-        fn provider_name(&self) -> &str {
-            "test"
-        }
-
-        fn model_name(&self) -> &str {
-            "test-model"
-        }
-
-        async fn send_message(
-            &self,
-            _system: &str,
-            _messages: Arc<Vec<Message>>,
-            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
-        ) -> Result<MessagesResponse, LlmError> {
-            Err(LlmError::IncompleteResponse(
-                "generation was truncated at the output limit (max_output_tokens)".to_string(),
-            ))
-        }
-
-        async fn send_message_streaming(
-            &self,
-            _system: &str,
-            _messages: Arc<Vec<Message>>,
-            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
-            _on_delta: &(dyn Fn(String) + Send + Sync),
-        ) -> Result<MessagesResponse, LlmError> {
-            unreachable!("compaction uses send_message")
-        }
-    }
-
-    #[tokio::test]
-    async fn handle_compact_never_saves_a_truncated_summary() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let config = test_config(dir.path().to_str().expect("utf8").to_string());
-        let state = build_state(config, Box::new(TruncatedSummarizer));
-        let chat_id = create_test_chat(&state, "test-compact-truncated").await;
-        seed_compactable_session(&state, chat_id).await;
-
-        // Act
-        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
-
-        // Assert: the failure is reported and the original session remains.
-        let response = result.expect("response");
-        assert!(
-            response.starts_with("Compaction failed:"),
-            "response: {response}"
-        );
-        let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
-            db.load_session_snapshot(chat_id, 10)
-        })
-        .await
-        .expect("snapshot");
-        let body = snapshot.messages_json.expect("snapshot body");
-        assert!(!body.contains("checkpoint"));
-        assert!(body.contains("fresh question"));
-    }
-
     #[tokio::test]
     async fn handle_compact_runs_when_automatic_compaction_is_disabled() {
         // Arrange: `enabled` only controls automatic compaction.

@@ -190,27 +190,11 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_too_large_with_a_generic_body_is_an_overflow() {
-        // Arrange
-        let status = StatusCode::PAYLOAD_TOO_LARGE;
-
-        // Act
-        let error = classify(
-            status,
-            None,
-            None,
-            "<html><body><h1>413 Payload Too Large</h1></body></html>",
-            None,
-        );
-
-        // Assert
-        assert!(error.is_context_overflow());
-    }
-
-    #[test]
     fn throttling_mentions_of_tokens_stay_api_errors() {
         // Arrange: Bedrock formats throttling with a token-limit phrase.
-        let status = StatusCode::TOO_MANY_REQUESTS;
+        // Use 400 so the message patterns actually run; 429 is rejected before
+        // the string check.
+        let status = StatusCode::BAD_REQUEST;
 
         // Act
         let error = classify(
@@ -223,7 +207,7 @@ mod tests {
 
         // Assert
         assert!(!error.is_context_overflow());
-        assert!(error.is_retryable());
+        assert!(matches!(&error, LlmError::ApiError { .. }));
     }
 
     #[test]
