@@ -103,12 +103,12 @@ mod tests {
     fn bundled_catalog_maps_known_models_and_provider_aliases() {
         // Pick any entry so a catalog refresh does not invalidate the test.
         let (model, limits) = CATALOG
-            .get("openai")
+            .get("anthropic")
             .and_then(|models| models.iter().next())
-            .expect("the catalog contains an OpenAI model");
+            .expect("the catalog contains an Anthropic model");
         let expected = Some((limits.context_window, limits.max_output_tokens));
-        assert_eq!(lookup("openai", model), expected);
-        assert_eq!(lookup("Azure", model), expected);
+        assert_eq!(lookup("Anthropic", model), expected);
+        assert_eq!(lookup("claude", model), expected);
 
         let (zai_model, zai_limits) = CATALOG
             .get("zai")
