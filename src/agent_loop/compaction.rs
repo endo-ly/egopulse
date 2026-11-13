@@ -19,7 +19,7 @@
 //!
 //! Summaries are reference material for the next request, never instructions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,8 @@ use tracing::{info, warn};
 
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::message_format::{
-    is_tool_error_message, message_to_archive_text, strip_thinking, tool_result_body,
+    is_tool_error_message, is_tool_result_success, message_to_archive_text, strip_thinking,
+    tool_result_body,
 };
 use crate::agent_loop::session_snapshot::{
     CompactionCheckpoint, ContextUsageAnchor, SessionContext, checkpoint_message,
@@ -262,11 +263,27 @@ impl FileOperations {
     }
 
     fn extract_from(&mut self, messages: &[Message]) {
+        let outcomes = messages
+            .iter()
+            .filter_map(|message| {
+                let tool_call_id = message.tool_call_id.as_deref()?;
+                Some((tool_call_id, is_tool_result_success(message)))
+            })
+            .collect::<HashMap<_, _>>();
         for message in messages {
             if message.role != "assistant" {
                 continue;
             }
             for tool_call in &message.tool_calls {
+                // A call without a successful result did not change the file:
+                // it may have failed or been cut off before execution.
+                if !outcomes
+                    .get(tool_call.id.as_str())
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let Some(path) = tool_call
                     .arguments
                     .get("path")
@@ -1243,6 +1260,18 @@ mod tests {
         }
     }
 
+    fn tool_result_status(id: &str, status: &str) -> Message {
+        tool_result(
+            id,
+            &serde_json::json!({
+                "tool": "write",
+                "status": status,
+                "result": "ok",
+            })
+            .to_string(),
+        )
+    }
+
     fn session(messages: Vec<Message>) -> SessionContext {
         SessionContext {
             checkpoint: None,
@@ -1384,7 +1413,10 @@ mod tests {
         });
         previous.messages = Arc::new(vec![
             tool_call("call_1", "read", "docs/config.md"),
-            tool_result("call_1", "ok"),
+            tool_result(
+                "call_1",
+                r#"{"tool":"read","status":"success","result":"ok"}"#,
+            ),
             text("assistant", "answer"),
             text("user", &"b".repeat(60_000)),
             text("assistant", "reply"),
@@ -1402,22 +1434,28 @@ mod tests {
     }
 
     #[test]
-    fn modified_files_are_not_reported_as_read_only() {
+    fn only_successful_file_operations_are_recorded() {
+        // A failed or unexecuted write/edit did not change the file, and a read
+        // that never ran is not a read file either.
         let mut operations = FileOperations::default();
         operations.extract_from(&[
             tool_call("1", "read", "/tmp/a"),
+            tool_result_status("1", "success"),
             tool_call("2", "write", "/tmp/a"),
+            tool_result_status("2", "success"),
             tool_call("3", "edit", "/tmp/b"),
+            tool_result_status("3", "error"),
             tool_call("4", "read", "/tmp/c"),
+            tool_result_status("4", "success"),
+            tool_call("5", "write", "/tmp/d"),
+            tool_result_status("5", "error"),
+            tool_call("6", "edit", "/tmp/e"),
         ]);
 
         let (read_files, modified_files) = operations.compute_lists();
 
         assert_eq!(read_files, vec!["/tmp/c".to_string()]);
-        assert_eq!(
-            modified_files,
-            vec!["/tmp/a".to_string(), "/tmp/b".to_string()]
-        );
+        assert_eq!(modified_files, vec!["/tmp/a".to_string()]);
     }
 
     #[test]
@@ -1781,7 +1819,10 @@ mod tests {
             text("user", "big request"),
         ];
         messages.push(tool_call("call_1", "read", "src/lib.rs"));
-        messages.push(tool_result("call_1", "contents"));
+        messages.push(tool_result(
+            "call_1",
+            r#"{"tool":"read","status":"success","result":"contents"}"#,
+        ));
         messages.push(text("assistant", &"partial ".repeat(50)));
         let session = session(messages);
         let runtime = state.turn_dependencies();

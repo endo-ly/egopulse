@@ -105,18 +105,26 @@ pub(crate) fn message_to_text(message: &Message) -> String {
 }
 
 pub(crate) fn is_tool_error_message(message: &Message) -> bool {
+    tool_result_has_status(message, "error")
+}
+
+/// Returns `true` only when the tool result explicitly reports success.
+///
+/// A missing or malformed status is not success: compaction uses this to avoid
+/// listing a file as modified when the corresponding tool never changed it.
+pub(crate) fn is_tool_result_success(message: &Message) -> bool {
+    tool_result_has_status(message, "success")
+}
+
+fn tool_result_has_status(message: &Message, expected: &str) -> bool {
     let Some(payload) = tool_result_payload(message) else {
         return false;
     };
     serde_json::from_str::<serde_json::Value>(payload)
         .ok()
-        .and_then(|value| {
-            value
-                .get("status")
-                .and_then(|status| status.as_str())
-                .map(|status| status == "error")
+        .is_some_and(|value| {
+            value.get("status").and_then(|status| status.as_str()) == Some(expected)
         })
-        .unwrap_or(false)
 }
 
 pub(crate) fn tool_result_body(payload: &str) -> String {
