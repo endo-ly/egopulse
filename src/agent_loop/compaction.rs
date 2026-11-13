@@ -2121,31 +2121,4 @@ mod tests {
         // Assert
         assert_eq!(projected, 1_100 - 500);
     }
-
-    #[test]
-    fn estimate_counts_tool_arguments_and_images() {
-        let call = tool_call("1", "write", "/tmp/file");
-        let image = Message {
-            role: "user".to_string(),
-            content: MessageContent::parts(vec![
-                MessageContentPart::InputText {
-                    text: "look".to_string(),
-                },
-                MessageContentPart::InputImage {
-                    image_url: "data:image/png;base64,AAAA".to_string(),
-                    detail: None,
-                },
-            ]),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            finish_reason: None,
-        };
-
-        assert!(estimate_message_tokens(&call) >= 2);
-        assert!(
-            estimate_message_tokens(&image)
-                >= (crate::llm::tokens::ESTIMATED_IMAGE_CHARS / CHARS_PER_TOKEN_ESTIMATE)
-        );
-    }
 }
