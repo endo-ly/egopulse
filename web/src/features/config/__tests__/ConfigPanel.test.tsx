@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ConfigPanel } from "../ConfigPanel";
@@ -73,8 +73,10 @@ describe("ConfigPanel", () => {
 
     // Assert
     await screen.findByRole("heading", { level: 2, name: "MCP" });
-    const contexts = scrollIntoView.mock.contexts;
-    expect(contexts[contexts.length - 1]).toBe(document.getElementById(configSectionElementId("mcp")));
+    await waitFor(() => {
+      const contexts = scrollIntoView.mock.contexts;
+      expect(contexts[contexts.length - 1]).toBe(document.getElementById(configSectionElementId("mcp")));
+    });
   });
 
   it("highlights_the_section_reported_as_active", async () => {
