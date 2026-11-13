@@ -244,8 +244,7 @@ struct CompactionPreparation {
 #[derive(Clone, Debug, Default)]
 struct FileOperations {
     read: BTreeSet<String>,
-    written: BTreeSet<String>,
-    edited: BTreeSet<String>,
+    modified: BTreeSet<String>,
 }
 
 impl FileOperations {
@@ -256,24 +255,36 @@ impl FileOperations {
                 .read
                 .extend(checkpoint.read_files.iter().cloned());
             operations
-                .edited
+                .modified
                 .extend(checkpoint.modified_files.iter().cloned());
         }
         operations
     }
 
     fn extract_from(&mut self, messages: &[Message]) {
-        let outcomes = messages
-            .iter()
-            .filter_map(|message| {
-                let tool_call_id = message.tool_call_id.as_deref()?;
-                Some((tool_call_id, is_tool_result_success(message)))
-            })
-            .collect::<HashMap<_, _>>();
-        for message in messages {
-            if message.role != "assistant" {
+        let mut index = 0;
+        while index < messages.len() {
+            let message = &messages[index];
+            if message.role != "assistant" || message.tool_calls.is_empty() {
+                index += 1;
                 continue;
             }
+
+            // A tool call is identified only within its own result block.
+            // The same id may be reused by a later turn, so a conversation-wide
+            // lookup would apply one turn's outcome to another turn's call.
+            let mut outcomes = HashMap::new();
+            let mut result_index = index + 1;
+            while let Some(result) = messages.get(result_index) {
+                if result.role != "tool" {
+                    break;
+                }
+                if let Some(tool_call_id) = result.tool_call_id.as_deref() {
+                    outcomes.insert(tool_call_id, is_tool_result_success(result));
+                }
+                result_index += 1;
+            }
+
             for tool_call in &message.tool_calls {
                 // A call without a successful result did not change the file:
                 // it may have failed or been cut off before execution.
@@ -299,29 +310,26 @@ impl FileOperations {
                     "read" => {
                         self.read.insert(path.to_string());
                     }
-                    "write" => {
-                        self.written.insert(path.to_string());
-                    }
-                    "edit" => {
-                        self.edited.insert(path.to_string());
+                    "write" | "edit" => {
+                        self.modified.insert(path.to_string());
                     }
                     _ => {}
                 }
             }
+            index = result_index;
         }
     }
 
     /// Returns `(read_files, modified_files)`. A modified file is never also
     /// reported as read-only.
     fn compute_lists(&self) -> (Vec<String>, Vec<String>) {
-        let modified: BTreeSet<&String> = self.edited.iter().chain(&self.written).collect();
         let read_files = self
             .read
             .iter()
-            .filter(|path| !modified.contains(path))
+            .filter(|path| !self.modified.contains(*path))
             .cloned()
             .collect();
-        let modified_files = modified.into_iter().cloned().collect();
+        let modified_files = self.modified.iter().cloned().collect();
         (read_files, modified_files)
     }
 }
@@ -1450,12 +1458,23 @@ mod tests {
             tool_call("5", "write", "/tmp/d"),
             tool_result_status("5", "error"),
             tool_call("6", "edit", "/tmp/e"),
+            // A later turn may reuse an id. The failure must not erase the
+            // earlier success, and the later success must not apply to the
+            // earlier failed call.
+            text("user", "next turn"),
+            tool_call("2", "write", "/tmp/old"),
+            tool_result_status("2", "error"),
+            tool_call("3", "edit", "/tmp/new"),
+            tool_result_status("3", "success"),
         ]);
 
         let (read_files, modified_files) = operations.compute_lists();
 
         assert_eq!(read_files, vec!["/tmp/c".to_string()]);
-        assert_eq!(modified_files, vec!["/tmp/a".to_string()]);
+        assert_eq!(
+            modified_files,
+            vec!["/tmp/a".to_string(), "/tmp/new".to_string()]
+        );
     }
 
     #[test]
