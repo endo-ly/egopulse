@@ -135,7 +135,7 @@ execute_scheduled_turn():
 
 - 役割: 表示用・一覧用の message レコード
 - 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`, `seq`, `turn_id`
-- `/new` や compaction では削除されない。セッションクリアは `sessions.messages_json` のリセットのみ行う
+- `/new` や compaction では削除されない。`/new` は `sessions.messages_json` を空の `ContextSnapshot` エンベロープ（`messages: []`）へ置き換える
 
 `seq IS NOT NULL` の committed conversation history は append-only かつ immutable であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。staged row は commit 時に `seq` が付与され、terminal Turn への promotion 時には削除される場合がある。
 
@@ -160,7 +160,7 @@ Tool 実行中の human follow-up は staged message として保存され、`tu
 - `checkpoint`: 畳んだ履歴の要約とファイル一覧。`null` なら未圧縮
 - `last_usage`: 直近の実測 usage と、それがどのメッセージまでを覆うかのアンカー
 
-`messages_json` には checkpoint をメッセージとして重複保存しない。checkpoint はリクエスト構築時に参照用メッセージへ投影する。
+`messages_json` には checkpoint をメッセージとして重複保存しない。checkpoint はリクエスト構築時に参照用メッセージへ投影する。`/new` も同じエンベロープで空の snapshot を保存し、次の Turn はそのまま復元できる。
 
 ### `tool_calls`
 
@@ -356,7 +356,17 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 - split turn では履歴要約とターン前半要約を別リクエストで生成し、`\n\n---\n\n**Turn Context (split turn):**\n\n` で連結する。片方でも失敗したら何も commit しない
 - 要約入力は role ごとにタグ付けしたプレーンテキスト（`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` / `[Tool result]:` / `[Tool error]:`）。reasoning は含めない
 - 1 件の tool 結果は 2,000 文字で切り、`[... N more characters truncated]` を付ける
-- 要約対象全体を固定文字数で切る処理は行わない
+- 要約対象全体が要約モデルの入力上限を超える場合は、先頭から収まる範囲だけを送り、末尾を省略したことをマーカーで示す
+- 省略した部分も元の会話は archive と append-only の `messages` テーブルに残る。checkpoint には要約できた範囲だけが反映される
+
+### 要約リクエストの入力上限
+
+要約リクエスト自身が context window を超えないよう、送信前に会話部分の上限を決める。上限は対象モデルの `context_window` から、出力に必要な容量として `max_output_tokens` を引いて求める。`max_output_tokens` が context window の半分を超える設定では、入力の余地を残すため半分を上限に予約する。
+
+- system prompt・要約プロンプト・前回 checkpoint・追加指示を先に推定し、残りを会話テキストの予算にする
+- 会話テキストが予算を超える場合は、UTF-16 コード単位で先頭から収まる範囲を残し、末尾に `[... conversation truncated to fit the summarization request ...]` を付ける
+- 切り詰めは要約リクエストの入力だけに適用する。保持メッセージ、checkpoint の要約本文、archive の内容は変更しない
+- 要約モデルの出力上限や API 最小出力の扱いは通常の LLM リクエストと同じ
 
 ### 要約プロンプト
 
