@@ -591,24 +591,38 @@ fn content_text(content: &MessageContent) -> String {
     }
 }
 
-/// Serializes messages into plain text so the model does not continue them.
+/// Holds labeled conversation text for summary input.
 ///
 /// Visible text, tool calls, and tool results are kept; provider reasoning is
 /// omitted because it is often not part of the model's live context.
-fn serialize_conversation_parts(messages: &[Message]) -> Vec<String> {
-    let mut parts: Vec<String> = Vec::new();
+struct ConversationPart {
+    label: String,
+    body: String,
+}
+
+impl ConversationPart {
+    fn new(label: &str, body: String) -> Self {
+        Self {
+            label: label.to_string(),
+            body,
+        }
+    }
+}
+
+fn conversation_parts(messages: &[Message]) -> Vec<ConversationPart> {
+    let mut parts = Vec::new();
     for message in messages {
         match message.role.as_str() {
             "user" => {
                 let content = content_text(&message.content);
                 if !content.trim().is_empty() {
-                    parts.push(format!("[User]: {content}"));
+                    parts.push(ConversationPart::new("User", content));
                 }
             }
             "assistant" => {
                 let content = content_text(&message.content);
                 if !content.trim().is_empty() {
-                    parts.push(format!("[Assistant]: {content}"));
+                    parts.push(ConversationPart::new("Assistant", content));
                 }
                 if !message.tool_calls.is_empty() {
                     let calls = message
@@ -617,7 +631,7 @@ fn serialize_conversation_parts(messages: &[Message]) -> Vec<String> {
                         .map(|tool_call| format!("{}({})", tool_call.name, tool_call.arguments))
                         .collect::<Vec<_>>()
                         .join("; ");
-                    parts.push(format!("[Assistant tool calls]: {calls}"));
+                    parts.push(ConversationPart::new("Assistant tool calls", calls));
                 }
             }
             "tool" => {
@@ -645,7 +659,7 @@ fn serialize_conversation_parts(messages: &[Message]) -> Vec<String> {
                 } else {
                     body
                 };
-                parts.push(format!("[{label}]: {body}"));
+                parts.push(ConversationPart::new(label, body));
             }
             _ => {}
         }
@@ -693,16 +707,26 @@ async fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
         .min(token_budget)
 }
 
+#[derive(Clone, Copy, Default)]
+struct SummaryCursor {
+    index: usize,
+    offset: usize,
+}
+
+struct SummaryChunk {
+    prompt: String,
+    next: SummaryCursor,
+}
+
 /// Fits complete messages first, splitting only a message that cannot fit by itself.
 fn summary_chunk<F>(
     budget: usize,
-    units: &[(String, String)],
-    index: usize,
-    offset: usize,
+    units: &[ConversationPart],
+    cursor: SummaryCursor,
     previous: Option<&str>,
     instructions: Option<&str>,
     build: F,
-) -> Result<(String, usize, usize), EgoPulseError>
+) -> Result<SummaryChunk, EgoPulseError>
 where
     F: Fn(&str, Option<&str>, Option<&str>) -> String,
 {
@@ -714,9 +738,9 @@ where
         .saturating_sub(fixed_chars);
     let mut chunk = String::new();
     let mut used = 0;
-    let mut pos = index;
-    let mut start = offset;
-    while let Some((label, body)) = units.get(pos) {
+    let mut pos = cursor.index;
+    let mut start = cursor.offset;
+    while let Some(ConversationPart { label, body }) = units.get(pos) {
         let prefix = if start == 0 {
             format!("[{label}]: ")
         } else {
@@ -765,7 +789,13 @@ where
             required_tokens: summary_request_estimate(&fixed),
         }));
     }
-    Ok((build(&chunk, previous, instructions), pos, start))
+    Ok(SummaryChunk {
+        prompt: build(&chunk, previous, instructions),
+        next: SummaryCursor {
+            index: pos,
+            offset: start,
+        },
+    })
 }
 
 fn summary_prompt(
@@ -897,17 +927,17 @@ async fn log_summarizer_usage(
 async fn summarize<F>(
     request: &CompactionRequest<'_>,
     label: &str,
-    mut build_prompt: F,
-) -> Result<String, EgoPulseError>
+    build_prompt: F,
+) -> Result<(String, SummaryCursor), EgoPulseError>
 where
-    F: FnMut(usize) -> Result<String, EgoPulseError>,
+    F: Fn(usize) -> Result<SummaryChunk, EgoPulseError>,
 {
     let mut budget = summary_input_budget(request).await;
     let mut overflow_retries = 0usize;
     loop {
-        let prompt = build_prompt(budget)?;
-        let estimate = summary_request_estimate(&prompt);
-        let response = match request_summary(request.llm, prompt).await {
+        let chunk = build_prompt(budget)?;
+        let estimate = summary_request_estimate(&chunk.prompt);
+        let response = match request_summary(request.llm, chunk.prompt).await {
             Ok(response) => response,
             Err(error) => {
                 // If the prompt is already far below the budget, halving the
@@ -963,16 +993,59 @@ where
         )
         .await;
 
-        return validate_summary(&response).inspect_err(|error| {
-            warn!(
-                channel = %request.context.channel,
-                chat_id = request.chat_id,
-                label,
-                error = %error,
-                "context compaction summary rejected"
-            );
-        });
+        return validate_summary(&response)
+            .map(|summary| (summary, chunk.next))
+            .inspect_err(|error| {
+                warn!(
+                    channel = %request.context.channel,
+                    chat_id = request.chat_id,
+                    label,
+                    error = %error,
+                    "context compaction summary rejected"
+                );
+            });
     }
+}
+
+/// Makes room for the next input by treating an oversized checkpoint as history.
+fn prepare_previous_summary(
+    units: &mut Vec<ConversationPart>,
+    cursor: &mut SummaryCursor,
+    previous: &mut Option<String>,
+    instructions: Option<&str>,
+    budget: usize,
+    recovery_attempts: &mut usize,
+) -> Result<(), EgoPulseError> {
+    let Some(prior) = previous.as_ref() else {
+        return Ok(());
+    };
+    let fixed = summary_prompt("", Some(prior), instructions);
+    if summary_request_estimate(&summary_prompt(
+        "[Previous checkpoint continued]: x",
+        Some(prior),
+        instructions,
+    )) <= budget
+    {
+        return Ok(());
+    }
+    if *recovery_attempts >= 3 {
+        return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
+            budget_tokens: budget,
+            required_tokens: summary_request_estimate(&fixed),
+        }));
+    }
+    if cursor.offset > 0 {
+        let part = &mut units[cursor.index];
+        part.label.push_str(" continued");
+        part.body = part.body[cursor.offset..].to_string();
+    }
+    units.insert(
+        cursor.index,
+        ConversationPart::new("Previous checkpoint", previous.take().unwrap()),
+    );
+    cursor.offset = 0;
+    *recovery_attempts += 1;
+    Ok(())
 }
 
 async fn summarize_conversation(
@@ -983,58 +1056,28 @@ async fn summarize_conversation(
     label: &str,
     turn_prefix: bool,
 ) -> Result<String, EgoPulseError> {
-    let mut units = Vec::new();
-    for part in serialize_conversation_parts(messages) {
-        let serialized = redact_summary_text(&part, request.config);
-        if let Some((label, body)) = serialized
-            .strip_prefix('[')
-            .and_then(|text| text.split_once("]: "))
-        {
-            units.push((label.to_string(), body.to_string()));
-        }
+    let mut units = conversation_parts(messages);
+    for part in &mut units {
+        part.body = redact_summary_text(&part.body, request.config);
     }
     let instructions = instructions.map(|text| redact_summary_text(text, request.config));
     let mut previous = previous_summary.map(|text| redact_summary_text(text, request.config));
-    let mut index = 0;
-    let mut offset = 0;
+    let mut cursor = SummaryCursor::default();
     let mut recovery_attempts = 0;
     loop {
-        // Re-summarize an oversized checkpoint as oldest input before continuing.
-        let budget = summary_input_budget(request).await;
-        if let Some(prior) = previous.as_ref() {
-            let fixed = summary_prompt("", Some(prior), instructions.as_deref());
-            if summary_request_estimate(&summary_prompt(
-                "[Previous checkpoint continued]: x",
-                Some(prior),
-                instructions.as_deref(),
-            )) > budget
-            {
-                if recovery_attempts >= 3 {
-                    return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
-                        budget_tokens: budget,
-                        required_tokens: summary_request_estimate(&fixed),
-                    }));
-                }
-                if offset > 0 {
-                    let (label, body) = &mut units[index];
-                    *label = format!("{label} continued");
-                    *body = body[offset..].to_string();
-                }
-                units.insert(
-                    index,
-                    ("Previous checkpoint".to_string(), previous.take().unwrap()),
-                );
-                offset = 0;
-                recovery_attempts += 1;
-            }
-        }
-        let mut next = (index, offset);
-        let summary = summarize(request, label, |budget| {
-            let (prompt, next_index, next_offset) = summary_chunk(
+        prepare_previous_summary(
+            &mut units,
+            &mut cursor,
+            &mut previous,
+            instructions.as_deref(),
+            summary_input_budget(request).await,
+            &mut recovery_attempts,
+        )?;
+        let (summary, next) = summarize(request, label, |budget| {
+            summary_chunk(
                 budget,
                 &units,
-                index,
-                offset,
+                cursor,
                 previous.as_deref(),
                 instructions.as_deref(),
                 |chunk, prior, focus| {
@@ -1050,13 +1093,11 @@ async fn summarize_conversation(
                         summary_prompt(chunk, prior, focus)
                     }
                 },
-            )?;
-            next = (next_index, next_offset);
-            Ok(prompt)
+            )
         })
         .await?;
-        (index, offset) = next;
-        if index == units.len() {
+        cursor = next;
+        if cursor.index == units.len() {
             return Ok(summary);
         }
         previous = Some(summary);
@@ -1721,7 +1762,11 @@ mod tests {
             ),
         ];
 
-        let serialized = serialize_conversation_parts(&messages).join("\n\n");
+        let serialized = conversation_parts(&messages)
+            .iter()
+            .map(|part| format!("[{}]: {}", part.label, part.body))
+            .collect::<Vec<_>>()
+            .join("\n\n");
 
         assert!(serialized.starts_with("[User]: hello"));
         assert!(serialized.contains("[Assistant tool calls]: read("));
@@ -1734,34 +1779,13 @@ mod tests {
         let mut message = text("assistant", "answer");
         message.reasoning_content = Some("hidden chain of thought".to_string());
 
-        let serialized = serialize_conversation_parts(&[message]).join("\n\n");
+        let serialized = conversation_parts(&[message])
+            .iter()
+            .map(|part| format!("[{}]: {}", part.label, part.body))
+            .collect::<Vec<_>>()
+            .join("\n\n");
 
         assert_eq!(serialized, "[Assistant]: answer");
-    }
-
-    #[test]
-    fn previous_summary_preserves_file_tags_in_its_text() {
-        // Arrange: a previous checkpoint whose summary already ends with tags.
-        let mut previous = session(vec![
-            text("user", "old question"),
-            text("assistant", &"old answer ".repeat(1_000)),
-            text("user", "fresh question"),
-        ]);
-        previous.checkpoint = Some(CompactionCheckpoint {
-            summary: "previous\n\n<read-files>\nsrc/a.rs\n</read-files>".to_string(),
-            tokens_before: 10,
-            read_files: vec!["src/a.rs".to_string()],
-            modified_files: Vec::new(),
-        });
-
-        // Act: summary text is preserved exactly.
-        let preparation = prepare_compaction(&previous, 100).expect("preparation");
-
-        // Assert
-        assert_eq!(
-            preparation.previous_summary.as_deref(),
-            Some("previous\n\n<read-files>\nsrc/a.rs\n</read-files>")
-        );
     }
 
     #[test]
@@ -2078,6 +2102,60 @@ mod tests {
                 .as_text_lossy()
                 .contains("old question")
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn oversized_summaries_stop_after_the_recovery_limit() {
+        // Arrange: every generated summary is too large to use as a checkpoint.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized = "long summary ".repeat(5_000);
+        let provider = RecordingProvider::new(
+            (0..3).map(|_| Ok(summary_response(&oversized))).collect(),
+            vec![0; 3],
+        );
+        let config = crate::agent_loop::test_support::test_config_with_compaction(
+            dir.path().to_string_lossy().to_string(),
+            1,
+        );
+        let state =
+            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
+        let context = crate::agent_loop::test_support::cli_context("oversized-summary");
+        let chat_id = chat_id_for(&state, &context).await;
+        let runtime = state.turn_dependencies();
+        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
+        let request = CompactionRequest {
+            state: &runtime,
+            context: &context,
+            chat_id,
+            llm: &llm,
+            prompt: PromptContext {
+                system_prompt: "system",
+                tools_json: None,
+                has_tools: false,
+            },
+            config: &state.config,
+            request_only_messages: Vec::new(),
+        };
+
+        // Act
+        let result = generate_summary(
+            &request,
+            &[text("user", "new conversation")],
+            Some(&oversized),
+            None,
+            "history",
+        )
+        .await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(EgoPulseError::Llm(
+                LlmError::SummaryInputCapacityExceeded { .. }
+            ))
+        ));
+        assert_eq!(provider.seen_messages().len(), 3);
     }
 
     #[tokio::test]

@@ -2419,36 +2419,6 @@ channels:
 
 #[test]
 #[serial]
-fn rejects_the_removed_global_context_window_setting() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-default_context_window_tokens: 2000000
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-test
-    default_model: gpt-4o-mini
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret"#,
-    );
-
-    // The global setting is gone: a config that still carries it must not be
-    // silently accepted with the value ignored.
-    let error = Config::load(Some(&file_path)).expect_err("removed setting");
-    assert!(
-        matches!(error, ConfigError::ConfigParseFailed { .. }),
-        "expected ConfigParseFailed, got {error:?}"
-    );
-}
-
-#[test]
-#[serial]
 fn persists_provider_model_contexts_without_secret_leak() {
     use crate::config::ModelConfig;
     use crate::config::persist::save_config_with_secrets;

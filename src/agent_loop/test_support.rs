@@ -214,6 +214,19 @@ pub(crate) fn test_config_with_compaction_window(
     config
 }
 
+pub(crate) fn build_state_with_compaction_window(
+    state_root: &std::path::Path,
+    context_window_tokens: usize,
+    llm: Box<dyn LlmProvider>,
+) -> AppState {
+    let config = test_config_with_compaction_window(
+        state_root.to_string_lossy().into_owned(),
+        1,
+        context_window_tokens,
+    );
+    build_state(config, llm)
+}
+
 /// Sets the context window of the model used by the test LLM.
 ///
 /// The mock providers report `test/test-model`, so an explicit entry for that

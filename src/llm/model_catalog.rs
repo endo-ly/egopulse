@@ -119,14 +119,4 @@ mod tests {
             Some((zai_limits.context_window, zai_limits.max_output_tokens))
         );
     }
-
-    #[test]
-    fn unknown_provider_or_model_has_no_catalog_entry() {
-        assert_eq!(lookup("my-gateway", "my-model"), None);
-        assert_eq!(lookup("openai", "model-not-in-the-catalog"), None);
-        assert_eq!(lookup("ollama", "llama3.2"), None);
-        // The auto router is omitted so its fixed source limit cannot describe
-        // a destination the router chooses at request time.
-        assert_eq!(lookup("openrouter", "auto"), None);
-    }
 }

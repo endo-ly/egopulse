@@ -1041,7 +1041,8 @@ mod tests {
     use crate::agent_loop::process_turn;
     use crate::agent_loop::process_turn_with_events;
     use crate::agent_loop::test_support::{
-        RecordingProvider, build_state, build_state_with_provider, cli_context,
+        RecordingProvider, build_state, build_state_with_compaction_window,
+        build_state_with_provider, cli_context,
     };
     use crate::conversation::ConversationScope;
     use crate::llm::{MessagesResponse, ToolCall};
@@ -1254,12 +1255,8 @@ mod tests {
         // The window is wide enough that the pre-request threshold does not
         // fire: the provider rejects the request instead, which is the path
         // under test.
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 60_000, Box::new(provider.clone()));
         let context = cli_context("overflow-recovery");
         let runtime = state.turn_dependencies();
         let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
@@ -1336,12 +1333,8 @@ mod tests {
             ],
             vec![0, 0, 0],
         );
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            2_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 2_000, Box::new(provider.clone()));
         let context = cli_context("silent-overflow");
         let runtime = state.turn_dependencies();
 
@@ -1407,12 +1400,8 @@ mod tests {
             ],
             vec![0, 0, 0],
         );
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            2_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 2_000, Box::new(provider.clone()));
         let context = cli_context("forced-compaction");
 
         // Act
@@ -1466,12 +1455,8 @@ mod tests {
             ],
             vec![0, 0, 0, 0],
         );
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 60_000, Box::new(provider.clone()));
         let context = cli_context("overflow-retry-guard");
         let runtime = state.turn_dependencies();
         let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
@@ -1539,12 +1524,8 @@ mod tests {
             ],
             vec![0, 0, 0],
         );
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 60_000, Box::new(provider.clone()));
         let context = cli_context("overflow-twice");
         let runtime = state.turn_dependencies();
         let chat_id = crate::agent_loop::session::resolve_chat_id(&runtime, &context)
@@ -1582,12 +1563,8 @@ mod tests {
             },
             TruncatedScriptStep::Complete("complete answer"),
         ]);
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 60_000, Box::new(provider.clone()));
         let context = cli_context("truncation-discard");
         let chat_id = seed_short_session(&state, &context).await;
         let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
@@ -1647,12 +1624,8 @@ mod tests {
             .inner
             .fail_summary
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 60_000, Box::new(provider.clone()));
         let context = cli_context("truncation-summary-failure");
         let chat_id = seed_short_session(&state, &context).await;
         let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
@@ -1882,12 +1855,8 @@ mod tests {
                 stream_delta: "",
             },
         ]);
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
+        let state =
+            build_state_with_compaction_window(dir.path(), 60_000, Box::new(provider.clone()));
         let context = cli_context("truncation-twice");
         seed_short_session(&state, &context).await;
 
