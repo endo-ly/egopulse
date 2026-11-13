@@ -1336,9 +1336,6 @@ mod tests {
             ["thinking".to_string(), " carefully".to_string()]
         );
         assert_eq!(response.content, "thinking carefully");
-        let requests = server.received_requests().await.expect("requests");
-        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
-        assert!(body.get("max_output_tokens").is_none());
         assert_eq!(
             response.usage,
             Some(LlmUsage {

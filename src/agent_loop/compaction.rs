@@ -44,6 +44,8 @@ use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, Messa
 use crate::llm::{RetryPolicy, complete_response};
 use crate::tools::sanitize_output_string;
 
+const TOOL_RESULT_MAX_CHARS: usize = 2_000;
+
 /// Separator between the history summary and a split-turn prefix summary.
 const SPLIT_TURN_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
 
@@ -593,7 +595,7 @@ fn content_text(content: &MessageContent) -> String {
 ///
 /// Visible text, tool calls, and tool results are kept; provider reasoning is
 /// omitted because it is often not part of the model's live context.
-pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
+fn serialize_conversation_parts(messages: &[Message]) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     for message in messages {
         match message.role.as_str() {
@@ -633,12 +635,22 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
                 } else {
                     "Tool result"
                 };
+                let total = body.chars().count();
+                let body = if total > TOOL_RESULT_MAX_CHARS {
+                    format!(
+                        "{}\n\n[... {} more characters truncated]",
+                        body.chars().take(TOOL_RESULT_MAX_CHARS).collect::<String>(),
+                        total - TOOL_RESULT_MAX_CHARS
+                    )
+                } else {
+                    body
+                };
                 parts.push(format!("[{label}]: {body}"));
             }
             _ => {}
         }
     }
-    parts.join("\n\n")
+    parts
 }
 
 /// Returns the raw token budget for one summarization request.
@@ -681,51 +693,79 @@ async fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
         .min(token_budget)
 }
 
-/// Fits the oldest remaining text into one summary request without dropping input.
+/// Fits complete messages first, splitting only a message that cannot fit by itself.
 fn summary_chunk<F>(
     budget: usize,
-    conversation: &str,
+    units: &[(String, String)],
+    index: usize,
+    offset: usize,
     previous: Option<&str>,
     instructions: Option<&str>,
     build: F,
-) -> Result<(String, usize), EgoPulseError>
+) -> Result<(String, usize, usize), EgoPulseError>
 where
     F: Fn(&str, Option<&str>, Option<&str>) -> String,
 {
     let fixed = build("", previous, instructions);
-    let required = summary_request_estimate(&fixed);
-    if required >= budget && !conversation.is_empty() || required > budget {
-        return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
-            budget_tokens: budget,
-            required_tokens: required,
-        }));
-    }
-    let mut low = 0;
-    let mut high = conversation.chars().count();
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        let end = conversation
-            .char_indices()
-            .nth(mid)
-            .map_or(conversation.len(), |(index, _)| index);
-        if summary_request_estimate(&build(&conversation[..end], previous, instructions)) <= budget
-        {
-            low = mid;
+    let fixed_chars = crate::llm::tokens::text_chars(&fixed)
+        + crate::llm::tokens::text_chars(SUMMARIZATION_SYSTEM_PROMPT);
+    let capacity = budget
+        .saturating_mul(CHARS_PER_TOKEN_ESTIMATE)
+        .saturating_sub(fixed_chars);
+    let mut chunk = String::new();
+    let mut used = 0;
+    let mut pos = index;
+    let mut start = offset;
+    while let Some((label, body)) = units.get(pos) {
+        let prefix = if start == 0 {
+            format!("[{label}]: ")
         } else {
-            high = mid - 1;
+            format!("[{label} continued]: ")
+        };
+        let separator = if chunk.is_empty() { "" } else { "\n\n" };
+        let remaining = &body[start..];
+        let overhead =
+            crate::llm::tokens::text_chars(separator) + crate::llm::tokens::text_chars(&prefix);
+        let available = capacity.saturating_sub(used + overhead);
+        let mut chars = 0;
+        let mut end = 0;
+        for (i, ch) in remaining.char_indices() {
+            if chars + ch.len_utf16() > available {
+                break;
+            }
+            chars += ch.len_utf16();
+            end = i + ch.len_utf8();
         }
+        if end == remaining.len() && used + overhead <= capacity {
+            chunk.push_str(separator);
+            chunk.push_str(&prefix);
+            chunk.push_str(remaining);
+            used += overhead + chars;
+            pos += 1;
+            start = 0;
+            continue;
+        }
+        if !chunk.is_empty() {
+            break;
+        }
+        if end == 0 {
+            return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
+                budget_tokens: budget,
+                required_tokens: summary_request_estimate(&fixed) + 1,
+            }));
+        }
+        chunk.push_str(&prefix);
+        chunk.push_str(&remaining[..end]);
+        start += end;
+        break;
     }
-    let end = conversation
-        .char_indices()
-        .nth(low)
-        .map_or(conversation.len(), |(index, _)| index);
-    if end == 0 && !conversation.is_empty() {
+    if units.is_empty() && summary_request_estimate(&fixed) > budget {
         return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
             budget_tokens: budget,
-            required_tokens: required + 1,
+            required_tokens: summary_request_estimate(&fixed),
         }));
     }
-    Ok((build(&conversation[..end], previous, instructions), end))
+    Ok((build(&chunk, previous, instructions), pos, start))
 }
 
 fn summary_prompt(
@@ -943,16 +983,58 @@ async fn summarize_conversation(
     label: &str,
     turn_prefix: bool,
 ) -> Result<String, EgoPulseError> {
-    let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
-    let mut previous = previous_summary.map(|text| redact_summary_text(text, request.config));
+    let mut units = Vec::new();
+    for part in serialize_conversation_parts(messages) {
+        let serialized = redact_summary_text(&part, request.config);
+        if let Some((label, body)) = serialized
+            .strip_prefix('[')
+            .and_then(|text| text.split_once("]: "))
+        {
+            units.push((label.to_string(), body.to_string()));
+        }
+    }
     let instructions = instructions.map(|text| redact_summary_text(text, request.config));
+    let mut previous = previous_summary.map(|text| redact_summary_text(text, request.config));
+    let mut index = 0;
     let mut offset = 0;
+    let mut recovery_attempts = 0;
     loop {
-        let mut consumed = 0;
+        // Re-summarize an oversized checkpoint as oldest input before continuing.
+        let budget = summary_input_budget(request).await;
+        if let Some(prior) = previous.as_ref() {
+            let fixed = summary_prompt("", Some(prior), instructions.as_deref());
+            if summary_request_estimate(&summary_prompt(
+                "[Previous checkpoint continued]: x",
+                Some(prior),
+                instructions.as_deref(),
+            )) > budget
+            {
+                if recovery_attempts >= 3 {
+                    return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
+                        budget_tokens: budget,
+                        required_tokens: summary_request_estimate(&fixed),
+                    }));
+                }
+                if offset > 0 {
+                    let (label, body) = &mut units[index];
+                    *label = format!("{label} continued");
+                    *body = body[offset..].to_string();
+                }
+                units.insert(
+                    index,
+                    ("Previous checkpoint".to_string(), previous.take().unwrap()),
+                );
+                offset = 0;
+                recovery_attempts += 1;
+            }
+        }
+        let mut next = (index, offset);
         let summary = summarize(request, label, |budget| {
-            let (prompt, end) = summary_chunk(
+            let (prompt, next_index, next_offset) = summary_chunk(
                 budget,
-                &conversation[offset..],
+                &units,
+                index,
+                offset,
                 previous.as_deref(),
                 instructions.as_deref(),
                 |chunk, prior, focus| {
@@ -969,12 +1051,12 @@ async fn summarize_conversation(
                     }
                 },
             )?;
-            consumed = end;
+            next = (next_index, next_offset);
             Ok(prompt)
         })
         .await?;
-        offset += consumed;
-        if offset == conversation.len() {
+        (index, offset) = next;
+        if index == units.len() {
             return Ok(summary);
         }
         previous = Some(summary);
@@ -1101,7 +1183,12 @@ pub(crate) async fn compact(
     };
 
     let started = Instant::now();
-    let summary = build_summary(request, &preparation, instructions).await?;
+    let summary = tokio::time::timeout(
+        SUMMARY_REQUEST_DEADLINE,
+        build_summary(request, &preparation, instructions),
+    )
+    .await
+    .map_err(|_| EgoPulseError::Llm(LlmError::DeadlineExceeded))??;
     // Archive only once the summary exists: a failed attempt keeps the context
     // untruncated, so there is nothing to preserve yet.
     archive_before_compaction(request, session).await;
@@ -1623,7 +1710,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_complete_tool_results() {
+    fn serializes_tool_results_with_a_character_limit() {
         let long = "x".repeat(2050);
         let messages = vec![
             text("user", "hello"),
@@ -1634,11 +1721,12 @@ mod tests {
             ),
         ];
 
-        let serialized = serialize_conversation(&messages);
+        let serialized = serialize_conversation_parts(&messages).join("\n\n");
 
         assert!(serialized.starts_with("[User]: hello"));
         assert!(serialized.contains("[Assistant tool calls]: read("));
-        assert!(serialized.contains(&long));
+        assert!(serialized.contains(&"x".repeat(2_000)));
+        assert!(serialized.contains("50 more characters truncated"));
     }
 
     #[test]
@@ -1646,7 +1734,7 @@ mod tests {
         let mut message = text("assistant", "answer");
         message.reasoning_content = Some("hidden chain of thought".to_string());
 
-        let serialized = serialize_conversation(&[message]);
+        let serialized = serialize_conversation_parts(&[message]).join("\n\n");
 
         assert_eq!(serialized, "[Assistant]: answer");
     }
@@ -1790,10 +1878,10 @@ mod tests {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            (0..100)
+            (0..10)
                 .map(|_| Ok(summary_response("history summary")))
                 .collect(),
-            vec![0; 100],
+            vec![0; 10],
         );
         let mut config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
@@ -1813,7 +1901,7 @@ mod tests {
         let chat_id = chat_id_for(&state, &context).await;
         // This history is far larger than the test model's 9,000-token window,
         // so the summary request itself must be bounded before it is sent.
-        let huge_answer = "old answer ".repeat(40_000);
+        let huge_answer = "old answer ".repeat(3_000);
         let correction = format!(
             "The old plan is withdrawn. New decision: keep the newest text. API key: {secret}"
         );
@@ -1874,16 +1962,12 @@ mod tests {
         assert!(prompt.contains("<conversation>"));
         assert!(prompt.contains("old question"));
         let all_prompts = provider.seen_messages();
-        let mut reconstructed = String::new();
+        let mut assistant_chunks = 0;
         for (index, messages) in all_prompts.iter().enumerate() {
             let prompt = messages[0].content.as_text_lossy();
-            let chunk = prompt
-                .strip_prefix("<conversation>\n")
-                .expect("conversation start")
-                .split_once("\n</conversation>")
-                .expect("conversation end")
-                .0;
-            reconstructed.push_str(chunk);
+            if prompt.contains("[Assistant]: ") || prompt.contains("[Assistant continued]: ") {
+                assistant_chunks += 1;
+            }
             if index > 0 {
                 assert!(
                     prompt.contains("<previous-summary>\nhistory summary\n</previous-summary>")
@@ -1892,13 +1976,16 @@ mod tests {
             assert!(summary_request_estimate(&prompt) <= input_budget);
             assert!(!prompt.contains(secret));
         }
-        assert_eq!(
-            reconstructed,
-            redact_summary_text(
-                &serialize_conversation(&session.messages[..3]),
-                request.config
-            )
+        assert!(
+            assistant_chunks >= 2,
+            "split messages retain their role and continuation"
         );
+        assert!(all_prompts.iter().any(|messages| {
+            messages[0]
+                .content
+                .as_text_lossy()
+                .contains("[Assistant continued]: ")
+        }));
         let last = all_prompts.last().unwrap()[0].content.as_text_lossy();
         assert!(last.contains("The old plan is withdrawn."));
         assert!(
@@ -1915,11 +2002,15 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn rejects_a_previous_summary_that_exceeds_the_input_budget() {
+    async fn summarizes_a_previous_checkpoint_that_exceeds_the_input_budget() {
         // Arrange: the checkpoint alone is larger than the model's input budget.
         let dir = tempfile::tempdir().expect("tempdir");
-        let provider =
-            RecordingProvider::new(vec![Ok(summary_response("updated summary"))], vec![0]);
+        let provider = RecordingProvider::new(
+            (0..8)
+                .map(|_| Ok(summary_response("updated summary")))
+                .collect(),
+            vec![0; 8],
+        );
         let config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
             1,
@@ -1938,7 +2029,7 @@ mod tests {
         ]);
         let latest_decision = "The old plan is withdrawn. Latest decision: use plan B.";
         session.checkpoint = Some(CompactionCheckpoint {
-            summary: format!("{}\n\n{latest_decision}", "old checkpoint ".repeat(30_000)),
+            summary: format!("{}\n\n{latest_decision}", "old checkpoint ".repeat(2_000)),
             tokens_before: 1,
             read_files: Vec::new(),
             modified_files: Vec::new(),
@@ -1960,15 +2051,33 @@ mod tests {
         };
 
         // Act
-        let error = compact(&request, &session, CompactionReason::Manual, None)
+        let outcome = compact(&request, &session, CompactionReason::Manual, None)
             .await
-            .expect_err("oversized checkpoint must fail");
-        // Assert
-        assert!(matches!(
-            error,
-            EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded { .. })
-        ));
-        assert!(provider.seen_messages().is_empty());
+            .expect("oversized checkpoint can be summarized");
+        let CompactionOutcome::Compacted(compacted) = outcome else {
+            panic!("expected checkpoint")
+        };
+        assert_eq!(compacted.checkpoint.unwrap().summary, "updated summary");
+        let prompts = provider.seen_messages();
+        assert!(prompts.len() > 1);
+        assert!(
+            prompts[0][0]
+                .content
+                .as_text_lossy()
+                .contains("[Previous checkpoint]:")
+        );
+        assert!(prompts.iter().any(|messages| {
+            messages[0]
+                .content
+                .as_text_lossy()
+                .contains(latest_decision)
+        }));
+        assert!(
+            prompts.last().unwrap()[0]
+                .content
+                .as_text_lossy()
+                .contains("old question")
+        );
     }
 
     #[tokio::test]
@@ -2071,8 +2180,8 @@ mod tests {
         let context = crate::agent_loop::test_support::cli_context("overflow-compact");
         let chat_id = chat_id_for(&state, &context).await;
         let session = session(vec![
-            text("user", "old question"),
-            text("assistant", &"long answer ".repeat(2_000)),
+            text("user", &"old question ".repeat(2_000)),
+            text("assistant", "old answer"),
             text("user", "fresh question"),
         ]);
         let runtime = state.turn_dependencies();
