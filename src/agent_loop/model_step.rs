@@ -1396,81 +1396,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn a_guard_retry_that_hits_a_transient_failure_still_reports_the_suffix() {
-        // Arrange: the empty response installs the guard, the guarded request
-        // is rate limited, and the retry succeeds.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(
-            vec![
-                Ok(MessagesResponse {
-                    content: String::new(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: None,
-                }),
-                Err(crate::error::LlmError::ApiError {
-                    status: reqwest::StatusCode::TOO_MANY_REQUESTS,
-                    body_preview: "rate limited".to_string(),
-                    retry_after_secs: Some(0),
-                }),
-                Ok(MessagesResponse {
-                    content: "recovered response".to_string(),
-                    reasoning_content: None,
-                    tool_calls: Vec::new(),
-                    usage: Some(crate::llm::LlmUsage {
-                        input_tokens: 120,
-                        output_tokens: 8,
-                        cached_input_tokens: None,
-                    }),
-                }),
-            ],
-            vec![0, 0, 0],
-        );
-        let state = build_state_with_provider(
-            dir.path().to_str().expect("utf8").to_string(),
-            Box::new(provider),
-        );
-        let context = cli_context("guard-transient-measurement");
-        let snapshot = state.config_manager.current_blocking();
-        let llm = state
-            .turn_dependencies()
-            .llm_for_context_with_snapshot(&context, &snapshot)
-            .expect("llm");
-        let runtime = state.turn_dependencies();
-        let runner = ModelRunner::new(ModelStepRequest {
-            state: &runtime,
-            llm: llm.as_ref(),
-            system_prompt: "system prompt",
-            messages: Arc::new(vec![Message::text("user", "hello")]),
-            tools: None,
-            chat_id: 1,
-            caller_channel: "cli",
-            request_kind: "agent_loop",
-            usage_log_failure: "llm usage logging failed",
-            log_scope: "agent_loop",
-            send_failure_log: "LLM send_message failed",
-            iteration: 1,
-            scope: ConversationScope::Normal,
-            on_delta: &ignore_delta,
-        });
-
-        // Act
-        let outcome = runner
-            .run_with_transient_retry(Duration::from_secs(5))
-            .await
-            .expect("guarded retry should recover");
-
-        // Assert
-        assert!(matches!(
-            outcome.step,
-            ModelStep::Final(response) if response.content == "recovered response"
-        ));
-        assert_eq!(outcome.recovery_suffix.len(), 2);
-        assert!(message_to_text(&outcome.recovery_suffix[1]).contains("no user-visible text"));
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn non_empty_invalid_response_is_not_retried_by_empty_guard() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1821,7 +1746,11 @@ mod tests {
                     content: "recovered after guarded retry".to_string(),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
-                    usage: None,
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 120,
+                        output_tokens: 8,
+                        cached_input_tokens: None,
+                    }),
                 }),
             ],
             vec![0, 0, 0],
@@ -1845,6 +1774,35 @@ mod tests {
         let second_guard = seen_messages[2].last().expect("second guard message");
         assert!(message_to_text(first_guard).contains("no user-visible text"));
         assert_eq!(message_to_text(first_guard), message_to_text(second_guard));
+
+        // The successful retry is also the usage measurement target.
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:empty-guard-transient:agent:default",
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        for _ in 0..20 {
+            let (requests, input_tokens, output_tokens, total_tokens) =
+                call_blocking(Arc::clone(&state.db), move |db| {
+                    db.get_llm_usage_summary(Some(chat_id))
+                })
+                .await
+                .expect("usage summary");
+            if requests > 0 {
+                assert_eq!(
+                    (requests, input_tokens, output_tokens, total_tokens),
+                    (1, 120, 8, 128)
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("usage log was not written within the polling timeout");
     }
 
     #[tokio::test]
