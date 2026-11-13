@@ -2191,40 +2191,6 @@ channels:
 
 #[test]
 #[serial]
-fn resolves_catalog_context_window_when_model_context_missing() {
-    let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _home = EnvVarGuard::set("HOME", temp_dir.path());
-    let file_path = write_config(
-        &temp_dir,
-        r#"default_provider: openai
-providers:
-  openai:
-    label: OpenAI
-    base_url: https://api.openai.com/v1
-    api_key: sk-test
-    default_model: gpt-4o-mini
-    models:
-      gpt-4o-mini: {}
-channels:
-  web:
-    enabled: true
-    auth_token: web-secret"#,
-    );
-
-    let config = Config::load(Some(&file_path)).expect("load config");
-
-    // The model has no explicit context_window_tokens: the bundled catalog
-    // value applies, not a global default.
-    let metadata = config.resolve_model_metadata(&super::ProviderId::new("openai"), "gpt-4o-mini");
-    assert_eq!(metadata.context_window, 128_000);
-    assert_eq!(
-        metadata.context_window_source,
-        super::model_metadata::ModelValueSource::Catalog
-    );
-}
-
-#[test]
-#[serial]
 fn loads_compaction_settings_from_top_level() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());

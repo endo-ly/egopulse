@@ -64,25 +64,20 @@ describe("MessageBubble", () => {
     );
   });
 
-  it("truncated_answer_shows_an_output_limit_notice", () => {
-    // Act
-    const { container } = render(
+  it("shows_an_output_limit_notice_only_for_truncated_answers", () => {
+    // Arrange: one truncated answer and one complete answer.
+    const truncated = render(
       <MessageBubble
         message={msg({ content: "partial", finish_reason: "max_output_tokens" })}
       />,
     );
+    const complete = render(<MessageBubble message={msg({ content: "done" })} />);
 
-    // Assert
-    const notice = container.querySelector(".message-truncation-notice");
-    expect(notice?.textContent).toContain("output limit");
-  });
-
-  it("complete_answer_has_no_output_limit_notice", () => {
-    // Act
-    const { container } = render(<MessageBubble message={msg({ content: "done" })} />);
-
-    // Assert
-    expect(container.querySelector(".message-truncation-notice")).toBeNull();
+    // Assert: only the truncated answer carries the notice.
+    expect(
+      truncated.container.querySelector(".message-truncation-notice")?.textContent,
+    ).toContain("output limit");
+    expect(complete.container.querySelector(".message-truncation-notice")).toBeNull();
   });
 
   it("assistant_message_renders_content_without_stream_markers", () => {
