@@ -19,7 +19,7 @@
 //!
 //! Summaries are reference material for the next request, never instructions.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -281,26 +281,26 @@ impl FileOperations {
             // A tool call is identified only within its own result block.
             // The same id may be reused by a later turn, so a conversation-wide
             // lookup would apply one turn's outcome to another turn's call.
-            let mut outcomes = HashMap::new();
+            let mut successful_results = HashSet::new();
             let mut result_index = index + 1;
             while let Some(result) = messages.get(result_index) {
                 if result.role != "tool" {
                     break;
                 }
                 if let Some(tool_call_id) = result.tool_call_id.as_deref() {
-                    outcomes.insert(tool_call_id, is_tool_result_success(result));
+                    if is_tool_result_success(result) {
+                        successful_results.insert(tool_call_id.to_string());
+                    }
                 }
                 result_index += 1;
             }
 
             for tool_call in &message.tool_calls {
-                // A call without a successful result did not change the file:
-                // it may have failed or been cut off before execution.
-                if !outcomes
-                    .get(tool_call.id.as_str())
-                    .copied()
-                    .unwrap_or(false)
-                {
+                // Invalid arguments are rejected before the Tool runs, so the
+                // call cannot have touched the file. A normal write or edit is
+                // different: it may have written part of the file before an
+                // error, so an error result does not prove the file is intact.
+                if tool_call.invalid_arguments.is_some() {
                     continue;
                 }
                 let Some(path) = tool_call
@@ -315,7 +315,7 @@ impl FileOperations {
                     continue;
                 }
                 match tool_call.name.as_str() {
-                    "read" => {
+                    "read" if successful_results.contains(&tool_call.id) => {
                         self.read.insert(path.to_string());
                     }
                     "write" | "edit" => {
@@ -1451,9 +1451,14 @@ mod tests {
     }
 
     #[test]
-    fn only_successful_file_operations_are_recorded() {
-        // A failed or unexecuted write/edit did not change the file, and a read
-        // that never ran is not a read file either.
+    fn file_operations_record_possible_changes_and_skip_rejected_calls() {
+        // A write or edit may change the file before an error is returned, so
+        // an error result is still a modification. Calls rejected before
+        // execution (invalid arguments) cannot have touched the file. Reads
+        // count only when they succeeded.
+        let mut rejected = tool_call("6", "edit", "/tmp/e");
+        rejected.tool_calls[0].invalid_arguments = Some("truncated tool call".to_string());
+
         let mut operations = FileOperations::default();
         operations.extract_from(&[
             tool_call("1", "read", "/tmp/a"),
@@ -1466,23 +1471,35 @@ mod tests {
             tool_result_status("4", "success"),
             tool_call("5", "write", "/tmp/d"),
             tool_result_status("5", "error"),
-            tool_call("6", "edit", "/tmp/e"),
+            rejected,
+            tool_call("7", "read", "/tmp/f"),
+            tool_result_status("7", "error"),
             // A later turn may reuse an id. The failure must not erase the
             // earlier success, and the later success must not apply to the
             // earlier failed call.
             text("user", "next turn"),
             tool_call("2", "write", "/tmp/old"),
             tool_result_status("2", "error"),
-            tool_call("3", "edit", "/tmp/new"),
-            tool_result_status("3", "success"),
+            tool_call("4", "read", "/tmp/later"),
+            tool_result_status("4", "error"),
+            tool_call("7", "read", "/tmp/new"),
+            tool_result_status("7", "success"),
         ]);
 
         let (read_files, modified_files) = operations.compute_lists();
 
-        assert_eq!(read_files, vec!["/tmp/c".to_string()]);
+        assert_eq!(
+            read_files,
+            vec!["/tmp/c".to_string(), "/tmp/new".to_string()]
+        );
         assert_eq!(
             modified_files,
-            vec!["/tmp/a".to_string(), "/tmp/new".to_string()]
+            vec![
+                "/tmp/a".to_string(),
+                "/tmp/b".to_string(),
+                "/tmp/d".to_string(),
+                "/tmp/old".to_string()
+            ]
         );
     }
 
