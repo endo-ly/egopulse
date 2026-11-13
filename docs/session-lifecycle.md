@@ -367,8 +367,11 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 - system prompt・固定テンプレート・前回 checkpoint・追加指示・会話を含めた推定が上限以内になるよう調整する
 - 固定部分が上限に収まる場合は、残りを会話テキストの予算にする
 - 固定部分だけで上限を超える場合は、前回 checkpoint、追加指示を先に縮め、新しい会話を可能な限り残す
+- 前回 checkpoint は新しい側、追加指示は先頭側を残す
 - 会話テキストが予算を超える場合は、UTF-16 コード単位で新しい側から収まる範囲を残し、先頭に `[... earlier conversation truncated to fit the summarization request ...]` を付ける
-- 入力予算は EgoPulse のトークン推定に基づく。実際のトークナイザーが上回り provider が容量超過を返した場合は要約失敗として扱い、checkpoint を保存せず元の context を保持する
+- 入力予算は UTF-16 文字数から求めた推定値ではなく、通常の Compaction と同じ `UsageCalibrator` の `compaction` 補正係数で実測トークンへ換算する。実測前は保守的な既定係数を使い、補正後も context window は超えない
+- provider が容量超過を返した場合は、入力予算を現在の半分以下に縮めて最大 2 回再送する。それでも超過する場合は要約失敗として扱い、checkpoint を保存せず元の context を保持する
+- 固定テンプレートすら収まらない場合は、途中で切った指示を送らず入力容量不足として終了する
 - 切り詰めは要約リクエストの入力だけに適用する。保持メッセージ、checkpoint の要約本文、archive の内容は変更しない
 - 要約モデルの出力上限や API 最小出力の扱いは通常の LLM リクエストと同じ
 
