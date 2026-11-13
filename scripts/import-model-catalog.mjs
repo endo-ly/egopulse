@@ -35,7 +35,13 @@ const SOURCE_VERSION = "1.5.0";
 
 // Dynamic routing models have no fixed destination, so a single context window
 // cannot describe them. They stay unknown and use the custom-model defaults.
-const DYNAMIC_MODELS = new Set(["openrouter/auto"]);
+// Key by provider and model id: the source stores provider="openrouter" and
+// id="auto" separately, so a bare "openrouter/auto" id never matches. The
+// same router also appears under id="openrouter/auto".
+const DYNAMIC_MODEL_KEYS = new Set([
+  "openrouter\u0000auto",
+  "openrouter\u0000openrouter/auto",
+]);
 
 function globalRoot() {
   try {
@@ -118,8 +124,8 @@ function readEntries(dataDir) {
         ) {
           continue;
         }
-        if (DYNAMIC_MODELS.has(id)) continue;
         const key = `${provider}\u0000${id}`;
+        if (DYNAMIC_MODEL_KEYS.has(key)) continue;
         const previous = entries.get(key);
         if (
           previous &&
