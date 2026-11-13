@@ -11,7 +11,7 @@
 //   node scripts/import-model-catalog.mjs [data-dir]
 //
 // Without an argument the script looks for a global install:
-//   npm install -g @earendil-works/pi-coding-agent
+//   npm install -g @earendil-works/pi-coding-agent@1.5.0
 //   node scripts/import-model-catalog.mjs
 //
 // The data directory must contain the per-provider JSON files. Set
@@ -63,7 +63,8 @@ function resolveDataDir() {
   const dataDir = explicit ? resolve(explicit) : defaultDataDir();
   if (!dataDir || !existsSync(dataDir)) {
     console.error(
-      "provider data directory not found; pass it explicitly or install the package globally:\n" +
+      "provider data directory not found; pass it explicitly or install the pinned package globally:\n" +
+        "  npm install -g @earendil-works/pi-coding-agent@1.5.0\n" +
         "  node scripts/import-model-catalog.mjs /path/to/pi-ai/dist/providers/data",
     );
     process.exit(1);

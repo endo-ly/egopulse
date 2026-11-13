@@ -327,7 +327,7 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 
 system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
 
-出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
+出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
 
 補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
 

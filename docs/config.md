@@ -303,7 +303,7 @@ npm install -g @earendil-works/pi-coding-agent@1.5.0
 node scripts/import-model-catalog.mjs
 ```
 
-スクリプトはインポート元の `@earendil-works/pi-ai` のバージョンを固定値（現在は `1.5.0`）と照合し、異なる場合は生成を中止する。生成物の `source` フィールドには `@earendil-works/pi-ai@1.5.0` が記録されるため、どのバージョンのデータから作られたかを追跡できる。更新時はスクリプトの `SOURCE_VERSION` を上げ、生成物と一緒にコミットする。
+スクリプトはインポート元の `@earendil-works/pi-ai` のバージョンを固定値（現在は `1.5.0`）と照合し、異なる場合は生成を中止する。生成物の `source` フィールドには `@earendil-works/pi-ai@1.5.0` が記録されるため、どのバージョンのデータから作られたかを追跡できる。更新時はスクリプトの `SOURCE_VERSION`、この手順のインストール例、生成物を一緒に更新する。
 
 スクリプトは各プロバイダーの JSON から Chat モデルの `contextWindow` / `maxTokens` だけを取り出し、`provider/model` の組で重複を排除する。転送先が動的に変わるルーティングモデル（`openrouter/auto`）は固定値を設定できないため除外し、未知モデルの既定値として扱う。元データに無いモデル（提供終了したモデルなど）も同じ既定値になる。実際の上限が既定値と異なる場合は、モデル設定で明示的に上書きする。
 
@@ -313,7 +313,7 @@ node scripts/import-model-catalog.mjs
 
 `max_output_tokens` はプロバイダーへ送る出力上限として使う。Chat Completions は接続先が公式 OpenAI / Azure の場合は `max_completion_tokens`、それ以外の OpenAI 互換 API は `max_tokens` を送る。Responses API は `max_output_tokens` を送る。フィールドは設定上のプロバイダー ID ではなく接続先で決める。
 
-入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 安全余裕` まで切り下げる。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API ごとの最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合はリクエストを送らず、容量不足として Agent Loop の 1 回の compaction・再送対象にする。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
+入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 安全余裕` まで切り下げる。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API ごとの最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合はリクエストを送らず、容量不足として Agent Loop の 1 回の compaction・再送対象にする。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
 
 `max_output_tokens` の解決値（明示設定またはカタログ）が API の最小出力を下回る場合は、送信前に設定不整合として失敗する（`LlmError::OutputLimitBelowApiMinimum`）。この状態は compaction では解消しないため、自動圧縮・再送の対象にはしない。設定値を API の最小出力以上へ引き上げる必要がある。
 
