@@ -141,14 +141,22 @@ pub(crate) struct RequestMeasurement {
 
 impl RequestMeasurement {
     /// Builds the anchor for `usage` measured at `index`.
-    pub(crate) fn anchor(&self, index: usize, usage: &crate::llm::LlmUsage) -> ContextUsageAnchor {
-        ContextUsageAnchor::for_message(
+    ///
+    /// Returns `None` when the usage has no token counts, so a zero report
+    /// cannot replace a valid earlier measurement.
+    pub(crate) fn anchor(
+        &self,
+        index: usize,
+        usage: &crate::llm::LlmUsage,
+    ) -> Option<ContextUsageAnchor> {
+        let anchor = ContextUsageAnchor::for_message(
             index,
             usage,
             self.request_overhead_tokens,
             &self.model_key,
             &self.request_shape_hash,
-        )
+        );
+        anchor.has_measured_tokens().then_some(anchor)
     }
 }
 
@@ -161,7 +169,7 @@ pub(crate) struct MeasuredUsage {
 
 impl MeasuredUsage {
     /// Builds the anchor for the assistant message at `index`.
-    pub(crate) fn anchor(&self, index: usize) -> ContextUsageAnchor {
+    pub(crate) fn anchor(&self, index: usize) -> Option<ContextUsageAnchor> {
         self.request.anchor(index, &self.usage)
     }
 }
@@ -416,7 +424,8 @@ pub(crate) fn project_context_tokens(
     factor: f64,
 ) -> usize {
     let anchor_matches = session.last_usage.as_ref().filter(|anchor| {
-        anchor.model_key == model_key
+        anchor.has_measured_tokens()
+            && anchor.model_key == model_key
             && anchor.request_shape_hash == shape_hash
             && anchor.after_message_index < session.messages.len()
     });
@@ -1576,6 +1585,20 @@ mod tests {
         let trailing = estimate_message_tokens(&context.messages[2]);
         assert_eq!(matched, 1_100 + trailing);
         assert!(reestimated > matched);
+
+        // A provider can report an all-zero usage. It carries no measurement,
+        // so projection falls back to estimating the whole request instead of
+        // anchoring the context at zero.
+        context.last_usage = Some(crate::agent_loop::session_snapshot::ContextUsageAnchor {
+            after_message_index: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            request_overhead_tokens: 2,
+            model_key: "p/m".to_string(),
+            request_shape_hash: "shape-a".to_string(),
+        });
+        let zero_anchor = project_context_tokens(&prompt, &context, &[], "p/m", "shape-a", 1.0);
+        assert_eq!(zero_anchor, estimate_request_tokens(&prompt, &context, &[]));
     }
 
     #[test]

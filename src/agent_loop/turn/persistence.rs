@@ -155,9 +155,12 @@ impl<'a> TurnPersistence<'a> {
         updated.push(assistant_message.clone());
         let assistant_index = updated.len() - 1;
         context.messages = Arc::new(updated);
-        context.last_usage = measured
+        if let Some(anchor) = measured
             .as_ref()
-            .map(|measured| measured.anchor(assistant_index));
+            .and_then(|measured| measured.anchor(assistant_index))
+        {
+            context.last_usage = Some(anchor);
+        }
 
         let mut stored = StoredMessage::assistant(
             self.chat_id,
@@ -204,10 +207,13 @@ impl<'a> TurnPersistence<'a> {
         messages.push(assistant_message.clone());
         let assistant_index = messages.len() - 1;
         context.messages = Arc::new(messages);
-        context.last_usage = assistant_phase
+        if let Some(anchor) = assistant_phase
             .usage
             .as_ref()
-            .map(|usage| measurement.anchor(assistant_index, usage));
+            .and_then(|usage| measurement.anchor(assistant_index, usage))
+        {
+            context.last_usage = Some(anchor);
+        }
 
         let mut stored = StoredMessage {
             id: assistant_message_id.to_string(),

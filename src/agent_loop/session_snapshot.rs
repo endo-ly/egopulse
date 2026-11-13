@@ -97,6 +97,15 @@ impl ContextUsageAnchor {
         }
     }
 
+    /// Returns whether the provider reported at least one token.
+    ///
+    /// A provider can return a usage object whose counters are all zero. It
+    /// carries no measurement, so it must neither replace a valid anchor nor
+    /// be used for projection.
+    pub(crate) fn has_measured_tokens(&self) -> bool {
+        self.input_tokens > 0 || self.output_tokens > 0
+    }
+
     /// Returns the context tokens this usage measured for its own request.
     pub(crate) fn measured_context_tokens(&self) -> usize {
         let total = self.input_tokens.max(0) + self.output_tokens.max(0);
