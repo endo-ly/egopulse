@@ -704,8 +704,10 @@ async fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
         .min(token_budget)
 }
 
-/// Builds a sanitized summary prompt that fits the summarizer's input budget.
+/// Builds a summary prompt that fits the summarizer's input budget.
 ///
+/// The variable inputs must already be sanitized. The fixed templates are
+/// constants, so the assembled prompt does not need another redaction pass.
 /// The newest conversation text has priority. The previous checkpoint and the
 /// optional focus are older context, so they are reduced first when the fixed
 /// part alone leaves no room. The previous checkpoint keeps its newest end,
@@ -720,7 +722,6 @@ async fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
 /// a truncated instruction would produce an invalid summary, so the request is
 /// rejected instead.
 fn fit_summary_prompt<F>(
-    request: &CompactionRequest<'_>,
     budget: usize,
     mut conversation: String,
     mut previous_summary: Option<String>,
@@ -735,7 +736,6 @@ where
     // truncated form, so it is an input-capacity error.
     loop {
         let fixed = build("", previous_summary.as_deref(), instructions.as_deref());
-        let fixed = redact_summary_text(&fixed, request.config);
         let fixed_estimate = summary_request_estimate(&fixed);
         if conversation.is_empty() {
             if fixed_estimate <= budget {
@@ -771,7 +771,6 @@ where
             previous_summary.as_deref(),
             instructions.as_deref(),
         );
-        let prompt = redact_summary_text(&prompt, request.config);
         let estimate = summary_request_estimate(&prompt);
         if estimate <= budget {
             return Ok(prompt);
@@ -1131,7 +1130,6 @@ async fn generate_summary(
         instructions.map(|instructions| redact_summary_text(instructions, request.config));
     summarize(request, label, |budget| {
         fit_summary_prompt(
-            request,
             budget,
             conversation.clone(),
             previous_summary.clone(),
@@ -1152,7 +1150,6 @@ async fn generate_turn_prefix_summary(
         instructions.map(|instructions| redact_summary_text(instructions, request.config));
     summarize(request, "turn prefix", |budget| {
         fit_summary_prompt(
-            request,
             budget,
             conversation.clone(),
             None,
