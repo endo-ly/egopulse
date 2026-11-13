@@ -252,6 +252,10 @@ pub(crate) trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
 
+    fn minimum_output_tokens(&self, _messages: &[Message]) -> usize {
+        1
+    }
+
     /// Sends one request and returns the complete response.
     ///
     /// The body is consumed as a stream internally, even when the caller has

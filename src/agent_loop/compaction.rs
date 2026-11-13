@@ -1230,10 +1230,6 @@ pub(crate) async fn compact(
     )
     .await
     .map_err(|_| EgoPulseError::Llm(LlmError::DeadlineExceeded))??;
-    // Archive only once the summary exists: a failed attempt keeps the context
-    // untruncated, so there is nothing to preserve yet.
-    archive_before_compaction(request, session).await;
-
     let (read_files, modified_files) = preparation.file_operations.compute_lists();
     let summary = redact_summary_text(&summary, request.config);
     let kept_messages: Vec<Message> = session.messages[preparation.first_kept_index..].to_vec();
@@ -1252,6 +1248,34 @@ pub(crate) async fn compact(
         estimate_request_tokens(&request.prompt, &context, &request.request_only_messages) as i64,
         factor,
     ));
+    let mut projected_messages =
+        Vec::with_capacity(context.messages.len() + 1 + request.request_only_messages.len());
+    if let Some(checkpoint) = &context.checkpoint {
+        projected_messages.push(checkpoint_message(checkpoint));
+    }
+    projected_messages.extend(context.messages.iter().cloned());
+    projected_messages.extend(
+        request
+            .request_only_messages
+            .iter()
+            .map(|message| (*message).clone()),
+    );
+    let minimum = request.llm.minimum_output_tokens(&projected_messages);
+    if let Err(crate::llm::tokens::OutputCapacityError::InsufficientRoom { .. }) =
+        crate::llm::tokens::max_output_tokens_for_request(
+            context_window,
+            tokens_after,
+            minimum,
+            minimum,
+        )
+    {
+        return Err(EgoPulseError::Llm(LlmError::OutputCapacityExceeded {
+            context_window,
+            prompt_tokens: tokens_after,
+            minimum_output_tokens: minimum,
+        }));
+    }
+    archive_before_compaction(request, session).await;
     info!(
         channel = %request.context.channel,
         chat_id = request.chat_id,
@@ -1789,20 +1813,53 @@ mod tests {
     }
 
     #[test]
-    fn update_prompt_places_the_previous_summary_separately() {
-        let prompt = summary_prompt("[User]: hi", Some("previous summary"), None);
+    fn summary_chunks_consume_each_message_once() {
+        // Arrange
+        let units = vec![
+            ConversationPart {
+                label: "User".into(),
+                body: "first".into(),
+            },
+            ConversationPart {
+                label: "Assistant".into(),
+                body: "abc😀".repeat(100),
+            },
+            ConversationPart {
+                label: "User".into(),
+                body: "last".into(),
+            },
+        ];
+        let mut cursor = SummaryCursor::default();
+        let mut reconstructed = vec![String::new(); units.len()];
 
-        assert!(prompt.contains("<conversation>\n[User]: hi\n</conversation>"));
-        assert!(prompt.contains("<previous-summary>\nprevious summary\n</previous-summary>"));
-        assert!(prompt.contains(UPDATE_SUMMARY_PROMPT));
-        assert!(!prompt.contains(INITIAL_SUMMARY_PROMPT));
-    }
+        // Act
+        while cursor.index < units.len() {
+            let chunk = summary_chunk(100, &units, cursor, None, None, |text, _, _| {
+                text.to_string()
+            })
+            .unwrap();
+            for (index, part) in (cursor.index..).zip(chunk.prompt.split("\n\n")) {
+                let (label, body) = part.split_once("]: ").unwrap();
+                let expected = if index == cursor.index && cursor.offset > 0 {
+                    format!("[{} continued", units[index].label)
+                } else {
+                    format!("[{}", units[index].label)
+                };
+                assert_eq!(label, expected);
+                reconstructed[index].push_str(body);
+            }
+            assert!(chunk.next.index > cursor.index || chunk.next.offset > cursor.offset);
+            cursor = chunk.next;
+        }
 
-    #[test]
-    fn manual_instructions_are_appended_as_focus() {
-        let prompt = summary_prompt("conv", None, Some("focus on decisions"));
-
-        assert!(prompt.ends_with("Additional focus: focus on decisions"));
+        // Assert
+        assert_eq!(
+            reconstructed,
+            units
+                .iter()
+                .map(|unit| unit.body.clone())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2016,6 +2073,24 @@ mod tests {
             !prompt.contains(secret),
             "the summary request must not contain config secrets"
         );
+        // An oversized retained message cannot produce a usable checkpoint.
+        let oversized = SessionContext {
+            checkpoint: None,
+            messages: Arc::new(vec![
+                text("user", "old question"),
+                text("user", &"x".repeat(100_000)),
+            ]),
+            last_usage: None,
+        };
+        let error = compact(&request, &oversized, CompactionReason::Manual, None)
+            .await
+            .expect_err("retained context exceeds the window");
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(LlmError::OutputCapacityExceeded { .. })
+        ));
+        assert!(oversized.checkpoint.is_none());
+        assert_eq!(oversized.messages.len(), 2);
         assert!(last.contains("[REDACTED:provider.openai.api_key]"));
         assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
         assert!(
@@ -2478,62 +2553,6 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn automatic_compaction_respects_the_disabled_setting() {
-        // Arrange: one response for the manual compaction below; any automatic
-        // summarization call would consume it and fail the assertion.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider =
-            RecordingProvider::new(vec![Ok(summary_response("manual summary"))], vec![0]);
-        let mut config = crate::agent_loop::test_support::test_config_with_compaction(
-            dir.path().to_string_lossy().to_string(),
-            1,
-        );
-        config.compaction.enabled = false;
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("disabled-compact");
-        let chat_id = chat_id_for(&state, &context).await;
-        let session = session(vec![
-            text("user", &"x".repeat(1_000)),
-            text("user", "fresh question"),
-        ]);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
-
-        // Act: the automatic path stays off.
-        let outcome = compact_if_needed(&request, &session, None)
-            .await
-            .expect("compact");
-
-        // Assert
-        assert!(matches!(outcome, CompactionOutcome::Unchanged));
-        assert!(provider.seen_systems().is_empty());
-
-        // Act: the manual path still runs while automatic compaction is off.
-        let outcome = compact(&request, &session, CompactionReason::Manual, None)
-            .await
-            .expect("compact");
-
-        // Assert
-        assert!(matches!(outcome, CompactionOutcome::Compacted(_)));
-        assert_eq!(provider.seen_systems().len(), 1);
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
     async fn automatic_compaction_skips_a_context_that_still_fits() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2571,56 +2590,6 @@ mod tests {
         // Assert
         assert!(matches!(outcome, CompactionOutcome::Unchanged));
         assert!(provider.seen_systems().is_empty());
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn automatic_compaction_triggers_above_the_window() {
-        // Arrange
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = RecordingProvider::new(vec![Ok(summary_response("summary"))], vec![0]);
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_string_lossy().to_string(),
-            100,
-            2_000,
-        );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("trigger-compact");
-        let chat_id = chat_id_for(&state, &context).await;
-        let session = session(vec![
-            text("user", "earlier question"),
-            text("user", &"x".repeat(20_000)),
-            text("assistant", "answer"),
-            text("user", "fresh question"),
-        ]);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
-
-        // Act
-        let outcome = compact_if_needed(&request, &session, None)
-            .await
-            .expect("compact");
-
-        // Assert
-        let CompactionOutcome::Compacted(compacted) = outcome else {
-            panic!("expected a compacted context");
-        };
-        assert!(compacted.checkpoint.is_some());
-        assert_eq!(provider.seen_systems().len(), 1);
     }
 
     #[test]

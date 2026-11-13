@@ -1318,7 +1318,7 @@ mod tests {
                     reasoning_content: None,
                     tool_calls: Vec::new(),
                     usage: Some(crate::llm::LlmUsage {
-                        input_tokens: 5_000,
+                        input_tokens: 20_000,
                         output_tokens: 10,
                         cached_input_tokens: None,
                     }),
@@ -1334,7 +1334,7 @@ mod tests {
             vec![0, 0, 0],
         );
         let state =
-            build_state_with_compaction_window(dir.path(), 2_000, Box::new(provider.clone()));
+            build_state_with_compaction_window(dir.path(), 9_000, Box::new(provider.clone()));
         let context = cli_context("silent-overflow");
         let runtime = state.turn_dependencies();
 
@@ -1385,7 +1385,7 @@ mod tests {
                         invalid_arguments: None,
                     }],
                     usage: Some(crate::llm::LlmUsage {
-                        input_tokens: 5_000,
+                        input_tokens: 20_000,
                         output_tokens: 10,
                         cached_input_tokens: None,
                     }),
@@ -1401,7 +1401,7 @@ mod tests {
             vec![0, 0, 0],
         );
         let state =
-            build_state_with_compaction_window(dir.path(), 2_000, Box::new(provider.clone()));
+            build_state_with_compaction_window(dir.path(), 9_000, Box::new(provider.clone()));
         let context = cli_context("forced-compaction");
 
         // Act
@@ -1996,7 +1996,7 @@ mod tests {
         let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
             dir.path().to_str().expect("utf8").to_string(),
             1,
-            2_000,
+            9_000,
         );
         config.compaction.reserve_tokens = 0;
         let provider = CheckpointObservingProvider::new();
@@ -2012,7 +2012,7 @@ mod tests {
             chat_id,
             vec![
                 Message::text("user", "old question"),
-                Message::text("assistant", "old answer ".repeat(500)),
+                Message::text("assistant", "old answer ".repeat(5_000)),
                 Message::text("user", "another question"),
                 Message::text("assistant", "another answer"),
             ],

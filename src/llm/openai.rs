@@ -427,6 +427,16 @@ impl LlmProvider for OpenAiProvider {
         &self.model
     }
 
+    fn minimum_output_tokens(&self, messages: &[Message]) -> usize {
+        if self.is_codex {
+            1
+        } else if should_use_responses_api(messages) {
+            OPENAI_RESPONSES_MIN_OUTPUT_TOKENS
+        } else {
+            chat_completions_min_output_tokens(&self.provider, &self.base_url)
+        }
+    }
+
     async fn send_message_streaming(
         &self,
         system: &str,
