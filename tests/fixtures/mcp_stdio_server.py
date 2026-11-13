@@ -6,9 +6,16 @@ import pathlib
 import sys
 import time
 
+
+def write_pid(path, pid):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(str(pid))
+    temporary.replace(path)
+
+
 root = pathlib.Path(sys.argv[1])
 mode = sys.argv[2]
-(root / f"{mode}.launcher").write_text(str(os.getpid()))
+write_pid(root / f"{mode}.launcher", os.getpid())
 child = os.fork()
 if child:
     if mode == "early":
@@ -16,7 +23,7 @@ if child:
     _, status = os.waitpid(child, 0)
     os._exit(os.waitstatus_to_exitcode(status))
 
-(root / f"{mode}.pid").write_text(str(os.getpid()))
+write_pid(root / f"{mode}.pid", os.getpid())
 for line in sys.stdin:
     message = json.loads(line)
     if "id" not in message:
