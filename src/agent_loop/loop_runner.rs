@@ -293,46 +293,19 @@ impl<'a> AgentLoop<'a> {
 
                             let partial_text =
                                 strip_thinking(response.content.trim()).trim().to_string();
-                            if response.tool_calls.is_empty() {
+                            if response.tool_calls.is_empty() || truncated_tool_phase_continued {
                                 // Keep the generated text even when recovery is
                                 // impossible, and complete the Turn with the
-                                // truncation recorded on the message.
+                                // truncation recorded on the message. A second
+                                // unusable tool call is not fed back either.
                                 if partial_text.is_empty() {
-                                    return Err(EgoPulseError::Llm(LlmError::IncompleteResponse(
+                                    let detail = if response.tool_calls.is_empty() {
                                         "model output was truncated before any text was generated"
-                                            .to_string(),
-                                    )));
-                                }
-                                self.lifecycle.complete_model().await?;
-                                let silent_overflow =
-                                    response.usage.as_ref().is_some_and(|usage| {
-                                        usage.input_tokens > context_window as i64
-                                    });
-                                return self
-                                    .finalize_response(
-                                        loop_state,
-                                        &scope,
-                                        &prompt,
-                                        silent_overflow,
-                                        FinalizedAnswer {
-                                            message_id,
-                                            content: partial_text,
-                                            reasoning_content: response.reasoning_content.clone(),
-                                            finish_reason: Some(*reason),
-                                            usage: response.usage.clone(),
-                                        },
-                                        measurement,
-                                    )
-                                    .await;
-                            }
-
-                            if truncated_tool_phase_continued {
-                                // Do not feed a second unusable call back. Keep
-                                // the text if there is one; otherwise the Turn
-                                // has nothing to persist.
-                                if partial_text.is_empty() {
+                                    } else {
+                                        "model output was truncated inside a tool call"
+                                    };
                                     return Err(EgoPulseError::Llm(LlmError::IncompleteResponse(
-                                        "model output was truncated inside a tool call".to_string(),
+                                        detail.to_string(),
                                     )));
                                 }
                                 self.lifecycle.complete_model().await?;
