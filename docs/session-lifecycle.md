@@ -356,15 +356,19 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 - split turn では履歴要約とターン前半要約を別リクエストで生成し、`\n\n---\n\n**Turn Context (split turn):**\n\n` で連結する。片方でも失敗したら何も commit しない
 - 要約入力は role ごとにタグ付けしたプレーンテキスト（`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` / `[Tool result]:` / `[Tool error]:`）。reasoning は含めない
 - 1 件の tool 結果は 2,000 文字で切り、`[... N more characters truncated]` を付ける
-- 要約対象全体が要約モデルの入力上限を超える場合は、先頭から収まる範囲だけを送り、末尾を省略したことをマーカーで示す
+- 要約対象全体が要約モデルの入力上限を超える場合は、新しい側から収まる範囲を残し、古い側を省略したことを先頭のマーカーで示す
 - 省略した部分も元の会話は archive と append-only の `messages` テーブルに残る。checkpoint には要約できた範囲だけが反映される
+- 要約リクエストを組み立てる前に、会話・前回 checkpoint・追加指示を Config 由来の秘密値と既知パターンでサニタイズする。LLM が生成した要約の保存前サニタイズとは別に、送信入力そのものを保護する
 
 ### 要約リクエストの入力上限
 
-要約リクエスト自身が context window を超えないよう、送信前に会話部分の上限を決める。上限は対象モデルの `context_window` から、出力に必要な容量として `max_output_tokens` を引いて求める。`max_output_tokens` が context window の半分を超える設定では、入力の余地を残すため半分を上限に予約する。
+要約リクエスト自身が context window を超えないよう、送信前にプロンプト全体の上限を決める。上限は対象モデルの `context_window` から、出力に必要な容量として `max_output_tokens` を引いて求める。`max_output_tokens` が context window の半分を超える設定では、入力の余地を残すため半分を上限に予約する。
 
-- system prompt・要約プロンプト・前回 checkpoint・追加指示を先に推定し、残りを会話テキストの予算にする
-- 会話テキストが予算を超える場合は、UTF-16 コード単位で先頭から収まる範囲を残し、末尾に `[... conversation truncated to fit the summarization request ...]` を付ける
+- system prompt・固定テンプレート・前回 checkpoint・追加指示・会話を含めた推定が上限以内になるよう調整する
+- 固定部分が上限に収まる場合は、残りを会話テキストの予算にする
+- 固定部分だけで上限を超える場合は、前回 checkpoint、追加指示を先に縮め、新しい会話を可能な限り残す
+- 会話テキストが予算を超える場合は、UTF-16 コード単位で新しい側から収まる範囲を残し、先頭に `[... earlier conversation truncated to fit the summarization request ...]` を付ける
+- 入力予算は EgoPulse のトークン推定に基づく。実際のトークナイザーが上回り provider が容量超過を返した場合は要約失敗として扱い、checkpoint を保存せず元の context を保持する
 - 切り詰めは要約リクエストの入力だけに適用する。保持メッセージ、checkpoint の要約本文、archive の内容は変更しない
 - 要約モデルの出力上限や API 最小出力の扱いは通常の LLM リクエストと同じ
 
