@@ -81,11 +81,30 @@ pub(crate) fn estimate_prompt_tokens(
     tools_json: Option<&str>,
     messages: &[Message],
 ) -> usize {
+    estimate_prompt_tokens_and_images(system_prompt, tools_json, messages).0
+}
+
+/// Estimates the raw prompt size and reports whether a message contains an image.
+///
+/// The image check selects the API surface: an image request uses the Responses
+/// API, whose output minimum is larger than Chat Completions. The estimator
+/// borrows messages so compaction can size a projected request without cloning
+/// large text or image payloads.
+pub(crate) fn estimate_prompt_tokens_and_images<'a>(
+    system_prompt: &str,
+    tools_json: Option<&str>,
+    messages: impl IntoIterator<Item = &'a Message>,
+) -> (usize, bool) {
     let mut tokens = estimate_text_tokens(system_prompt);
     if let Some(tools) = tools_json {
         tokens += estimate_text_tokens(tools);
     }
-    tokens + estimate_messages_tokens(messages)
+    let mut has_images = false;
+    for message in messages {
+        tokens += estimate_message_tokens(message);
+        has_images |= message.content.is_multimodal();
+    }
+    (tokens, has_images)
 }
 
 /// Why a request cannot be sized for the model.

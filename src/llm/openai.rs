@@ -201,7 +201,7 @@ impl OpenAiProvider {
         body["max_output_tokens"] = serde_json::Value::from(self.request_max_output_tokens(
             system,
             tools_json.as_deref(),
-            &messages,
+            messages.iter(),
             OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
         )?);
         body["stream"] = serde_json::Value::Bool(true);
@@ -288,7 +288,7 @@ impl OpenAiProvider {
         let max_output_tokens = self.request_max_output_tokens(
             system,
             tools_json.as_deref(),
-            &messages,
+            messages.iter(),
             chat_completions_min_output_tokens(&self.provider, &self.base_url),
         )?;
         let mut body = build_streaming_request_body(
@@ -323,39 +323,33 @@ impl OpenAiProvider {
     ///
     /// The provider only sees the clamped value; the compaction recovery uses
     /// the unclamped model limit to decide whether a `length` stop was early.
-    fn request_max_output_tokens(
+    fn request_max_output_tokens<'a>(
         &self,
         system: &str,
         tools_json: Option<&str>,
-        messages: &[Message],
+        messages: impl IntoIterator<Item = &'a Message>,
         minimum_output_tokens: usize,
     ) -> Result<usize, LlmError> {
-        let prompt_tokens =
-            crate::llm::tokens::estimate_prompt_tokens(system, tools_json, messages);
+        let (prompt_tokens, _) =
+            crate::llm::tokens::estimate_prompt_tokens_and_images(system, tools_json, messages);
         crate::llm::tokens::max_output_tokens_for_request(
             self.model_metadata.context_window,
             prompt_tokens,
             self.model_metadata.max_output_tokens,
             minimum_output_tokens,
         )
-        .map_err(|error| match error {
-            crate::llm::tokens::OutputCapacityError::InsufficientRoom {
-                context_window,
-                prompt_tokens,
-                minimum_output_tokens,
-            } => LlmError::OutputCapacityExceeded {
-                context_window,
-                prompt_tokens,
-                minimum_output_tokens,
-            },
-            crate::llm::tokens::OutputCapacityError::BelowApiMinimum {
-                intended,
-                minimum_output_tokens,
-            } => LlmError::OutputLimitBelowApiMinimum {
-                configured: intended,
-                minimum: minimum_output_tokens,
-            },
-        })
+        .map_err(LlmError::from)
+    }
+
+    /// Minimum output for the API surface selected by the request messages.
+    fn minimum_output_tokens(&self, has_images: bool) -> usize {
+        if self.is_codex {
+            1
+        } else if has_images {
+            OPENAI_RESPONSES_MIN_OUTPUT_TOKENS
+        } else {
+            chat_completions_min_output_tokens(&self.provider, &self.base_url)
+        }
     }
 }
 
@@ -427,14 +421,18 @@ impl LlmProvider for OpenAiProvider {
         &self.model
     }
 
-    fn minimum_output_tokens(&self, messages: &[Message]) -> usize {
-        if self.is_codex {
-            1
-        } else if should_use_responses_api(messages) {
-            OPENAI_RESPONSES_MIN_OUTPUT_TOKENS
-        } else {
-            chat_completions_min_output_tokens(&self.provider, &self.base_url)
-        }
+    fn request_output_limit(
+        &self,
+        system: &str,
+        tools_json: Option<&str>,
+        messages: &[&Message],
+    ) -> Result<Option<usize>, LlmError> {
+        let has_images = messages
+            .iter()
+            .any(|message| message.content.is_multimodal());
+        let minimum = self.minimum_output_tokens(has_images);
+        self.request_max_output_tokens(system, tools_json, messages.iter().copied(), minimum)
+            .map(Some)
     }
 
     async fn send_message_streaming(
@@ -769,9 +767,10 @@ mod tests {
     use futures_util::stream;
 
     use super::{
-        OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS, OPENROUTER_MIN_OUTPUT_TOKENS, OpenAiProvider,
-        consume_chat_completion_stream, consume_responses_stream, max_output_tokens_field,
-        parse_chat_completion_usage, request_stream_usage,
+        OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
+        OPENROUTER_MIN_OUTPUT_TOKENS, OpenAiProvider, consume_chat_completion_stream,
+        consume_responses_stream, max_output_tokens_field, parse_chat_completion_usage,
+        request_stream_usage,
     };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -1483,6 +1482,46 @@ mod tests {
                 }
                 other => panic!("expected OutputCapacityExceeded, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn an_image_request_rejects_a_limit_below_the_responses_minimum() {
+        // Arrange: the Responses API requires 16 output tokens, but the
+        // configured limit is 8.
+        let mut llm_config = config(
+            "gpt-4o-mini",
+            "https://api.openai.com/v1".to_string(),
+            Some("sk-test"),
+        );
+        llm_config.model_metadata = crate::config::ModelMetadata {
+            context_window: 128_000,
+            max_output_tokens: 8,
+            context_window_source: crate::config::ModelValueSource::Configured,
+            max_output_tokens_source: crate::config::ModelValueSource::Configured,
+        };
+        let provider = OpenAiProvider::new(&llm_config).expect("provider");
+        let mut image = Message::text("user", "look");
+        image.content = MessageContent::parts(vec![MessageContentPart::InputImage {
+            image_url: "data:image/png;base64,AA==".to_string(),
+            detail: None,
+        }]);
+
+        // Act
+        let error = provider
+            .request_output_limit("", None, &[&image])
+            .expect_err("the configured limit is below the Responses minimum");
+
+        // Assert
+        match error {
+            crate::error::LlmError::OutputLimitBelowApiMinimum {
+                configured,
+                minimum,
+            } => {
+                assert_eq!(configured, 8);
+                assert_eq!(minimum, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS);
+            }
+            other => panic!("expected OutputLimitBelowApiMinimum, got {other:?}"),
         }
     }
 

@@ -1250,31 +1250,21 @@ pub(crate) async fn compact(
     ));
     let mut projected_messages =
         Vec::with_capacity(context.messages.len() + 1 + request.request_only_messages.len());
-    if let Some(checkpoint) = &context.checkpoint {
-        projected_messages.push(checkpoint_message(checkpoint));
+    let checkpoint = context.checkpoint.as_ref().map(checkpoint_message);
+    if let Some(checkpoint) = &checkpoint {
+        projected_messages.push(checkpoint);
     }
-    projected_messages.extend(context.messages.iter().cloned());
-    projected_messages.extend(
-        request
-            .request_only_messages
-            .iter()
-            .map(|message| (*message).clone()),
-    );
-    let minimum = request.llm.minimum_output_tokens(&projected_messages);
-    if let Err(crate::llm::tokens::OutputCapacityError::InsufficientRoom { .. }) =
-        crate::llm::tokens::max_output_tokens_for_request(
-            context_window,
-            tokens_after,
-            minimum,
-            minimum,
-        )
-    {
-        return Err(EgoPulseError::Llm(LlmError::OutputCapacityExceeded {
-            context_window,
-            prompt_tokens: tokens_after,
-            minimum_output_tokens: minimum,
-        }));
-    }
+    projected_messages.extend(context.messages.iter());
+    projected_messages.extend(request.request_only_messages.iter().copied());
+    // Validate the projected request with the provider's own sizing so a
+    // checkpoint is never saved for a request the next model call would reject.
+    // This uses the raw prompt estimate and the resolved output limit instead
+    // of the calibrated projection used for trigger/logging.
+    request.llm.request_output_limit(
+        request.prompt.system_prompt,
+        request.prompt.tools_json,
+        &projected_messages,
+    )?;
     archive_before_compaction(request, session).await;
     info!(
         channel = %request.context.channel,
@@ -1513,12 +1503,26 @@ pub(crate) fn archive_conversation_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::test_support::RecordingProvider;
+    use crate::agent_loop::test_support::{RecordingProvider, TestOutputLimits};
     use crate::llm::ToolCall;
     use crate::llm::tokens::text_chars;
 
     fn text(role: &str, content: &str) -> Message {
         Message::text(role, content)
+    }
+
+    fn image_message(role: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: MessageContent::parts(vec![MessageContentPart::InputImage {
+                image_url: "data:image/png;base64,AA==".to_string(),
+                detail: None,
+            }]),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            finish_reason: None,
+        }
     }
 
     fn tool_call(id: &str, name: &str, path: &str) -> Message {
@@ -1953,6 +1957,52 @@ mod tests {
             .expect("chat id")
     }
 
+    struct CompactionFixture {
+        state: crate::runtime::AppState,
+        context: SurfaceContext,
+        runtime: TurnDependencies,
+        llm: Arc<dyn LlmProvider>,
+        chat_id: i64,
+    }
+
+    impl CompactionFixture {
+        async fn new(
+            config: crate::config::Config,
+            provider: &RecordingProvider,
+            session_id: &str,
+        ) -> Self {
+            let state =
+                crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
+            let context = crate::agent_loop::test_support::cli_context(session_id);
+            let chat_id = chat_id_for(&state, &context).await;
+            let runtime = state.turn_dependencies();
+            let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
+            Self {
+                state,
+                context,
+                runtime,
+                llm,
+                chat_id,
+            }
+        }
+
+        fn request(&self) -> CompactionRequest<'_> {
+            CompactionRequest {
+                state: &self.runtime,
+                context: &self.context,
+                chat_id: self.chat_id,
+                llm: &self.llm,
+                prompt: PromptContext {
+                    system_prompt: "system",
+                    tools_json: None,
+                    has_tools: false,
+                },
+                config: &self.state.config,
+                request_only_messages: Vec::new(),
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn builds_a_checkpoint_and_keeps_the_recent_tail() {
@@ -1963,7 +2013,12 @@ mod tests {
                 .map(|_| Ok(summary_response("history summary")))
                 .collect(),
             vec![0; 10],
-        );
+        )
+        .with_output_limits(TestOutputLimits {
+            context_window: 9_000,
+            max_output_tokens: 4_096,
+            minimum_output_tokens: 1,
+        });
         let mut config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
             1,
@@ -1976,10 +2031,6 @@ mod tests {
             .api_key = Some(crate::config::secret_ref::ResolvedValue::Literal(
             secret.to_string(),
         ));
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("manual-compact");
-        let chat_id = chat_id_for(&state, &context).await;
         // This history is far larger than the test model's 9,000-token window,
         // so the summary request itself must be bounded before it is sent.
         let huge_answer = "old answer ".repeat(3_000);
@@ -1992,21 +2043,8 @@ mod tests {
             text("user", &correction),
             text("user", "fresh question"),
         ]);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "manual-compact").await;
+        let request = fixture.request();
         let input_budget = summary_input_budget(&request).await;
         assert!(
             text_chars(&huge_answer) > input_budget * CHARS_PER_TOKEN_ESTIMATE,
@@ -2101,6 +2139,54 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn a_configured_output_limit_below_the_api_minimum_keeps_the_context() {
+        // Arrange: an image request uses the Responses API minimum, and the
+        // configured output limit cannot satisfy it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider =
+            RecordingProvider::new(vec![Ok(summary_response("history summary"))], vec![0])
+                .with_output_limits(TestOutputLimits {
+                    context_window: 9_000,
+                    max_output_tokens: 8,
+                    minimum_output_tokens: 16,
+                });
+        let config = crate::agent_loop::test_support::test_config_with_compaction(
+            dir.path().to_string_lossy().to_string(),
+            1,
+        );
+        let fixture = CompactionFixture::new(config, &provider, "below-minimum").await;
+        let request = fixture.request();
+        let session = session(vec![
+            text("user", "old question"),
+            text("assistant", "old answer"),
+            image_message("user"),
+            text("user", "fresh question"),
+        ]);
+
+        // Act
+        let error = compact(&request, &session, CompactionReason::Manual, None)
+            .await
+            .expect_err("the configured output limit is below the API minimum");
+
+        // Assert
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(LlmError::OutputLimitBelowApiMinimum {
+                configured: 8,
+                minimum: 16,
+            })
+        ));
+        assert!(session.checkpoint.is_none());
+        assert_eq!(session.messages.len(), 4);
+        assert_eq!(
+            provider.seen_systems().len(),
+            1,
+            "the summary succeeds before the checkpoint is validated"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn summarizes_a_previous_checkpoint_that_exceeds_the_input_budget() {
         // Arrange: the checkpoint alone is larger than the model's input budget.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2114,10 +2200,8 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("large-checkpoint");
-        let chat_id = chat_id_for(&state, &context).await;
+        let fixture = CompactionFixture::new(config, &provider, "large-checkpoint").await;
+        let request = fixture.request();
         let mut session = session(vec![
             text("user", "old question"),
             text(
@@ -2133,21 +2217,6 @@ mod tests {
             read_files: Vec::new(),
             modified_files: Vec::new(),
         });
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
 
         // Act
         let outcome = compact(&request, &session, CompactionReason::Manual, None)
@@ -2193,25 +2262,8 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("oversized-summary");
-        let chat_id = chat_id_for(&state, &context).await;
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "oversized-summary").await;
+        let request = fixture.request();
 
         // Act
         let result = generate_summary(
@@ -2244,10 +2296,6 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("update-compact");
-        let chat_id = chat_id_for(&state, &context).await;
         let mut session = session(vec![
             text("user", "older question"),
             text("assistant", "older answer"),
@@ -2259,21 +2307,8 @@ mod tests {
             read_files: vec!["src/main.rs".to_string()],
             modified_files: Vec::new(),
         });
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "update-compact").await;
+        let request = fixture.request();
 
         // Act
         let outcome = compact(
@@ -2328,30 +2363,13 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("overflow-compact");
-        let chat_id = chat_id_for(&state, &context).await;
         let session = session(vec![
             text("user", &"old question ".repeat(2_000)),
             text("assistant", "old answer"),
             text("user", "fresh question"),
         ]);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "overflow-compact").await;
+        let request = fixture.request();
         let initial_budget = summary_input_budget(&request).await;
 
         // Act
@@ -2393,25 +2411,8 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("calibrated-compact");
-        let chat_id = chat_id_for(&state, &context).await;
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider);
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "calibrated-compact").await;
+        let request = fixture.request();
         let budget_before = summary_input_budget(&request).await;
 
         // Act: the provider measured three tokens for every estimated token.
@@ -2437,30 +2438,13 @@ mod tests {
             1,
             200,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("tiny-compact");
-        let chat_id = chat_id_for(&state, &context).await;
         let session = session(vec![
             text("user", "old question"),
             text("assistant", "old answer"),
             text("user", "fresh question"),
         ]);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "tiny-compact").await;
+        let request = fixture.request();
 
         // Act
         let result = compact(&request, &session, CompactionReason::Manual, None).await;
@@ -2494,10 +2478,6 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("split-compact");
-        let chat_id = chat_id_for(&state, &context).await;
         let mut messages = vec![
             text("user", "old question"),
             text("assistant", "old answer"),
@@ -2510,21 +2490,8 @@ mod tests {
         ));
         messages.push(text("assistant", &"partial ".repeat(50)));
         let session = session(messages);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "split-compact").await;
+        let request = fixture.request();
 
         // Act
         let outcome = compact(&request, &session, CompactionReason::Manual, None)
@@ -2561,26 +2528,9 @@ mod tests {
             dir.path().to_string_lossy().to_string(),
             1,
         );
-        let state =
-            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("small-compact");
-        let chat_id = chat_id_for(&state, &context).await;
         let session = session(vec![text("user", "hello"), text("assistant", "hi")]);
-        let runtime = state.turn_dependencies();
-        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
-        let request = CompactionRequest {
-            state: &runtime,
-            context: &context,
-            chat_id,
-            llm: &llm,
-            prompt: PromptContext {
-                system_prompt: "system",
-                tools_json: None,
-                has_tools: false,
-            },
-            config: &state.config,
-            request_only_messages: Vec::new(),
-        };
+        let fixture = CompactionFixture::new(config, &provider, "small-compact").await;
+        let request = fixture.request();
 
         // Act
         let outcome = compact_if_needed(&request, &session, None)

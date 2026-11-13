@@ -252,8 +252,22 @@ pub(crate) trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
 
-    fn minimum_output_tokens(&self, _messages: &[Message]) -> usize {
-        1
+    /// Returns the output limit this provider would send for a request.
+    ///
+    /// The provider estimates the prompt, fits it into the model's context
+    /// window, and applies the API surface's minimum output. Compaction calls
+    /// this for the projected context so a checkpoint is judged by exactly the
+    /// same calculation as the request that follows it. The message references
+    /// keep the check from cloning the conversation.
+    ///
+    /// Returns `Ok(None)` when the provider does not enforce a model window.
+    fn request_output_limit(
+        &self,
+        _system_prompt: &str,
+        _tools_json: Option<&str>,
+        _messages: &[&Message],
+    ) -> Result<Option<usize>, LlmError> {
+        Ok(None)
     }
 
     /// Sends one request and returns the complete response.

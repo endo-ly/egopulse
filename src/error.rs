@@ -487,6 +487,30 @@ impl LlmError {
     }
 }
 
+impl From<crate::llm::tokens::OutputCapacityError> for LlmError {
+    fn from(error: crate::llm::tokens::OutputCapacityError) -> Self {
+        use crate::llm::tokens::OutputCapacityError;
+        match error {
+            OutputCapacityError::InsufficientRoom {
+                context_window,
+                prompt_tokens,
+                minimum_output_tokens,
+            } => Self::OutputCapacityExceeded {
+                context_window,
+                prompt_tokens,
+                minimum_output_tokens,
+            },
+            OutputCapacityError::BelowApiMinimum {
+                intended,
+                minimum_output_tokens,
+            } => Self::OutputLimitBelowApiMinimum {
+                configured: intended,
+                minimum: minimum_output_tokens,
+            },
+        }
+    }
+}
+
 /// Logging subsystem initialization errors.
 #[derive(Debug, Error)]
 pub enum LoggingError {

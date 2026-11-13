@@ -3,6 +3,9 @@
 use std::sync::Arc;
 
 use crate::conversation::SurfaceContext;
+use crate::llm::tokens::{
+    estimate_message_tokens, estimate_text_tokens, max_output_tokens_for_request,
+};
 use crate::llm::{LlmProvider, Message};
 use crate::runtime::AppState;
 
@@ -58,6 +61,13 @@ pub(crate) struct FakeProvider {
     pub(crate) responses: std::sync::Mutex<Vec<crate::llm::MessagesResponse>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TestOutputLimits {
+    pub(crate) context_window: usize,
+    pub(crate) max_output_tokens: usize,
+    pub(crate) minimum_output_tokens: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct RecordingProvider {
     responses:
@@ -67,6 +77,7 @@ pub(crate) struct RecordingProvider {
     seen_tools: Arc<std::sync::Mutex<Vec<Option<Vec<crate::llm::ToolDefinition>>>>>,
     delays_ms: Arc<std::sync::Mutex<Vec<u64>>>,
     streaming_delta: Option<String>,
+    output_limits: Option<TestOutputLimits>,
 }
 
 #[async_trait::async_trait]
@@ -148,6 +159,31 @@ impl LlmProvider for RecordingProvider {
     fn model_name(&self) -> &str {
         "test-model"
     }
+
+    fn request_output_limit(
+        &self,
+        system: &str,
+        tools_json: Option<&str>,
+        messages: &[&Message],
+    ) -> Result<Option<usize>, crate::error::LlmError> {
+        let Some(limits) = self.output_limits else {
+            return Ok(None);
+        };
+        let prompt_tokens = estimate_text_tokens(system)
+            + tools_json.map(estimate_text_tokens).unwrap_or_default()
+            + messages
+                .iter()
+                .map(|message| estimate_message_tokens(message))
+                .sum::<usize>();
+        max_output_tokens_for_request(
+            limits.context_window,
+            prompt_tokens,
+            limits.max_output_tokens,
+            limits.minimum_output_tokens,
+        )
+        .map(Some)
+        .map_err(Into::into)
+    }
 }
 
 impl RecordingProvider {
@@ -167,11 +203,17 @@ impl RecordingProvider {
             seen_tools: Arc::new(std::sync::Mutex::new(Vec::new())),
             delays_ms: Arc::new(std::sync::Mutex::new(delays_ms)),
             streaming_delta: None,
+            output_limits: None,
         }
     }
 
     pub(crate) fn with_streaming_delta(mut self, delta: &str) -> Self {
         self.streaming_delta = Some(delta.to_string());
+        self
+    }
+
+    pub(crate) fn with_output_limits(mut self, limits: TestOutputLimits) -> Self {
+        self.output_limits = Some(limits);
         self
     }
 

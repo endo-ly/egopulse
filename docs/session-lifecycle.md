@@ -396,7 +396,7 @@ Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕`
 ### Checkpoint と保持メッセージ
 
 - checkpoint は `summary` / `tokens_before` / `read_files` / `modified_files` を持つ
-- 圧縮後の推定入力と安全余裕を除き、API の最小出力枠を確保できない場合は容量不足として失敗し、元の context を保持する
+- 圧縮後の推定入力を、次リクエストと同じ生のトークン推定・解決済みの `max_output_tokens`・API 最小出力で検証する。API の最小出力枠を確保できない場合は `LlmError::OutputCapacityExceeded`、`max_output_tokens` 自体が最小出力を下回る場合は `LlmError::OutputLimitBelowApiMinimum` として失敗し、元の context を保持する
 - 圧縮に成功したら、model へ送る前に checkpoint・保持メッセージ・`last_usage = None` を `chats.revision` の CAS で 1 回の snapshot 更新として確定する。永続化に失敗した場合は未保存の圧縮結果で model を呼ばない
 - snapshot が同時更新されていた場合は上書きせず、Turn を競合として終了する。Tool を再実行する自動リトライは行わない
 - 次のリクエストでは checkpoint を参照用の 1 メッセージへ投影し、その後ろに保持メッセージを連結する
