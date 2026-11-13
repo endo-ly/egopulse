@@ -63,9 +63,9 @@ function resolveDataDir() {
   const dataDir = explicit ? resolve(explicit) : defaultDataDir();
   if (!dataDir || !existsSync(dataDir)) {
     console.error(
-      "provider data directory not found; pass it explicitly or install the pinned package globally:\n" +
+      "provider data directory not found; install the pinned package globally or pass it explicitly:\n" +
         "  npm install -g @earendil-works/pi-coding-agent@1.5.0\n" +
-        "  node scripts/import-model-catalog.mjs /path/to/pi-ai/dist/providers/data",
+        "  node scripts/import-model-catalog.mjs [data-dir]",
     );
     process.exit(1);
   }
