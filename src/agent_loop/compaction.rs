@@ -47,9 +47,9 @@ use crate::tools::sanitize_output_string;
 /// Maximum characters of a single tool result inside a summary request.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
 
-/// Appended when the history does not fit the summarizer's input budget.
+/// Prepended when the history does not fit the summarizer's input budget.
 const SUMMARY_TRUNCATION_MARKER: &str =
-    "\n\n[... conversation truncated to fit the summarization request ...]";
+    "[... earlier conversation truncated to fit the summarization request ...]\n\n";
 
 /// Separator between the history summary and a split-turn prefix summary.
 const SPLIT_TURN_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
@@ -659,9 +659,8 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
 ///
 /// The summarizer needs room for its own answer. Reserve the configured
 /// output limit, bounded by half the context window so a model whose output
-/// limit exceeds its window still leaves room for the history. A low budget
-/// cannot increase a request; it only limits the conversation text so the
-/// provider does not reject the summary for exceeding the context window.
+/// limit exceeds its window still leaves room for the history. The resulting
+/// budget caps the whole summary prompt, including its fixed templates.
 fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
     let metadata = request.config.resolve_model_metadata(
         &crate::config::ProviderId::new(request.llm.provider_name()),
@@ -674,39 +673,116 @@ fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
         .max(1)
 }
 
-/// Serializes the history within the summarizer's remaining input budget.
+/// Builds a sanitized summary prompt that fits the summarizer's input budget.
 ///
-/// The oldest text is kept and the tail is replaced by a marker when the
-/// serialized history does not fit. The original conversation remains in the
-/// compaction archive and the append-only `messages` table.
-fn summary_conversation(
+/// The newest conversation text has priority. The previous checkpoint and the
+/// optional focus are older context, so they are reduced first when the fixed
+/// part alone leaves no room. The conversation is then kept from its newest
+/// end and marked when older text is omitted. The original conversation
+/// remains in the compaction archive and the append-only `messages` table.
+fn fit_summary_prompt<F>(
     request: &CompactionRequest<'_>,
-    messages: &[Message],
-    fixed_prompt: &str,
-) -> String {
+    mut conversation: String,
+    mut previous_summary: Option<String>,
+    mut instructions: Option<String>,
+    build: F,
+) -> String
+where
+    F: Fn(&str, Option<&str>, Option<&str>) -> String,
+{
     let budget = summary_input_budget(request);
-    let overhead = summary_request_estimate(fixed_prompt);
-    let conversation_budget = budget.saturating_sub(overhead);
-    truncate_summary_conversation(serialize_conversation(messages), conversation_budget)
+    loop {
+        let prompt = build(
+            &conversation,
+            previous_summary.as_deref(),
+            instructions.as_deref(),
+        );
+        let prompt = redact_summary_text(&prompt, request.config);
+        let estimate = summary_request_estimate(&prompt);
+        if estimate <= budget {
+            return prompt;
+        }
+        // Keep the new conversation when the fixed part leaves room for it.
+        // Otherwise the fixed part is over budget on its own and must shrink
+        // before the remaining conversation can be kept.
+        let fixed = build("", previous_summary.as_deref(), instructions.as_deref());
+        let fixed = redact_summary_text(&fixed, request.config);
+        let fixed_estimate = summary_request_estimate(&fixed);
+        if fixed_estimate >= budget {
+            // Leave room for the conversation. If the conversation is larger
+            // than the whole budget, the fixed part is reduced to zero and the
+            // conversation is truncated separately.
+            let conversation_tokens = text_chars(&conversation).div_ceil(CHARS_PER_TOKEN_ESTIMATE);
+            let available_fixed = budget.saturating_sub(conversation_tokens);
+            let excess_chars = fixed_estimate
+                .saturating_sub(available_fixed)
+                .max(1)
+                .saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+            if let Some(previous) = previous_summary.as_mut() {
+                if !previous.is_empty() {
+                    *previous = truncate_utf16_prefix(
+                        previous,
+                        text_chars(previous).saturating_sub(excess_chars),
+                    );
+                    if previous.is_empty() {
+                        previous_summary = None;
+                    }
+                    continue;
+                }
+            }
+            if let Some(focus) = instructions.as_mut() {
+                if !focus.is_empty() {
+                    *focus = truncate_utf16_prefix(
+                        focus,
+                        text_chars(focus).saturating_sub(excess_chars),
+                    );
+                    if focus.is_empty() {
+                        instructions = None;
+                    }
+                    continue;
+                }
+            }
+            // Only the fixed templates remain and they exceed the budget. This
+            // is a tiny-window configuration, but the request still must not
+            // exceed the provider's limit.
+            return truncate_utf16_prefix(&prompt, budget.saturating_mul(CHARS_PER_TOKEN_ESTIMATE));
+        }
+
+        if !conversation.is_empty() {
+            let excess_chars = (estimate - budget).saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+            let max_chars = text_chars(&conversation).saturating_sub(excess_chars);
+            conversation = truncate_summary_conversation_chars(conversation, max_chars);
+            continue;
+        }
+        // The full prompt is over budget without any variable content, which
+        // means the fixed template itself is over budget.
+        return truncate_utf16_prefix(&prompt, budget.saturating_mul(CHARS_PER_TOKEN_ESTIMATE));
+    }
 }
 
-fn truncate_summary_conversation(conversation: String, budget_tokens: usize) -> String {
-    let max_chars = budget_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
-    if text_chars(&conversation) <= max_chars {
-        return conversation;
-    }
+fn truncate_summary_conversation_chars(conversation: String, max_chars: usize) -> String {
+    let (body, was_truncated) = match conversation.strip_prefix(SUMMARY_TRUNCATION_MARKER) {
+        Some(body) => (body, true),
+        None => (conversation.as_str(), false),
+    };
     let marker_chars = text_chars(SUMMARY_TRUNCATION_MARKER);
+    if !was_truncated && text_chars(body) <= max_chars {
+        return body.to_string();
+    }
+    if was_truncated && marker_chars + text_chars(body) <= max_chars {
+        return format!("{SUMMARY_TRUNCATION_MARKER}{body}");
+    }
     let keep_chars = max_chars.saturating_sub(marker_chars);
     if keep_chars == 0 {
         return String::new();
     }
-    let end = utf16_prefix_end(&conversation, keep_chars);
-    if end == 0 {
+    let start = utf16_suffix_start(body, keep_chars);
+    if start >= body.len() {
         return String::new();
     }
-    let mut truncated = conversation;
-    truncated.truncate(end);
+    let mut truncated = String::with_capacity(SUMMARY_TRUNCATION_MARKER.len() + body.len() - start);
     truncated.push_str(SUMMARY_TRUNCATION_MARKER);
+    truncated.push_str(&body[start..]);
     truncated
 }
 
@@ -721,6 +797,24 @@ fn utf16_prefix_end(text: &str, max_chars: usize) -> usize {
         used = next;
     }
     text.len()
+}
+
+/// Returns the byte index where the longest UTF-16 suffix within `max_chars`
+/// starts.
+fn utf16_suffix_start(text: &str, max_chars: usize) -> usize {
+    let mut used = 0;
+    for (index, character) in text.char_indices().rev() {
+        let next = used + character.len_utf16();
+        if next > max_chars {
+            return index + character.len_utf8();
+        }
+        used = next;
+    }
+    0
+}
+
+fn truncate_utf16_prefix(text: &str, max_chars: usize) -> String {
+    text[..utf16_prefix_end(text, max_chars)].to_string()
 }
 
 /// Removes a previous checkpoint's trailing file-operation blocks.
@@ -945,9 +1039,18 @@ async fn generate_summary(
     instructions: Option<&str>,
     label: &str,
 ) -> Result<String, EgoPulseError> {
-    let fixed_prompt = summary_prompt("", previous_summary, instructions);
-    let conversation = summary_conversation(request, messages, &fixed_prompt);
-    let prompt = summary_prompt(&conversation, previous_summary, instructions);
+    let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
+    let previous_summary =
+        previous_summary.map(|summary| redact_summary_text(summary, request.config));
+    let instructions =
+        instructions.map(|instructions| redact_summary_text(instructions, request.config));
+    let prompt = fit_summary_prompt(
+        request,
+        conversation,
+        previous_summary,
+        instructions,
+        summary_prompt,
+    );
     summarize(request, prompt, label).await
 }
 
@@ -956,9 +1059,16 @@ async fn generate_turn_prefix_summary(
     messages: &[Message],
     instructions: Option<&str>,
 ) -> Result<String, EgoPulseError> {
-    let fixed_prompt = turn_prefix_prompt("", instructions);
-    let conversation = summary_conversation(request, messages, &fixed_prompt);
-    let prompt = turn_prefix_prompt(&conversation, instructions);
+    let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
+    let instructions =
+        instructions.map(|instructions| redact_summary_text(instructions, request.config));
+    let prompt = fit_summary_prompt(
+        request,
+        conversation,
+        None,
+        instructions,
+        |conversation, _, instructions| turn_prefix_prompt(conversation, instructions),
+    );
     summarize(request, prompt, "turn prefix").await
 }
 
@@ -1737,25 +1847,25 @@ mod tests {
             .expect("chat id")
     }
 
-    fn seed_session(state: &crate::runtime::AppState, chat_id: i64, context: &SessionContext) {
-        let snapshot =
-            crate::agent_loop::session_snapshot::context_to_snapshot(&state.assets, context)
-                .expect("snapshot");
-        let json = serde_json::to_string(&snapshot).expect("json");
-        state.db.save_session(chat_id, &json).expect("save session");
-    }
-
     #[tokio::test]
     #[serial_test::serial]
-    async fn manual_compaction_stores_a_checkpoint_and_keeps_the_recent_tail() {
+    async fn builds_a_checkpoint_and_keeps_the_recent_tail() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
         let provider =
             RecordingProvider::new(vec![Ok(summary_response("history summary"))], vec![0]);
-        let config = crate::agent_loop::test_support::test_config_with_compaction(
+        let mut config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
             1,
         );
+        let secret = "cfg-secret-4f9d2a7c";
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("openai provider")
+            .api_key = Some(crate::config::secret_ref::ResolvedValue::Literal(
+            secret.to_string(),
+        ));
         let state =
             crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
         let context = crate::agent_loop::test_support::cli_context("manual-compact");
@@ -1763,12 +1873,15 @@ mod tests {
         // This history is far larger than the test model's 9,000-token window,
         // so the summary request itself must be bounded before it is sent.
         let huge_answer = "old answer ".repeat(40_000);
+        let correction = format!(
+            "The old plan is withdrawn. New decision: keep the newest text. API key: {secret}"
+        );
         let session = session(vec![
             text("user", "old question"),
             text("assistant", &huge_answer),
+            text("user", &correction),
             text("user", "fresh question"),
         ]);
-        seed_session(&state, chat_id, &session);
         let runtime = state.turn_dependencies();
         let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
         let request = CompactionRequest {
@@ -1812,13 +1925,77 @@ mod tests {
         assert_eq!(seen_systems, vec![SUMMARIZATION_SYSTEM_PROMPT.to_string()]);
         let prompt = provider.seen_messages()[0][0].content.as_text_lossy();
         assert!(prompt.contains("<conversation>"));
-        assert!(prompt.contains("[User]: old question"));
-        assert!(prompt.contains("[Assistant]: old answer"));
         assert!(prompt.contains(SUMMARY_TRUNCATION_MARKER.trim()));
+        assert!(prompt.contains("The old plan is withdrawn."));
+        assert!(
+            !prompt.contains(secret),
+            "the summary request must not contain config secrets"
+        );
+        assert!(prompt.contains("[REDACTED:provider.openai.api_key]"));
         assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
         assert!(
             summary_request_estimate(&prompt) <= summary_input_budget(&request),
             "the summary request must stay within the model input budget"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fits_a_large_previous_summary_into_the_input_budget() {
+        // Arrange: the checkpoint alone is larger than the model's input budget.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider =
+            RecordingProvider::new(vec![Ok(summary_response("updated summary"))], vec![0]);
+        let config = crate::agent_loop::test_support::test_config_with_compaction(
+            dir.path().to_string_lossy().to_string(),
+            1,
+        );
+        let state =
+            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
+        let context = crate::agent_loop::test_support::cli_context("large-checkpoint");
+        let chat_id = chat_id_for(&state, &context).await;
+        let mut session = session(vec![
+            text("user", "old question"),
+            text(
+                "assistant",
+                "The earlier plan is withdrawn; the current decision is the correction.",
+            ),
+            text("user", "fresh question"),
+        ]);
+        session.checkpoint = Some(CompactionCheckpoint {
+            summary: "old checkpoint ".repeat(30_000),
+            tokens_before: 1,
+            read_files: Vec::new(),
+            modified_files: Vec::new(),
+        });
+        let runtime = state.turn_dependencies();
+        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
+        let request = CompactionRequest {
+            state: &runtime,
+            context: &context,
+            chat_id,
+            llm: &llm,
+            prompt: PromptContext {
+                system_prompt: "system",
+                tools_json: None,
+                has_tools: false,
+            },
+            config: &state.config,
+            request_only_messages: Vec::new(),
+        };
+
+        // Act
+        let outcome = compact(&request, &session, CompactionReason::Manual, None)
+            .await
+            .expect("compact");
+
+        // Assert: the newest conversation survives and the whole request fits.
+        assert!(matches!(outcome, CompactionOutcome::Compacted(_)));
+        let prompt = provider.seen_messages()[0][0].content.as_text_lossy();
+        assert!(prompt.contains("the current decision is the correction"));
+        assert!(
+            summary_request_estimate(&prompt) <= summary_input_budget(&request),
+            "the previous summary must not push the request beyond the input budget"
         );
     }
 
@@ -1890,14 +2067,13 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn summarization_failure_is_returned_to_the_caller() {
-        // Arrange
+    async fn a_summary_context_overflow_is_returned_to_the_caller() {
+        // Arrange: the estimate fit, but the provider tokenizer disagreed.
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            vec![Err(LlmError::ApiError {
+            vec![Err(LlmError::ContextOverflow {
                 status: reqwest::StatusCode::BAD_REQUEST,
-                body_preview: "invalid request".to_string(),
-                retry_after_secs: None,
+                body_preview: "context length exceeded".to_string(),
             })],
             vec![0],
         );
@@ -1934,8 +2110,15 @@ mod tests {
         let result = compact(&request, &session, CompactionReason::Manual, None).await;
 
         // Assert
-        assert!(matches!(result, Err(EgoPulseError::Llm(_))));
-        assert_eq!(provider.seen_systems().len(), 1, "no retry on a 400");
+        assert!(matches!(
+            result,
+            Err(EgoPulseError::Llm(LlmError::ContextOverflow { .. }))
+        ));
+        assert_eq!(
+            provider.seen_systems().len(),
+            1,
+            "a summary overflow is not retried"
+        );
     }
 
     #[tokio::test]
