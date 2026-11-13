@@ -63,6 +63,15 @@ const NO_PRIOR_HISTORY: &str = "No prior history.";
 /// provider that keeps failing cannot stretch one compaction indefinitely.
 const SUMMARY_REQUEST_DEADLINE: Duration = Duration::from_secs(600);
 
+/// Calibration bucket for the summary request input estimate.
+const SUMMARY_REQUEST_KIND: &str = "compaction";
+
+/// Number of times a summary request is retried after a provider overflow.
+///
+/// The first attempt uses the calibrated estimate. A provider-side rejection
+/// means the estimate was too low, so each retry halves the input budget.
+const SUMMARY_OVERFLOW_RETRIES: usize = 2;
+
 /// System prompt for every checkpoint summarization request.
 const SUMMARIZATION_SYSTEM_PROMPT: &str = "\
 You are a context summarization assistant. Read the conversation between a user and an AI assistant, \
@@ -655,42 +664,107 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
     parts.join("\n\n")
 }
 
-/// Returns the token budget for one summarization request.
+/// Returns the raw token budget for one summarization request.
 ///
 /// The summarizer needs room for its own answer. Reserve the configured
 /// output limit, bounded by half the context window so a model whose output
-/// limit exceeds its window still leaves room for the history. The resulting
-/// budget caps the whole summary prompt, including its fixed templates.
-fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
+/// limit exceeds its window still leaves room for the history.
+///
+/// The result is in raw estimate units, not provider tokens. The compaction
+/// calibration factor converts between the two. Without a measurement, the
+/// conservative default factor leaves headroom for text that tokenizes denser
+/// than the UTF-16 estimate; a provider overflow is still retried with a
+/// smaller budget by the caller.
+fn summary_calibration_key(request: &CompactionRequest<'_>) -> CalibrationKey {
+    CalibrationKey::new(
+        request.llm.provider_name(),
+        request.llm.model_name(),
+        SUMMARY_REQUEST_KIND,
+        false,
+    )
+}
+
+async fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
     let metadata = request.config.resolve_model_metadata(
         &crate::config::ProviderId::new(request.llm.provider_name()),
         request.llm.model_name(),
     );
     let output_reserve = metadata.max_output_tokens.min(metadata.context_window / 2);
-    metadata
+    let token_budget = metadata
         .context_window
         .saturating_sub(output_reserve)
+        .max(1);
+    let factor = request
+        .state
+        .usage_calibrator
+        .factor(&summary_calibration_key(request))
+        .await;
+    (((token_budget as f64) / factor).floor() as usize)
         .max(1)
+        .min(token_budget)
 }
 
 /// Builds a sanitized summary prompt that fits the summarizer's input budget.
 ///
 /// The newest conversation text has priority. The previous checkpoint and the
 /// optional focus are older context, so they are reduced first when the fixed
-/// part alone leaves no room. The conversation is then kept from its newest
-/// end and marked when older text is omitted. The original conversation
+/// part alone leaves no room. The previous checkpoint keeps its newest end,
+/// while the focus keeps its beginning. The conversation is then kept from its
+/// newest end and marked when older text is omitted. The original conversation
 /// remains in the compaction archive and the append-only `messages` table.
+///
+/// # Errors
+///
+/// Returns [`LlmError::SummaryInputCapacityExceeded`] when the fixed templates
+/// cannot fit even after the previous checkpoint and focus are removed. Sending
+/// a truncated instruction would produce an invalid summary, so the request is
+/// rejected instead.
 fn fit_summary_prompt<F>(
     request: &CompactionRequest<'_>,
+    budget: usize,
     mut conversation: String,
     mut previous_summary: Option<String>,
     mut instructions: Option<String>,
     build: F,
-) -> String
+) -> Result<String, EgoPulseError>
 where
     F: Fn(&str, Option<&str>, Option<&str>) -> String,
 {
-    let budget = summary_input_budget(request);
+    // Reduce older context until the fixed part leaves room for the
+    // conversation. A fixed template that still does not fit has no safe
+    // truncated form, so it is an input-capacity error.
+    loop {
+        let fixed = build("", previous_summary.as_deref(), instructions.as_deref());
+        let fixed = redact_summary_text(&fixed, request.config);
+        let fixed_estimate = summary_request_estimate(&fixed);
+        if conversation.is_empty() {
+            if fixed_estimate <= budget {
+                return Ok(fixed);
+            }
+        } else if fixed_estimate < budget {
+            break;
+        }
+
+        let conversation_tokens = text_chars(&conversation).div_ceil(CHARS_PER_TOKEN_ESTIMATE);
+        let available_fixed = budget.saturating_sub(conversation_tokens);
+        let shrink_chars = fixed_estimate
+            .saturating_sub(available_fixed)
+            .max(1)
+            .saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+        if shrink_previous_summary(&mut previous_summary, shrink_chars) {
+            continue;
+        }
+        if shrink_instructions(&mut instructions, shrink_chars) {
+            continue;
+        }
+        return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
+            budget_tokens: budget,
+            required_tokens: fixed_estimate,
+        }));
+    }
+
+    // The fixed part fits. Remove the oldest conversation text until the whole
+    // prompt fits, keeping the newest end and marking the omitted prefix.
     loop {
         let prompt = build(
             &conversation,
@@ -700,64 +774,49 @@ where
         let prompt = redact_summary_text(&prompt, request.config);
         let estimate = summary_request_estimate(&prompt);
         if estimate <= budget {
-            return prompt;
+            return Ok(prompt);
         }
-        // Keep the new conversation when the fixed part leaves room for it.
-        // Otherwise the fixed part is over budget on its own and must shrink
-        // before the remaining conversation can be kept.
-        let fixed = build("", previous_summary.as_deref(), instructions.as_deref());
-        let fixed = redact_summary_text(&fixed, request.config);
-        let fixed_estimate = summary_request_estimate(&fixed);
-        if fixed_estimate >= budget {
-            // Leave room for the conversation. If the conversation is larger
-            // than the whole budget, the fixed part is reduced to zero and the
-            // conversation is truncated separately.
-            let conversation_tokens = text_chars(&conversation).div_ceil(CHARS_PER_TOKEN_ESTIMATE);
-            let available_fixed = budget.saturating_sub(conversation_tokens);
-            let excess_chars = fixed_estimate
-                .saturating_sub(available_fixed)
-                .max(1)
-                .saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
-            if let Some(previous) = previous_summary.as_mut() {
-                if !previous.is_empty() {
-                    *previous = truncate_utf16_prefix(
-                        previous,
-                        text_chars(previous).saturating_sub(excess_chars),
-                    );
-                    if previous.is_empty() {
-                        previous_summary = None;
-                    }
-                    continue;
-                }
-            }
-            if let Some(focus) = instructions.as_mut() {
-                if !focus.is_empty() {
-                    *focus = truncate_utf16_prefix(
-                        focus,
-                        text_chars(focus).saturating_sub(excess_chars),
-                    );
-                    if focus.is_empty() {
-                        instructions = None;
-                    }
-                    continue;
-                }
-            }
-            // Only the fixed templates remain and they exceed the budget. This
-            // is a tiny-window configuration, but the request still must not
-            // exceed the provider's limit.
-            return truncate_utf16_prefix(&prompt, budget.saturating_mul(CHARS_PER_TOKEN_ESTIMATE));
-        }
-
-        if !conversation.is_empty() {
-            let excess_chars = (estimate - budget).saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
-            let max_chars = text_chars(&conversation).saturating_sub(excess_chars);
-            conversation = truncate_summary_conversation_chars(conversation, max_chars);
-            continue;
-        }
-        // The full prompt is over budget without any variable content, which
-        // means the fixed template itself is over budget.
-        return truncate_utf16_prefix(&prompt, budget.saturating_mul(CHARS_PER_TOKEN_ESTIMATE));
+        let excess_chars = (estimate - budget).saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+        let max_chars = text_chars(&conversation).saturating_sub(excess_chars);
+        conversation = truncate_summary_conversation_chars(conversation, max_chars);
     }
+}
+
+/// Shrinks a previous checkpoint from the oldest side. Returns `false` when
+/// there is nothing left to shrink.
+fn shrink_previous_summary(previous_summary: &mut Option<String>, shrink_chars: usize) -> bool {
+    let Some(previous) = previous_summary.as_mut() else {
+        return false;
+    };
+    if previous.is_empty() {
+        return false;
+    }
+    let max_chars = text_chars(previous).saturating_sub(shrink_chars);
+    let start = utf16_suffix_start(previous, max_chars);
+    let kept = &previous[start..];
+    if kept.is_empty() {
+        *previous_summary = None;
+    } else {
+        *previous = kept.to_string();
+    }
+    true
+}
+
+/// Shrinks the additional focus from the end. Returns `false` when there is
+/// nothing left to shrink.
+fn shrink_instructions(instructions: &mut Option<String>, shrink_chars: usize) -> bool {
+    let Some(focus) = instructions.as_mut() else {
+        return false;
+    };
+    if focus.is_empty() {
+        return false;
+    }
+    let max_chars = text_chars(focus).saturating_sub(shrink_chars);
+    *focus = truncate_utf16_prefix(focus, max_chars);
+    if focus.is_empty() {
+        *instructions = None;
+    }
+    true
 }
 
 fn truncate_summary_conversation_chars(conversation: String, max_chars: usize) -> String {
@@ -960,7 +1019,7 @@ async fn log_summarizer_usage(
             model: &model,
             input_tokens,
             output_tokens,
-            request_kind: "compaction",
+            request_kind: SUMMARY_REQUEST_KIND,
             estimated_tokens,
             has_tools: false,
             cached_input_tokens,
@@ -970,66 +1029,92 @@ async fn log_summarizer_usage(
     .inspect_err(|error| warn!(error = %error, "compaction usage logging failed"));
 }
 
-/// Sends one summarization request, records its usage, and validates the
-/// result.
+/// Sends summarization requests until one succeeds, shrinking the input after
+/// a provider overflow, then records usage and validates the result.
 ///
-/// Every failure is returned: the caller decides whether the original context
-/// is kept (automatic compaction) or reported to the user (`/compact`).
-async fn summarize(
+/// Every final failure is returned: the caller decides whether the original
+/// context is kept (automatic compaction) or reported to the user (`/compact`).
+/// A provider overflow is not final until the retry budget is exhausted or the
+/// input cannot shrink further.
+async fn summarize<F>(
     request: &CompactionRequest<'_>,
-    prompt: String,
     label: &str,
-) -> Result<String, EgoPulseError> {
-    let estimate = summary_request_estimate(&prompt);
-    let response = match request_summary(request.llm, prompt).await {
-        Ok(response) => response,
-        Err(error) => {
+    mut build_prompt: F,
+) -> Result<String, EgoPulseError>
+where
+    F: FnMut(usize) -> Result<String, EgoPulseError>,
+{
+    let mut budget = summary_input_budget(request).await;
+    let mut overflow_retries = 0usize;
+    loop {
+        let prompt = build_prompt(budget)?;
+        let estimate = summary_request_estimate(&prompt);
+        let response = match request_summary(request.llm, prompt).await {
+            Ok(response) => response,
+            Err(error) => {
+                // If the prompt is already far below the budget, halving the
+                // budget alone could rebuild an identical request. Cap the
+                // retry at half the current estimate as well.
+                let next_budget = (budget / 2).min(estimate / 2).max(1);
+                if error.is_context_overflow()
+                    && overflow_retries < SUMMARY_OVERFLOW_RETRIES
+                    && next_budget < budget
+                {
+                    overflow_retries += 1;
+                    warn!(
+                        channel = %request.context.channel,
+                        chat_id = request.chat_id,
+                        label,
+                        attempt = overflow_retries,
+                        previous_budget_tokens = budget,
+                        next_budget_tokens = next_budget,
+                        "context compaction summary exceeded the provider window; retrying with a smaller input"
+                    );
+                    budget = next_budget;
+                    continue;
+                }
+                warn!(
+                    channel = %request.context.channel,
+                    chat_id = request.chat_id,
+                    label,
+                    error = %error,
+                    "context compaction summarization failed"
+                );
+                return Err(EgoPulseError::Llm(error));
+            }
+        };
+
+        if let Some(usage) = &response.usage {
+            request
+                .state
+                .usage_calibrator
+                .record(
+                    summary_calibration_key(request),
+                    estimate,
+                    usage.input_tokens,
+                )
+                .await;
+        }
+        log_summarizer_usage(
+            request.state,
+            request.context,
+            request.chat_id,
+            request.llm,
+            &response,
+            estimate,
+        )
+        .await;
+
+        return validate_summary(&response).inspect_err(|error| {
             warn!(
                 channel = %request.context.channel,
                 chat_id = request.chat_id,
                 label,
                 error = %error,
-                "context compaction summarization failed"
+                "context compaction summary rejected"
             );
-            return Err(EgoPulseError::Llm(error));
-        }
-    };
-
-    if let Some(usage) = &response.usage {
-        request
-            .state
-            .usage_calibrator
-            .record(
-                CalibrationKey::new(
-                    request.llm.provider_name(),
-                    request.llm.model_name(),
-                    "compaction",
-                    false,
-                ),
-                estimate,
-                usage.input_tokens,
-            )
-            .await;
+        });
     }
-    log_summarizer_usage(
-        request.state,
-        request.context,
-        request.chat_id,
-        request.llm,
-        &response,
-        estimate,
-    )
-    .await;
-
-    validate_summary(&response).inspect_err(|error| {
-        warn!(
-            channel = %request.context.channel,
-            chat_id = request.chat_id,
-            label,
-            error = %error,
-            "context compaction summary rejected"
-        );
-    })
 }
 
 async fn generate_summary(
@@ -1044,14 +1129,17 @@ async fn generate_summary(
         previous_summary.map(|summary| redact_summary_text(summary, request.config));
     let instructions =
         instructions.map(|instructions| redact_summary_text(instructions, request.config));
-    let prompt = fit_summary_prompt(
-        request,
-        conversation,
-        previous_summary,
-        instructions,
-        summary_prompt,
-    );
-    summarize(request, prompt, label).await
+    summarize(request, label, |budget| {
+        fit_summary_prompt(
+            request,
+            budget,
+            conversation.clone(),
+            previous_summary.clone(),
+            instructions.clone(),
+            summary_prompt,
+        )
+    })
+    .await
 }
 
 async fn generate_turn_prefix_summary(
@@ -1062,14 +1150,17 @@ async fn generate_turn_prefix_summary(
     let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
     let instructions =
         instructions.map(|instructions| redact_summary_text(instructions, request.config));
-    let prompt = fit_summary_prompt(
-        request,
-        conversation,
-        None,
-        instructions,
-        |conversation, _, instructions| turn_prefix_prompt(conversation, instructions),
-    );
-    summarize(request, prompt, "turn prefix").await
+    summarize(request, "turn prefix", |budget| {
+        fit_summary_prompt(
+            request,
+            budget,
+            conversation.clone(),
+            None,
+            instructions.clone(),
+            |conversation, _, instructions| turn_prefix_prompt(conversation, instructions),
+        )
+    })
+    .await
 }
 
 /// Compacts the context when it no longer fits the provider window.
@@ -1897,8 +1988,9 @@ mod tests {
             config: &state.config,
             request_only_messages: Vec::new(),
         };
+        let input_budget = summary_input_budget(&request).await;
         assert!(
-            text_chars(&huge_answer) > summary_input_budget(&request) * CHARS_PER_TOKEN_ESTIMATE,
+            text_chars(&huge_answer) > input_budget * CHARS_PER_TOKEN_ESTIMATE,
             "the test history must exceed the summarizer input budget"
         );
 
@@ -1934,7 +2026,7 @@ mod tests {
         assert!(prompt.contains("[REDACTED:provider.openai.api_key]"));
         assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
         assert!(
-            summary_request_estimate(&prompt) <= summary_input_budget(&request),
+            summary_request_estimate(&prompt) <= input_budget,
             "the summary request must stay within the model input budget"
         );
     }
@@ -1962,8 +2054,9 @@ mod tests {
             ),
             text("user", "fresh question"),
         ]);
+        let latest_decision = "The old plan is withdrawn. Latest decision: use plan B.";
         session.checkpoint = Some(CompactionCheckpoint {
-            summary: "old checkpoint ".repeat(30_000),
+            summary: format!("{}\n\n{latest_decision}", "old checkpoint ".repeat(30_000)),
             tokens_before: 1,
             read_files: Vec::new(),
             modified_files: Vec::new(),
@@ -1989,12 +2082,14 @@ mod tests {
             .await
             .expect("compact");
 
-        // Assert: the newest conversation survives and the whole request fits.
+        // Assert: the newest checkpoint information survives and the whole
+        // request fits.
         assert!(matches!(outcome, CompactionOutcome::Compacted(_)));
         let prompt = provider.seen_messages()[0][0].content.as_text_lossy();
-        assert!(prompt.contains("the current decision is the correction"));
+        assert!(prompt.contains(latest_decision));
+        let input_budget = summary_input_budget(&request).await;
         assert!(
-            summary_request_estimate(&prompt) <= summary_input_budget(&request),
+            summary_request_estimate(&prompt) <= input_budget,
             "the previous summary must not push the request beyond the input budget"
         );
     }
@@ -2067,15 +2162,19 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_summary_context_overflow_is_returned_to_the_caller() {
-        // Arrange: the estimate fit, but the provider tokenizer disagreed.
+    async fn a_summary_context_overflow_retries_with_a_smaller_input() {
+        // Arrange: the calibrated estimate fits, but the provider tokenizer
+        // needs more tokens. The first attempt overflows; the second succeeds.
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
-            vec![Err(LlmError::ContextOverflow {
-                status: reqwest::StatusCode::BAD_REQUEST,
-                body_preview: "context length exceeded".to_string(),
-            })],
-            vec![0],
+            vec![
+                Err(LlmError::ContextOverflow {
+                    status: reqwest::StatusCode::BAD_REQUEST,
+                    body_preview: "context length exceeded".to_string(),
+                }),
+                Ok(summary_response("history summary")),
+            ],
+            vec![0, 0],
         );
         let config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
@@ -2083,7 +2182,117 @@ mod tests {
         );
         let state =
             crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
-        let context = crate::agent_loop::test_support::cli_context("failed-compact");
+        let context = crate::agent_loop::test_support::cli_context("overflow-compact");
+        let chat_id = chat_id_for(&state, &context).await;
+        let session = session(vec![
+            text("user", "old question"),
+            text("assistant", &"long answer ".repeat(2_000)),
+            text("user", "fresh question"),
+        ]);
+        let runtime = state.turn_dependencies();
+        let llm: Arc<dyn LlmProvider> = Arc::new(provider.clone());
+        let request = CompactionRequest {
+            state: &runtime,
+            context: &context,
+            chat_id,
+            llm: &llm,
+            prompt: PromptContext {
+                system_prompt: "system",
+                tools_json: None,
+                has_tools: false,
+            },
+            config: &state.config,
+            request_only_messages: Vec::new(),
+        };
+        let initial_budget = summary_input_budget(&request).await;
+
+        // Act
+        let outcome = compact(&request, &session, CompactionReason::Manual, None)
+            .await
+            .expect("compact");
+
+        // Assert: the retry shrinks the input and the checkpoint is saved.
+        let CompactionOutcome::Compacted(compacted) = outcome else {
+            panic!("expected a compacted context");
+        };
+        assert_eq!(
+            compacted.checkpoint.as_ref().expect("checkpoint").summary,
+            "history summary"
+        );
+        let prompts = provider.seen_messages();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(provider.seen_systems().len(), 2);
+        let first = prompts[0][0].content.as_text_lossy();
+        let second = prompts[1][0].content.as_text_lossy();
+        assert!(text_chars(&second) < text_chars(&first));
+        assert!(second.contains(SUMMARY_TRUNCATION_MARKER.trim()));
+        assert!(
+            summary_request_estimate(&first) <= initial_budget,
+            "the first summary request must use the initial budget"
+        );
+        assert!(
+            summary_request_estimate(&second) <= initial_budget / 2,
+            "the retry must use a smaller input budget"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn summary_input_budget_applies_the_compaction_calibration() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(Vec::new(), Vec::new());
+        let config = crate::agent_loop::test_support::test_config_with_compaction(
+            dir.path().to_string_lossy().to_string(),
+            1,
+        );
+        let state =
+            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
+        let context = crate::agent_loop::test_support::cli_context("calibrated-compact");
+        let chat_id = chat_id_for(&state, &context).await;
+        let runtime = state.turn_dependencies();
+        let llm: Arc<dyn LlmProvider> = Arc::new(provider);
+        let request = CompactionRequest {
+            state: &runtime,
+            context: &context,
+            chat_id,
+            llm: &llm,
+            prompt: PromptContext {
+                system_prompt: "system",
+                tools_json: None,
+                has_tools: false,
+            },
+            config: &state.config,
+            request_only_messages: Vec::new(),
+        };
+        let budget_before = summary_input_budget(&request).await;
+
+        // Act: the provider measured three tokens for every estimated token.
+        request
+            .state
+            .usage_calibrator
+            .record(summary_calibration_key(&request), 100, 300)
+            .await;
+
+        // Assert
+        let budget_after = summary_input_budget(&request).await;
+        assert!(budget_after < budget_before);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_fixed_summary_template_that_exceeds_the_budget_is_rejected() {
+        // Arrange: even the template without history cannot fit this window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(Vec::new(), Vec::new());
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_string_lossy().to_string(),
+            1,
+            200,
+        );
+        let state =
+            crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
+        let context = crate::agent_loop::test_support::cli_context("tiny-compact");
         let chat_id = chat_id_for(&state, &context).await;
         let session = session(vec![
             text("user", "old question"),
@@ -2112,12 +2321,13 @@ mod tests {
         // Assert
         assert!(matches!(
             result,
-            Err(EgoPulseError::Llm(LlmError::ContextOverflow { .. }))
+            Err(EgoPulseError::Llm(
+                LlmError::SummaryInputCapacityExceeded { .. }
+            ))
         ));
-        assert_eq!(
-            provider.seen_systems().len(),
-            1,
-            "a summary overflow is not retried"
+        assert!(
+            provider.seen_messages().is_empty(),
+            "a truncated template must never be sent"
         );
     }
 

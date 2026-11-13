@@ -138,6 +138,10 @@ impl EgoPulseError {
                     "The configured output limit ({configured}) is below the API minimum ({minimum}). Increase max_output_tokens."
                 )
             }
+            Self::Llm(LlmError::SummaryInputCapacityExceeded { .. }) => {
+                "The conversation is too large to summarize within the model context window."
+                    .to_string()
+            }
             Self::Llm(LlmError::InvalidResponse(_)) => {
                 "LLM returned an invalid response.".to_string()
             }
@@ -385,6 +389,13 @@ pub enum LlmError {
     },
     #[error("llm_output_limit_below_api_minimum: configured={configured} minimum={minimum}")]
     OutputLimitBelowApiMinimum { configured: usize, minimum: usize },
+    #[error(
+        "llm_summary_input_capacity_exceeded: budget_tokens={budget_tokens} required_tokens={required_tokens}"
+    )]
+    SummaryInputCapacityExceeded {
+        budget_tokens: usize,
+        required_tokens: usize,
+    },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
     #[error("llm_deadline_exceeded: no response within the model iteration deadline")]
@@ -431,7 +442,8 @@ impl LlmError {
     /// that ended before its completion event.
     ///
     /// Non-retryable variants (`InvalidResponse`, `IncompleteResponse`,
-    /// `ContextOverflow`, `InitFailed`, `RequestConstructionFailed`,
+    /// `ContextOverflow`, `OutputCapacityExceeded`, `OutputLimitBelowApiMinimum`,
+    /// `SummaryInputCapacityExceeded`, `InitFailed`, `RequestConstructionFailed`,
     /// `DeadlineExceeded`, and 4xx other than 429) either indicate a
     /// deterministic problem, mean the provider completed the generation but
     /// cut it off (output limit or content filter), require a smaller request
@@ -445,6 +457,7 @@ impl LlmError {
             Self::ContextOverflow { .. }
             | Self::OutputCapacityExceeded { .. }
             | Self::OutputLimitBelowApiMinimum { .. }
+            | Self::SummaryInputCapacityExceeded { .. }
             | Self::InitFailed(_)
             | Self::IncompleteResponse(_)
             | Self::InvalidResponse(_)
@@ -462,6 +475,7 @@ impl LlmError {
             Self::ContextOverflow { .. }
             | Self::OutputCapacityExceeded { .. }
             | Self::OutputLimitBelowApiMinimum { .. }
+            | Self::SummaryInputCapacityExceeded { .. }
             | Self::InitFailed(_)
             | Self::RequestFailed(_)
             | Self::IncompleteStream(_)

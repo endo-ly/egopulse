@@ -1994,12 +1994,13 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_checkpoint_is_persisted_before_the_model_request() {
-        // Arrange: a window of 1 token makes the first request compact.
+        // Arrange: a small window and a long history make the first request
+        // compact. The window still leaves room for the summary templates.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = crate::agent_loop::test_support::test_config_with_compaction_window(
             dir.path().to_str().expect("utf8").to_string(),
             1,
-            1,
+            2_000,
         );
         config.compaction.reserve_tokens = 0;
         let provider = CheckpointObservingProvider::new();
@@ -2015,7 +2016,7 @@ mod tests {
             chat_id,
             vec![
                 Message::text("user", "old question"),
-                Message::text("assistant", "old answer"),
+                Message::text("assistant", "old answer ".repeat(500)),
                 Message::text("user", "another question"),
                 Message::text("assistant", "another answer"),
             ],
