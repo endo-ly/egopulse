@@ -315,7 +315,7 @@ node scripts/import-model-catalog.mjs
 
 入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 安全余裕` まで切り下げる。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API ごとの最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合はリクエストを送らず、容量不足として Agent Loop の 1 回の compaction・再送対象にする。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
 
-`max_output_tokens` の設定値が API の最小出力を下回る場合は、送信前に設定不整合として失敗する（`LlmError::OutputLimitBelowApiMinimum`）。この状態は compaction では解消しないため、自動圧縮・再送の対象にはしない。設定値を API の最小出力以上へ引き上げる必要がある。
+`max_output_tokens` の解決値（明示設定またはカタログ）が API の最小出力を下回る場合は、送信前に設定不整合として失敗する（`LlmError::OutputLimitBelowApiMinimum`）。この状態は compaction では解消しないため、自動圧縮・再送の対象にはしない。設定値を API の最小出力以上へ引き上げる必要がある。
 
 `headers` はリクエストヘッダをプロバイダー単位で付与する。値は文字列で、SecretRef は使用できない。
 
