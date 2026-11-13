@@ -1079,9 +1079,9 @@ impl Database {
 
     /// Updates `sessions.messages_json` to `new_messages_json` and bumps
     /// `chats.revision`. Unlike [`Database::clear_session_messages`], which
-    /// wipes to `[]`, this keeps a caller-supplied payload — used by the sleep
-    /// batch to retain the trailing N messages while still archiving the full
-    /// conversation.
+    /// writes an empty `ContextSnapshot`, this keeps a caller-supplied payload
+    /// — used by the sleep batch to retain the trailing N messages while still
+    /// archiving the full conversation.
     ///
     /// Uses optimistic concurrency on `chats.revision`: the update only
     /// succeeds when `expected_revision` matches the current row. Returns
