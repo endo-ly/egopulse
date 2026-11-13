@@ -303,7 +303,7 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 | Context Overflow | Provider が context window 超過を返したとき |
 | 容量不足 | 推定入力が context window を埋め、API の最小出力すら確保できないとき。リクエストは送信しない |
 | 実測の超過 | 正常応答の `input_tokens` が context window を超えたとき。閾値判定を待たずに圧縮し、応答は再生成しない |
-| 出力打ち切り | `length` で意図した出力上限より手前で終わったとき、または入力が窓をほぼ満たして出力 0 で終わったとき |
+| 出力打ち切り | `length` で意図した出力上限より手前で終わったとき（実測 usage がある場合） |
 
 `compaction.enabled = false` では、閾値・Context Overflow・容量不足・実測の超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` だけは実行できる。
 
@@ -327,7 +327,7 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 
 system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
 
-出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。
+出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
 
 補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
 
@@ -445,7 +445,7 @@ Provider の出力上限で生成が終わった場合、`finish_reason=length` 
 
 判定には、モデルメタデータから解決した**意図した最大出力トークン**（`max_output_tokens`）を使う。リクエスト時に context window へ収めるため切り下げても、意図値は維持する。
 
-1. `compaction.enabled = true` かつ復旧未実施で、`output_tokens < max_output_tokens`（または `output_tokens = 0` かつ `input_tokens` が窓の 99% 以上）なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
+1. `compaction.enabled = true` かつ復旧未実施で、実測 `output_tokens < max_output_tokens` なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
 2. 意図した上限まで生成し切った `length`、usage が無い場合、`enabled = false`、2 回目の打ち切りでは再送しない
 3. 復旧しない場合も、生成済みの通常テキストは破棄せず final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
 4. `finish_reason` は Session snapshot と `messages` テーブルの両方に保存する。`GET /api/history`、SSE / WebSocket の最終応答、TUI の完了通知、Discord / Telegram の配送本文は同じ値を使い、再受付・再接続・再読み込みでも打ち切り状態が失われない。テキストのみのチャネルには回答の後ろに注意文を付ける
