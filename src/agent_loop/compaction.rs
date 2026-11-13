@@ -38,7 +38,7 @@ use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::tokens::{
     CHARS_PER_TOKEN_ESTIMATE, estimate_message_tokens, estimate_messages_tokens,
-    estimate_text_tokens,
+    estimate_text_tokens, text_chars,
 };
 use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
 use crate::llm::{RetryPolicy, complete_response};
@@ -46,6 +46,10 @@ use crate::tools::sanitize_output_string;
 
 /// Maximum characters of a single tool result inside a summary request.
 const TOOL_RESULT_MAX_CHARS: usize = 2_000;
+
+/// Appended when the history does not fit the summarizer's input budget.
+const SUMMARY_TRUNCATION_MARKER: &str =
+    "\n\n[... conversation truncated to fit the summarization request ...]";
 
 /// Separator between the history summary and a split-turn prefix summary.
 const SPLIT_TURN_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
@@ -651,6 +655,71 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
     parts.join("\n\n")
 }
 
+/// Returns the token budget for one summarization request.
+///
+/// The summarizer needs room for its own answer. Reserve the configured
+/// output limit, bounded by half the context window so a model whose output
+/// limit exceeds its window still leaves room for the history. A low budget
+/// cannot increase a request; it only limits the conversation text so the
+/// provider does not reject the summary for exceeding the context window.
+fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
+    let metadata = request.config.resolve_model_metadata(
+        &crate::config::ProviderId::new(request.llm.provider_name()),
+        request.llm.model_name(),
+    );
+    let output_reserve = metadata.max_output_tokens.min(metadata.context_window / 2);
+    metadata
+        .context_window
+        .saturating_sub(output_reserve)
+        .max(1)
+}
+
+/// Serializes the history within the summarizer's remaining input budget.
+///
+/// The oldest text is kept and the tail is replaced by a marker when the
+/// serialized history does not fit. The original conversation remains in the
+/// compaction archive and the append-only `messages` table.
+fn summary_conversation(
+    request: &CompactionRequest<'_>,
+    messages: &[Message],
+    fixed_prompt: &str,
+) -> String {
+    let budget = summary_input_budget(request);
+    let overhead = summary_request_estimate(fixed_prompt);
+    let conversation_budget = budget.saturating_sub(overhead);
+    truncate_summary_conversation(serialize_conversation(messages), conversation_budget)
+}
+
+fn truncate_summary_conversation(conversation: String, budget_tokens: usize) -> String {
+    let max_chars = budget_tokens.saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
+    if text_chars(&conversation) <= max_chars {
+        return conversation;
+    }
+    let marker_chars = text_chars(SUMMARY_TRUNCATION_MARKER);
+    let keep_chars = max_chars.saturating_sub(marker_chars);
+    if keep_chars == 0 {
+        return String::new();
+    }
+    let end = utf16_prefix_end(&conversation, keep_chars);
+    let mut truncated = conversation;
+    truncated.truncate(end);
+    truncated.push_str(SUMMARY_TRUNCATION_MARKER);
+    truncated
+}
+
+/// Returns the byte index of the longest UTF-16 prefix within `max_chars`.
+fn utf16_prefix_end(text: &str, max_chars: usize) -> usize {
+    let mut used = 0;
+    for (index, character) in text.char_indices() {
+        let next = used + character.len_utf16();
+        if next > max_chars {
+            return index;
+        }
+        used = next;
+    }
+    text.len()
+}
+
 /// Removes a previous checkpoint's trailing file-operation blocks.
 ///
 /// The lists are carried in the checkpoint fields and re-appended after the
@@ -873,7 +942,8 @@ async fn generate_summary(
     instructions: Option<&str>,
     label: &str,
 ) -> Result<String, EgoPulseError> {
-    let conversation = serialize_conversation(messages);
+    let fixed_prompt = summary_prompt("", previous_summary, instructions);
+    let conversation = summary_conversation(request, messages, &fixed_prompt);
     let prompt = summary_prompt(&conversation, previous_summary, instructions);
     summarize(request, prompt, label).await
 }
@@ -883,7 +953,8 @@ async fn generate_turn_prefix_summary(
     messages: &[Message],
     instructions: Option<&str>,
 ) -> Result<String, EgoPulseError> {
-    let conversation = serialize_conversation(messages);
+    let fixed_prompt = turn_prefix_prompt("", instructions);
+    let conversation = summary_conversation(request, messages, &fixed_prompt);
     let prompt = turn_prefix_prompt(&conversation, instructions);
     summarize(request, prompt, "turn prefix").await
 }
@@ -1686,9 +1757,12 @@ mod tests {
             crate::agent_loop::test_support::build_state(config, Box::new(provider.clone()));
         let context = crate::agent_loop::test_support::cli_context("manual-compact");
         let chat_id = chat_id_for(&state, &context).await;
+        // This history is far larger than the test model's 9,000-token window,
+        // so the summary request itself must be bounded before it is sent.
+        let huge_answer = "old answer ".repeat(40_000);
         let session = session(vec![
             text("user", "old question"),
-            text("assistant", "old answer"),
+            text("assistant", &huge_answer),
             text("user", "fresh question"),
         ]);
         seed_session(&state, chat_id, &session);
@@ -1707,6 +1781,10 @@ mod tests {
             config: &state.config,
             request_only_messages: Vec::new(),
         };
+        assert!(
+            text_chars(&huge_answer) > summary_input_budget(&request) * CHARS_PER_TOKEN_ESTIMATE,
+            "the test history must exceed the summarizer input budget"
+        );
 
         // Act
         let outcome = compact(&request, &session, CompactionReason::Manual, None)
@@ -1733,7 +1811,12 @@ mod tests {
         assert!(prompt.contains("<conversation>"));
         assert!(prompt.contains("[User]: old question"));
         assert!(prompt.contains("[Assistant]: old answer"));
+        assert!(prompt.contains(SUMMARY_TRUNCATION_MARKER.trim()));
         assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
+        assert!(
+            summary_request_estimate(&prompt) <= summary_input_budget(&request),
+            "the summary request must stay within the model input budget"
+        );
     }
 
     #[tokio::test]
