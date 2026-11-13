@@ -1059,22 +1059,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_compact_returns_count() {
-        // Arrange
-        let (state, _dir) = build_test_state();
-        let chat_id = create_test_chat(&state, "test-compact").await;
-
-        seed_compactable_session(&state, chat_id).await;
-
-        // Act
-        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
-
-        // Assert
-        let response = result.expect("response");
-        assert_eq!(response, "Compacted 3 messages to 2.");
-    }
-
-    #[tokio::test]
     async fn handle_compact_runs_when_automatic_compaction_is_disabled() {
         // Arrange: `enabled` only controls automatic compaction.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1087,9 +1071,25 @@ mod tests {
         // Act
         let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
 
-        // Assert
+        // Assert: the command reports the compaction and persists it.
         let response = result.expect("response");
         assert_eq!(response, "Compacted 3 messages to 2.");
+
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("the next turn should restore the compacted session");
+        let checkpoint = loaded.context.checkpoint.expect("saved checkpoint");
+        assert!(checkpoint.summary.contains("summary"));
+        assert_eq!(loaded.context.messages.len(), 2);
+        assert_eq!(loaded.context.messages[0].role, "assistant");
+        assert_eq!(
+            loaded.context.messages[1].content.as_text_lossy(),
+            "fresh question"
+        );
     }
 
     #[tokio::test]
