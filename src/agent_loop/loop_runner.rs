@@ -103,7 +103,6 @@ pub(crate) struct AgentLoopResult {
 /// Inputs of one truncation recovery decision.
 struct TruncationRecovery<'a> {
     usage: Option<&'a crate::llm::LlmUsage>,
-    context_window: usize,
     recovery_attempted: bool,
 }
 
@@ -262,7 +261,6 @@ impl<'a> AgentLoop<'a> {
                                     &prompt,
                                     TruncationRecovery {
                                         usage: response.usage.as_ref(),
-                                        context_window,
                                         recovery_attempted: overflow_recovery_attempted,
                                     },
                                 )
@@ -802,8 +800,7 @@ impl<'a> AgentLoop<'a> {
     /// generation.
     ///
     /// A `length` stop is only recoverable when the provider reported usage and
-    /// the generation ended before the intended output limit, or when the input
-    /// itself filled the window and left no room for an answer. Reaching the
+    /// the generation ended before the intended output limit. Reaching the
     /// intended limit is not evidence that compacting will produce a complete
     /// answer, so those cases surface the error. A tool-call response is never
     /// executed: the partial call is discarded with the response.
@@ -819,7 +816,6 @@ impl<'a> AgentLoop<'a> {
         let enabled = self.automatic_compaction_enabled();
         let TruncationRecovery {
             usage,
-            context_window,
             recovery_attempted,
         } = recovery;
         let Some(usage) = usage else {
@@ -834,12 +830,9 @@ impl<'a> AgentLoop<'a> {
                 self.prepared.channel_llm.model_name(),
             )
             .max_output_tokens;
-        let context_pressure = context_window > 0
-            && usage.output_tokens == 0
-            && usage.input_tokens as f64 >= context_window as f64 * 0.99;
         let early_stop =
             intended_max_output > 0 && usage.output_tokens < intended_max_output as i64;
-        if !enabled || recovery_attempted || !(context_pressure || early_stop) {
+        if !enabled || recovery_attempted || !early_stop {
             return Ok(false);
         }
 
@@ -1695,41 +1688,6 @@ mod tests {
                 .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
             "the retried request must start with the checkpoint"
         );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn a_truncated_generation_with_zero_output_is_recovered() {
-        // Arrange: the model produced nothing before the limit, which is the
-        // context-pressure shape providers report with `length` + 0 output.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = TruncatedScriptProvider::new(vec![
-            TruncatedScriptStep::Truncated {
-                content: "",
-                output_tokens: 0,
-                tool_calls: Vec::new(),
-                stream_delta: "",
-            },
-            TruncatedScriptStep::Complete("complete answer"),
-        ]);
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
-        let context = cli_context("truncation-zero-output");
-        seed_short_session(&state, &context).await;
-
-        // Act
-        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
-            .await
-            .expect("zero-output truncation should recover");
-
-        // Assert
-        assert_eq!(reply, "complete answer");
-        assert_eq!(provider.model_requests(), 2);
-        assert_eq!(provider.summary_requests(), 1);
     }
 
     #[tokio::test]
