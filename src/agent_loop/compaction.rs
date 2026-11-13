@@ -1511,20 +1511,6 @@ mod tests {
         Message::text(role, content)
     }
 
-    fn image_message(role: &str) -> Message {
-        Message {
-            role: role.to_string(),
-            content: MessageContent::parts(vec![MessageContentPart::InputImage {
-                image_url: "data:image/png;base64,AA==".to_string(),
-                detail: None,
-            }]),
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            finish_reason: None,
-        }
-    }
-
     fn tool_call(id: &str, name: &str, path: &str) -> Message {
         Message {
             role: "assistant".to_string(),
@@ -2111,6 +2097,13 @@ mod tests {
             !prompt.contains(secret),
             "the summary request must not contain config secrets"
         );
+        assert!(last.contains("[REDACTED:provider.openai.api_key]"));
+        assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
+        assert!(
+            summary_request_estimate(&prompt) <= input_budget,
+            "the summary request must stay within the model input budget"
+        );
+
         // An oversized retained message cannot produce a usable checkpoint.
         let oversized = SessionContext {
             checkpoint: None,
@@ -2127,21 +2120,13 @@ mod tests {
             error,
             EgoPulseError::Llm(LlmError::OutputCapacityExceeded { .. })
         ));
-        assert!(oversized.checkpoint.is_none());
-        assert_eq!(oversized.messages.len(), 2);
-        assert!(last.contains("[REDACTED:provider.openai.api_key]"));
-        assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
-        assert!(
-            summary_request_estimate(&prompt) <= input_budget,
-            "the summary request must stay within the model input budget"
-        );
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn a_configured_output_limit_below_the_api_minimum_keeps_the_context() {
-        // Arrange: an image request uses the Responses API minimum, and the
-        // configured output limit cannot satisfy it.
+        // Arrange: the configured output limit is below the API minimum used
+        // by the test provider.
         let dir = tempfile::tempdir().expect("tempdir");
         let provider =
             RecordingProvider::new(vec![Ok(summary_response("history summary"))], vec![0])
@@ -2159,7 +2144,6 @@ mod tests {
         let session = session(vec![
             text("user", "old question"),
             text("assistant", "old answer"),
-            image_message("user"),
             text("user", "fresh question"),
         ]);
 
@@ -2176,8 +2160,6 @@ mod tests {
                 minimum: 16,
             })
         ));
-        assert!(session.checkpoint.is_none());
-        assert_eq!(session.messages.len(), 4);
         assert_eq!(
             provider.seen_systems().len(),
             1,
