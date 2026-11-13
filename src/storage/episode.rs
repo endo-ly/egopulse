@@ -110,7 +110,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1
                AND seq IS NOT NULL
@@ -133,7 +134,8 @@ impl Database {
         let (cursor_at, cursor_id) = cursor.unzip();
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1
                AND seq IS NOT NULL

@@ -24,11 +24,10 @@ pub(crate) fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result
         timestamp: row.get(5)?,
         message_kind,
         recipient_agent_id: row.get(7)?,
-        seq: row.get(8).ok(),
-        turn_id: row.get(9).ok(),
-        parent_message_id: row.get(10).ok(),
-        // Queries that do not project the column simply read NULL.
-        finish_reason: row.get(11).ok().flatten(),
+        seq: row.get(8)?,
+        turn_id: row.get(9)?,
+        parent_message_id: row.get(10)?,
+        finish_reason: row.get(11)?,
     })
 }
 
@@ -249,7 +248,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1 AND seq IS NOT NULL AND message_kind <> ?2
              ORDER BY seq DESC
@@ -397,7 +397,8 @@ impl Database {
         let existing = tx
             .query_row(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                        finish_reason
                  FROM messages WHERE id = ?1 AND chat_id = ?2",
                 params![request_key, chat_id],
                 row_to_stored_message,
@@ -523,7 +524,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE turn_id = ?1 AND seq IS NULL
                AND sender_kind = 'user' AND message_kind = 'message'
@@ -544,7 +546,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.chat_id, m.sender_id, m.content, m.sender_kind, m.timestamp,
                     m.message_kind, m.recipient_agent_id, m.seq, m.turn_id,
-                    m.parent_message_id, t.scheduled_request_json
+                    m.parent_message_id, m.finish_reason, t.scheduled_request_json
              FROM messages m
              JOIN turn_runs t ON t.turn_id = m.turn_id
              WHERE m.seq IS NULL AND m.sender_kind = 'user'
@@ -556,7 +558,7 @@ impl Database {
         stmt.query_map(params![limit as i64], |row| {
             Ok(TerminalStagedMessage {
                 message: row_to_stored_message(row)?,
-                scheduled_request_json: row.get(11)?,
+                scheduled_request_json: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -610,7 +612,8 @@ impl Database {
         let mut staged = {
             let mut stmt = tx.prepare(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                        finish_reason
                  FROM messages
                  WHERE chat_id = ?1 AND turn_id = ?2 AND seq IS NULL
                    AND sender_kind = 'user' AND message_kind = 'message'
@@ -1141,7 +1144,8 @@ impl Database {
         let recent_messages = {
             let mut stmt = tx.prepare(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                        finish_reason
                  FROM messages
                  WHERE chat_id = ?1 AND seq IS NOT NULL AND message_kind <> ?2
                  ORDER BY seq DESC
@@ -1220,7 +1224,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1
                AND seq IS NOT NULL
