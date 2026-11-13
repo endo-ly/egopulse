@@ -38,18 +38,11 @@ use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
 use crate::llm::tokens::{
     CHARS_PER_TOKEN_ESTIMATE, estimate_message_tokens, estimate_messages_tokens,
-    estimate_text_tokens, text_chars,
+    estimate_text_tokens,
 };
 use crate::llm::{LlmProvider, Message, MessageContent, MessageContentPart, MessagesResponse};
 use crate::llm::{RetryPolicy, complete_response};
 use crate::tools::sanitize_output_string;
-
-/// Maximum characters of a single tool result inside a summary request.
-const TOOL_RESULT_MAX_CHARS: usize = 2_000;
-
-/// Prepended when the history does not fit the summarizer's input budget.
-const SUMMARY_TRUNCATION_MARKER: &str =
-    "[... earlier conversation truncated to fit the summarization request ...]\n\n";
 
 /// Separator between the history summary and a split-turn prefix summary.
 const SPLIT_TURN_SEPARATOR: &str = "\n\n---\n\n**Turn Context (split turn):**\n\n";
@@ -576,7 +569,7 @@ fn prepare_compaction(
         previous_summary: session
             .checkpoint
             .as_ref()
-            .map(|checkpoint| strip_file_operation_suffix(&checkpoint.summary).to_string()),
+            .map(|checkpoint| checkpoint.summary.clone()),
         file_operations,
     })
 }
@@ -596,23 +589,10 @@ fn content_text(content: &MessageContent) -> String {
     }
 }
 
-fn truncate_for_summary(text: &str, max_chars: usize) -> String {
-    let total = text.chars().count();
-    if total <= max_chars {
-        return text.to_string();
-    }
-    let truncated: String = text.chars().take(max_chars).collect();
-    format!(
-        "{truncated}\n\n[... {} more characters truncated]",
-        total - max_chars
-    )
-}
-
 /// Serializes messages into plain text so the model does not continue them.
 ///
 /// Visible text, tool calls, and tool results are kept; provider reasoning is
-/// omitted because it is often not part of the model's live context. Each tool
-/// result is truncated so one large result cannot dominate the request.
+/// omitted because it is often not part of the model's live context.
 pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
     for message in messages {
@@ -653,10 +633,7 @@ pub(crate) fn serialize_conversation(messages: &[Message]) -> String {
                 } else {
                     "Tool result"
                 };
-                parts.push(format!(
-                    "[{label}]: {}",
-                    truncate_for_summary(&body, TOOL_RESULT_MAX_CHARS)
-                ));
+                parts.push(format!("[{label}]: {body}"));
             }
             _ => {}
         }
@@ -704,209 +681,51 @@ async fn summary_input_budget(request: &CompactionRequest<'_>) -> usize {
         .min(token_budget)
 }
 
-/// Builds a summary prompt that fits the summarizer's input budget.
-///
-/// The variable inputs must already be sanitized. The fixed templates are
-/// constants, so the assembled prompt does not need another redaction pass.
-/// The newest conversation text has priority. The previous checkpoint and the
-/// optional focus are older context, so they are reduced first when the fixed
-/// part alone leaves no room. The previous checkpoint keeps its newest end,
-/// while the focus keeps its beginning. The conversation is then kept from its
-/// newest end and marked when older text is omitted. The original conversation
-/// remains in the compaction archive and the append-only `messages` table.
-///
-/// # Errors
-///
-/// Returns [`LlmError::SummaryInputCapacityExceeded`] when the fixed templates
-/// cannot fit even after the previous checkpoint and focus are removed. Sending
-/// a truncated instruction would produce an invalid summary, so the request is
-/// rejected instead.
-fn fit_summary_prompt<F>(
+/// Fits the oldest remaining text into one summary request without dropping input.
+fn summary_chunk<F>(
     budget: usize,
-    mut conversation: String,
-    mut previous_summary: Option<String>,
-    mut instructions: Option<String>,
+    conversation: &str,
+    previous: Option<&str>,
+    instructions: Option<&str>,
     build: F,
-) -> Result<String, EgoPulseError>
+) -> Result<(String, usize), EgoPulseError>
 where
     F: Fn(&str, Option<&str>, Option<&str>) -> String,
 {
-    // Reduce older context until the fixed part leaves room for the
-    // conversation. A fixed template that still does not fit has no safe
-    // truncated form, so it is an input-capacity error.
-    loop {
-        let fixed = build("", previous_summary.as_deref(), instructions.as_deref());
-        let fixed_estimate = summary_request_estimate(&fixed);
-        if conversation.is_empty() {
-            if fixed_estimate <= budget {
-                return Ok(fixed);
-            }
-        } else if fixed_estimate < budget {
-            break;
-        }
-
-        let conversation_tokens = text_chars(&conversation).div_ceil(CHARS_PER_TOKEN_ESTIMATE);
-        let available_fixed = budget.saturating_sub(conversation_tokens);
-        let shrink_chars = fixed_estimate
-            .saturating_sub(available_fixed)
-            .max(1)
-            .saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
-        if shrink_previous_summary(&mut previous_summary, shrink_chars) {
-            continue;
-        }
-        if shrink_instructions(&mut instructions, shrink_chars) {
-            continue;
-        }
+    let fixed = build("", previous, instructions);
+    let required = summary_request_estimate(&fixed);
+    if required >= budget && !conversation.is_empty() || required > budget {
         return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
             budget_tokens: budget,
-            required_tokens: fixed_estimate,
+            required_tokens: required,
         }));
     }
-
-    // The fixed part fits. Remove the oldest conversation text until the whole
-    // prompt fits, keeping the newest end and marking the omitted prefix.
-    loop {
-        let prompt = build(
-            &conversation,
-            previous_summary.as_deref(),
-            instructions.as_deref(),
-        );
-        let estimate = summary_request_estimate(&prompt);
-        if estimate <= budget {
-            return Ok(prompt);
-        }
-        let excess_chars = (estimate - budget).saturating_mul(CHARS_PER_TOKEN_ESTIMATE);
-        let max_chars = text_chars(&conversation).saturating_sub(excess_chars);
-        conversation = truncate_summary_conversation_chars(conversation, max_chars);
-    }
-}
-
-/// Shrinks a previous checkpoint from the oldest side. Returns `false` when
-/// there is nothing left to shrink.
-fn shrink_previous_summary(previous_summary: &mut Option<String>, shrink_chars: usize) -> bool {
-    let Some(previous) = previous_summary.as_mut() else {
-        return false;
-    };
-    if previous.is_empty() {
-        return false;
-    }
-    let max_chars = text_chars(previous).saturating_sub(shrink_chars);
-    let start = utf16_suffix_start(previous, max_chars);
-    let kept = &previous[start..];
-    if kept.is_empty() {
-        *previous_summary = None;
-    } else {
-        *previous = kept.to_string();
-    }
-    true
-}
-
-/// Shrinks the additional focus from the end. Returns `false` when there is
-/// nothing left to shrink.
-fn shrink_instructions(instructions: &mut Option<String>, shrink_chars: usize) -> bool {
-    let Some(focus) = instructions.as_mut() else {
-        return false;
-    };
-    if focus.is_empty() {
-        return false;
-    }
-    let max_chars = text_chars(focus).saturating_sub(shrink_chars);
-    *focus = truncate_utf16_prefix(focus, max_chars);
-    if focus.is_empty() {
-        *instructions = None;
-    }
-    true
-}
-
-fn truncate_summary_conversation_chars(conversation: String, max_chars: usize) -> String {
-    let (body, was_truncated) = match conversation.strip_prefix(SUMMARY_TRUNCATION_MARKER) {
-        Some(body) => (body, true),
-        None => (conversation.as_str(), false),
-    };
-    let marker_chars = text_chars(SUMMARY_TRUNCATION_MARKER);
-    if !was_truncated && text_chars(body) <= max_chars {
-        return body.to_string();
-    }
-    if was_truncated && marker_chars + text_chars(body) <= max_chars {
-        return format!("{SUMMARY_TRUNCATION_MARKER}{body}");
-    }
-    let keep_chars = max_chars.saturating_sub(marker_chars);
-    if keep_chars == 0 {
-        return String::new();
-    }
-    let start = utf16_suffix_start(body, keep_chars);
-    if start >= body.len() {
-        return String::new();
-    }
-    let mut truncated = String::with_capacity(SUMMARY_TRUNCATION_MARKER.len() + body.len() - start);
-    truncated.push_str(SUMMARY_TRUNCATION_MARKER);
-    truncated.push_str(&body[start..]);
-    truncated
-}
-
-/// Returns the byte index of the longest UTF-16 prefix within `max_chars`.
-fn utf16_prefix_end(text: &str, max_chars: usize) -> usize {
-    let mut used = 0;
-    for (index, character) in text.char_indices() {
-        let next = used + character.len_utf16();
-        if next > max_chars {
-            return index;
-        }
-        used = next;
-    }
-    text.len()
-}
-
-/// Returns the byte index where the longest UTF-16 suffix within `max_chars`
-/// starts.
-fn utf16_suffix_start(text: &str, max_chars: usize) -> usize {
-    let mut used = 0;
-    for (index, character) in text.char_indices().rev() {
-        let next = used + character.len_utf16();
-        if next > max_chars {
-            return index + character.len_utf8();
-        }
-        used = next;
-    }
-    0
-}
-
-fn truncate_utf16_prefix(text: &str, max_chars: usize) -> String {
-    text[..utf16_prefix_end(text, max_chars)].to_string()
-}
-
-/// Removes a previous checkpoint's trailing file-operation blocks.
-///
-/// The lists are carried in the checkpoint fields and re-appended after the
-/// update, so passing the old blocks back to the model would duplicate them.
-fn strip_file_operation_suffix(summary: &str) -> &str {
-    let mut end = summary.len();
-    for marker in ["\n\n<read-files>", "\n\n<modified-files>"] {
-        if let Some(index) = summary.find(marker) {
-            end = end.min(index);
+    let mut low = 0;
+    let mut high = conversation.chars().count();
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let end = conversation
+            .char_indices()
+            .nth(mid)
+            .map_or(conversation.len(), |(index, _)| index);
+        if summary_request_estimate(&build(&conversation[..end], previous, instructions)) <= budget
+        {
+            low = mid;
+        } else {
+            high = mid - 1;
         }
     }
-    summary[..end].trim_end()
-}
-
-fn file_operations_suffix(read_files: &[String], modified_files: &[String]) -> String {
-    let mut sections = Vec::new();
-    if !read_files.is_empty() {
-        sections.push(format!(
-            "<read-files>\n{}\n</read-files>",
-            read_files.join("\n")
-        ));
+    let end = conversation
+        .char_indices()
+        .nth(low)
+        .map_or(conversation.len(), |(index, _)| index);
+    if end == 0 && !conversation.is_empty() {
+        return Err(EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded {
+            budget_tokens: budget,
+            required_tokens: required + 1,
+        }));
     }
-    if !modified_files.is_empty() {
-        sections.push(format!(
-            "<modified-files>\n{}\n</modified-files>",
-            modified_files.join("\n")
-        ));
-    }
-    if sections.is_empty() {
-        return String::new();
-    }
-    format!("\n\n{}", sections.join("\n\n"))
+    Ok((build(&conversation[..end], previous, instructions), end))
 }
 
 fn summary_prompt(
@@ -1116,6 +935,52 @@ where
     }
 }
 
+async fn summarize_conversation(
+    request: &CompactionRequest<'_>,
+    messages: &[Message],
+    previous_summary: Option<&str>,
+    instructions: Option<&str>,
+    label: &str,
+    turn_prefix: bool,
+) -> Result<String, EgoPulseError> {
+    let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
+    let mut previous = previous_summary.map(|text| redact_summary_text(text, request.config));
+    let instructions = instructions.map(|text| redact_summary_text(text, request.config));
+    let mut offset = 0;
+    loop {
+        let mut consumed = 0;
+        let summary = summarize(request, label, |budget| {
+            let (prompt, end) = summary_chunk(
+                budget,
+                &conversation[offset..],
+                previous.as_deref(),
+                instructions.as_deref(),
+                |chunk, prior, focus| {
+                    if turn_prefix {
+                        let input = match prior {
+                            Some(prior) => format!(
+                                "<previous-summary>\n{prior}\n</previous-summary>\n\n{chunk}"
+                            ),
+                            None => chunk.to_string(),
+                        };
+                        turn_prefix_prompt(&input, focus)
+                    } else {
+                        summary_prompt(chunk, prior, focus)
+                    }
+                },
+            )?;
+            consumed = end;
+            Ok(prompt)
+        })
+        .await?;
+        offset += consumed;
+        if offset == conversation.len() {
+            return Ok(summary);
+        }
+        previous = Some(summary);
+    }
+}
+
 async fn generate_summary(
     request: &CompactionRequest<'_>,
     messages: &[Message],
@@ -1123,20 +988,14 @@ async fn generate_summary(
     instructions: Option<&str>,
     label: &str,
 ) -> Result<String, EgoPulseError> {
-    let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
-    let previous_summary =
-        previous_summary.map(|summary| redact_summary_text(summary, request.config));
-    let instructions =
-        instructions.map(|instructions| redact_summary_text(instructions, request.config));
-    summarize(request, label, |budget| {
-        fit_summary_prompt(
-            budget,
-            conversation.clone(),
-            previous_summary.clone(),
-            instructions.clone(),
-            summary_prompt,
-        )
-    })
+    summarize_conversation(
+        request,
+        messages,
+        previous_summary,
+        instructions,
+        label,
+        false,
+    )
     .await
 }
 
@@ -1145,19 +1004,7 @@ async fn generate_turn_prefix_summary(
     messages: &[Message],
     instructions: Option<&str>,
 ) -> Result<String, EgoPulseError> {
-    let conversation = redact_summary_text(&serialize_conversation(messages), request.config);
-    let instructions =
-        instructions.map(|instructions| redact_summary_text(instructions, request.config));
-    summarize(request, "turn prefix", |budget| {
-        fit_summary_prompt(
-            budget,
-            conversation.clone(),
-            None,
-            instructions.clone(),
-            |conversation, _, instructions| turn_prefix_prompt(conversation, instructions),
-        )
-    })
-    .await
+    summarize_conversation(request, messages, None, instructions, "turn prefix", true).await
 }
 
 /// Compacts the context when it no longer fits the provider window.
@@ -1254,13 +1101,12 @@ pub(crate) async fn compact(
     };
 
     let started = Instant::now();
-    let mut summary = build_summary(request, &preparation, instructions).await?;
+    let summary = build_summary(request, &preparation, instructions).await?;
     // Archive only once the summary exists: a failed attempt keeps the context
     // untruncated, so there is nothing to preserve yet.
     archive_before_compaction(request, session).await;
 
     let (read_files, modified_files) = preparation.file_operations.compute_lists();
-    summary.push_str(&file_operations_suffix(&read_files, &modified_files));
     let summary = redact_summary_text(&summary, request.config);
     let kept_messages: Vec<Message> = session.messages[preparation.first_kept_index..].to_vec();
     let context = SessionContext {
@@ -1517,6 +1363,7 @@ mod tests {
     use super::*;
     use crate::agent_loop::test_support::RecordingProvider;
     use crate::llm::ToolCall;
+    use crate::llm::tokens::text_chars;
 
     fn text(role: &str, content: &str) -> Message {
         Message::text(role, content)
@@ -1776,8 +1623,8 @@ mod tests {
     }
 
     #[test]
-    fn serializes_tool_results_with_a_bounded_length() {
-        let long = "x".repeat(TOOL_RESULT_MAX_CHARS + 50);
+    fn serializes_complete_tool_results() {
+        let long = "x".repeat(2050);
         let messages = vec![
             text("user", "hello"),
             tool_call("call_1", "read", "src/main.rs"),
@@ -1791,8 +1638,7 @@ mod tests {
 
         assert!(serialized.starts_with("[User]: hello"));
         assert!(serialized.contains("[Assistant tool calls]: read("));
-        assert!(serialized.contains("more characters truncated"));
-        assert!(!serialized.contains(&"x".repeat(TOOL_RESULT_MAX_CHARS + 1)));
+        assert!(serialized.contains(&long));
     }
 
     #[test]
@@ -1806,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_file_blocks_are_stripped_before_the_update_prompt() {
+    fn previous_summary_preserves_file_tags_in_its_text() {
         // Arrange: a previous checkpoint whose summary already ends with tags.
         let mut previous = session(vec![
             text("user", "old question"),
@@ -1820,11 +1666,14 @@ mod tests {
             modified_files: Vec::new(),
         });
 
-        // Act: the summary passed to the model is stripped of the old blocks.
+        // Act: summary text is preserved exactly.
         let preparation = prepare_compaction(&previous, 100).expect("preparation");
 
         // Assert
-        assert_eq!(preparation.previous_summary.as_deref(), Some("previous"));
+        assert_eq!(
+            preparation.previous_summary.as_deref(),
+            Some("previous\n\n<read-files>\nsrc/a.rs\n</read-files>")
+        );
     }
 
     #[test]
@@ -1940,8 +1789,12 @@ mod tests {
     async fn builds_a_checkpoint_and_keeps_the_recent_tail() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");
-        let provider =
-            RecordingProvider::new(vec![Ok(summary_response("history summary"))], vec![0]);
+        let provider = RecordingProvider::new(
+            (0..100)
+                .map(|_| Ok(summary_response("history summary")))
+                .collect(),
+            vec![0; 100],
+        );
         let mut config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
             1,
@@ -2011,16 +1864,48 @@ mod tests {
         assert!(compacted.last_usage.is_none());
 
         let seen_systems = provider.seen_systems();
-        assert_eq!(seen_systems, vec![SUMMARIZATION_SYSTEM_PROMPT.to_string()]);
+        assert!(seen_systems.len() > 1);
+        assert!(
+            seen_systems
+                .iter()
+                .all(|system| system == SUMMARIZATION_SYSTEM_PROMPT)
+        );
         let prompt = provider.seen_messages()[0][0].content.as_text_lossy();
         assert!(prompt.contains("<conversation>"));
-        assert!(prompt.contains(SUMMARY_TRUNCATION_MARKER.trim()));
-        assert!(prompt.contains("The old plan is withdrawn."));
+        assert!(prompt.contains("old question"));
+        let all_prompts = provider.seen_messages();
+        let mut reconstructed = String::new();
+        for (index, messages) in all_prompts.iter().enumerate() {
+            let prompt = messages[0].content.as_text_lossy();
+            let chunk = prompt
+                .strip_prefix("<conversation>\n")
+                .expect("conversation start")
+                .split_once("\n</conversation>")
+                .expect("conversation end")
+                .0;
+            reconstructed.push_str(chunk);
+            if index > 0 {
+                assert!(
+                    prompt.contains("<previous-summary>\nhistory summary\n</previous-summary>")
+                );
+            }
+            assert!(summary_request_estimate(&prompt) <= input_budget);
+            assert!(!prompt.contains(secret));
+        }
+        assert_eq!(
+            reconstructed,
+            redact_summary_text(
+                &serialize_conversation(&session.messages[..3]),
+                request.config
+            )
+        );
+        let last = all_prompts.last().unwrap()[0].content.as_text_lossy();
+        assert!(last.contains("The old plan is withdrawn."));
         assert!(
             !prompt.contains(secret),
             "the summary request must not contain config secrets"
         );
-        assert!(prompt.contains("[REDACTED:provider.openai.api_key]"));
+        assert!(last.contains("[REDACTED:provider.openai.api_key]"));
         assert!(prompt.contains(INITIAL_SUMMARY_PROMPT));
         assert!(
             summary_request_estimate(&prompt) <= input_budget,
@@ -2030,7 +1915,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn fits_a_large_previous_summary_into_the_input_budget() {
+    async fn rejects_a_previous_summary_that_exceeds_the_input_budget() {
         // Arrange: the checkpoint alone is larger than the model's input budget.
         let dir = tempfile::tempdir().expect("tempdir");
         let provider =
@@ -2075,20 +1960,15 @@ mod tests {
         };
 
         // Act
-        let outcome = compact(&request, &session, CompactionReason::Manual, None)
+        let error = compact(&request, &session, CompactionReason::Manual, None)
             .await
-            .expect("compact");
-
-        // Assert: the newest checkpoint information survives and the whole
-        // request fits.
-        assert!(matches!(outcome, CompactionOutcome::Compacted(_)));
-        let prompt = provider.seen_messages()[0][0].content.as_text_lossy();
-        assert!(prompt.contains(latest_decision));
-        let input_budget = summary_input_budget(&request).await;
-        assert!(
-            summary_request_estimate(&prompt) <= input_budget,
-            "the previous summary must not push the request beyond the input budget"
-        );
+            .expect_err("oversized checkpoint must fail");
+        // Assert
+        assert!(matches!(
+            error,
+            EgoPulseError::Llm(LlmError::SummaryInputCapacityExceeded { .. })
+        ));
+        assert!(provider.seen_messages().is_empty());
     }
 
     #[tokio::test]
@@ -2149,7 +2029,12 @@ mod tests {
         };
         let summary = &compacted.checkpoint.as_ref().expect("checkpoint").summary;
         assert!(summary.starts_with("updated summary"));
-        assert!(summary.contains("<read-files>\nsrc/main.rs\n</read-files>"));
+        assert!(
+            checkpoint_message(compacted.checkpoint.as_ref().unwrap())
+                .content
+                .as_text_lossy()
+                .contains("<read-files>\nsrc/main.rs\n</read-files>")
+        );
         let prompt = provider.seen_messages()[0][0].content.as_text_lossy();
         assert!(prompt.contains("<previous-summary>\nprevious summary\n</previous-summary>"));
         assert!(prompt.contains(UPDATE_SUMMARY_PROMPT));
@@ -2170,8 +2055,12 @@ mod tests {
                     body_preview: "context length exceeded".to_string(),
                 }),
                 Ok(summary_response("history summary")),
+                Ok(summary_response("history summary")),
+                Ok(summary_response("history summary")),
+                Ok(summary_response("history summary")),
+                Ok(summary_response("history summary")),
             ],
-            vec![0, 0],
+            vec![0; 6],
         );
         let config = crate::agent_loop::test_support::test_config_with_compaction(
             dir.path().to_string_lossy().to_string(),
@@ -2217,12 +2106,11 @@ mod tests {
             "history summary"
         );
         let prompts = provider.seen_messages();
-        assert_eq!(prompts.len(), 2);
-        assert_eq!(provider.seen_systems().len(), 2);
+        assert!(prompts.len() >= 2);
+        assert_eq!(provider.seen_systems().len(), prompts.len());
         let first = prompts[0][0].content.as_text_lossy();
         let second = prompts[1][0].content.as_text_lossy();
         assert!(text_chars(&second) < text_chars(&first));
-        assert!(second.contains(SUMMARY_TRUNCATION_MARKER.trim()));
         assert!(
             summary_request_estimate(&first) <= initial_budget,
             "the first summary request must use the initial budget"
@@ -2389,7 +2277,12 @@ mod tests {
         assert!(summary.contains("history summary"));
         assert!(summary.contains(SPLIT_TURN_SEPARATOR));
         assert!(summary.contains("turn prefix summary"));
-        assert!(summary.contains("<read-files>\nsrc/lib.rs\n</read-files>"));
+        assert!(
+            checkpoint_message(compacted.checkpoint.as_ref().unwrap())
+                .content
+                .as_text_lossy()
+                .contains("<read-files>\nsrc/lib.rs\n</read-files>")
+        );
         assert_eq!(provider.seen_systems().len(), 2);
         let turn_prefix_prompt = provider.seen_messages()[1][0].content.as_text_lossy();
         assert!(turn_prefix_prompt.contains("# Conversation"));
@@ -2414,7 +2307,7 @@ mod tests {
         let context = crate::agent_loop::test_support::cli_context("disabled-compact");
         let chat_id = chat_id_for(&state, &context).await;
         let session = session(vec![
-            text("user", &"x".repeat(100_000)),
+            text("user", &"x".repeat(1_000)),
             text("user", "fresh question"),
         ]);
         let runtime = state.turn_dependencies();

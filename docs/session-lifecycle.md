@@ -156,6 +156,7 @@ Tool 実行中の human follow-up は staged message として保存され、`tu
 
 `messages_json` は `ContextSnapshot` エンベロープ（`version` / `checkpoint` / `messages` / `last_usage`）を JSON で持つ。
 
+- `version`: 必須の snapshot バージョン。不明または欠落したバージョンは復元時にエラーとする
 - `messages`: LLM 入力に近い保持メッセージ。tool call、tool result、multimodal image ref を含む
 - `checkpoint`: 畳んだ履歴の要約とファイル一覧。`null` なら未圧縮
 - `last_usage`: 直近の実測 usage と、それがどのメッセージまでを覆うかのアンカー
@@ -327,7 +328,7 @@ should_compact = enabled && context_tokens > context_window - reserve_tokens
 
 system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
 
-出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
+Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。Codex Backend は `max_output_tokens` に対応しないため送信しない。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
 
 補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
 
@@ -355,9 +356,7 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 - 履歴は初回なら新規要約、前回 checkpoint があれば `<previous-summary>` として別入力に渡し更新する。前回要約を会話の 1 件目として再利用しない
 - split turn では履歴要約とターン前半要約を別リクエストで生成し、`\n\n---\n\n**Turn Context (split turn):**\n\n` で連結する。片方でも失敗したら何も commit しない
 - 要約入力は role ごとにタグ付けしたプレーンテキスト（`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` / `[Tool result]:` / `[Tool error]:`）。reasoning は含めない
-- 1 件の tool 結果は 2,000 文字で切り、`[... N more characters truncated]` を付ける
-- 要約対象全体が要約モデルの入力上限を超える場合は、新しい側から収まる範囲を残し、古い側を省略したことを先頭のマーカーで示す
-- 省略した部分も元の会話は archive と append-only の `messages` テーブルに残る。checkpoint には要約できた範囲だけが反映される
+- 要約対象が入力上限を超える場合は古い部分から順に分割し、各段階の要約を次の入力に引き継ぐ。全範囲の要約に成功した場合だけ checkpoint を作成する
 - 要約リクエストを組み立てる前に、会話・前回 checkpoint・追加指示を Config 由来の秘密値と既知パターンでサニタイズする。LLM が生成した要約の保存前サニタイズとは別に、送信入力そのものを保護する
 
 ### 要約リクエストの入力上限
@@ -366,13 +365,10 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 
 - system prompt・固定テンプレート・前回 checkpoint・追加指示・会話を含めた推定が上限以内になるよう調整する
 - 固定部分が上限に収まる場合は、残りを会話テキストの予算にする
-- 固定部分だけで上限を超える場合は、前回 checkpoint、追加指示を先に縮め、新しい会話を可能な限り残す
-- 前回 checkpoint は新しい側、追加指示は先頭側を残す
-- 会話テキストが予算を超える場合は、UTF-16 コード単位で新しい側から収まる範囲を残し、先頭に `[... earlier conversation truncated to fit the summarization request ...]` を付ける
+- 前回 checkpoint と追加指示は省略せず、残りの容量に収まる会話の先頭部分を要約する。残りがあれば要約結果を引き継いで繰り返す
 - 入力予算は UTF-16 文字数から求めた推定値ではなく、通常の Compaction と同じ `UsageCalibrator` の `compaction` 補正係数で実測トークンへ換算する。実測前は保守的な既定係数を使い、補正後も context window は超えない
 - provider が容量超過を返した場合は、入力予算を現在の半分以下に縮めて最大 2 回再送する。それでも超過する場合は要約失敗として扱い、checkpoint を保存せず元の context を保持する
-- 固定テンプレートすら収まらない場合は、途中で切った指示を送らず入力容量不足として終了する
-- 切り詰めは要約リクエストの入力だけに適用する。保持メッセージ、checkpoint の要約本文、archive の内容は変更しない
+- 固定部分と会話の先頭が収まらない場合は入力容量不足として終了し、元の context を保持する
 - 要約モデルの出力上限や API 最小出力の扱いは通常の LLM リクエストと同じ
 
 ### 要約プロンプト
@@ -392,7 +388,7 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 
 ### Tool ファイル操作の追跡
 
-要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。`write` と `edit` は、Tool Result がエラーでも書き込み途中でファイルが変わった可能性があるため modified にする。実行前に拒否された呼び出し（`invalid_arguments` あり）はファイルへ触れていないため除外する。`read` は成功した Tool Result があるものだけを read-only にする。modified に含まれるファイルは read-only に重複計上しない。前回 checkpoint の一覧を引き継ぎ、要約末尾へ `<read-files>` / `<modified-files>` として付ける。該当が無ければ何も付けない。
+要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。`write` と `edit` は、Tool Result がエラーでも書き込み途中でファイルが変わった可能性があるため modified にする。実行前に拒否された呼び出し（`invalid_arguments` あり）はファイルへ触れていないため除外する。`read` は成功した Tool Result があるものだけを read-only にする。modified に含まれるファイルは read-only に重複計上しない。前回 checkpoint の一覧を引き継ぎ、リクエスト時に要約末尾へ `<read-files>` / `<modified-files>` として付ける。該当が無ければ何も付けない。
 
 ### Checkpoint と保持メッセージ
 
@@ -467,7 +463,7 @@ Provider の出力上限で生成が終わった場合、`finish_reason=length` 
 
 1. `compaction.enabled = true` かつ復旧未実施で、実測 `output_tokens < max_output_tokens` なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
 2. 意図した上限まで生成し切った `length`、usage が無い場合、`enabled = false`、2 回目の打ち切りでは再送しない
-3. 復旧しない場合も、生成済みの通常テキストは破棄せず final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
+3. 要約に失敗した場合も含め、復旧しない場合は生成済みの通常テキストは破棄せず final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
 4. `finish_reason` は Session snapshot と `messages` テーブルの両方に保存する。`GET /api/history`、SSE / WebSocket の最終応答、TUI の完了通知、Discord / Telegram の配送本文は同じ値を使い、再受付・再接続・再読み込みでも打ち切り状態が失われない。テキストのみのチャネルには回答の後ろに注意文を付ける
 5. Tool Call を含む打ち切りは、未完成の呼び出しを実行しない。復旧する場合は圧縮後のリクエストを送り直し、Tool の副作用は発生させない。復旧しない場合は、既存の Tool 結果経路で各呼び出しを失敗結果として保存し、Tool Call と結果の対応を保ったまま次の model step へ渡す。同じターンで 2 回目の打ち切り Tool Call が発生した場合は失敗結果を追加せず、本文があれば final として保存する
 6. 復旧して再送する場合は、途中出力を公開済みのときだけ `AssistantMessageDiscarded` を 1 回通知する。復旧せず部分応答を保持する場合は破棄通知を送らない

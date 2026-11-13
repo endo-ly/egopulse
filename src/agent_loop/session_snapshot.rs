@@ -141,7 +141,6 @@ pub(crate) struct SnapshotMessage {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ContextSnapshot {
     /// Envelope version. Only [`SNAPSHOT_VERSION`] is read and written.
-    #[serde(default = "snapshot_version")]
     pub(crate) version: u32,
     /// Compaction checkpoint that precedes the kept messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,10 +150,6 @@ pub(crate) struct ContextSnapshot {
     /// Usage anchor of the last measured model response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_usage: Option<ContextUsageAnchor>,
-}
-
-fn snapshot_version() -> u32 {
-    SNAPSHOT_VERSION
 }
 
 /// Stored message content in a session snapshot.
@@ -251,10 +246,16 @@ pub(crate) fn context_from_snapshot(
 
 /// Builds the reference message that projects a checkpoint into an LLM request.
 pub(crate) fn checkpoint_message(checkpoint: &CompactionCheckpoint) -> Message {
-    Message::text(
-        "user",
-        format!("{CHECKPOINT_HEADER}\n\n{}", checkpoint.summary),
-    )
+    let mut content = format!("{CHECKPOINT_HEADER}\n\n{}", checkpoint.summary);
+    for (tag, paths) in [
+        ("read-files", &checkpoint.read_files),
+        ("modified-files", &checkpoint.modified_files),
+    ] {
+        if !paths.is_empty() {
+            content.push_str(&format!("\n\n<{tag}>\n{}\n</{tag}>", paths.join("\n")));
+        }
+    }
+    Message::text("user", content)
 }
 
 /// Converts persisted session snapshot messages into hydrated LLM messages.
@@ -386,6 +387,12 @@ mod tests {
     use super::{SnapshotContent, SnapshotContentPart, SnapshotMessage, messages_from_snapshot};
     use crate::assets::AssetStore;
     use crate::llm::{MessageContent, MessageContentPart};
+
+    #[test]
+    fn snapshot_requires_version() {
+        let result = serde_json::from_str::<super::ContextSnapshot>(r#"{"messages":[]}"#);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn text_only_snapshot_restores_to_llm_messages() {

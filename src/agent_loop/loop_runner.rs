@@ -379,20 +379,8 @@ impl<'a> AgentLoop<'a> {
                             && !output_published
                             && (error.is_context_overflow() || error.is_output_capacity_exceeded())
                         {
-                            match self
-                                .compact_overflow(&mut loop_state, &scope, &prompt)
-                                .await
-                            {
-                                Ok(changed) => changed,
-                                Err(compaction_error) => {
-                                    warn!(
-                                        iteration,
-                                        error = %compaction_error,
-                                        "context overflow or output capacity recovery could not compact the context"
-                                    );
-                                    false
-                                }
-                            }
+                            self.compact_overflow(&mut loop_state, &scope, &prompt)
+                                .await?
                         } else {
                             false
                         };
@@ -417,56 +405,22 @@ impl<'a> AgentLoop<'a> {
                 .as_ref()
                 .is_some_and(|usage| usage.input_tokens > context_window as i64);
             match phase_response {
-                ModelStep::Final(response) => {
+                step @ (ModelStep::Final(_) | ModelStep::MalformedToolCalls(_)) => {
                     self.lifecycle.complete_model().await?;
-                    match evaluate_end_turn(
-                        &response.content,
-                        response.reasoning_content.as_deref(),
-                        &mut loop_state.declarative_retry_attempted,
-                    )? {
-                        LoopAction::Retry(suffix) => {
-                            // The streamed text will never be persisted; tell
-                            // consumers to drop it so the retry starts clean.
-                            // Iterations that streamed nothing need no event.
-                            if output_published.load(Ordering::SeqCst) {
-                                self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
-                                    message_id: message_id.clone(),
-                                });
-                            }
-                            loop_state.retry_suffix = Some(suffix);
-                        }
-                        LoopAction::Done {
-                            final_content,
-                            reasoning_content,
-                        } => {
-                            return self
-                                .finalize_response(
-                                    loop_state,
-                                    &scope,
-                                    &prompt,
-                                    silent_overflow,
-                                    FinalizedAnswer {
-                                        message_id,
-                                        content: final_content,
-                                        reasoning_content,
-                                        finish_reason: None,
-                                        usage: usage.clone(),
-                                    },
-                                    measurement,
-                                )
-                                .await;
-                        }
-                    }
-                    iteration += 1;
-                    continue;
-                }
-                ModelStep::MalformedToolCalls(response) => {
-                    self.lifecycle.complete_model().await?;
-                    match evaluate_malformed_response(
-                        &response.content,
-                        response.reasoning_content.as_deref(),
-                        &mut loop_state.declarative_retry_attempted,
-                    )? {
+                    let action = match step {
+                        ModelStep::Final(response) => evaluate_end_turn(
+                            &response.content,
+                            response.reasoning_content.as_deref(),
+                            &mut loop_state.declarative_retry_attempted,
+                        )?,
+                        ModelStep::MalformedToolCalls(response) => evaluate_malformed_response(
+                            &response.content,
+                            response.reasoning_content.as_deref(),
+                            &mut loop_state.declarative_retry_attempted,
+                        )?,
+                        _ => unreachable!(),
+                    };
+                    match action {
                         LoopAction::Retry(suffix) => {
                             if output_published.load(Ordering::SeqCst) {
                                 self.on_event.emit(AgentEvent::AssistantMessageDiscarded {
@@ -743,16 +697,20 @@ impl<'a> AgentLoop<'a> {
         if !self.automatic_compaction_enabled() {
             return Ok(false);
         }
-        match compact(
+        let outcome = compact(
             &self.compaction_request(scope, *prompt),
             &loop_state.context,
             CompactionReason::Overflow,
             None,
         )
-        .await?
-        {
-            CompactionOutcome::Unchanged => Ok(false),
-            CompactionOutcome::Compacted(context) => {
+        .await;
+        match outcome {
+            Err(error) => {
+                warn!(error = %error, "context overflow compaction failed");
+                Ok(false)
+            }
+            Ok(CompactionOutcome::Unchanged) => Ok(false),
+            Ok(CompactionOutcome::Compacted(context)) => {
                 self.commit_compacted_context(loop_state, context).await?;
                 Ok(true)
             }
@@ -1270,8 +1228,8 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn context_overflow_compacts_and_retries_the_model_step_once() {
-        // Arrange: automatic compaction is disabled so the first request is
-        // sent with the oversized context; the provider then rejects it.
+        // Arrange: the first request is sent before the threshold is reached;
+        // the provider then rejects it as oversized.
         let dir = tempfile::tempdir().expect("tempdir");
         let provider = RecordingProvider::new(
             vec![
@@ -1676,6 +1634,75 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn failed_summary_preserves_truncated_answer_without_checkpoint_or_discard() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = TruncatedScriptProvider::new(vec![TruncatedScriptStep::Truncated {
+            content: "partial answer",
+            output_tokens: 100,
+            tool_calls: Vec::new(),
+            stream_delta: "partial ",
+        }]);
+        provider
+            .inner
+            .fail_summary
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
+            dir.path().to_str().expect("utf8").to_string(),
+            1,
+            60_000,
+        );
+        let state = build_state(config, Box::new(provider.clone()));
+        let context = cli_context("truncation-summary-failure");
+        let chat_id = seed_short_session(&state, &context).await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::<AgentEvent>::new()));
+        let event_log = Arc::clone(&events);
+
+        // Act
+        let reply = process_turn_with_events(
+            &state.turn_dependencies(),
+            &context,
+            "fresh question",
+            move |event| {
+                event_log.lock().expect("events").push(event);
+            },
+        )
+        .await
+        .expect("partial answer survives");
+
+        // Assert
+        assert_eq!(reply, "partial answer");
+        assert_eq!(provider.model_requests(), 1);
+        assert_eq!(provider.summary_requests(), 1);
+        let (_, discarded, _) = collect_loop_events(&events);
+        assert!(discarded.is_empty());
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            context.scope,
+            chat_id,
+        )
+        .await
+        .expect("session");
+        assert!(loaded.context.checkpoint.is_none());
+        assert_eq!(
+            loaded.context.messages.last().and_then(|m| m.finish_reason),
+            Some(TruncationReason::MaxOutputTokens)
+        );
+        let history = call_blocking(Arc::clone(&state.db), move |db| {
+            db.get_all_messages(chat_id)
+        })
+        .await
+        .expect("messages");
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "partial answer"
+                    && message.finish_reason.as_deref() == Some("max_output_tokens"))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn a_generation_that_used_the_whole_intended_output_is_not_retried() {
         // Arrange: output == intended limit, so compacting is not expected to
         // produce a complete answer.
@@ -2052,6 +2079,7 @@ mod tests {
         steps: std::sync::Mutex<Vec<TruncatedScriptStep>>,
         model_requests: std::sync::atomic::AtomicUsize,
         summary_requests: std::sync::atomic::AtomicUsize,
+        fail_summary: std::sync::atomic::AtomicBool,
         seen_messages: std::sync::Mutex<Vec<Vec<crate::llm::Message>>>,
     }
 
@@ -2074,6 +2102,7 @@ mod tests {
                     steps: std::sync::Mutex::new(steps),
                     model_requests: std::sync::atomic::AtomicUsize::new(0),
                     summary_requests: std::sync::atomic::AtomicUsize::new(0),
+                    fail_summary: std::sync::atomic::AtomicBool::new(false),
                     seen_messages: std::sync::Mutex::new(Vec::new()),
                 }),
             }
@@ -2107,6 +2136,15 @@ mod tests {
             self.inner
                 .summary_requests
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .inner
+                .fail_summary
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::error::LlmError::InvalidResponse(
+                    "summary failed".to_string(),
+                ));
+            }
             Ok(final_response("history summary"))
         }
 

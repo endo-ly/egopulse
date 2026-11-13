@@ -240,16 +240,6 @@ impl OpenAiProvider {
             tools.as_deref().map(|arc| arc.as_slice()),
             self.reasoning_effort.as_deref(),
         );
-        let tools_json = tools
-            .as_deref()
-            .filter(|tools| !tools.is_empty())
-            .and_then(|tools| serde_json::to_string(tools).ok());
-        body["max_output_tokens"] = serde_json::Value::from(self.request_max_output_tokens(
-            system,
-            tools_json.as_deref(),
-            &messages,
-            OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
-        )?);
         body["store"] = serde_json::Value::Bool(false);
         body["stream"] = serde_json::Value::Bool(true);
 
@@ -1346,6 +1336,9 @@ mod tests {
             ["thinking".to_string(), " carefully".to_string()]
         );
         assert_eq!(response.content, "thinking carefully");
+        let requests = server.received_requests().await.expect("requests");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("JSON body");
+        assert!(body.get("max_output_tokens").is_none());
         assert_eq!(
             response.usage,
             Some(LlmUsage {
