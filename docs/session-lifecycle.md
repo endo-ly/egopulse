@@ -375,7 +375,7 @@ system prompt と tool 定義はメッセージの外側にあるため `estimat
 
 ### Tool ファイル操作の追跡
 
-要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。`write` と `edit` は modified、それ以外の `read` は read-only。modified に含まれるファイルは read-only に重複計上しない。前回 checkpoint の一覧を引き継ぎ、要約末尾へ `<read-files>` / `<modified-files>` として付ける。該当が無ければ何も付けない。
+要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。`write` と `edit` は、Tool Result がエラーでも書き込み途中でファイルが変わった可能性があるため modified にする。実行前に拒否された呼び出し（`invalid_arguments` あり）はファイルへ触れていないため除外する。`read` は成功した Tool Result があるものだけを read-only にする。modified に含まれるファイルは read-only に重複計上しない。前回 checkpoint の一覧を引き継ぎ、要約末尾へ `<read-files>` / `<modified-files>` として付ける。該当が無ければ何も付けない。
 
 ### Checkpoint と保持メッセージ
 
@@ -401,6 +401,8 @@ projected = measured + calibrated(trailing + current_overhead - measured_overhea
 
 空応答の再試行で runtime guard を足して再送した場合、usage はその再送リクエストのものになる。`ModelRunner` は実際に送った追加メッセージを呼び出し元へ返し、その分を `request_overhead_tokens` に含める。対応が取れない usage はアンカーとして採用しない。
 
+provider が返した usage の `input_tokens` と `output_tokens` がどちらも 0 の場合は、計測値として採用しない。既存の有効なアンカーがあれば維持し、保存済み snapshot に全ゼロのアンカーが残っている場合も投影時に無効として扱い、リクエスト全体の推定へ戻す。
+
 `request_shape_hash` は system prompt / tool 定義 / model だけを対象にし、channel context などの一時メッセージは含めない。これらの増減は `request_overhead_tokens` の差で扱うため、hash に含めると毎回アンカーが無効になる。
 
 次の場合に破棄し、全体推定へ戻す。
@@ -410,6 +412,7 @@ projected = measured + calibrated(trailing + current_overhead - measured_overhea
 - tool output の補修でメッセージ数が変わったとき
 - Sleep Batch が snapshot を切り詰めたとき
 - request shape（system prompt / tool 定義 / model）が変わったとき
+- アンカーが全ゼロの usage しか持たないとき
 
 ## 6. Fallback と Context Overflow
 

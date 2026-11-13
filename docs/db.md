@@ -347,7 +347,7 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 | output_tokens | INTEGER | NOT NULL | 出力トークン数 |
 | total_tokens | INTEGER | NOT NULL | 合計トークン数（input + output） |
 | request_kind | TEXT | NOT NULL DEFAULT 'agent_loop' | リクエスト種別 |
-| estimated_tokens | INTEGER | NOT NULL DEFAULT 0 | 生推定トークン数（chars/3）。補正係数の再構築に使用 |
+| estimated_tokens | INTEGER | NOT NULL DEFAULT 0 | 生推定トークン数（UTF-16 コード単位を 4 で割った値）。補正係数の再構築に使用 |
 | has_tools | INTEGER | NOT NULL DEFAULT 0 | tool 定義を含む payload か（0/1） |
 | cached_input_tokens | INTEGER | NULL | `input_tokens` のうち prompt cache から供給された分。Provider が報告しない場合は NULL、報告して 0 の場合は 0 |
 | created_at | TEXT | NOT NULL | RFC3339 タイムスタンプ |

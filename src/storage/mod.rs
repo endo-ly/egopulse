@@ -780,8 +780,8 @@ pub(crate) struct LlmUsageLogEntry<'a> {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub request_kind: &'a str,
-    /// Raw prompt estimate (chars / 3) for the call. Used to rebuild
-    /// calibration factors on startup. Required for every row.
+    /// Raw prompt estimate (UTF-16 code units divided by 4) for the call.
+    /// Used to rebuild calibration factors on startup. Required for every row.
     pub estimated_tokens: i64,
     /// Whether the request payload included tool definitions.
     pub has_tools: bool,

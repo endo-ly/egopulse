@@ -305,7 +305,7 @@ node scripts/import-model-catalog.mjs
 
 スクリプトはインポート元の `@earendil-works/pi-ai` のバージョンを固定値（現在は `1.5.0`）と照合し、異なる場合は生成を中止する。生成物の `source` フィールドには `@earendil-works/pi-ai@1.5.0` が記録されるため、どのバージョンのデータから作られたかを追跡できる。更新時はスクリプトの `SOURCE_VERSION`、この手順のインストール例、生成物を一緒に更新する。
 
-スクリプトは各プロバイダーの JSON から Chat モデルの `contextWindow` / `maxTokens` だけを取り出し、`provider/model` の組で重複を排除する。転送先が動的に変わるルーティングモデル（`openrouter/auto`）は固定値を設定できないため除外し、未知モデルの既定値として扱う。元データに無いモデル（提供終了したモデルなど）も同じ既定値になる。実際の上限が既定値と異なる場合は、モデル設定で明示的に上書きする。
+スクリプトは各プロバイダーの JSON から Chat モデルの `contextWindow` / `maxTokens` だけを取り出し、`provider/model` の組で重複を排除する。転送先が動的に変わるルーティングモデルは、provider とモデル ID の組（`openrouter` + `auto` / `openrouter/auto`）で判定して除外し、未知モデルの既定値として扱う。元データに無いモデル（提供終了したモデルなど）も同じ既定値になる。実際の上限が既定値と異なる場合は、モデル設定で明示的に上書きする。
 
 プロバイダー ID の別名（`azure` / `openai-codex` / `zhipu` / `aliyun-bailian` など）は解決層で吸収する。モデル ID だけで別プロバイダーのモデルへ一致させることはしない。
 
