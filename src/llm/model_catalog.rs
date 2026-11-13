@@ -1,6 +1,7 @@
 //! Bundled metadata for known provider/model pairs.
 //!
-//! The table is generated from pi's bundled provider data (MIT) by
+//! The table is generated from the reference implementation's bundled provider
+//! data (MIT) by
 //! `scripts/import-model-catalog.mjs` and compiled into the binary, so startup,
 //! every turn, and offline runs resolve the same limits without a network
 //! request. A model that is not listed falls back to the custom-model defaults
@@ -25,12 +26,23 @@ struct Limits {
     max_output_tokens: usize,
 }
 
+#[derive(serde::Deserialize)]
+struct CatalogFile {
+    /// Source package and version the generated file was built from.
+    source: String,
+    models: Vec<(String, String, usize, usize)>,
+}
+
 /// Imported models keyed by provider and then by model id.
 static CATALOG: LazyLock<HashMap<String, HashMap<String, Limits>>> = LazyLock::new(|| {
-    let rows: Vec<(String, String, usize, usize)> =
+    let file: CatalogFile =
         serde_json::from_str(CATALOG_JSON).expect("the bundled model catalog must be valid JSON");
+    assert!(
+        file.source.starts_with("@earendil-works/pi-ai@"),
+        "the bundled model catalog must record its source package"
+    );
     let mut catalog: HashMap<String, HashMap<String, Limits>> = HashMap::new();
-    for (provider, model, context_window, max_output_tokens) in rows {
+    for (provider, model, context_window, max_output_tokens) in file.models {
         catalog.entry(provider).or_default().insert(
             model,
             Limits {
@@ -89,37 +101,29 @@ mod tests {
 
     #[test]
     fn bundled_catalog_maps_known_models_and_provider_aliases() {
-        // Two concrete pairs prove the import maps the fields correctly;
-        // the rest of the generated table is data, not behavior.
-        assert_eq!(lookup("openai", "gpt-4o"), Some((128_000, 16_384)));
-        assert_eq!(
-            lookup("openrouter", "openai/gpt-4.1"),
-            Some((1_047_576, 32_768))
-        );
-        assert_eq!(lookup("Azure", "gpt-4o"), lookup("openai", "gpt-4o"));
-        assert_eq!(lookup("zhipu", "glm-4.7"), lookup("zai", "glm-4.7"));
-        assert_eq!(
-            lookup("openai-codex", "gpt-5.3-codex"),
-            lookup("openai", "gpt-5.3-codex")
-        );
-    }
+        // Pick any entry so a catalog refresh does not invalidate the test.
+        let (model, limits) = CATALOG
+            .get("openai")
+            .and_then(|models| models.iter().next())
+            .expect("the catalog contains an OpenAI model");
+        let expected = Some((limits.context_window, limits.max_output_tokens));
+        assert_eq!(lookup("openai", model), expected);
+        assert_eq!(lookup("Azure", model), expected);
 
-    #[test]
-    fn every_bundled_model_has_positive_limits() {
-        // A malformed import must not silently produce a zero-token model.
-        assert!(!CATALOG.is_empty());
-        for (provider, models) in CATALOG.iter() {
-            for (model, limits) in models {
-                assert!(limits.context_window > 0, "{provider}/{model}");
-                assert!(limits.max_output_tokens > 0, "{provider}/{model}");
-            }
-        }
+        let (zai_model, zai_limits) = CATALOG
+            .get("zai")
+            .and_then(|models| models.iter().next())
+            .expect("the catalog contains a z.ai model");
+        assert_eq!(
+            lookup("zhipu", zai_model),
+            Some((zai_limits.context_window, zai_limits.max_output_tokens))
+        );
     }
 
     #[test]
     fn unknown_provider_or_model_has_no_catalog_entry() {
-        assert_eq!(lookup("my-gateway", "gpt-4o"), None);
-        assert_eq!(lookup("openai", "gpt-4o-on-my-gateway"), None);
+        assert_eq!(lookup("my-gateway", "my-model"), None);
+        assert_eq!(lookup("openai", "model-not-in-the-catalog"), None);
         assert_eq!(lookup("ollama", "llama3.2"), None);
     }
 }

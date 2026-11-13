@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Regenerates src/llm/model_catalog.json from pi's bundled provider data.
+// Regenerates src/llm/model_catalog.json from the reference implementation's
+// bundled provider data.
 //
-// pi publishes the context window and output limit of every model it knows in
+// It publishes the context window and output limit of every model it knows in
 // `@earendil-works/pi-ai/dist/providers/data/*.json` (MIT). EgoPulse keeps only
 // the two numeric limits plus the provider/model identity, so the runtime never
-// parses pi's full provider descriptions.
+// parses the full provider descriptions.
 //
 // Usage:
 //   node scripts/import-model-catalog.mjs [data-dir]
@@ -14,8 +15,10 @@
 //   node scripts/import-model-catalog.mjs
 //
 // The data directory must contain the per-provider JSON files. Set
-// PI_AI_DATA_DIR to use another checkout. Replacing the generated file is the
-// whole update: no model entries are maintained by hand.
+// PI_AI_DATA_DIR to use another checkout. The package version is pinned below
+// and verified before reading the data; bump SOURCE_VERSION and regenerate the
+// JSON when the source is upgraded. Replacing the generated file is the whole
+// update: no model entries are maintained by hand.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -24,6 +27,11 @@ import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputPath = join(repositoryRoot, "src", "llm", "model_catalog.json");
+
+// Pinned source package. The generated JSON records this version so a catalog
+// can always be traced back to the data it was built from.
+const SOURCE_PACKAGE = "@earendil-works/pi-ai";
+const SOURCE_VERSION = "1.5.0";
 
 // Dynamic routing models have no fixed destination, so a single context window
 // cannot describe them. They stay unknown and use the custom-model defaults.
@@ -55,12 +63,35 @@ function resolveDataDir() {
   const dataDir = explicit ? resolve(explicit) : defaultDataDir();
   if (!dataDir || !existsSync(dataDir)) {
     console.error(
-      "provider data directory not found; pass it explicitly or install pi globally:\n" +
+      "provider data directory not found; pass it explicitly or install the package globally:\n" +
         "  node scripts/import-model-catalog.mjs /path/to/pi-ai/dist/providers/data",
     );
     process.exit(1);
   }
   return dataDir;
+}
+
+function readSourceVersion(dataDir) {
+  let dir = resolve(dataDir);
+  for (let depth = 0; depth < 6; depth += 1) {
+    const manifestPath = join(dir, "package.json");
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      if (manifest.name === SOURCE_PACKAGE) {
+        if (manifest.version !== SOURCE_VERSION) {
+          throw new Error(
+            `expected ${SOURCE_PACKAGE}@${SOURCE_VERSION}, found ${manifest.version}; ` +
+              "install the pinned version or update SOURCE_VERSION",
+          );
+        }
+        return `${manifest.name}@${manifest.version}`;
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error(`could not find ${SOURCE_PACKAGE}/package.json above ${dataDir}`);
 }
 
 function readEntries(dataDir) {
@@ -110,12 +141,13 @@ function readEntries(dataDir) {
 }
 
 const dataDir = resolveDataDir();
+const source = readSourceVersion(dataDir);
 const entries = readEntries(dataDir);
 if (entries.length === 0) {
   console.error(`no chat models found in ${dataDir}`);
   process.exit(1);
 }
-writeFileSync(outputPath, `${JSON.stringify(entries)}\n`);
+writeFileSync(outputPath, `${JSON.stringify({ source, models: entries })}\n`);
 console.log(
-  `wrote ${entries.length} models from ${dataDir} to ${outputPath}`,
+  `wrote ${entries.length} models from ${source} to ${outputPath}`,
 );
