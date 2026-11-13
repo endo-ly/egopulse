@@ -106,6 +106,15 @@ struct TruncationRecovery<'a> {
     recovery_attempted: bool,
 }
 
+/// The final answer fields shared by normal completion and truncation.
+struct FinalizedAnswer {
+    message_id: String,
+    content: String,
+    reasoning_content: Option<String>,
+    finish_reason: Option<TruncationReason>,
+    usage: Option<crate::llm::LlmUsage>,
+}
+
 /// Executes the LLM/tool loop for one durable Turn.
 pub(crate) struct AgentLoop<'a> {
     state: &'a TurnDependencies,
@@ -193,7 +202,7 @@ impl<'a> AgentLoop<'a> {
             let model_key = model_key(self.prepared.channel_llm.as_ref());
             let mut overflow_recovery_attempted = false;
             let output_published = Arc::new(AtomicBool::new(false));
-            let (phase_response, shape_hash, request_overhead_tokens) = loop {
+            let (phase_response, measurement) = loop {
                 let shape_hash = request_shape_hash(
                     &self.prepared.system_prompt,
                     tools_json.as_deref(),
@@ -246,6 +255,11 @@ impl<'a> AgentLoop<'a> {
                         request_only.extend(outcome.recovery_suffix.iter());
                         let request_overhead_tokens =
                             estimate_request_overhead(&prompt, &loop_state.context, &request_only);
+                        let measurement = RequestMeasurement {
+                            model_key: model_key.clone(),
+                            request_shape_hash: shape_hash.clone(),
+                            request_overhead_tokens,
+                        };
                         if let ModelStep::Truncated { response, reason } = &outcome.step {
                             let published = output_published.load(Ordering::SeqCst);
                             if published {
@@ -294,35 +308,22 @@ impl<'a> AgentLoop<'a> {
                                     response.usage.as_ref().is_some_and(|usage| {
                                         usage.input_tokens > context_window as i64
                                     });
-                                let compacted = self
-                                    .compact_after_response(
-                                        &mut loop_state,
+                                return self
+                                    .finalize_response(
+                                        loop_state,
                                         &scope,
                                         &prompt,
                                         silent_overflow,
+                                        FinalizedAnswer {
+                                            message_id,
+                                            content: partial_text,
+                                            reasoning_content: response.reasoning_content.clone(),
+                                            finish_reason: Some(*reason),
+                                            usage: response.usage.clone(),
+                                        },
+                                        measurement,
                                     )
                                     .await;
-                                let usage = response.usage.clone();
-                                return Ok(AgentLoopResult {
-                                    final_content: partial_text,
-                                    reasoning_content: response.reasoning_content.clone(),
-                                    final_message_id: message_id,
-                                    context: loop_state.context,
-                                    session_revision: loop_state.session_revision,
-                                    finish_reason: Some(*reason),
-                                    usage: (!compacted)
-                                        .then(|| {
-                                            usage.map(|usage| MeasuredUsage {
-                                                usage,
-                                                request: RequestMeasurement {
-                                                    model_key: model_key.clone(),
-                                                    request_shape_hash: shape_hash.clone(),
-                                                    request_overhead_tokens,
-                                                },
-                                            })
-                                        })
-                                        .flatten(),
-                                });
                             }
 
                             if truncated_tool_phase_continued {
@@ -339,35 +340,22 @@ impl<'a> AgentLoop<'a> {
                                     response.usage.as_ref().is_some_and(|usage| {
                                         usage.input_tokens > context_window as i64
                                     });
-                                let compacted = self
-                                    .compact_after_response(
-                                        &mut loop_state,
+                                return self
+                                    .finalize_response(
+                                        loop_state,
                                         &scope,
                                         &prompt,
                                         silent_overflow,
+                                        FinalizedAnswer {
+                                            message_id,
+                                            content: partial_text,
+                                            reasoning_content: response.reasoning_content.clone(),
+                                            finish_reason: Some(*reason),
+                                            usage: response.usage.clone(),
+                                        },
+                                        measurement,
                                     )
                                     .await;
-                                let usage = response.usage.clone();
-                                return Ok(AgentLoopResult {
-                                    final_content: partial_text,
-                                    reasoning_content: response.reasoning_content.clone(),
-                                    final_message_id: message_id,
-                                    context: loop_state.context,
-                                    session_revision: loop_state.session_revision,
-                                    finish_reason: Some(*reason),
-                                    usage: (!compacted)
-                                        .then(|| {
-                                            usage.map(|usage| MeasuredUsage {
-                                                usage,
-                                                request: RequestMeasurement {
-                                                    model_key: model_key.clone(),
-                                                    request_shape_hash: shape_hash.clone(),
-                                                    request_overhead_tokens,
-                                                },
-                                            })
-                                        })
-                                        .flatten(),
-                                });
                             }
 
                             // The call was cut inside its arguments. The normal
@@ -392,11 +380,7 @@ impl<'a> AgentLoop<'a> {
                                 phase,
                                 &message_id,
                                 &guard_tracker,
-                                &RequestMeasurement {
-                                    model_key: model_key.clone(),
-                                    request_shape_hash: shape_hash.clone(),
-                                    request_overhead_tokens,
-                                },
+                                &measurement,
                             )
                             .await?;
                             loop_state.force_compaction = response
@@ -407,7 +391,7 @@ impl<'a> AgentLoop<'a> {
                             iteration += 1;
                             continue 'turns;
                         }
-                        break (outcome.step, shape_hash, request_overhead_tokens);
+                        break (outcome.step, measurement);
                     }
                     Err(error) => {
                         let (error, output_published) = error.into_parts();
@@ -482,38 +466,22 @@ impl<'a> AgentLoop<'a> {
                             final_content,
                             reasoning_content,
                         } => {
-                            let compacted = self
-                                .compact_after_response(
-                                    &mut loop_state,
+                            return self
+                                .finalize_response(
+                                    loop_state,
                                     &scope,
                                     &prompt,
                                     silent_overflow,
+                                    FinalizedAnswer {
+                                        message_id,
+                                        content: final_content,
+                                        reasoning_content,
+                                        finish_reason: None,
+                                        usage: usage.clone(),
+                                    },
+                                    measurement,
                                 )
                                 .await;
-                            return Ok(AgentLoopResult {
-                                final_content,
-                                reasoning_content,
-                                final_message_id: message_id,
-                                context: loop_state.context,
-                                session_revision: loop_state.session_revision,
-                                finish_reason: None,
-                                // A compacted context no longer matches the
-                                // measured request, so the anchor is dropped
-                                // and the next projection falls back to an
-                                // estimate.
-                                usage: (!compacted)
-                                    .then(|| {
-                                        usage.clone().map(|usage| MeasuredUsage {
-                                            usage,
-                                            request: RequestMeasurement {
-                                                model_key: model_key.clone(),
-                                                request_shape_hash: shape_hash.clone(),
-                                                request_overhead_tokens,
-                                            },
-                                        })
-                                    })
-                                    .flatten(),
-                            });
                         }
                     }
                     iteration += 1;
@@ -538,38 +506,22 @@ impl<'a> AgentLoop<'a> {
                             final_content,
                             reasoning_content,
                         } => {
-                            let compacted = self
-                                .compact_after_response(
-                                    &mut loop_state,
+                            return self
+                                .finalize_response(
+                                    loop_state,
                                     &scope,
                                     &prompt,
                                     silent_overflow,
+                                    FinalizedAnswer {
+                                        message_id,
+                                        content: final_content,
+                                        reasoning_content,
+                                        finish_reason: None,
+                                        usage: usage.clone(),
+                                    },
+                                    measurement,
                                 )
                                 .await;
-                            return Ok(AgentLoopResult {
-                                final_content,
-                                reasoning_content,
-                                final_message_id: message_id,
-                                context: loop_state.context,
-                                session_revision: loop_state.session_revision,
-                                finish_reason: None,
-                                // A compacted context no longer matches the
-                                // measured request, so the anchor is dropped
-                                // and the next projection falls back to an
-                                // estimate.
-                                usage: (!compacted)
-                                    .then(|| {
-                                        usage.clone().map(|usage| MeasuredUsage {
-                                            usage,
-                                            request: RequestMeasurement {
-                                                model_key: model_key.clone(),
-                                                request_shape_hash: shape_hash.clone(),
-                                                request_overhead_tokens,
-                                            },
-                                        })
-                                    })
-                                    .flatten(),
-                            });
                         }
                     }
                     iteration += 1;
@@ -590,11 +542,7 @@ impl<'a> AgentLoop<'a> {
                         assistant_phase,
                         &message_id,
                         &guard_tracker,
-                        &RequestMeasurement {
-                            model_key: model_key.clone(),
-                            request_shape_hash: shape_hash.clone(),
-                            request_overhead_tokens,
-                        },
+                        &measurement,
                     )
                     .await?;
                     loop_state.force_compaction = silent_overflow;
@@ -762,6 +710,48 @@ impl<'a> AgentLoop<'a> {
                 false
             }
         }
+    }
+
+    /// Completes the Turn with a final answer and its measured usage.
+    ///
+    /// The answer is already final, so a silent overflow only compacts the
+    /// stored context for the next request. Usage is dropped when compaction
+    /// replaced the measured conversation.
+    async fn finalize_response(
+        &self,
+        mut loop_state: LoopState,
+        scope: &RequestScope,
+        prompt: &PromptContext<'_>,
+        silent_overflow: bool,
+        answer: FinalizedAnswer,
+        measurement: RequestMeasurement,
+    ) -> Result<AgentLoopResult, EgoPulseError> {
+        let FinalizedAnswer {
+            message_id,
+            content,
+            reasoning_content,
+            finish_reason,
+            usage,
+        } = answer;
+        let compacted = self
+            .compact_after_response(&mut loop_state, scope, prompt, silent_overflow)
+            .await;
+        Ok(AgentLoopResult {
+            final_content: content,
+            reasoning_content,
+            final_message_id: message_id,
+            context: loop_state.context,
+            session_revision: loop_state.session_revision,
+            finish_reason,
+            usage: (!compacted)
+                .then(|| {
+                    usage.map(|usage| MeasuredUsage {
+                        usage,
+                        request: measurement,
+                    })
+                })
+                .flatten(),
+        })
     }
 
     /// Compacts the context after the provider reported a context overflow.
@@ -1649,49 +1639,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn a_truncated_generation_is_compacted_and_retried_once() {
-        // Arrange: the first generation stops below the intended output limit.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let provider = TruncatedScriptProvider::new(vec![
-            TruncatedScriptStep::Truncated {
-                content: "partial answer",
-                output_tokens: 100,
-                tool_calls: Vec::new(),
-                stream_delta: "",
-            },
-            TruncatedScriptStep::Complete("complete answer"),
-        ]);
-        let config = crate::agent_loop::test_support::test_config_with_compaction_window(
-            dir.path().to_str().expect("utf8").to_string(),
-            1,
-            60_000,
-        );
-        let state = build_state(config, Box::new(provider.clone()));
-        let context = cli_context("truncation-recovery");
-        seed_short_session(&state, &context).await;
-
-        // Act
-        let reply = process_turn(&state.turn_dependencies(), &context, "fresh question")
-            .await
-            .expect("truncated generation should recover");
-
-        // Assert: one summary and one retried model request, with the
-        // checkpoint in front of the retried request.
-        assert_eq!(reply, "complete answer");
-        assert_eq!(provider.model_requests(), 2);
-        assert_eq!(provider.summary_requests(), 1);
-        let requests = provider.seen_messages();
-        assert!(
-            requests[1][0]
-                .content
-                .as_text_lossy()
-                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
-            "the retried request must start with the checkpoint"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn truncation_recovery_discards_published_partial_output() {
         // Arrange: deltas are published before the provider reports the limit.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1725,8 +1672,19 @@ mod tests {
         .await
         .expect("turn should finalize after recovery");
 
-        // Assert: the partial streamed text is discarded and never persisted.
+        // Assert: the retry is a real model request preceded by the
+        // checkpoint, and the partial streamed text is discarded before it.
         assert_eq!(reply, "complete answer");
+        assert_eq!(provider.model_requests(), 2);
+        assert_eq!(provider.summary_requests(), 1);
+        let requests = provider.seen_messages();
+        assert!(
+            requests[1][0]
+                .content
+                .as_text_lossy()
+                .starts_with("[CONTEXT CHECKPOINT — REFERENCE ONLY]"),
+            "the retried request must start with the checkpoint"
+        );
         let (deltas, discarded, final_id) = collect_loop_events(&events);
         assert_eq!(discarded, vec![deltas[0].0.clone()]);
         assert_eq!(final_id, deltas[0].0, "the retry reuses the iteration id");
