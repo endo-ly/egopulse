@@ -15,8 +15,7 @@ use crate::assets::AssetStore;
 use crate::error::StorageError;
 use crate::llm::{Message, MessageContent, MessageContentPart, ToolCall};
 
-/// Version of the persisted snapshot envelope written by this build.
-pub(crate) const SNAPSHOT_VERSION: u32 = 1;
+use crate::storage::SESSION_SNAPSHOT_VERSION as SNAPSHOT_VERSION;
 
 /// Header prepended to a compaction checkpoint when it is projected into an
 /// LLM request. The checkpoint is history, not a new instruction.

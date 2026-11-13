@@ -1021,17 +1021,41 @@ mod tests {
         assert_eq!(messages.len(), 1, "message records should be preserved");
         assert_eq!(messages[0].content, "hello");
 
-        // session snapshot should be empty
+        // The snapshot is replaced by a restorable empty ContextSnapshot, not
+        // the legacy bare array.
         let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 10)
         })
         .await
         .expect("snapshot");
+        let cleared: serde_json::Value = serde_json::from_str(
+            snapshot
+                .messages_json
+                .as_deref()
+                .expect("cleared snapshot body"),
+        )
+        .expect("valid cleared snapshot");
         assert_eq!(
-            snapshot.messages_json.as_deref(),
-            Some(r#"[]"#),
-            "session snapshot should be cleared to empty array"
+            cleared["version"],
+            serde_json::json!(crate::storage::SESSION_SNAPSHOT_VERSION),
+            "the cleared snapshot must keep the envelope version"
         );
+        assert_eq!(
+            cleared["messages"],
+            serde_json::json!([]),
+            "session snapshot should be cleared to an empty ContextSnapshot"
+        );
+
+        // The following Turn must be able to restore this snapshot.
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("the next turn should restore the cleared session");
+        assert!(loaded.context.messages.is_empty());
+        assert!(loaded.context.checkpoint.is_none());
     }
 
     #[tokio::test]

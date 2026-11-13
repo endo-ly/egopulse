@@ -8,6 +8,12 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
+/// Version of the persisted `ContextSnapshot` envelope.
+///
+/// The storage layer writes this version when an empty snapshot is produced
+/// for `/new`; the agent loop uses the same value for every saved snapshot.
+pub(crate) const SESSION_SNAPSHOT_VERSION: u32 = 1;
+
 /// Maximum durable-pending turns (`turn_runs` in `accepted`/`input_committed`)
 /// allowed per session. Enforced atomically with the accept INSERT so a
 /// capacity rejection never leaves a runnable row.

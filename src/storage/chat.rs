@@ -1027,9 +1027,11 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Clears session message history by setting `messages_json` to an empty
-    /// JSON array.  The session row itself and `messages` / `tool_calls`
-    /// records are preserved.
+    /// Clears session message history by writing an empty `ContextSnapshot`.
+    ///
+    /// The snapshot keeps the envelope version so the next Turn can restore it
+    /// normally. The session row itself and `messages` / `tool_calls` records
+    /// are preserved.
     ///
     /// Uses optimistic concurrency on `chats.revision`: the update only
     /// succeeds when `expected_revision` matches the current row.  Returns
@@ -1040,7 +1042,12 @@ impl Database {
         chat_id: i64,
         expected_revision: i64,
     ) -> Result<bool, StorageError> {
-        match self.update_session_snapshot(chat_id, "[]", Some(expected_revision)) {
+        let empty_snapshot = serde_json::json!({
+            "version": super::SESSION_SNAPSHOT_VERSION,
+            "messages": [],
+        })
+        .to_string();
+        match self.update_session_snapshot(chat_id, &empty_snapshot, Some(expected_revision)) {
             Ok(_) => Ok(true),
             Err(StorageError::SessionSnapshotConflict) => Ok(false),
             Err(other) => Err(other),
@@ -1591,8 +1598,11 @@ mod tests {
         let (db, _dir) = test_db();
         let chat_id = 100;
 
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
+        )
+        .expect("save session");
         store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
         store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
 
@@ -1605,10 +1615,18 @@ mod tests {
         assert!(cleared, "should have updated the row");
 
         let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        let cleared_json: serde_json::Value =
+            serde_json::from_str(snapshot.messages_json.as_deref().expect("snapshot body"))
+                .expect("valid snapshot JSON");
         assert_eq!(
-            snapshot.messages_json.as_deref(),
-            Some(r#"[]"#),
-            "messages_json should be empty array"
+            cleared_json["version"],
+            serde_json::json!(crate::storage::SESSION_SNAPSHOT_VERSION),
+            "the cleared snapshot must keep the envelope version"
+        );
+        assert_eq!(
+            cleared_json["messages"],
+            serde_json::json!([]),
+            "messages_json should contain an empty message list"
         );
 
         let messages = db
@@ -1622,8 +1640,11 @@ mod tests {
         let (db, _dir) = test_db();
         let chat_id = 200;
 
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
+        )
+        .expect("save session");
 
         let cleared = db
             .clear_session_messages(chat_id, 0)
@@ -1631,8 +1652,15 @@ mod tests {
         assert!(!cleared, "should not have updated the row");
 
         let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
-        assert!(
-            snapshot.messages_json.as_deref() != Some(r#"[]"#),
+        let current: serde_json::Value =
+            serde_json::from_str(snapshot.messages_json.as_deref().expect("snapshot body"))
+                .expect("valid snapshot JSON");
+        assert_eq!(
+            current["messages"]
+                .as_array()
+                .expect("messages array")
+                .len(),
+            1,
             "messages_json should not be cleared"
         );
     }
