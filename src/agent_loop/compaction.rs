@@ -701,6 +701,9 @@ fn truncate_summary_conversation(conversation: String, budget_tokens: usize) -> 
         return String::new();
     }
     let end = utf16_prefix_end(&conversation, keep_chars);
+    if end == 0 {
+        return String::new();
+    }
     let mut truncated = conversation;
     truncated.truncate(end);
     truncated.push_str(SUMMARY_TRUNCATION_MARKER);
