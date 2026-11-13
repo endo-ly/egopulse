@@ -130,6 +130,14 @@ impl EgoPulseError {
             Self::Llm(LlmError::OutputCapacityExceeded { .. }) => {
                 "The conversation left no room for a model answer. Please try again.".to_string()
             }
+            Self::Llm(LlmError::OutputLimitBelowApiMinimum {
+                configured,
+                minimum,
+            }) => {
+                format!(
+                    "The configured output limit ({configured}) is below the API minimum ({minimum}). Increase max_output_tokens."
+                )
+            }
             Self::Llm(LlmError::InvalidResponse(_)) => {
                 "LLM returned an invalid response.".to_string()
             }
@@ -375,6 +383,8 @@ pub enum LlmError {
         prompt_tokens: usize,
         minimum_output_tokens: usize,
     },
+    #[error("llm_output_limit_below_api_minimum: configured={configured} minimum={minimum}")]
+    OutputLimitBelowApiMinimum { configured: usize, minimum: usize },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
     #[error("llm_deadline_exceeded: no response within the model iteration deadline")]
@@ -434,6 +444,7 @@ impl LlmError {
             Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
             Self::ContextOverflow { .. }
             | Self::OutputCapacityExceeded { .. }
+            | Self::OutputLimitBelowApiMinimum { .. }
             | Self::InitFailed(_)
             | Self::IncompleteResponse(_)
             | Self::InvalidResponse(_)
@@ -450,6 +461,7 @@ impl LlmError {
             } => *retry_after_secs,
             Self::ContextOverflow { .. }
             | Self::OutputCapacityExceeded { .. }
+            | Self::OutputLimitBelowApiMinimum { .. }
             | Self::InitFailed(_)
             | Self::RequestFailed(_)
             | Self::IncompleteStream(_)

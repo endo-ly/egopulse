@@ -345,10 +345,23 @@ impl OpenAiProvider {
             self.model_metadata.max_output_tokens,
             minimum_output_tokens,
         )
-        .map_err(|error| LlmError::OutputCapacityExceeded {
-            context_window: error.context_window,
-            prompt_tokens: error.prompt_tokens,
-            minimum_output_tokens: error.minimum_output_tokens,
+        .map_err(|error| match error {
+            crate::llm::tokens::OutputCapacityError::InsufficientRoom {
+                context_window,
+                prompt_tokens,
+                minimum_output_tokens,
+            } => LlmError::OutputCapacityExceeded {
+                context_window,
+                prompt_tokens,
+                minimum_output_tokens,
+            },
+            crate::llm::tokens::OutputCapacityError::BelowApiMinimum {
+                intended,
+                minimum_output_tokens,
+            } => LlmError::OutputLimitBelowApiMinimum {
+                configured: intended,
+                minimum: minimum_output_tokens,
+            },
         })
     }
 }

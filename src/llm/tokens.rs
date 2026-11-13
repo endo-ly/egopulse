@@ -88,19 +88,32 @@ pub(crate) fn estimate_prompt_tokens(
     tokens + estimate_messages_tokens(messages)
 }
 
-/// Why a request cannot be sized within the model's context window.
+/// Why a request cannot be sized for the model.
 ///
 /// The provider boundary turns this into a request error instead of sending a
-/// generation limit that the API would reject or that guarantees an empty
-/// answer.
+/// generation limit that the API would reject, that guarantees an empty
+/// answer, or that exceeds the configured output limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OutputCapacityError {
-    /// Context window of the model, in tokens.
-    pub(crate) context_window: usize,
-    /// Estimated prompt size of the request, in tokens.
-    pub(crate) prompt_tokens: usize,
-    /// Minimum output limit required by the API surface.
-    pub(crate) minimum_output_tokens: usize,
+pub(crate) enum OutputCapacityError {
+    /// The prompt leaves less room than the API's minimum output.
+    InsufficientRoom {
+        /// Context window of the model, in tokens.
+        context_window: usize,
+        /// Estimated prompt size of the request, in tokens.
+        prompt_tokens: usize,
+        /// Minimum output limit required by the API surface.
+        minimum_output_tokens: usize,
+    },
+    /// The configured output limit is below the API's minimum.
+    ///
+    /// Compacting the conversation cannot fix this: the limit itself is
+    /// unusable for the selected API surface.
+    BelowApiMinimum {
+        /// Output limit configured for the model.
+        intended: usize,
+        /// Minimum output limit required by the API surface.
+        minimum_output_tokens: usize,
+    },
 }
 
 /// Fits the requested output limit into the room left by the prompt.
@@ -111,14 +124,19 @@ pub(crate) struct OutputCapacityError {
 /// smallest limit the API surface accepts (Responses requires more than one
 /// token, Chat Completions accepts one).
 ///
-/// Returns an error when the prompt leaves less than the API minimum. Sending a
-/// request in that state cannot produce a valid answer, and the caller is
-/// expected to compact the context before retrying.
+/// The returned limit never exceeds `intended`, so setting `max_output_tokens`
+/// lower than the API minimum fails instead of silently sending a larger limit.
+///
+/// Returns an error when the configured limit is below the API minimum or the
+/// prompt leaves less room than that minimum. The first is a configuration
+/// mismatch that compaction cannot fix; the second is resolved by compacting
+/// the context.
 ///
 /// # Errors
 ///
-/// Returns [`OutputCapacityError`] when the remaining room is below
-/// `minimum_output_tokens`.
+/// Returns [`OutputCapacityError::BelowApiMinimum`] when `intended` is below
+/// `minimum_output_tokens`, and [`OutputCapacityError::InsufficientRoom`] when
+/// the remaining room is below that minimum.
 pub(crate) fn max_output_tokens_for_request(
     context_window: usize,
     prompt_tokens: usize,
@@ -126,19 +144,25 @@ pub(crate) fn max_output_tokens_for_request(
     minimum_output_tokens: usize,
 ) -> Result<usize, OutputCapacityError> {
     let minimum = minimum_output_tokens.max(1);
+    if intended < minimum {
+        return Err(OutputCapacityError::BelowApiMinimum {
+            intended,
+            minimum_output_tokens: minimum,
+        });
+    }
     let remaining = context_window.saturating_sub(prompt_tokens);
     // Reserve room for estimation error, but never more than half of what is
     // left: a small window must still be able to answer.
     let safety = CONTEXT_SAFETY_TOKENS.min(remaining / 2);
     let available = remaining.saturating_sub(safety);
     if available < minimum {
-        return Err(OutputCapacityError {
+        return Err(OutputCapacityError::InsufficientRoom {
             context_window,
             prompt_tokens,
             minimum_output_tokens: minimum,
         });
     }
-    Ok(intended.max(minimum).min(available))
+    Ok(intended.min(available))
 }
 
 #[cfg(test)]
@@ -222,22 +246,33 @@ mod tests {
             max_output_tokens_for_request(32_768, 40_000, 16_384, 1).expect_err("no output room");
 
         // Assert
-        assert_eq!(error.context_window, 32_768);
-        assert_eq!(error.prompt_tokens, 40_000);
-        assert_eq!(error.minimum_output_tokens, 1);
+        assert_eq!(
+            error,
+            OutputCapacityError::InsufficientRoom {
+                context_window: 32_768,
+                prompt_tokens: 40_000,
+                minimum_output_tokens: 1,
+            }
+        );
     }
 
     #[test]
-    fn the_api_minimum_is_honored_and_never_exceeded() {
+    fn a_configured_limit_below_the_api_minimum_is_rejected() {
         // Arrange: the Responses API requires at least 16 tokens, and the
         // caller's intended limit is smaller than that.
 
         // Act
-        let limit = max_output_tokens_for_request(32_768, 20_000, 8, 16)
-            .expect("there is room for the minimum");
+        let error = max_output_tokens_for_request(32_768, 20_000, 8, 16)
+            .expect_err("the configured limit must not be exceeded");
 
         // Assert
-        assert_eq!(limit, 16);
+        assert_eq!(
+            error,
+            OutputCapacityError::BelowApiMinimum {
+                intended: 8,
+                minimum_output_tokens: 16,
+            }
+        );
     }
 
     #[test]
