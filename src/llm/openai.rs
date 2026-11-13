@@ -23,6 +23,9 @@ const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS: usize = 16;
 /// Smallest output limit accepted by Chat Completions.
 const OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS: usize = 1;
 
+/// Smallest output limit accepted by OpenRouter for some routed models.
+const OPENROUTER_MIN_OUTPUT_TOKENS: usize = 16;
+
 /// Inactivity deadline between reads of one request.
 ///
 /// A provider that accepts the connection but never produces a byte (a
@@ -296,7 +299,7 @@ impl OpenAiProvider {
             system,
             tools_json.as_deref(),
             &messages,
-            OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS,
+            chat_completions_min_output_tokens(&self.provider, &self.base_url),
         )?;
         let mut body = build_streaming_request_body(
             &self.model,
@@ -364,6 +367,26 @@ impl OpenAiProvider {
             },
         })
     }
+}
+
+/// Minimum output for the Chat Completions endpoint.
+///
+/// OpenRouter documents a 16-token minimum for some routed models while the
+/// generic Chat Completions minimum is one token. Keep the generic minimum for
+/// other compatible APIs so their available room is not reduced needlessly.
+fn chat_completions_min_output_tokens(provider: &str, base_url: &str) -> usize {
+    if provider.eq_ignore_ascii_case("openrouter") || is_openrouter_base_url(base_url) {
+        OPENROUTER_MIN_OUTPUT_TOKENS
+    } else {
+        OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS
+    }
+}
+
+fn is_openrouter_base_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "openrouter.ai" || host.ends_with(".openrouter.ai"))
 }
 
 /// Field name that carries the output limit for Chat Completions.
@@ -746,8 +769,9 @@ mod tests {
     use futures_util::stream;
 
     use super::{
-        OpenAiProvider, consume_chat_completion_stream, consume_responses_stream,
-        max_output_tokens_field, parse_chat_completion_usage, request_stream_usage,
+        OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS, OPENROUTER_MIN_OUTPUT_TOKENS, OpenAiProvider,
+        consume_chat_completion_stream, consume_responses_stream, max_output_tokens_field,
+        parse_chat_completion_usage, request_stream_usage,
     };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -1423,37 +1447,42 @@ mod tests {
     async fn a_full_window_is_rejected_before_sending_the_request() {
         // Arrange: the context window is smaller than the prompt, so no
         // output minimum can be met. The unreachable URL proves that the
-        // request is not sent.
-        let mut llm_config = config(
-            "gpt-4o-mini",
-            "http://127.0.0.1:1/v1".to_string(),
-            Some("sk-test"),
-        );
-        llm_config.model_metadata = crate::config::ModelMetadata {
-            context_window: 1,
-            max_output_tokens: 16_384,
-            context_window_source: crate::config::ModelValueSource::Configured,
-            max_output_tokens_source: crate::config::ModelValueSource::Configured,
-        };
-        let provider = OpenAiProvider::new(&llm_config).expect("provider");
+        // request is not sent. OpenRouter also requires a larger minimum than
+        // a generic Chat Completions endpoint.
+        for (base_url, expected_minimum) in [
+            (
+                "http://127.0.0.1:1/v1",
+                OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS,
+            ),
+            ("https://openrouter.ai/api/v1", OPENROUTER_MIN_OUTPUT_TOKENS),
+        ] {
+            let mut llm_config = config("gpt-4o-mini", base_url.to_string(), Some("sk-test"));
+            llm_config.model_metadata = crate::config::ModelMetadata {
+                context_window: 1,
+                max_output_tokens: 16_384,
+                context_window_source: crate::config::ModelValueSource::Configured,
+                max_output_tokens_source: crate::config::ModelValueSource::Configured,
+            };
+            let provider = OpenAiProvider::new(&llm_config).expect("provider");
 
-        // Act
-        let error = provider
-            .send_message_streaming("system", message("hello"), None, &|_| {})
-            .await
-            .expect_err("no output room");
+            // Act
+            let error = provider
+                .send_message_streaming("system", message("hello"), None, &|_| {})
+                .await
+                .expect_err("no output room");
 
-        // Assert
-        match error {
-            crate::error::LlmError::OutputCapacityExceeded {
-                context_window,
-                minimum_output_tokens,
-                ..
-            } => {
-                assert_eq!(context_window, 1);
-                assert_eq!(minimum_output_tokens, 1);
+            // Assert
+            match error {
+                crate::error::LlmError::OutputCapacityExceeded {
+                    context_window,
+                    minimum_output_tokens,
+                    ..
+                } => {
+                    assert_eq!(context_window, 1);
+                    assert_eq!(minimum_output_tokens, expected_minimum);
+                }
+                other => panic!("expected OutputCapacityExceeded, got {other:?}"),
             }
-            other => panic!("expected OutputCapacityExceeded, got {other:?}"),
         }
     }
 
