@@ -6,6 +6,7 @@
 //! which validates, persists, and enforces `expected_fingerprint`.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use axum::Json;
@@ -103,30 +104,47 @@ fn secret_payload(value: Option<&ResolvedValue>) -> Value {
 }
 
 fn general_payload(config: &Config) -> Value {
+    let default_compaction = defaults::default_compaction_config();
     json!({
         "default_agent": config.default_agent.as_str(),
         "default_provider": config.default_provider.as_str(),
         "default_model": config.default_model,
         "timezone": config.timezone,
         "max_history_messages": config.max_history_messages,
-        "compaction_timeout_secs": config.compaction_timeout_secs,
-        "default_context_window_tokens": config.default_context_window_tokens,
-        "compaction_threshold_ratio": config.compaction_threshold_ratio,
-        "compaction_target_ratio": config.compaction_target_ratio,
-        "compact_keep_recent": config.compact_keep_recent,
+        "compaction_enabled": config.compaction.enabled,
+        "compaction_reserve_tokens": config.compaction.reserve_tokens,
+        "compaction_keep_recent_tokens": config.compaction.keep_recent_tokens,
+        "compaction_model_overrides": config
+            .compaction
+            .model_overrides
+            .iter()
+            .map(|(key, override_settings)| {
+                json!({
+                    "model": key,
+                    "reserve_tokens": override_settings.reserve_tokens,
+                    "keep_recent_tokens": override_settings.keep_recent_tokens,
+                })
+            })
+            .collect::<Vec<_>>(),
         "log_level": config.log_level,
         "state_root": config.state_root,
         "defaults": {
             "max_history_messages": defaults::default_max_history_messages(),
-            "compaction_timeout_secs": defaults::default_compaction_timeout_secs(),
-            "default_context_window_tokens": defaults::default_context_window_tokens(),
-            "compaction_threshold_ratio": defaults::default_compaction_threshold_ratio(),
-            "compaction_target_ratio": defaults::default_compaction_target_ratio(),
-            "compact_keep_recent": defaults::default_compact_keep_recent(),
+            "compaction_enabled": default_compaction.enabled,
+            "compaction_reserve_tokens": default_compaction.reserve_tokens,
+            "compaction_keep_recent_tokens": default_compaction.keep_recent_tokens,
             "timezone": "UTC",
             "log_level": "info",
         },
     })
+}
+
+fn model_value_source_name(source: crate::config::ModelValueSource) -> &'static str {
+    match source {
+        crate::config::ModelValueSource::Configured => "configured",
+        crate::config::ModelValueSource::Catalog => "catalog",
+        crate::config::ModelValueSource::Default => "default",
+    }
 }
 
 fn source_name(source: LlmSettingSource) -> &'static str {
@@ -196,9 +214,15 @@ fn providers_payload(config: &Config) -> Vec<Value> {
                 .models
                 .iter()
                 .map(|(name, model)| {
+                    let metadata = config.resolve_model_metadata(id, name);
                     json!({
                         "name": name,
                         "context_window_tokens": model.context_window_tokens,
+                        "max_output_tokens": model.max_output_tokens,
+                        "resolved_context_window_tokens": metadata.context_window,
+                        "resolved_max_output_tokens": metadata.max_output_tokens,
+                        "context_window_source": model_value_source_name(metadata.context_window_source),
+                        "max_output_tokens_source": model_value_source_name(metadata.max_output_tokens_source),
                         "has_instructions": model.model_instructions.is_some() || model.model_instructions_file.is_some(),
                     })
                 })
@@ -603,11 +627,16 @@ pub(super) struct GeneralPatch {
     default_model: Option<Option<String>>,
     timezone: Option<String>,
     max_history_messages: Option<usize>,
-    compaction_timeout_secs: Option<u64>,
-    default_context_window_tokens: Option<usize>,
-    compaction_threshold_ratio: Option<f64>,
-    compaction_target_ratio: Option<f64>,
-    compact_keep_recent: Option<usize>,
+    compaction_enabled: Option<bool>,
+    compaction_reserve_tokens: Option<usize>,
+    compaction_keep_recent_tokens: Option<usize>,
+    compaction_model_overrides: Option<HashMap<String, CompactionModelOverridePatch>>,
+}
+
+#[derive(Deserialize)]
+struct CompactionModelOverridePatch {
+    reserve_tokens: Option<usize>,
+    keep_recent_tokens: Option<usize>,
 }
 
 /// Updates global defaults and conversation tuning.
@@ -635,20 +664,28 @@ pub(super) async fn api_patch_general(
         if let Some(v) = patch.max_history_messages {
             config.max_history_messages = v;
         }
-        if let Some(v) = patch.compaction_timeout_secs {
-            config.compaction_timeout_secs = v;
+        if let Some(v) = patch.compaction_enabled {
+            config.compaction.enabled = v;
         }
-        if let Some(v) = patch.default_context_window_tokens {
-            config.default_context_window_tokens = v;
+        if let Some(v) = patch.compaction_reserve_tokens {
+            config.compaction.reserve_tokens = v;
         }
-        if let Some(v) = patch.compaction_threshold_ratio {
-            config.compaction_threshold_ratio = v;
+        if let Some(v) = patch.compaction_keep_recent_tokens {
+            config.compaction.keep_recent_tokens = v;
         }
-        if let Some(v) = patch.compaction_target_ratio {
-            config.compaction_target_ratio = v;
-        }
-        if let Some(v) = patch.compact_keep_recent {
-            config.compact_keep_recent = v;
+        if let Some(v) = patch.compaction_model_overrides {
+            config.compaction.model_overrides = v
+                .into_iter()
+                .map(|(key, override_settings)| {
+                    (
+                        key,
+                        crate::config::CompactionModelOverride {
+                            reserve_tokens: override_settings.reserve_tokens,
+                            keep_recent_tokens: override_settings.keep_recent_tokens,
+                        },
+                    )
+                })
+                .collect();
         }
         Ok(Vec::new())
     })

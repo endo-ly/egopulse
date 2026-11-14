@@ -506,6 +506,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             StoredMessage {
                 id: "m2".to_string(),
@@ -519,6 +520,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             StoredMessage {
                 id: "m3".to_string(),
@@ -532,6 +534,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             StoredMessage {
                 id: "m4".to_string(),
@@ -545,6 +548,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
         ];
         let text = messages_to_extract_text(&messages);

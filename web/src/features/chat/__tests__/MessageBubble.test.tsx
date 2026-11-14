@@ -64,6 +64,22 @@ describe("MessageBubble", () => {
     );
   });
 
+  it("shows_an_output_limit_notice_only_for_truncated_answers", () => {
+    // Arrange: one truncated answer and one complete answer.
+    const truncated = render(
+      <MessageBubble
+        message={msg({ content: "partial", finish_reason: "max_output_tokens" })}
+      />,
+    );
+    const complete = render(<MessageBubble message={msg({ content: "done" })} />);
+
+    // Assert: only the truncated answer carries the notice.
+    expect(
+      truncated.container.querySelector(".message-truncation-notice")?.textContent,
+    ).toContain("output limit");
+    expect(complete.container.querySelector(".message-truncation-notice")).toBeNull();
+  });
+
   it("assistant_message_renders_content_without_stream_markers", () => {
     // Message identity is stable, so bubbles carry no draft/cursor state:
     // progress is a separate indicator row owned by ChatTab.

@@ -111,15 +111,10 @@ fn fallback_fingerprint(config: &Config) -> String {
     config.default_model.hash(&mut hasher);
     config.state_root.hash(&mut hasher);
     config.timezone.hash(&mut hasher);
-    config.compaction_timeout_secs.hash(&mut hasher);
+    config.compaction.enabled.hash(&mut hasher);
+    config.compaction.reserve_tokens.hash(&mut hasher);
+    config.compaction.keep_recent_tokens.hash(&mut hasher);
     config.max_history_messages.hash(&mut hasher);
-    config.compact_keep_recent.hash(&mut hasher);
-    config.default_context_window_tokens.hash(&mut hasher);
-    config
-        .compaction_threshold_ratio
-        .to_bits()
-        .hash(&mut hasher);
-    config.compaction_target_ratio.to_bits().hash(&mut hasher);
     config.default_agent.as_str().hash(&mut hasher);
     let mut providers = config.providers.iter().collect::<Vec<_>>();
     providers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));

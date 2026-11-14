@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 22;
+pub(super) const SCHEMA_VERSION: i64 = 24;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1196,14 +1196,82 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 22;
     }
 
+    if version < 23 {
+        let tx = conn.unchecked_transaction()?;
+        migrate_session_snapshots_to_envelope(&tx, "normal")?;
+        set_schema_version_in_tx(&tx, 23, "wrap session snapshots in the context envelope")?;
+        tx.commit()?;
+        version = 23;
+    }
+
+    if version < 24 {
+        let tx = conn.unchecked_transaction()?;
+        // Why the model stopped, when it stopped at a limit. NULL for every
+        // message that ended on its own and for rows written before this
+        // column existed; the transcript and the Web history expose it so a
+        // truncated answer is not indistinguishable from a complete one.
+        add_column_if_missing(&tx, "messages", "finish_reason", "TEXT")?;
+        set_schema_version_in_tx(&tx, 24, "record the model finish reason on messages")?;
+        tx.commit()?;
+        version = 24;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
+    Ok(())
+}
+
+/// Wraps every legacy `sessions.messages_json` array in the context snapshot
+/// envelope.
+///
+/// The legacy payload is moved verbatim into `messages`. A compaction summary
+/// that was previously stored as a synthetic user message stays in the message
+/// list; it becomes a real checkpoint only after the next compaction. Re-running
+/// the migration is idempotent: envelopes are objects, legacy payloads are
+/// arrays.
+fn migrate_session_snapshots_to_envelope(
+    tx: &rusqlite::Transaction,
+    database: &str,
+) -> Result<(), StorageError> {
+    let rows = {
+        let mut stmt = tx.prepare("SELECT chat_id, messages_json FROM sessions")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (chat_id, json) in rows {
+        let value: serde_json::Value = serde_json::from_str(&json).map_err(|error| {
+            StorageError::InvalidSnapshot(format!(
+                "{database} chat {chat_id} has an unreadable session snapshot: {error}"
+            ))
+        })?;
+        let messages = match value {
+            serde_json::Value::Object(_) => continue,
+            serde_json::Value::Array(messages) => messages,
+            other => {
+                return Err(StorageError::InvalidSnapshot(format!(
+                    "{database} chat {chat_id} session snapshot is neither a message array nor an envelope: {other}"
+                )));
+            }
+        };
+        let envelope = serde_json::json!({
+            "version": 1,
+            "messages": messages,
+        });
+        tx.execute(
+            "UPDATE sessions SET messages_json = ?2 WHERE chat_id = ?1",
+            params![chat_id, envelope.to_string()],
+        )?;
+    }
+
     Ok(())
 }
 
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 8;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 10;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1544,6 +1612,31 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         set_schema_version_in_tx(&tx, 8, "add chats.archived and chats.pinned (secret db)")?;
         tx.commit()?;
         version = 8;
+    }
+
+    if version < 9 {
+        let tx = conn.unchecked_transaction()?;
+        migrate_session_snapshots_to_envelope(&tx, "secret")?;
+        set_schema_version_in_tx(
+            &tx,
+            9,
+            "wrap session snapshots in the context envelope (secret db)",
+        )?;
+        tx.commit()?;
+        version = 9;
+    }
+
+    if version < 10 {
+        let tx = conn.unchecked_transaction()?;
+        // Mirrored from the primary DB so history stays scope agnostic.
+        add_column_if_missing(&tx, "messages", "finish_reason", "TEXT")?;
+        set_schema_version_in_tx(
+            &tx,
+            10,
+            "record the model finish reason on messages (secret db)",
+        )?;
+        tx.commit()?;
+        version = 10;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);
@@ -2773,7 +2866,7 @@ mod tests {
             .is_err()
         );
 
-        assert_eq!(schema_version_of(&db), 22);
+        assert_eq!(schema_version_of(&db), super::SCHEMA_VERSION);
     }
 
     #[test]
@@ -2807,7 +2900,7 @@ mod tests {
             })
             .expect("count snapshots");
         assert_eq!(snapshot_count, 2);
-        assert_eq!(schema_version_of(&db), 22);
+        assert_eq!(schema_version_of(&db), super::SCHEMA_VERSION);
     }
 
     // --- v9: memory_snapshots constraints -------------------------------------
@@ -3014,6 +3107,102 @@ mod tests {
         assert!(invalid_run.is_err(), "should reject non-existent run_id");
     }
 
+    // --- v23: session snapshot envelope ---------------------------------------
+
+    #[test]
+    fn migration_v23_wraps_legacy_session_snapshots() {
+        // Arrange: a current DB with a legacy array snapshot and an empty one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let legacy = db
+            .resolve_or_create_chat_id("cli", "cli:v23-legacy", "private", "default")
+            .expect("legacy chat");
+        let empty = db
+            .resolve_or_create_chat_id("cli", "cli:v23-empty", "private", "default")
+            .expect("empty chat");
+        let legacy_json =
+            r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]"#;
+        db.save_session(legacy, legacy_json)
+            .expect("legacy session");
+        db.save_session(empty, "[]").expect("empty session");
+        rollback_schema(&db, 22, "v23 wrap");
+
+        // Assert: both snapshots are envelopes and the messages are verbatim.
+        let conn = db.get_conn().expect("conn");
+        let legacy_after: String = conn
+            .query_row(
+                "SELECT messages_json FROM sessions WHERE chat_id = ?1",
+                rusqlite::params![legacy],
+                |row| row.get(0),
+            )
+            .expect("legacy snapshot");
+        let legacy_value: serde_json::Value =
+            serde_json::from_str(&legacy_after).expect("envelope");
+        assert_eq!(legacy_value["version"], 1);
+        assert_eq!(
+            legacy_value["messages"],
+            serde_json::from_str::<serde_json::Value>(legacy_json).expect("legacy messages")
+        );
+        assert!(legacy_value["checkpoint"].is_null());
+        assert!(legacy_value["last_usage"].is_null());
+
+        let empty_after: String = conn
+            .query_row(
+                "SELECT messages_json FROM sessions WHERE chat_id = ?1",
+                rusqlite::params![empty],
+                |row| row.get(0),
+            )
+            .expect("empty snapshot");
+        let empty_value: serde_json::Value = serde_json::from_str(&empty_after).expect("envelope");
+        assert_eq!(empty_value["version"], 1);
+        assert_eq!(
+            empty_value["messages"].as_array().expect("messages").len(),
+            0
+        );
+
+        // Act: re-run the migration block on the already-migrated rows.
+        rollback_schema(&db, 22, "v23 rerun");
+
+        // Assert: envelopes are left byte-identical (idempotent).
+        let legacy_again: String = conn
+            .query_row(
+                "SELECT messages_json FROM sessions WHERE chat_id = ?1",
+                rusqlite::params![legacy],
+                |row| row.get(0),
+            )
+            .expect("legacy snapshot");
+        assert_eq!(legacy_after, legacy_again);
+        assert_eq!(schema_version_of(&db), super::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v23_rejects_a_corrupt_snapshot() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("runtime").join("egopulse.db");
+        let db = super::super::Database::new(&db_path).expect("db");
+        let chat = db
+            .resolve_or_create_chat_id("cli", "cli:v23-corrupt", "private", "default")
+            .expect("chat");
+        db.save_session(chat, "{not-json").expect("corrupt session");
+
+        // Act
+        let conn = db.get_conn().expect("conn");
+        conn.execute(
+            "UPDATE db_meta SET value = '22' WHERE key = 'schema_version'",
+            [],
+        )
+        .expect("rollback version");
+        let result = super::run_migrations(&conn);
+
+        // Assert: the migration does not silently discard the row.
+        assert!(matches!(
+            result,
+            Err(crate::error::StorageError::InvalidSnapshot(_))
+        ));
+    }
+
     // --- v12: durable turn + integer seq/revision -----------------------------
 
     fn rollback_schema(db: &super::super::Database, to_version: i64, label: &str) {
@@ -3130,7 +3319,14 @@ mod tests {
             )
             .expect("session state");
         assert_eq!(snapshot_through, 3);
-        assert_eq!(json, llm_context);
+        let migrated: serde_json::Value = serde_json::from_str(&json).expect("envelope");
+        assert_eq!(migrated["version"], 1);
+        assert!(migrated["checkpoint"].is_null());
+        assert!(migrated["last_usage"].is_null());
+        assert_eq!(
+            migrated["messages"],
+            serde_json::from_str::<serde_json::Value>(llm_context).expect("legacy messages")
+        );
 
         let tool_states: Vec<(String, String)> = conn
             .prepare("SELECT id, state FROM tool_calls ORDER BY id")

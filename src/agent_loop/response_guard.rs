@@ -6,18 +6,23 @@ use crate::llm::Message;
 /// text and no executable tool call.
 pub(crate) const EMPTY_REPLY_RUNTIME_GUARD: &str = "[runtime_guard]: Your previous reply had no user-visible text. Reply again now with a concise visible answer. If tools are required, execute them first and then provide the visible result.";
 
-pub(crate) fn runtime_guard_messages(
-    messages: &[Message],
+/// Builds the messages a runtime guard appends to a request: the discarded
+/// assistant reply and the corrective instruction.
+///
+/// Callers that keep the conversation separate from the request append this
+/// suffix instead of copying the whole history, so the correction survives a
+/// compaction of the conversation.
+pub(crate) fn runtime_guard_suffix(
     assistant_text: &str,
     assistant_reasoning_content: Option<&str>,
     guard_text: &str,
 ) -> Vec<Message> {
-    let mut retry_messages = messages.to_vec();
     let mut assistant_message = Message::text("assistant", assistant_text.to_string());
     assistant_message.reasoning_content = assistant_reasoning_content.map(ToString::to_string);
-    retry_messages.push(assistant_message);
-    retry_messages.push(Message::text("user", guard_text.to_string()));
-    retry_messages
+    vec![
+        assistant_message,
+        Message::text("user", guard_text.to_string()),
+    ]
 }
 
 /// レスポンスが「宣言だけしてツールを実行しない」パターンに一致するか判定する。
@@ -188,6 +193,7 @@ mod tests {
         .expect("loaded session");
         assert!(
             loaded
+                .context
                 .messages
                 .iter()
                 .all(|message| !message.content.as_text_lossy().contains("[runtime_guard]"))

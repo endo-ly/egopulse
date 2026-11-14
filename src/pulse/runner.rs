@@ -208,7 +208,7 @@ pub(crate) async fn run_activation_with_snapshot(
             .run_with_transient_retry(PULSE_MAX_LLM_RETRY_BACKOFF)
             .await
         {
-            Ok(response) => response,
+            Ok(outcome) => outcome.step,
             Err(error) if guard_tracker.limit_reached() => {
                 let (error, _) = error.into_parts();
                 warn!(error = %error, "pulse could not generate a report after guard denial limit");
@@ -235,6 +235,14 @@ pub(crate) async fn run_activation_with_snapshot(
                 ));
             }
             ModelStep::ToolCalls(assistant_phase) => assistant_phase,
+            ModelStep::Truncated { reason, .. } => {
+                return Err(crate::error::EgoPulseError::Llm(
+                    crate::error::LlmError::IncompleteResponse(format!(
+                        "pulse output was truncated at the output limit ({})",
+                        reason.as_str()
+                    )),
+                ));
+            }
         };
         let assistant_message_id = crate::pulse::message_id::step(pulse_run_id);
 

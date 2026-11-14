@@ -4,6 +4,7 @@ import type {
   AgentConfigEntry,
   BotEntry,
   ChatChannelEntry,
+  CompactionModelOverride,
   LlmSource,
   McpDefinitions,
   ProviderConfigEntry,
@@ -79,21 +80,50 @@ function GeneralView({ config }: { config: RuntimeConfig }) {
       <Rows>
         <Row label="History messages" value={g.max_history_messages} isDefault={g.max_history_messages === d.max_history_messages} />
         <Row
-          label="Context window"
-          value={`${formatCount(g.default_context_window_tokens)} tokens`}
-          sub="For models without their own setting"
-          isDefault={g.default_context_window_tokens === d.default_context_window_tokens}
+          label="Model limits"
+          value="Bundled catalog"
+          sub="Unknown models use 128K context / 16K output"
         />
         <Row
           label="Compaction"
-          value={`At ${Math.round(g.compaction_threshold_ratio * 100)}% of the window, down to ${Math.round(g.compaction_target_ratio * 100)}%`}
-          isDefault={g.compaction_threshold_ratio === d.compaction_threshold_ratio && g.compaction_target_ratio === d.compaction_target_ratio}
+          value={g.compaction_enabled ? "Automatic" : "Off"}
+          isDefault={g.compaction_enabled === d.compaction_enabled}
         />
-        <Row label="Keep recent" value={`${g.compact_keep_recent} messages`} isDefault={g.compact_keep_recent === d.compact_keep_recent} />
-        <Row label="Compaction timeout" value={`${g.compaction_timeout_secs}s`} isDefault={g.compaction_timeout_secs === d.compaction_timeout_secs} />
+        <Row
+          label="Reserve tokens"
+          value={`${formatCount(g.compaction_reserve_tokens)} tokens`}
+          isDefault={g.compaction_reserve_tokens === d.compaction_reserve_tokens}
+        />
+        <Row
+          label="Keep recent tokens"
+          value={`${formatCount(g.compaction_keep_recent_tokens)} tokens`}
+          isDefault={g.compaction_keep_recent_tokens === d.compaction_keep_recent_tokens}
+        />
       </Rows>
+      {g.compaction_model_overrides.length > 0 && (
+        <>
+          <h4 className="config-subhead">Compaction overrides</h4>
+          <Rows>
+            {g.compaction_model_overrides.map((entry) => (
+              <Row
+                key={entry.model}
+                label={entry.model}
+                value={compactionOverrideValue(entry)}
+              />
+            ))}
+          </Rows>
+        </>
+      )}
     </>
   );
+}
+
+function compactionOverrideValue(entry: CompactionModelOverride): string {
+  const parts = [
+    entry.reserve_tokens === null ? null : `reserve ${formatCount(entry.reserve_tokens)}`,
+    entry.keep_recent_tokens === null ? null : `keep ${formatCount(entry.keep_recent_tokens)}`,
+  ].filter((part): part is string => part !== null);
+  return parts.length > 0 ? `${parts.join(" · ")} tokens` : "Inherits the global values";
 }
 
 // ---------------------------------------------------------------------------
@@ -225,7 +255,14 @@ function ProviderView({ provider, config }: { provider: ProviderConfigEntry; con
             {provider.models.map((model) => (
               <li key={model.name}>
                 <code>{model.name}</code>
-                {model.context_window_tokens !== null && <span className="model-meta">{formatCount(model.context_window_tokens)} context</span>}
+                <span className="model-meta">
+                  {formatCount(model.resolved_context_window_tokens)} context
+                  {model.context_window_source === "default" ? " (default)" : ""}
+                </span>
+                <span className="model-meta">
+                  {formatCount(model.resolved_max_output_tokens)} max output
+                  {model.max_output_tokens_source === "default" ? " (default)" : ""}
+                </span>
                 {model.has_instructions && <span className="model-meta">custom instructions</span>}
               </li>
             ))}

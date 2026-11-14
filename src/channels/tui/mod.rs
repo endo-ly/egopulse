@@ -422,8 +422,10 @@ impl TuiApp {
                             self.transcript.clear();
                         }
                         self.transcript.begin_turn(prompt);
-                        self.transcript
-                            .apply_turn_event(TurnEvent::FinalResponse { text: response });
+                        self.transcript.apply_turn_event(TurnEvent::FinalResponse {
+                            text: response,
+                            finish_reason: None,
+                        });
                     }
                     CommandOutcome::Error { message } => {
                         self.transcript.begin_turn(prompt);

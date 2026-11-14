@@ -8,14 +8,14 @@ use tokio::time::Instant;
 use tracing::warn;
 
 use crate::agent_loop::TurnDependencies;
-use crate::agent_loop::compaction::estimate_prompt_tokens;
 use crate::agent_loop::message_format::{
     sanitize_assistant_response_text, strip_thinking, summarize_tool_calls_with_content,
 };
-use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_messages};
+use crate::agent_loop::response_guard::{EMPTY_REPLY_RUNTIME_GUARD, runtime_guard_suffix};
 use crate::conversation::ConversationScope;
 use crate::error::{EgoPulseError, LlmError};
 use crate::llm::calibration::CalibrationKey;
+use crate::llm::tokens::estimate_prompt_tokens;
 use crate::llm::{
     LlmProvider, LlmUsage, MAX_ATTEMPTS, Message, MessagesResponse, RetryDecision, RetryPolicy,
     RetryStop, ToolCall, ToolDefinition, decide,
@@ -34,6 +34,8 @@ pub(crate) struct AssistantToolPhase {
     pub(crate) assistant_message: Message,
     pub(crate) assistant_preview: String,
     pub(crate) tool_calls: Vec<ToolCall>,
+    /// Provider usage of the request that produced this phase.
+    pub(crate) usage: Option<LlmUsage>,
 }
 
 pub(crate) fn ignore_delta(_: String) {}
@@ -49,6 +51,35 @@ pub(crate) enum ModelStep {
     Final(MessagesResponse),
     MalformedToolCalls(MessagesResponse),
     ToolCalls(AssistantToolPhase),
+    /// The provider stopped the generation at the output limit. The partial
+    /// content is preserved, but it must never be executed as a tool phase or
+    /// persisted as a final answer without recovery.
+    Truncated {
+        response: MessagesResponse,
+        reason: crate::llm::TruncationReason,
+    },
+}
+
+impl ModelStep {
+    /// Returns the provider usage of the step, when the provider reported it.
+    pub(crate) fn usage(&self) -> Option<&LlmUsage> {
+        match self {
+            Self::Final(response) | Self::MalformedToolCalls(response) => response.usage.as_ref(),
+            Self::ToolCalls(phase) => phase.usage.as_ref(),
+            Self::Truncated { response, .. } => response.usage.as_ref(),
+        }
+    }
+}
+
+/// A completed model step and the messages that were appended to the request
+/// to obtain it.
+///
+/// The provider usage describes the request that was actually sent, so the
+/// compaction anchor has to account for these extra messages as well. They are
+/// request-only: the empty-reply guard must never enter the conversation.
+pub(crate) struct ModelStepOutcome {
+    pub(crate) step: ModelStep,
+    pub(crate) recovery_suffix: Vec<Message>,
 }
 
 #[derive(Clone)]
@@ -84,19 +115,10 @@ impl<'a> ModelRunner<'a> {
     pub(crate) async fn run_with_retry(
         &self,
         turn_id: &str,
-    ) -> Result<ModelStep, ModelRequestError> {
-        let hash = model_request_hash(
-            self.request.system_prompt,
-            &self.request.messages,
-            self.request
-                .tools
-                .as_deref()
-                .filter(|tools| !tools.is_empty())
-                .and_then(|tools| serde_json::to_string(tools).ok())
-                .as_deref(),
-        );
+    ) -> Result<ModelStepOutcome, ModelRequestError> {
+        let hash = self.request_hash();
         let turn_id_for_init = turn_id.to_string();
-        let hash_for_init = hash;
+        let hash_for_init = hash.clone();
         let scope = self.request.scope;
         let iteration = self.request.iteration as i64;
         let db = self.request.state.db_for(scope);
@@ -115,6 +137,48 @@ impl<'a> ModelRunner<'a> {
             });
         }
 
+        self.run_attempts(turn_id).await
+    }
+
+    /// Re-issues the same model iteration after the context was compacted.
+    ///
+    /// The durable iteration is already `model_pending`; only the request hash
+    /// changes, because the request itself changed. The transport attempt
+    /// counter is left alone: this is a single recovery attempt, not a retry.
+    pub(crate) async fn retry_after_compaction(
+        &self,
+        turn_id: &str,
+    ) -> Result<ModelStepOutcome, ModelRequestError> {
+        let hash = self.request_hash();
+        let turn_id_for_hash = turn_id.to_string();
+        let db = self.request.state.db_for(self.request.scope);
+        call_blocking(db, move |db| {
+            db.refresh_turn_model_hash(&turn_id_for_hash, &hash)
+        })
+        .await
+        .map_err(|error| ModelRequestError {
+            error: EgoPulseError::from(error),
+            output_published: false,
+        })?;
+
+        self.run_attempts(turn_id).await
+    }
+
+    /// Returns the hash that identifies the exact request about to be sent.
+    pub(crate) fn request_hash(&self) -> String {
+        model_request_hash(
+            self.request.system_prompt,
+            &self.request.messages,
+            self.request
+                .tools
+                .as_deref()
+                .filter(|tools| !tools.is_empty())
+                .and_then(|tools| serde_json::to_string(tools).ok())
+                .as_deref(),
+        )
+    }
+
+    async fn run_attempts(&self, turn_id: &str) -> Result<ModelStepOutcome, ModelRequestError> {
         let db = self.request.state.db_for(self.request.scope);
         self.retry_transient_failures(DeltaPublication::Published, None, || {
             let db = Arc::clone(&db);
@@ -138,7 +202,7 @@ impl<'a> ModelRunner<'a> {
     pub(crate) async fn run_with_transient_retry(
         &self,
         max_backoff: Duration,
-    ) -> Result<ModelStep, ModelRequestError> {
+    ) -> Result<ModelStepOutcome, ModelRequestError> {
         self.retry_transient_failures(DeltaPublication::Discarded, Some(max_backoff), || async {})
             .await
     }
@@ -157,7 +221,7 @@ impl<'a> ModelRunner<'a> {
         delta_publication: DeltaPublication,
         max_backoff: Option<Duration>,
         mut before_retry: F,
-    ) -> Result<ModelStep, ModelRequestError>
+    ) -> Result<ModelStepOutcome, ModelRequestError>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = ()>,
@@ -203,7 +267,21 @@ impl<'a> ModelRunner<'a> {
                 }
             };
             match response {
-                Ok(step) => return Ok(step),
+                Ok(success) => {
+                    // A guard appended by an earlier attempt of this iteration
+                    // is part of the request that produced the usage, even
+                    // when the successful attempt needed no new guard.
+                    let base_len = self.request.messages.len();
+                    let mut recovery_suffix = retry_messages
+                        .get(base_len..)
+                        .map(<[Message]>::to_vec)
+                        .unwrap_or_default();
+                    recovery_suffix.extend(success.recovery_suffix);
+                    return Ok(ModelStepOutcome {
+                        step: success.step,
+                        recovery_suffix,
+                    });
+                }
                 Err(step_error) => {
                     let (error, next_retry_messages) = step_error.into_parts();
                     retry_messages = next_retry_messages;
@@ -269,7 +347,7 @@ impl<'a> ModelRunner<'a> {
         empty_retry_attempted: &mut bool,
         output_published: Option<&AtomicBool>,
         on_delta: &(dyn Fn(String) + Send + Sync),
-    ) -> Result<ModelStep, ModelStepError> {
+    ) -> Result<ModelStepSuccess, ModelStepError> {
         send_model_step_with_empty_retry(
             ModelStepRequest {
                 messages,
@@ -291,6 +369,7 @@ pub(crate) struct ModelStepError {
 }
 
 /// An iteration-level model failure and whether it already published output.
+#[derive(Debug)]
 pub(crate) struct ModelRequestError {
     error: EgoPulseError,
     output_published: bool,
@@ -356,8 +435,8 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         .and_then(|tools| serde_json::to_string(tools).ok());
     let raw_estimate = estimate_prompt_tokens(
         request.system_prompt,
-        &request.messages,
         tools_json.as_deref(),
+        &request.messages,
     );
     let calibration_key = CalibrationKey::new(
         request.llm.provider_name(),
@@ -366,9 +445,9 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         has_tools,
     );
 
-    let response = request
+    let streamed = request
         .llm
-        .send_message_streaming(
+        .send_message_streaming_with_truncation(
             request.system_prompt,
             Arc::clone(&request.messages),
             request.tools.clone(),
@@ -383,6 +462,10 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
                 request.send_failure_log
             );
         })?;
+    let (response, truncation) = match streamed {
+        crate::llm::StreamedResponse::Complete(response) => (response, None),
+        crate::llm::StreamedResponse::Truncated { response, reason } => (response, Some(reason)),
+    };
 
     if let Some(usage) = &response.usage {
         request
@@ -391,6 +474,10 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
             .record(calibration_key, raw_estimate, usage.input_tokens)
             .await;
         log_llm_usage(&request, usage, raw_estimate, has_tools).await;
+    }
+
+    if let Some(reason) = truncation {
+        return Ok(ModelStep::Truncated { response, reason });
     }
 
     if response.tool_calls.is_empty() {
@@ -406,6 +493,7 @@ async fn send_model_step(request: ModelStepRequest<'_>) -> Result<ModelStep, Ego
         response.content,
         response.reasoning_content,
         valid_tool_calls,
+        response.usage,
     )))
 }
 
@@ -424,10 +512,14 @@ async fn send_model_step_with_empty_retry(
     request: ModelStepRequest<'_>,
     empty_retry_attempted: &mut bool,
     output_published: Option<&AtomicBool>,
-) -> Result<ModelStep, ModelStepError> {
+) -> Result<ModelStepSuccess, ModelStepError> {
     let first_response = send_model_step(request.clone()).await;
     if !model_step_response_is_empty(&first_response) {
         return first_response
+            .map(|step| ModelStepSuccess {
+                step,
+                recovery_suffix: Vec::new(),
+            })
             .map_err(|error| ModelStepError::new(error, Arc::clone(&request.messages)));
     }
 
@@ -455,12 +547,11 @@ async fn send_model_step_with_empty_retry(
         ),
         _ => ("", None),
     };
-    let retry_messages = Arc::new(runtime_guard_messages(
-        &request.messages,
-        assistant_text,
-        reasoning_content,
-        EMPTY_REPLY_RUNTIME_GUARD,
-    ));
+    let recovery_suffix =
+        runtime_guard_suffix(assistant_text, reasoning_content, EMPTY_REPLY_RUNTIME_GUARD);
+    let mut retry_messages = (*request.messages).clone();
+    retry_messages.extend(recovery_suffix.iter().cloned());
+    let retry_messages = Arc::new(retry_messages);
     let retry_messages_for_error = Arc::clone(&retry_messages);
     let retry_response = send_model_step(ModelStepRequest {
         messages: retry_messages,
@@ -474,15 +565,29 @@ async fn send_model_step_with_empty_retry(
             retry_messages_for_error,
         ))
     } else {
-        retry_response.map_err(|error| ModelStepError::new(error, retry_messages_for_error))
+        retry_response
+            .map(|step| ModelStepSuccess {
+                step,
+                recovery_suffix,
+            })
+            .map_err(|error| ModelStepError::new(error, retry_messages_for_error))
     }
+}
+
+/// A model step and the messages an internal recovery appended to the request
+/// that produced it.
+struct ModelStepSuccess {
+    step: ModelStep,
+    recovery_suffix: Vec<Message>,
 }
 
 fn model_step_response_is_empty(response: &Result<ModelStep, EgoPulseError>) -> bool {
     match response {
         Err(EgoPulseError::Llm(error)) => error.is_empty_response(),
         Ok(ModelStep::Final(response)) => strip_thinking(response.content.trim()).trim().is_empty(),
-        Ok(ModelStep::MalformedToolCalls(_)) | Ok(ModelStep::ToolCalls(_)) => false,
+        Ok(ModelStep::MalformedToolCalls(_))
+        | Ok(ModelStep::ToolCalls(_))
+        | Ok(ModelStep::Truncated { .. }) => false,
         Err(_) => false,
     }
 }
@@ -520,10 +625,11 @@ fn model_request_hash(
     format!("{:x}", hasher.finalize())
 }
 
-fn build_assistant_tool_phase(
+pub(crate) fn build_assistant_tool_phase(
     content: String,
     reasoning_content: Option<String>,
     tool_calls: Vec<ToolCall>,
+    usage: Option<LlmUsage>,
 ) -> AssistantToolPhase {
     let assistant_text = sanitize_assistant_response_text(&content);
     let assistant_preview = summarize_tool_calls_with_content(&assistant_text, &tool_calls);
@@ -533,12 +639,14 @@ fn build_assistant_tool_phase(
         reasoning_content,
         tool_calls: tool_calls.clone(),
         tool_call_id: None,
+        finish_reason: None,
     };
 
     AssistantToolPhase {
         assistant_message,
         assistant_preview,
         tool_calls,
+        usage,
     }
 }
 
@@ -667,6 +775,7 @@ mod tests {
             "<thinking>hidden</thinking>Reading notes".to_string(),
             Some("reasoning".to_string()),
             tool_calls.clone(),
+            None,
         );
 
         // Assert
@@ -1102,7 +1211,7 @@ mod tests {
         // Assert
         assert!(retry_attempted);
         assert!(matches!(
-            response,
+            response.step,
             ModelStep::Final(response) if response.content == "recovered response"
         ));
         let seen_messages = observer.seen_messages();
@@ -1110,6 +1219,79 @@ mod tests {
         let retry_message = seen_messages[1].last().expect("runtime guard message");
         assert_eq!(retry_message.role, "user");
         assert!(message_to_text(retry_message).contains("no user-visible text"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_reply_recovery_reports_the_messages_it_appended() {
+        // Arrange: the first response is empty, so the runner re-sends the
+        // request with the runtime guard and returns the recovered answer.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = RecordingProvider::new(
+            vec![
+                Ok(MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                }),
+                Ok(MessagesResponse {
+                    content: "recovered response".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 120,
+                        output_tokens: 8,
+                        cached_input_tokens: None,
+                    }),
+                }),
+            ],
+            vec![0, 0],
+        );
+        let state = build_state_with_provider(
+            dir.path().to_str().expect("utf8").to_string(),
+            Box::new(provider),
+        );
+        let context = cli_context("empty-response-measurement");
+        let snapshot = state.config_manager.current_blocking();
+        let llm = state
+            .turn_dependencies()
+            .llm_for_context_with_snapshot(&context, &snapshot)
+            .expect("llm");
+        let runtime = state.turn_dependencies();
+        let runner = ModelRunner::new(ModelStepRequest {
+            state: &runtime,
+            llm: llm.as_ref(),
+            system_prompt: "system prompt",
+            messages: Arc::new(vec![Message::text("user", "hello")]),
+            tools: None,
+            chat_id: 1,
+            caller_channel: "cli",
+            request_kind: "agent_loop",
+            usage_log_failure: "llm usage logging failed",
+            log_scope: "agent_loop",
+            send_failure_log: "LLM send_message failed",
+            iteration: 1,
+            scope: ConversationScope::Normal,
+            on_delta: &ignore_delta,
+        });
+
+        // Act
+        let outcome = runner
+            .run_with_transient_retry(Duration::from_secs(5))
+            .await
+            .expect("empty response should recover");
+
+        // Assert: the usage was measured on the guarded request, so the caller
+        // receives exactly the messages that request added.
+        assert!(matches!(
+            outcome.step,
+            ModelStep::Final(response) if response.content == "recovered response"
+        ));
+        assert_eq!(outcome.recovery_suffix.len(), 2);
+        assert_eq!(outcome.recovery_suffix[0].role, "assistant");
+        assert_eq!(outcome.recovery_suffix[1].role, "user");
+        assert!(message_to_text(&outcome.recovery_suffix[1]).contains("no user-visible text"));
     }
 
     #[tokio::test]
@@ -1464,7 +1646,11 @@ mod tests {
                     content: "recovered after guarded retry".to_string(),
                     reasoning_content: None,
                     tool_calls: Vec::new(),
-                    usage: None,
+                    usage: Some(crate::llm::LlmUsage {
+                        input_tokens: 120,
+                        output_tokens: 8,
+                        cached_input_tokens: None,
+                    }),
                 }),
             ],
             vec![0, 0, 0],
@@ -1488,6 +1674,35 @@ mod tests {
         let second_guard = seen_messages[2].last().expect("second guard message");
         assert!(message_to_text(first_guard).contains("no user-visible text"));
         assert_eq!(message_to_text(first_guard), message_to_text(second_guard));
+
+        // The successful retry is also the usage measurement target.
+        let chat_id = call_blocking(Arc::clone(&state.db), move |db| {
+            db.resolve_or_create_chat_id(
+                "cli",
+                "cli:empty-guard-transient:agent:default",
+                "cli",
+                "default",
+            )
+        })
+        .await
+        .expect("chat id");
+        for _ in 0..20 {
+            let (requests, input_tokens, output_tokens, total_tokens) =
+                call_blocking(Arc::clone(&state.db), move |db| {
+                    db.get_llm_usage_summary(Some(chat_id))
+                })
+                .await
+                .expect("usage summary");
+            if requests > 0 {
+                assert_eq!(
+                    (requests, input_tokens, output_tokens, total_tokens),
+                    (1, 120, 8, 128)
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("usage log was not written within the polling timeout");
     }
 
     #[tokio::test]

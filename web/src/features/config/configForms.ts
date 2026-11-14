@@ -33,11 +33,9 @@ export function generalTarget(config: RuntimeConfig): EditTarget {
       default_model: g.default_model,
       timezone: g.timezone,
       max_history_messages: g.max_history_messages,
-      compaction_timeout_secs: g.compaction_timeout_secs,
-      default_context_window_tokens: g.default_context_window_tokens,
-      compaction_threshold_ratio: g.compaction_threshold_ratio,
-      compaction_target_ratio: g.compaction_target_ratio,
-      compact_keep_recent: g.compact_keep_recent,
+      compaction_enabled: g.compaction_enabled,
+      compaction_reserve_tokens: g.compaction_reserve_tokens,
+      compaction_keep_recent_tokens: g.compaction_keep_recent_tokens,
     },
     specs: [
       {
@@ -65,11 +63,9 @@ export function generalTarget(config: RuntimeConfig): EditTarget {
         hint: "IANA name, e.g. Asia/Tokyo. Sleep, Pulse, and timestamps use it.",
       },
       { key: "max_history_messages", label: "History messages", kind: "number", min: 1, hint: `Messages restored when a session has no saved state. Default ${g.defaults.max_history_messages}.` },
-      { key: "default_context_window_tokens", label: "Context window", kind: "number", min: 1, max: 1_000_000, hint: `Tokens, for models without their own setting. Default ${g.defaults.default_context_window_tokens}.` },
-      { key: "compaction_threshold_ratio", label: "Compact at", kind: "number", step: 0.05, min: 0.05, max: 1, hint: `Share of the context window that triggers compaction. Default ${g.defaults.compaction_threshold_ratio}.` },
-      { key: "compaction_target_ratio", label: "Compact down to", kind: "number", step: 0.05, min: 0.05, max: 0.95, hint: `Share left after compaction; below "Compact at". Default ${g.defaults.compaction_target_ratio}.` },
-      { key: "compact_keep_recent", label: "Keep recent", kind: "number", min: 0, hint: `Latest messages kept verbatim. Default ${g.defaults.compact_keep_recent}.` },
-      { key: "compaction_timeout_secs", label: "Compaction timeout", kind: "number", min: 1, hint: `Seconds. Default ${g.defaults.compaction_timeout_secs}.` },
+      { key: "compaction_enabled", label: "Automatic compaction", kind: "toggle", hint: `Compact long contexts automatically. Default ${g.defaults.compaction_enabled}.` },
+      { key: "compaction_reserve_tokens", label: "Reserve tokens", kind: "number", min: 0, hint: `Context window headroom for output, tools, and margin. Default ${g.defaults.compaction_reserve_tokens}.` },
+      { key: "compaction_keep_recent_tokens", label: "Keep recent tokens", kind: "number", min: 0, hint: `Recent history kept verbatim. Default ${g.defaults.compaction_keep_recent_tokens}.` },
     ],
   };
 }

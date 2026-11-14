@@ -26,6 +26,8 @@ export interface ChatMessage {
   content: string;
   timestamp: string;
   message_kind: string;
+  /** Why the model stopped early; null for a complete answer. */
+  finish_reason?: string | null;
   /** Pulse activation this row belongs to; absent or null outside any activation. */
   pulse?: PulseRef | null;
   /** Owning run for live entries (replay-truncated cleanup); absent on persisted rows. */

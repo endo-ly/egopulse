@@ -24,9 +24,10 @@ pub(crate) fn row_to_stored_message(row: &rusqlite::Row<'_>) -> rusqlite::Result
         timestamp: row.get(5)?,
         message_kind,
         recipient_agent_id: row.get(7)?,
-        seq: row.get(8).ok(),
-        turn_id: row.get(9).ok(),
-        parent_message_id: row.get(10).ok(),
+        seq: row.get(8)?,
+        turn_id: row.get(9)?,
+        parent_message_id: row.get(10)?,
+        finish_reason: row.get(11)?,
     })
 }
 
@@ -216,7 +217,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1 AND seq IS NOT NULL AND seq < ?2
              ORDER BY seq DESC
@@ -246,7 +248,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1 AND seq IS NOT NULL AND message_kind <> ?2
              ORDER BY seq DESC
@@ -300,7 +303,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1 AND seq IS NOT NULL
              ORDER BY seq ASC",
@@ -308,6 +312,47 @@ impl Database {
         stmt.query_map(params![chat_id], row_to_stored_message)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Loads one message's content and model finish reason by id.
+    ///
+    /// Replay paths rebuild the final delivery from the persisted row, so a
+    /// truncated answer is reported as truncated on re-acceptance too.
+    pub(crate) fn get_message_delivery(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<(String, Option<String>)>, StorageError> {
+        let conn = self.get_conn()?;
+        let delivery = conn
+            .query_row(
+                "SELECT content, finish_reason FROM messages WHERE id = ?1",
+                params![message_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        Ok(delivery)
+    }
+
+    /// Loads the finish reason persisted for a Turn's final message.
+    ///
+    /// Channel delivery uses it to mark a truncated answer on transports that
+    /// carry only text.
+    pub(crate) fn get_turn_final_finish_reason(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.get_conn()?;
+        let reason = conn
+            .query_row(
+                "SELECT m.finish_reason
+                 FROM turn_runs t
+                 JOIN messages m ON m.id = t.final_message_id
+                 WHERE t.turn_id = ?1",
+                params![turn_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(reason.flatten())
     }
 
     /// Loads the `content` column of a single message by its id.
@@ -352,7 +397,8 @@ impl Database {
         let existing = tx
             .query_row(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                        finish_reason
                  FROM messages WHERE id = ?1 AND chat_id = ?2",
                 params![request_key, chat_id],
                 row_to_stored_message,
@@ -369,7 +415,7 @@ impl Database {
                 )));
             }
             tx.commit()?;
-            return Ok(StageToolFollowupOutcome::Accepted(message));
+            return Ok(StageToolFollowupOutcome::Accepted(Box::new(message)));
         }
 
         let existing_turn_hash: Option<String> = tx
@@ -446,6 +492,7 @@ impl Database {
             seq: None,
             turn_id: Some(turn_id),
             parent_message_id: None,
+            finish_reason: None,
         };
         tx.execute(
             "INSERT INTO messages
@@ -466,7 +513,7 @@ impl Database {
             ],
         )?;
         tx.commit()?;
-        Ok(StageToolFollowupOutcome::Accepted(message))
+        Ok(StageToolFollowupOutcome::Accepted(Box::new(message)))
     }
 
     /// Lists staged user messages owned by one Turn in acceptance order.
@@ -477,7 +524,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE turn_id = ?1 AND seq IS NULL
                AND sender_kind = 'user' AND message_kind = 'message'
@@ -498,7 +546,7 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.chat_id, m.sender_id, m.content, m.sender_kind, m.timestamp,
                     m.message_kind, m.recipient_agent_id, m.seq, m.turn_id,
-                    m.parent_message_id, t.scheduled_request_json
+                    m.parent_message_id, m.finish_reason, t.scheduled_request_json
              FROM messages m
              JOIN turn_runs t ON t.turn_id = m.turn_id
              WHERE m.seq IS NULL AND m.sender_kind = 'user'
@@ -510,7 +558,7 @@ impl Database {
         stmt.query_map(params![limit as i64], |row| {
             Ok(TerminalStagedMessage {
                 message: row_to_stored_message(row)?,
-                scheduled_request_json: row.get(11)?,
+                scheduled_request_json: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -564,7 +612,8 @@ impl Database {
         let mut staged = {
             let mut stmt = tx.prepare(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                        finish_reason
                  FROM messages
                  WHERE chat_id = ?1 AND turn_id = ?2 AND seq IS NULL
                    AND sender_kind = 'user' AND message_kind = 'message'
@@ -754,8 +803,9 @@ pub(super) fn commit_message_locked(
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO messages
              (id, chat_id, sender_id, content, sender_kind, timestamp,
-              message_kind, recipient_agent_id, seq, turn_id, parent_message_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+              finish_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             &message.id,
             message.chat_id,
@@ -768,6 +818,7 @@ pub(super) fn commit_message_locked(
             seq,
             message.turn_id.as_deref(),
             message.parent_message_id.as_deref(),
+            message.finish_reason.as_deref(),
         ],
     )?;
 
@@ -847,7 +898,7 @@ impl Database {
 
     /// Advances the LLM session snapshot without appending a message.
     ///
-    /// Used by compaction and by unconditional session seeds. Bumps
+    /// Bumps
     /// `chats.revision` so the change is observable under the same CAS
     /// contract. `snapshot_through_seq` is left at the chat's current maximum
     /// `seq` (no new message was added).
@@ -914,6 +965,11 @@ impl Database {
 // ---------------------------------------------------------------------------
 
 impl Database {
+    /// Seeds or replaces a session snapshot unconditionally.
+    ///
+    /// Production paths must use the CAS-aware writers ([`Self::store_message_with_session`],
+    /// [`Self::replace_session_snapshot`], [`Self::truncate_session_messages`]).
+    #[cfg(test)]
     pub(crate) fn save_session(
         &self,
         chat_id: i64,
@@ -971,9 +1027,11 @@ impl Database {
         Ok(updated > 0)
     }
 
-    /// Clears session message history by setting `messages_json` to an empty
-    /// JSON array.  The session row itself and `messages` / `tool_calls`
-    /// records are preserved.
+    /// Clears session message history by writing an empty `ContextSnapshot`.
+    ///
+    /// The snapshot keeps the envelope version so the next Turn can restore it
+    /// normally. The session row itself and `messages` / `tool_calls` records
+    /// are preserved.
     ///
     /// Uses optimistic concurrency on `chats.revision`: the update only
     /// succeeds when `expected_revision` matches the current row.  Returns
@@ -984,18 +1042,46 @@ impl Database {
         chat_id: i64,
         expected_revision: i64,
     ) -> Result<bool, StorageError> {
-        match self.update_session_snapshot(chat_id, "[]", Some(expected_revision)) {
+        let empty_snapshot = serde_json::json!({
+            "version": super::SESSION_SNAPSHOT_VERSION,
+            "messages": [],
+        })
+        .to_string();
+        match self.update_session_snapshot(chat_id, &empty_snapshot, Some(expected_revision)) {
             Ok(_) => Ok(true),
             Err(StorageError::SessionSnapshotConflict) => Ok(false),
             Err(other) => Err(other),
         }
     }
 
+    /// Replaces the session snapshot only when `expected_revision` matches.
+    ///
+    /// Used by `/compact` and by the Agent Loop when it commits a compaction
+    /// checkpoint before a model request. `None` seeds the snapshot when the
+    /// chat has none yet. Returns the new `chats.revision`, or `Ok(None)` when
+    /// the chat was updated concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] when the underlying SQLite update fails.
+    pub(crate) fn replace_session_snapshot(
+        &self,
+        chat_id: i64,
+        new_messages_json: &str,
+        expected_revision: Option<i64>,
+    ) -> Result<Option<i64>, StorageError> {
+        match self.update_session_snapshot(chat_id, new_messages_json, expected_revision) {
+            Ok(outcome) => Ok(Some(outcome.revision)),
+            Err(StorageError::SessionSnapshotConflict) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Updates `sessions.messages_json` to `new_messages_json` and bumps
     /// `chats.revision`. Unlike [`Database::clear_session_messages`], which
-    /// wipes to `[]`, this keeps a caller-supplied payload — used by the sleep
-    /// batch to retain the trailing N messages while still archiving the full
-    /// conversation.
+    /// writes an empty `ContextSnapshot`, this keeps a caller-supplied payload
+    /// — used by the sleep batch to retain the trailing N messages while still
+    /// archiving the full conversation.
     ///
     /// Uses optimistic concurrency on `chats.revision`: the update only
     /// succeeds when `expected_revision` matches the current row. Returns
@@ -1065,7 +1151,8 @@ impl Database {
         let recent_messages = {
             let mut stmt = tx.prepare(
                 "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                        message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                        finish_reason
                  FROM messages
                  WHERE chat_id = ?1 AND seq IS NOT NULL AND message_kind <> ?2
                  ORDER BY seq DESC
@@ -1144,7 +1231,8 @@ impl Database {
         let conn = self.get_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT id, chat_id, sender_id, content, sender_kind, timestamp,
-                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id
+                    message_kind, recipient_agent_id, seq, turn_id, parent_message_id,
+                    finish_reason
              FROM messages
              WHERE chat_id = ?1
                AND seq IS NOT NULL
@@ -1211,6 +1299,7 @@ impl Database {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         self.store_channel_log_message(&message).map(|_| ())
     }
@@ -1236,6 +1325,56 @@ mod tests {
                 rusqlite::params![id, chat_id, "alice", content, "user", ts, "message"],
             )
             .expect("store message");
+    }
+
+    #[test]
+    fn finish_reason_round_trips_through_the_messages_table() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let mut message =
+            StoredMessage::assistant(100, "lyre".to_string(), "partial answer".to_string());
+        message.id = "truncated-1".to_string();
+        message.finish_reason = Some("max_output_tokens".to_string());
+
+        // Act
+        db.store_message_only(&message).expect("store message");
+        let loaded = db.get_all_messages(100).expect("history");
+        let delivery = db
+            .get_message_delivery("truncated-1")
+            .expect("delivery")
+            .expect("row");
+
+        // Assert
+        assert_eq!(
+            loaded[0].finish_reason.as_deref(),
+            Some("max_output_tokens")
+        );
+        assert_eq!(
+            delivery,
+            (
+                "partial answer".to_string(),
+                Some("max_output_tokens".to_string())
+            )
+        );
+
+        // The channel delivery path resolves the reason from the Turn row.
+        let conn = db.get_conn().expect("pool");
+        conn.execute(
+            "INSERT INTO turn_runs
+                 (turn_id, chat_id, request_key, state, config_revision,
+                  final_message_id, accepted_at, updated_at)
+             VALUES ('turn-1', 100, 'req-1', 'completed', 1, 'truncated-1', 't', 't')",
+            [],
+        )
+        .expect("seed turn");
+        assert_eq!(
+            db.get_turn_final_finish_reason("turn-1").expect("reason"),
+            Some("max_output_tokens".to_string())
+        );
+        assert_eq!(
+            db.get_turn_final_finish_reason("missing").expect("missing"),
+            None
+        );
     }
 
     #[test]
@@ -1459,8 +1598,11 @@ mod tests {
         let (db, _dir) = test_db();
         let chat_id = 100;
 
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
+        )
+        .expect("save session");
         store_msg(&db, "msg-1", chat_id, "hello", "2024-01-01T00:00:00Z");
         store_msg(&db, "msg-2", chat_id, "hi", "2024-01-01T00:00:01Z");
 
@@ -1473,10 +1615,18 @@ mod tests {
         assert!(cleared, "should have updated the row");
 
         let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
+        let cleared_json: serde_json::Value =
+            serde_json::from_str(snapshot.messages_json.as_deref().expect("snapshot body"))
+                .expect("valid snapshot JSON");
         assert_eq!(
-            snapshot.messages_json.as_deref(),
-            Some(r#"[]"#),
-            "messages_json should be empty array"
+            cleared_json["version"],
+            serde_json::json!(crate::storage::SESSION_SNAPSHOT_VERSION),
+            "the cleared snapshot must keep the envelope version"
+        );
+        assert_eq!(
+            cleared_json["messages"],
+            serde_json::json!([]),
+            "messages_json should contain an empty message list"
         );
 
         let messages = db
@@ -1490,8 +1640,11 @@ mod tests {
         let (db, _dir) = test_db();
         let chat_id = 200;
 
-        db.save_session(chat_id, r#"[{"role":"user","content":"hello"}]"#)
-            .expect("save session");
+        db.save_session(
+            chat_id,
+            &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
+        )
+        .expect("save session");
 
         let cleared = db
             .clear_session_messages(chat_id, 0)
@@ -1499,8 +1652,15 @@ mod tests {
         assert!(!cleared, "should not have updated the row");
 
         let snapshot = db.load_session_snapshot(chat_id, 10).expect("load session");
-        assert!(
-            snapshot.messages_json.as_deref() != Some(r#"[]"#),
+        let current: serde_json::Value =
+            serde_json::from_str(snapshot.messages_json.as_deref().expect("snapshot body"))
+                .expect("valid snapshot JSON");
+        assert_eq!(
+            current["messages"]
+                .as_array()
+                .expect("messages array")
+                .len(),
+            1,
             "messages_json should not be cleared"
         );
     }
@@ -1572,6 +1732,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
 
         db.store_message_with_session(&message, r#"[{"role":"user","content":"hello"}]"#, None)
@@ -1590,6 +1751,7 @@ mod tests {
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             },
             r#"[{"role":"user","content":"hello again"}]"#,
             None,

@@ -127,6 +127,21 @@ impl EgoPulseError {
             Self::Llm(LlmError::IncompleteResponse(_)) => {
                 "LLM response was incomplete (output limit or content filter).".to_string()
             }
+            Self::Llm(LlmError::OutputCapacityExceeded { .. }) => {
+                "The conversation left no room for a model answer. Please try again.".to_string()
+            }
+            Self::Llm(LlmError::OutputLimitBelowApiMinimum {
+                configured,
+                minimum,
+            }) => {
+                format!(
+                    "The configured output limit ({configured}) is below the API minimum ({minimum}). Increase max_output_tokens."
+                )
+            }
+            Self::Llm(LlmError::SummaryInputCapacityExceeded { .. }) => {
+                "The conversation is too large to summarize within the model context window."
+                    .to_string()
+            }
             Self::Llm(LlmError::InvalidResponse(_)) => {
                 "LLM returned an invalid response.".to_string()
             }
@@ -136,6 +151,18 @@ impl EgoPulseError {
             Self::Storage(_) => "Internal storage error.".to_string(),
             _ => "An unexpected error occurred.".to_string(),
         }
+    }
+
+    /// Returns `true` when the provider rejected the request because the
+    /// prompt exceeded the model's context window.
+    pub(crate) fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::Llm(error) if error.is_context_overflow())
+    }
+
+    /// Returns `true` when the request left no room for the API's minimum
+    /// output, so it must be compacted instead of sent.
+    pub(crate) fn is_output_capacity_exceeded(&self) -> bool {
+        matches!(self, Self::Llm(error) if error.is_output_capacity_exceeded())
     }
 
     pub(crate) fn is_codex_auth_error(&self) -> bool {
@@ -347,6 +374,28 @@ pub enum LlmError {
         body_preview: String,
         retry_after_secs: Option<u64>,
     },
+    #[error("llm_context_overflow: status={status} body_preview={body_preview}")]
+    ContextOverflow {
+        status: reqwest::StatusCode,
+        body_preview: String,
+    },
+    #[error(
+        "llm_output_capacity_exceeded: context_window={context_window} prompt_tokens={prompt_tokens} minimum_output_tokens={minimum_output_tokens}"
+    )]
+    OutputCapacityExceeded {
+        context_window: usize,
+        prompt_tokens: usize,
+        minimum_output_tokens: usize,
+    },
+    #[error("llm_output_limit_below_api_minimum: configured={configured} minimum={minimum}")]
+    OutputLimitBelowApiMinimum { configured: usize, minimum: usize },
+    #[error(
+        "llm_summary_input_capacity_exceeded: budget_tokens={budget_tokens} required_tokens={required_tokens}"
+    )]
+    SummaryInputCapacityExceeded {
+        budget_tokens: usize,
+        required_tokens: usize,
+    },
     #[error("llm_invalid_response: {0}")]
     InvalidResponse(String),
     #[error("llm_deadline_exceeded: no response within the model iteration deadline")]
@@ -367,23 +416,49 @@ impl LlmError {
         )
     }
 
+    /// Returns `true` when the provider rejected the request because the
+    /// prompt exceeded the model's context window.
+    ///
+    /// The classification happens at the provider boundary, which is the only
+    /// place that knows the provider's error vocabulary; callers only react to
+    /// the variant.
+    pub(crate) fn is_context_overflow(&self) -> bool {
+        matches!(self, Self::ContextOverflow { .. })
+    }
+
+    /// Returns `true` when the request cannot be sent because the prompt leaves
+    /// less than the API's minimum output room.
+    ///
+    /// The LLM client refuses to build such a request: a one-token generation
+    /// limit cannot produce an answer, and the caller must compact the context
+    /// instead of retrying the same request.
+    pub(crate) fn is_output_capacity_exceeded(&self) -> bool {
+        matches!(self, Self::OutputCapacityExceeded { .. })
+    }
+
     /// Returns `true` when the error represents a transient failure that is
     /// safe to retry when nothing was published yet: a network/timeout failure
     /// (before or during the response body), a 429 / 5xx response, or a stream
     /// that ended before its completion event.
     ///
     /// Non-retryable variants (`InvalidResponse`, `IncompleteResponse`,
-    /// `InitFailed`, `RequestConstructionFailed`, `DeadlineExceeded`, and 4xx
-    /// other than 429) either indicate a deterministic problem, mean the
-    /// provider completed the generation but cut it off (output limit or
-    /// content filter), imply the provider already produced a response that
-    /// must not be silently discarded, or mean the iteration's time window is
-    /// gone.
+    /// `ContextOverflow`, `OutputCapacityExceeded`, `OutputLimitBelowApiMinimum`,
+    /// `SummaryInputCapacityExceeded`, `InitFailed`, `RequestConstructionFailed`,
+    /// `DeadlineExceeded`, and 4xx other than 429) either indicate a
+    /// deterministic problem, mean the provider completed the generation but
+    /// cut it off (output limit or content filter), require a smaller request
+    /// instead of an identical retry, imply the provider already produced a
+    /// response that must not be silently discarded, or mean the iteration's
+    /// time window is gone.
     pub(crate) fn is_retryable(&self) -> bool {
         match self {
             Self::RequestFailed(_) | Self::IncompleteStream(_) => true,
             Self::ApiError { status, .. } => status.as_u16() == 429 || status.is_server_error(),
-            Self::InitFailed(_)
+            Self::ContextOverflow { .. }
+            | Self::OutputCapacityExceeded { .. }
+            | Self::OutputLimitBelowApiMinimum { .. }
+            | Self::SummaryInputCapacityExceeded { .. }
+            | Self::InitFailed(_)
             | Self::IncompleteResponse(_)
             | Self::InvalidResponse(_)
             | Self::DeadlineExceeded
@@ -397,13 +472,41 @@ impl LlmError {
             Self::ApiError {
                 retry_after_secs, ..
             } => *retry_after_secs,
-            Self::InitFailed(_)
+            Self::ContextOverflow { .. }
+            | Self::OutputCapacityExceeded { .. }
+            | Self::OutputLimitBelowApiMinimum { .. }
+            | Self::SummaryInputCapacityExceeded { .. }
+            | Self::InitFailed(_)
             | Self::RequestFailed(_)
             | Self::IncompleteStream(_)
             | Self::IncompleteResponse(_)
             | Self::InvalidResponse(_)
             | Self::DeadlineExceeded
             | Self::RequestConstructionFailed(_) => None,
+        }
+    }
+}
+
+impl From<crate::llm::tokens::OutputCapacityError> for LlmError {
+    fn from(error: crate::llm::tokens::OutputCapacityError) -> Self {
+        use crate::llm::tokens::OutputCapacityError;
+        match error {
+            OutputCapacityError::InsufficientRoom {
+                context_window,
+                prompt_tokens,
+                minimum_output_tokens,
+            } => Self::OutputCapacityExceeded {
+                context_window,
+                prompt_tokens,
+                minimum_output_tokens,
+            },
+            OutputCapacityError::BelowApiMinimum {
+                intended,
+                minimum_output_tokens,
+            } => Self::OutputLimitBelowApiMinimum {
+                configured: intended,
+                minimum: minimum_output_tokens,
+            },
         }
     }
 }
@@ -430,6 +533,8 @@ pub enum StorageError {
     TaskJoin(String),
     #[error("storage_session_serialize_failed: {0}")]
     SessionSerialize(#[from] serde_json::Error),
+    #[error("session_snapshot_invalid: {0}")]
+    InvalidSnapshot(String),
     #[error("storage_session_snapshot_conflict")]
     SessionSnapshotConflict,
     #[error("storage_not_found: {0}")]

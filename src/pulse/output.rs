@@ -13,6 +13,7 @@ use tracing::{error, warn};
 use crate::agent_loop::session::{
     LoadedSession, PersistedTurn, persist_phase, persist_phase_messages,
 };
+use crate::agent_loop::session_snapshot::SessionContext;
 use crate::agent_loop::tool_execution::MAX_TOOL_RESULT_TEXT_CHARS;
 use crate::channels::utils::text::truncate_by_chars;
 use crate::conversation::ConversationScope;
@@ -284,27 +285,35 @@ async fn persist_notification_with_loaded(
     };
 
     let synthetic_message = Message::text("user", &synthetic_input.content);
-    let mut session_messages = (*loaded.messages).clone();
-    session_messages.push(synthetic_message.clone());
+    let mut session_context = SessionContext {
+        checkpoint: loaded.context.checkpoint.clone(),
+        messages: Arc::new((*loaded.context.messages).clone()),
+        last_usage: loaded.context.last_usage.clone(),
+    };
+    let mut input_messages = (*session_context.messages).clone();
+    input_messages.push(synthetic_message.clone());
+    session_context.messages = Arc::new(input_messages);
 
     let PersistedTurn {
         mut revision,
-        messages: mut session_messages,
+        context: mut session_context,
     } = persist_phase(
         &state.turn_dependencies(),
         ConversationScope::Normal,
         synthetic_input.clone(),
         synthetic_message,
-        &session_messages,
+        session_context,
         loaded.session_revision,
     )
     .await?;
 
     for phase in &activation_result.tool_phases {
-        session_messages.push(phase.assistant_message.clone());
+        let mut messages = (*session_context.messages).clone();
+        messages.push(phase.assistant_message.clone());
+        session_context.messages = Arc::new(messages);
         let PersistedTurn {
             revision: next_revision,
-            messages: persisted_messages,
+            context: persisted_context,
         } = persist_phase(
             &state.turn_dependencies(),
             ConversationScope::Normal,
@@ -317,18 +326,20 @@ async fn persist_notification_with_loaded(
                 )
             },
             phase.assistant_message.clone(),
-            &session_messages,
+            session_context,
             Some(revision),
         )
         .await?;
         revision = next_revision;
-        session_messages = persisted_messages;
+        session_context = persisted_context;
 
         if !phase.tool_messages.is_empty() {
-            session_messages.extend(phase.tool_messages.iter().cloned());
+            let mut messages = (*session_context.messages).clone();
+            messages.extend(phase.tool_messages.iter().cloned());
+            session_context.messages = Arc::new(messages);
             let PersistedTurn {
                 revision: next_revision,
-                messages: persisted_messages,
+                context: persisted_context,
             } = persist_phase_messages(
                 &state.turn_dependencies(),
                 ConversationScope::Normal,
@@ -342,12 +353,12 @@ async fn persist_notification_with_loaded(
                     )
                 },
                 phase.tool_messages.clone(),
-                &session_messages,
+                session_context,
                 Some(revision),
             )
             .await?;
             revision = next_revision;
-            session_messages = persisted_messages;
+            session_context = persisted_context;
         }
     }
 
@@ -358,14 +369,16 @@ async fn persist_notification_with_loaded(
     };
 
     let assistant_message = Message::text("assistant", output_text);
-    session_messages.push(assistant_message.clone());
+    let mut messages = (*session_context.messages).clone();
+    messages.push(assistant_message.clone());
+    session_context.messages = Arc::new(messages);
 
     persist_phase(
         &state.turn_dependencies(),
         ConversationScope::Normal,
         assistant_msg,
         assistant_message,
-        &session_messages,
+        session_context,
         Some(revision),
     )
     .await?;
@@ -736,7 +749,11 @@ mod tests {
         let seed = StoredMessage::user(chat_id, "user:test".to_string(), "seed".to_string());
         state
             .db
-            .store_message_with_session(&seed, r#"[{"role":"user","content":"seed"}]"#, None)
+            .store_message_with_session(
+                &seed,
+                &crate::test_util::session_envelope(r#"[{"role":"user","content":"seed"}]"#),
+                None,
+            )
             .expect("seed session");
         let stale = crate::agent_loop::session::load_messages_for_turn(
             &state.turn_dependencies(),
@@ -753,7 +770,9 @@ mod tests {
             .db
             .store_message_with_session(
                 &concurrent,
-                r#"[{"role":"user","content":"seed"},{"role":"user","content":"concurrent"}]"#,
+                &crate::test_util::session_envelope(
+                    r#"[{"role":"user","content":"seed"},{"role":"user","content":"concurrent"}]"#,
+                ),
                 stale.session_revision,
             )
             .expect("advance session");
@@ -820,6 +839,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
         let tool_message = Message {
             role: "tool".to_string(),
@@ -827,6 +847,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("call-read".to_string()),
+            finish_reason: None,
         };
         let activation = ActivationResult {
             output_text: notification_text.to_string(),
@@ -1121,6 +1142,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         assert_eq!(msg.sender_kind, SenderKind::User);
         assert_eq!(msg.sender_id, "pulse");

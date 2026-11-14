@@ -323,6 +323,7 @@ pub(super) async fn get_history(
                 "content": content,
                 "timestamp": message.timestamp,
                 "message_kind": message.message_kind.to_string(),
+                "finish_reason": message.finish_reason,
                 "pulse": pulse_entry(&message.id, &pulse_intentions),
             }));
         }
@@ -765,6 +766,46 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"message"));
         assert!(kinds.contains(&"system_event"));
+    }
+
+    #[tokio::test]
+    async fn api_history_reports_the_model_finish_reason() {
+        // Arrange: one truncated answer next to a complete one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let web_state = test_web_state(&dir);
+        let db = Arc::clone(&web_state.app_state.db);
+        let chat_id = insert_web_chat(&db, "web:main", "default");
+
+        let mut truncated =
+            StoredMessage::assistant(chat_id, "lyre".to_string(), "partial".to_string());
+        truncated.id = "truncated-1".to_string();
+        truncated.finish_reason = Some("max_output_tokens".to_string());
+        db.store_message_only(&truncated).expect("store truncated");
+        let complete =
+            StoredMessage::assistant(chat_id, "lyre".to_string(), "complete".to_string());
+        db.store_message_only(&complete).expect("store complete");
+
+        let query = Query(super::HistoryQuery {
+            session_key: Some("main".to_string()),
+            limit: None,
+            before_seq: None,
+        });
+
+        // Act
+        let result = get_history(AxumState(web_state), query).await.expect("ok");
+
+        // Assert
+        let messages = result.0["messages"].as_array().expect("messages array");
+        let truncated = messages
+            .iter()
+            .find(|message| message["id"] == "truncated-1")
+            .expect("truncated row");
+        assert_eq!(truncated["finish_reason"], "max_output_tokens");
+        let complete = messages
+            .iter()
+            .find(|message| message["content"] == "complete")
+            .expect("complete row");
+        assert!(complete["finish_reason"].is_null());
     }
 
     #[tokio::test]

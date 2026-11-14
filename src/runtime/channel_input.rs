@@ -153,6 +153,7 @@ pub(crate) async fn store_human_channel_log_message(
                 seq: None,
                 turn_id: None,
                 parent_message_id: None,
+                finish_reason: None,
             };
             if let Err(error) = call_blocking(db, move |db| db.store_message_only(&stored)).await {
                 tracing::warn!(

@@ -3,15 +3,18 @@
 //! OpenAI 互換 Chat Completions API および Responses API へのリクエスト構築・送信・
 //! レスポンス解析を行う。ツールコールに対応する。
 
+mod api_error;
 mod cache;
 pub(crate) mod calibration;
 pub(crate) mod codex_auth;
 mod headers;
 mod messages;
+pub(crate) mod model_catalog;
 mod openai;
 mod responses;
 mod retry;
 mod sse;
+pub(crate) mod tokens;
 
 use std::sync::Arc;
 
@@ -92,6 +95,12 @@ pub(crate) struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Why an assistant message ended before the model chose to stop.
+    ///
+    /// The field is persisted with the session message and never sent to the
+    /// provider: request translation reads the content and tool calls only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<TruncationReason>,
 }
 
 /// Message content: either plain text or multimodal parts.
@@ -169,6 +178,7 @@ impl Message {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
+            finish_reason: None,
         }
     }
 }
@@ -191,11 +201,74 @@ pub(crate) struct MessagesResponse {
     pub usage: Option<LlmUsage>,
 }
 
+/// Why a provider stopped a generation before the model chose to stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TruncationReason {
+    /// The generation reached the requested (or context-clamped) output limit.
+    MaxOutputTokens,
+}
+
+impl TruncationReason {
+    /// Stable text used in errors and logs.
+    pub(crate) fn as_str(self) -> &'static str {
+        "max_output_tokens"
+    }
+
+    /// Parses the persisted form; unknown values read as "no reason".
+    pub(crate) fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "max_output_tokens" => Some(Self::MaxOutputTokens),
+            _ => None,
+        }
+    }
+
+    /// Text shown next to a truncated answer on text-only channels.
+    pub(crate) fn notice(self) -> &'static str {
+        "The response stopped at the output limit, so it may be incomplete."
+    }
+}
+
+/// Outcome of one streamed request.
+///
+/// A truncated generation keeps its text, tool calls, and usage so the caller
+/// can decide whether a recovery attempt is justified. The strict
+/// [`LlmProvider::send_message_streaming`] contract turns it into an error for
+/// callers that must not act on a partial generation.
+#[derive(Debug)]
+pub(crate) enum StreamedResponse {
+    /// The model finished on its own.
+    Complete(MessagesResponse),
+    /// The provider ended the generation at a limit.
+    Truncated {
+        response: MessagesResponse,
+        reason: TruncationReason,
+    },
+}
+
 /// Trait for LLM providers that send a single request and return a complete message response.
 #[async_trait]
 pub(crate) trait LlmProvider: Send + Sync {
     fn provider_name(&self) -> &str;
     fn model_name(&self) -> &str;
+
+    /// Returns the output limit this provider would send for a request.
+    ///
+    /// The provider estimates the prompt, fits it into the model's context
+    /// window, and applies the API surface's minimum output. Compaction calls
+    /// this for the projected context so a checkpoint is judged by exactly the
+    /// same calculation as the request that follows it. The message references
+    /// keep the check from cloning the conversation.
+    ///
+    /// Returns `Ok(None)` when the provider does not enforce a model window.
+    fn request_output_limit(
+        &self,
+        _system_prompt: &str,
+        _tools_json: Option<&str>,
+        _messages: &[&Message],
+    ) -> Result<Option<usize>, LlmError> {
+        Ok(None)
+    }
 
     /// Sends one request and returns the complete response.
     ///
@@ -224,6 +297,23 @@ pub(crate) trait LlmProvider: Send + Sync {
         tools: Option<Arc<Vec<ToolDefinition>>>,
         on_delta: &(dyn Fn(String) + Send + Sync),
     ) -> Result<MessagesResponse, LlmError>;
+
+    /// Sends one streaming request and preserves a truncated generation.
+    ///
+    /// Only the caller that can compact and retry needs the partial response
+    /// and its usage. The default delegates to the strict method, which turns
+    /// a truncation into an error.
+    async fn send_message_streaming_with_truncation(
+        &self,
+        system: &str,
+        messages: Arc<Vec<Message>>,
+        tools: Option<Arc<Vec<ToolDefinition>>>,
+        on_delta: &(dyn Fn(String) + Send + Sync),
+    ) -> Result<StreamedResponse, LlmError> {
+        self.send_message_streaming(system, messages, tools, on_delta)
+            .await
+            .map(StreamedResponse::Complete)
+    }
 }
 
 /// Creates the LLM provider for `config` and the given conversation.
@@ -648,6 +738,7 @@ mod tests {
                             invalid_arguments: None,
                         }],
                         tool_call_id: None,
+                        finish_reason: None,
                     },
                     Message {
                         role: "tool".to_string(),
@@ -663,6 +754,7 @@ mod tests {
                         reasoning_content: None,
                         tool_calls: Vec::new(),
                         tool_call_id: Some("call_1".to_string()),
+                        finish_reason: None,
                     },
                 ]),
                 Some(Arc::new(vec![ToolDefinition {

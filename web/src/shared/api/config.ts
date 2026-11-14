@@ -12,26 +12,31 @@ export interface SecretStatus {
 
 export type LlmSource = "profile" | "agent" | "global_default" | "provider_default";
 
+/** Compaction token settings for a single model. */
+export interface CompactionModelOverride {
+  model: string;
+  reserve_tokens: number | null;
+  keep_recent_tokens: number | null;
+}
+
 export interface GeneralConfig {
   default_agent: string;
   default_provider: string;
   default_model: string | null;
   timezone: string;
   max_history_messages: number;
-  compaction_timeout_secs: number;
-  default_context_window_tokens: number;
-  compaction_threshold_ratio: number;
-  compaction_target_ratio: number;
-  compact_keep_recent: number;
+  compaction_enabled: boolean;
+  compaction_reserve_tokens: number;
+  compaction_keep_recent_tokens: number;
+  /** Token settings that apply to one `provider/model` instead of the global ones. */
+  compaction_model_overrides: CompactionModelOverride[];
   log_level: string;
   state_root: string;
   defaults: {
     max_history_messages: number;
-    compaction_timeout_secs: number;
-    default_context_window_tokens: number;
-    compaction_threshold_ratio: number;
-    compaction_target_ratio: number;
-    compact_keep_recent: number;
+    compaction_enabled: boolean;
+    compaction_reserve_tokens: number;
+    compaction_keep_recent_tokens: number;
     timezone: string;
     log_level: string;
   };
@@ -60,7 +65,16 @@ export interface ProviderConfigEntry {
   label: string;
   base_url: string;
   default_model: string;
-  models: { name: string; context_window_tokens: number | null; has_instructions: boolean }[];
+  models: {
+    name: string;
+    context_window_tokens: number | null;
+    max_output_tokens: number | null;
+    resolved_context_window_tokens: number;
+    resolved_max_output_tokens: number;
+    context_window_source: "configured" | "catalog" | "default";
+    max_output_tokens_source: "configured" | "catalog" | "default";
+    has_instructions: boolean;
+  }[];
   api_key: SecretStatus;
   /** Providers like local servers or OAuth presets that work without a key. */
   api_key_optional: boolean;

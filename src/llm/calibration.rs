@@ -48,11 +48,11 @@ impl CalibrationKey {
 
 /// A persisted observation used to rebuild calibration factors on startup.
 ///
-/// Pairs the raw prompt estimate (`estimated_tokens`, chars/3) with the
-/// actual input token count (`input_tokens`) reported by the provider for one
-/// LLM call. The ratio is the measured correction factor for that call.
-/// `created_at` lets the caller merge observations from multiple databases
-/// in true chronological order before replaying the EMA.
+/// Pairs the raw prompt estimate (`estimated_tokens`, UTF-16 code units
+/// divided by 4) with the actual input token count (`input_tokens`) reported
+/// by the provider for one LLM call. The ratio is the measured correction
+/// factor for that call. `created_at` lets the caller merge observations from
+/// multiple databases in true chronological order before replaying the EMA.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CalibrationObservation {
     /// LLM provider name.
@@ -63,7 +63,7 @@ pub(crate) struct CalibrationObservation {
     pub(crate) request_kind: String,
     /// Whether the request payload included tool definitions.
     pub(crate) has_tools: bool,
-    /// Raw prompt estimate (chars / 3) for the call.
+    /// Raw prompt estimate (UTF-16 code units divided by 4) for the call.
     pub(crate) estimated_tokens: usize,
     /// Actual input token count reported by the provider.
     pub(crate) input_tokens: i64,

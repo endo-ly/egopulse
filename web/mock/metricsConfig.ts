@@ -302,6 +302,25 @@ const secretEnv = (ref: string, origin: "process" | "dotenv" = "dotenv") => ({
   configured: true,
 });
 
+function model(
+  name: string,
+  contextWindow: number | null,
+  maxOutput: number | null,
+  source: "configured" | "catalog" | "default",
+  hasInstructions: boolean,
+) {
+  return {
+    name,
+    context_window_tokens: contextWindow,
+    max_output_tokens: maxOutput,
+    resolved_context_window_tokens: contextWindow ?? 128000,
+    resolved_max_output_tokens: maxOutput ?? 16384,
+    context_window_source: source,
+    max_output_tokens_source: source,
+    has_instructions: hasInstructions,
+  };
+}
+
 const config = {
   general: {
     default_agent: "lyre",
@@ -309,11 +328,10 @@ const config = {
     default_model: null as string | null,
     timezone: "Asia/Tokyo",
     max_history_messages: 50,
-    compaction_timeout_secs: 180,
-    default_context_window_tokens: 128000,
-    compaction_threshold_ratio: 0.8,
-    compaction_target_ratio: 0.4,
-    compact_keep_recent: 20,
+    compaction_enabled: true,
+    compaction_reserve_tokens: 16384,
+    compaction_keep_recent_tokens: 20000,
+    compaction_model_overrides: [{ model: "openrouter/large-model", reserve_tokens: 400000, keep_recent_tokens: null }],
     log_level: "info",
     state_root: "/home/user/.egopulse",
   },
@@ -339,9 +357,9 @@ const config = {
       base_url: "https://openrouter.ai/api/v1",
       default_model: "anthropic/claude-sonnet-4",
       models: [
-        { name: "anthropic/claude-sonnet-4", context_window_tokens: 200000, has_instructions: true },
-        { name: "google/gemini-2.5-pro", context_window_tokens: 1048576, has_instructions: false },
-        { name: "openai/gpt-4.1-mini", context_window_tokens: null, has_instructions: false },
+        model("anthropic/claude-sonnet-4", 200000, 64000, "configured", true),
+        model("google/gemini-2.5-pro", 1048576, 65536, "catalog", false),
+        model("openai/gpt-4.1-mini", 128000, 32768, "default", false),
       ],
       api_key: secretEnv("OPENROUTER_API_KEY", "process") as {
         kind: string | null;
@@ -357,7 +375,7 @@ const config = {
       label: "Sakura AI",
       base_url: "https://api.ai.sakura.ad.jp/v1",
       default_model: "preview/Kimi-K2.6",
-      models: [{ name: "preview/Kimi-K2.6", context_window_tokens: 262144, has_instructions: false }],
+      models: [model("preview/Kimi-K2.6", 262144, 65536, "configured", false)],
       api_key: { kind: null, ref: null, origin: null, configured: false } as {
         kind: string | null;
         ref: string | null;
@@ -372,7 +390,7 @@ const config = {
       label: "OpenAI Codex",
       base_url: "https://chatgpt.com/backend-api/codex",
       default_model: "gpt-5.3-codex",
-      models: [{ name: "gpt-5.3-codex", context_window_tokens: 400000, has_instructions: false }],
+      models: [model("gpt-5.3-codex", 400000, 128000, "catalog", false)],
       api_key: { kind: null, ref: null, origin: null, configured: false } as {
         kind: string | null;
         ref: string | null;
@@ -398,11 +416,9 @@ const config = {
 
 const GENERAL_DEFAULTS = {
   max_history_messages: 50,
-  compaction_timeout_secs: 180,
-  default_context_window_tokens: 32768,
-  compaction_threshold_ratio: 0.8,
-  compaction_target_ratio: 0.4,
-  compact_keep_recent: 20,
+  compaction_enabled: true,
+  compaction_reserve_tokens: 16384,
+  compaction_keep_recent_tokens: 20000,
   timezone: "UTC",
   log_level: "info",
 };
@@ -524,7 +540,6 @@ export function configYaml() {
     `default_model: ${config.general.default_model ?? "null"}`,
     `default_agent: ${config.general.default_agent}`,
     `timezone: ${config.general.timezone}`,
-    `default_context_window_tokens: ${config.general.default_context_window_tokens}`,
     "agents:",
     ...config.agents.flatMap((agent) => [
       `  ${agent.id}:`,
@@ -592,11 +607,11 @@ export function patchConfig(target: string, body: Record<string, unknown>): { st
     Object.assign(provider, rest);
     if (models) {
       provider.models = models.map(
-        (name) => provider.models.find((m) => m.name === name) ?? { name, context_window_tokens: null, has_instructions: false },
+        (name) => provider.models.find((m) => m.name === name) ?? model(name, 128000, 16384, "default", false),
       );
     }
     if (!provider.models.some((m) => m.name === provider.default_model)) {
-      provider.models.push({ name: provider.default_model, context_window_tokens: null, has_instructions: false });
+      provider.models.push(model(provider.default_model, 128000, 16384, "default", false));
     }
     if (api_key?.action === "replace") {
       provider.api_key = {

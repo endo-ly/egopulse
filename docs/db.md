@@ -228,6 +228,7 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 | seq | INTEGER | nullable | chat 内の単調増加 sequence。因果順序の根拠。未割当は NULL |
 | turn_id | TEXT | nullable | 所属 Turn（`turn_runs`）。legacy 行は NULL |
 | parent_message_id | TEXT | nullable | Tool Result 等が参照する親 message |
+| finish_reason | TEXT | nullable | モデルが出力上限で停止した理由（`max_output_tokens`）。正常完了・対象外の行は NULL |
 
 **制約**:
 - `(chat_id, seq)` の部分 UNIQUE インデックス（`WHERE seq IS NOT NULL`）
@@ -263,12 +264,13 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 | カラム | 型 | 制約 | 説明 |
 |--------|----|------|------|
 | chat_id | INTEGER | PK | chats.chat_id と1:1 |
-| messages_json | TEXT | NOT NULL | シリアライズされた会話全体 |
+| messages_json | TEXT | NOT NULL | `ContextSnapshot` エンベロープ（`version` / `checkpoint` / `messages` / `last_usage`）。`messages` の各要素は `finish_reason`（`max_output_tokens` など）を任意で持つ |
 | updated_at | TEXT | NOT NULL | 監査時刻（RFC3339）。競合判定には使用せず整数 `chats.revision` を使用 |
 | snapshot_through_seq | INTEGER | NOT NULL DEFAULT 0 | `messages_json` へ反映済みの最終 message seq。`base + seq>snapshot_through` でLLM contextを構築 |
 
 **操作**:
-- `save_session(chat_id, messages_json)` — Upsert（`ON CONFLICT DO UPDATE`）
+- `replace_session_snapshot(chat_id, messages_json, expected_revision)` — `chats.revision` の CAS つき Upsert。`/compact` が使用
+- `truncate_session_messages(chat_id, expected_revision, messages_json)` — Sleep Batch の切り詰め
 - `load_session(chat_id)` — JSON と updated_at を取得
 - `load_session_snapshot(chat_id, limit)` — JSON + 最新メッセージレコードをトランザクションで取得
 - `store_message_with_session(msg, json, expected_updated_at)` — メッセージ保存 + セッション更新をトランザクションで楽観排他実行
@@ -276,6 +278,12 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 **設計ポイント**:
 - 楽観排他: `expected_updated_at` と実際の `updated_at` を比較し、競合時は `SessionSnapshotConflict` エラー
 - `messages_json` にはツール呼び出しブロックも含まれるため、セッション再開時に完全なコンテキストを復元可能
+- 出力上限で打ち切られた final message は `finish_reason` を保持し、通常完了と区別できる。復旧不能な打ち切り Tool Call は失敗結果として同じ snapshot に保存され、次の Turn で実行対象にならない
+- `checkpoint` は畳んだ履歴の要約、`last_usage` は直近の実測 usage とその適用範囲を持つ。checkpoint はメッセージとして重複保存しない
+- `last_usage` は `after_message_index` / `input_tokens` / `output_tokens` / `request_overhead_tokens` / `model_key` / `request_shape_hash` を持つ。`request_overhead_tokens` は計測したリクエストのうち会話メッセージ以外（system prompt・tool 定義・checkpoint・request-only メッセージ）の推定値
+- 自動 compaction の checkpoint は model 送信前に `chats.revision` の CAS で保存する。`/compact` も同じ経路を使う
+- 旧形式（`Message` 配列）は schema v23 / secret v9 のマイグレーションでエンベロープへ包まれる
+- `messages.finish_reason` は schema v24 / secret v10 で追加。打ち切り状態は Session snapshot だけでなく履歴行にも保存され、`GET /api/history` と SSE / WebSocket の最終応答が同じ値を返す
 
 ---
 
@@ -339,7 +347,7 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 | output_tokens | INTEGER | NOT NULL | 出力トークン数 |
 | total_tokens | INTEGER | NOT NULL | 合計トークン数（input + output） |
 | request_kind | TEXT | NOT NULL DEFAULT 'agent_loop' | リクエスト種別 |
-| estimated_tokens | INTEGER | NOT NULL DEFAULT 0 | 生推定トークン数（chars/3）。補正係数の再構築に使用 |
+| estimated_tokens | INTEGER | NOT NULL DEFAULT 0 | 生推定トークン数（UTF-16 コード単位を 4 で割った値）。補正係数の再構築に使用 |
 | has_tools | INTEGER | NOT NULL DEFAULT 0 | tool 定義を含む payload か（0/1） |
 | cached_input_tokens | INTEGER | NULL | `input_tokens` のうち prompt cache から供給された分。Provider が報告しない場合は NULL、報告して 0 の場合は 0 |
 | created_at | TEXT | NOT NULL | RFC3339 タイムスタンプ |
@@ -716,7 +724,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 | `StoredMessage` | messages | id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id, seq, turn_id, parent_message_id |
 | `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
 | `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
-| `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\> |
+| `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\>（`messages_json` は `ContextSnapshot`） |
 | `AgentSessionInfo` | chats + sessions（JOIN） | chat_id, channel, external_chat_id, updated_at, message_count, estimated_tokens |
 | `ToolCall` | tool_calls | id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp |
 | `LlmUsageSummary` | llm_usage_logs（集計） | requests, input_tokens, output_tokens, total_tokens, last_request_at |

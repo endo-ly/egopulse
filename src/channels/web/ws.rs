@@ -35,6 +35,7 @@ struct DeltaData {
 struct DoneData {
     response: String,
     message_id: String,
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,6 +194,8 @@ struct GatewayChatMessage {
     id: String,
     role: &'static str,
     content: Vec<GatewayChatContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -785,6 +788,7 @@ fn forward_run_event(
                         kind: "text",
                         text: data.delta,
                     }],
+                    finish_reason: None,
                 }),
                 error_message: None,
                 terminal: event.terminal,
@@ -813,6 +817,7 @@ fn forward_run_event(
                         kind: "text",
                         text: data.response,
                     }],
+                    finish_reason: data.finish_reason,
                 })
             };
             let gateway_event = GatewayChatEvent {
@@ -1197,7 +1202,7 @@ mod tests {
         let done_event = RunEvent {
             id: 10,
             event: "done".to_string(),
-            data: r#"{"response":"final answer","messageId":"turn:t1:assistant:2"}"#.to_string(),
+            data: r#"{"response":"final answer","messageId":"turn:t1:assistant:2","finishReason":"max_output_tokens"}"#.to_string(),
             terminal: true,
         };
 
@@ -1219,6 +1224,10 @@ mod tests {
         assert_eq!(payload["message"]["id"], "turn:t1:assistant:2");
         assert_eq!(payload["message"]["role"], "assistant");
         assert_eq!(payload["message"]["content"][0]["text"], "final answer");
+        assert_eq!(
+            payload["message"]["finish_reason"], "max_output_tokens",
+            "the truncation state must reach the WebSocket client"
+        );
     }
 
     #[test]
@@ -1228,7 +1237,7 @@ mod tests {
         let done_event = RunEvent {
             id: 11,
             event: "done".to_string(),
-            data: r#"{"response":"final answer","messageId":"turn:t1:assistant:2"}"#.to_string(),
+            data: r#"{"response":"final answer","messageId":"turn:t1:assistant:2","finishReason":"max_output_tokens"}"#.to_string(),
             terminal: true,
         };
 

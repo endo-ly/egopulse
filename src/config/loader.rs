@@ -11,10 +11,11 @@ use super::secret_ref::{
     DotenvFile, ResolvedValue, StringOrRef, WEB_AUTH_TOKEN_ENV_NAME, resolve_string_or_ref,
 };
 use super::{
-    AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, Config, DatabaseConfig,
-    DiscordBotConfig, DiscordChannelConfig, ProviderConfig, ProviderHeaderValue, ProviderId,
-    PulseConfig, SleepBatchConfig, TelegramBotConfig, TelegramChatConfig, WebhookReceiverConfig,
-    WebhookReceiverId, WebhookTargetConfig, WebhooksConfig, web_fetch::WebFetchConfig,
+    AgentConfig, AgentId, BotId, ChannelConfig, ChannelName, CompactionConfig, Config,
+    DatabaseConfig, DiscordBotConfig, DiscordChannelConfig, ProviderConfig, ProviderHeaderValue,
+    ProviderId, PulseConfig, SleepBatchConfig, TelegramBotConfig, TelegramChatConfig,
+    WebhookReceiverConfig, WebhookReceiverId, WebhookTargetConfig, WebhooksConfig,
+    web_fetch::WebFetchConfig,
 };
 use crate::error::ConfigError;
 
@@ -206,18 +207,30 @@ struct FileBackupConfig {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
+struct FileCompactionConfig {
+    enabled: Option<bool>,
+    reserve_tokens: Option<usize>,
+    keep_recent_tokens: Option<usize>,
+    model_overrides: Option<HashMap<String, FileCompactionModelOverride>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileCompactionModelOverride {
+    reserve_tokens: Option<usize>,
+    keep_recent_tokens: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct FileConfig {
     state_root: Option<String>,
     default_provider: Option<String>,
     default_model: Option<String>,
     providers: Option<HashMap<String, FileProviderConfig>>,
     log_level: Option<String>,
-    compaction_timeout_secs: Option<u64>,
+    compaction: Option<FileCompactionConfig>,
     max_history_messages: Option<usize>,
-    compact_keep_recent: Option<usize>,
-    default_context_window_tokens: Option<usize>,
-    compaction_threshold_ratio: Option<f64>,
-    compaction_target_ratio: Option<f64>,
     channels: Option<HashMap<String, FileChannelConfig>>,
     default_agent: Option<String>,
     agents: Option<HashMap<String, FileAgentConfig>>,
@@ -251,12 +264,8 @@ pub(super) fn build_config(
         default_model: file_default_model,
         providers: file_providers,
         log_level: file_log_level,
-        compaction_timeout_secs: file_compaction_timeout_secs,
+        compaction: file_compaction,
         max_history_messages: file_max_history_messages,
-        compact_keep_recent: file_compact_keep_recent,
-        default_context_window_tokens: file_default_context_window_tokens,
-        compaction_threshold_ratio: file_compaction_threshold_ratio,
-        compaction_target_ratio: file_compaction_target_ratio,
         channels: file_channels,
         default_agent: file_default_agent,
         agents: file_agents,
@@ -289,18 +298,9 @@ pub(super) fn build_config(
     let log_level = first_non_empty([env_var("LOG_LEVEL"), file_log_level])
         .unwrap_or_else(|| "info".to_string());
 
-    let compaction_timeout_secs = file_compaction_timeout_secs
-        .unwrap_or_else(super::resolve::default_compaction_timeout_secs);
+    let compaction = normalize_compaction(file_compaction);
     let max_history_messages =
         file_max_history_messages.unwrap_or_else(super::resolve::default_max_history_messages);
-    let compact_keep_recent =
-        file_compact_keep_recent.unwrap_or_else(super::resolve::default_compact_keep_recent);
-    let default_context_window_tokens = file_default_context_window_tokens
-        .unwrap_or(super::resolve::default_context_window_tokens());
-    let compaction_threshold_ratio = file_compaction_threshold_ratio
-        .unwrap_or(super::resolve::default_compaction_threshold_ratio());
-    let compaction_target_ratio =
-        file_compaction_target_ratio.unwrap_or(super::resolve::default_compaction_target_ratio());
 
     let agents = normalize_agents(file_agents.unwrap_or_default(), &dotenv)?;
     validate_agent_provider_references(&providers, &agents)?;
@@ -340,12 +340,8 @@ pub(super) fn build_config(
         providers,
         state_root,
         log_level,
-        compaction_timeout_secs,
+        compaction,
         max_history_messages,
-        compact_keep_recent,
-        default_context_window_tokens,
-        compaction_threshold_ratio,
-        compaction_target_ratio,
         channels,
         default_agent,
         agents,
@@ -1158,57 +1154,53 @@ fn validate_base_url(value: &str) -> Result<(), ConfigError> {
         .map_err(|_| ConfigError::InvalidBaseUrl)
 }
 
-fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
-    if config.compaction_timeout_secs == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compaction_timeout_secs must be at least 1".to_string(),
-        ));
+fn normalize_compaction(file: Option<FileCompactionConfig>) -> CompactionConfig {
+    let defaults = CompactionConfig::default();
+    let file = file.unwrap_or_default();
+    CompactionConfig {
+        enabled: file.enabled.unwrap_or(defaults.enabled),
+        reserve_tokens: file.reserve_tokens.unwrap_or(defaults.reserve_tokens),
+        keep_recent_tokens: file
+            .keep_recent_tokens
+            .unwrap_or(defaults.keep_recent_tokens),
+        model_overrides: file
+            .model_overrides
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, settings)| {
+                (
+                    key,
+                    crate::config::CompactionModelOverride {
+                        reserve_tokens: settings.reserve_tokens,
+                        keep_recent_tokens: settings.keep_recent_tokens,
+                    },
+                )
+            })
+            .collect(),
     }
+}
+
+fn validate_compaction_config(config: &Config) -> Result<(), ConfigError> {
+    // `reserve_tokens` and `keep_recent_tokens` accept any non-negative value,
+    // including zero. A reserve larger than the context window is not a
+    // configuration error either: compaction then simply keeps history at or
+    // above the headroom it was given.
     if config.max_history_messages == 0 {
         return Err(ConfigError::InvalidCompactionConfig(
             "max_history_messages must be at least 1".to_string(),
         ));
     }
-    if config.compact_keep_recent == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compact_keep_recent must be at least 1".to_string(),
-        ));
-    }
-    if config.compaction_threshold_ratio <= 0.0 || config.compaction_threshold_ratio > 1.0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compaction_threshold_ratio must be between 0 (exclusive) and 1.0 (inclusive)"
-                .to_string(),
-        ));
-    }
-    if config.compaction_target_ratio <= 0.0 || config.compaction_target_ratio > 1.0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compaction_target_ratio must be between 0 (exclusive) and 1.0 (inclusive)".to_string(),
-        ));
-    }
-    if config.compaction_target_ratio >= config.compaction_threshold_ratio {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "compaction_target_ratio must be less than compaction_threshold_ratio".to_string(),
-        ));
-    }
-    if config.default_context_window_tokens == 0 {
-        return Err(ConfigError::InvalidCompactionConfig(
-            "default_context_window_tokens must be at least 1".to_string(),
-        ));
-    }
-    const MAX_DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 1_000_000;
-    if config.default_context_window_tokens > MAX_DEFAULT_CONTEXT_WINDOW_TOKENS {
-        return Err(ConfigError::InvalidCompactionConfig(format!(
-            "default_context_window_tokens must not exceed {MAX_DEFAULT_CONTEXT_WINDOW_TOKENS}"
-        )));
-    }
     for (provider_id, provider) in &config.providers {
         for (model_name, model_config) in &provider.models {
-            if let Some(tokens) = model_config.context_window_tokens {
-                if tokens == 0 {
-                    return Err(ConfigError::InvalidCompactionConfig(format!(
-                        "context_window_tokens for {provider_id}/{model_name} must be at least 1"
-                    )));
-                }
+            if model_config.context_window_tokens == Some(0) {
+                return Err(ConfigError::InvalidCompactionConfig(format!(
+                    "context_window_tokens for {provider_id}/{model_name} must be at least 1"
+                )));
+            }
+            if model_config.max_output_tokens == Some(0) {
+                return Err(ConfigError::InvalidCompactionConfig(format!(
+                    "max_output_tokens for {provider_id}/{model_name} must be at least 1"
+                )));
             }
         }
     }

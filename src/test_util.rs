@@ -17,6 +17,11 @@ use crate::skills::SkillManager;
 use crate::storage::Database;
 use crate::tools::ToolRegistry;
 
+/// Wraps a legacy message-array JSON body in the session snapshot envelope.
+pub(crate) fn session_envelope(messages: &str) -> String {
+    format!(r#"{{"version":1,"messages":{messages}}}"#)
+}
+
 /// テスト用の最小 Config を生成する。
 ///
 /// OpenAI プロバイダ (`sk-test`) を含み、`state_root` 配下に一時ディレクトリを置く。
@@ -39,12 +44,8 @@ pub(crate) fn test_config(state_root: &str) -> Config {
         )]),
         state_root: state_root.to_string(),
         log_level: "info".to_string(),
-        compaction_timeout_secs: 180,
+        compaction: crate::config::CompactionConfig::default(),
         max_history_messages: 50,
-        compact_keep_recent: 20,
-        default_context_window_tokens: 32768,
-        compaction_threshold_ratio: 0.80,
-        compaction_target_ratio: 0.40,
         channels: std::collections::HashMap::from([(
             ChannelName::new("web"),
             ChannelConfig {

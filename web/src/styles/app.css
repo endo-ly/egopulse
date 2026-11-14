@@ -3368,6 +3368,13 @@
     border-radius: 0;
   }
 
+  .message-truncation-notice {
+    margin-top: var(--space-xs);
+    font-size: var(--text-xs);
+    font-style: italic;
+    color: var(--color-muted-2);
+  }
+
   .bubble-system .message-body {
     background: var(--color-panel-2);
     text-align: center;

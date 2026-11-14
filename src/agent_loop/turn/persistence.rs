@@ -3,17 +3,18 @@
 use std::sync::Arc;
 
 use crate::agent_loop::TurnDependencies;
-use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
+use crate::agent_loop::compaction::RequestMeasurement;
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::format_direct_input;
 use crate::agent_loop::model_step::AssistantToolPhase;
 use crate::agent_loop::session::{
     PersistedTurn, persist_phase, persist_phase_messages, serialize_snapshot,
 };
+use crate::agent_loop::session_snapshot::SessionContext;
 use crate::agent_loop::tool_execution::ToolResultPhase;
 use crate::conversation::SurfaceContext;
 use crate::error::{EgoPulseError, StorageError};
-use crate::llm::{LlmProvider, Message};
+use crate::llm::Message;
 use crate::storage::StoredMessage;
 
 /// Owns Message and Session persistence for one Turn.
@@ -22,6 +23,14 @@ pub(crate) struct TurnPersistence<'a> {
     context: &'a SurfaceContext,
     chat_id: i64,
     turn_id: String,
+}
+
+/// The final assistant answer persisted by [`TurnPersistence::persist_final`].
+pub(crate) struct FinalAnswer {
+    pub(crate) content: String,
+    pub(crate) reasoning_content: Option<String>,
+    /// Why the model stopped early, when the answer is a truncated partial one.
+    pub(crate) finish_reason: Option<crate::llm::TruncationReason>,
 }
 
 pub(super) struct UserInput<'a> {
@@ -48,13 +57,16 @@ impl<'a> TurnPersistence<'a> {
     }
 
     /// Persists the user input and the resulting session snapshot.
+    ///
+    /// Compaction is not part of this step: the Agent Loop compacts right
+    /// before each model request, and only that decision knows the exact
+    /// request (channel context, retry corrections, runtime guards) it is
+    /// sizing.
     pub(super) async fn persist_user_input(
         &self,
         input: UserInput<'_>,
-        llm: &Arc<dyn LlmProvider>,
-        prompt_ctx: &PromptContext<'_>,
         config_snapshot: &crate::config::manager::ConfigSnapshot,
-    ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
+    ) -> Result<(SessionContext, Option<i64>), EgoPulseError> {
         let config = &config_snapshot.config;
         let mut loaded = crate::agent_loop::session::load_messages_for_turn_with_limit(
             self.runtime,
@@ -73,26 +85,20 @@ impl<'a> TurnPersistence<'a> {
         stored_message.timestamp = input.received_at.to_string();
 
         for attempt in 0..2 {
-            let current_messages = std::mem::replace(&mut loaded.messages, Arc::new(Vec::new()));
-            let mut candidate_messages =
-                Arc::try_unwrap(current_messages).unwrap_or_else(|arc| (*arc).clone());
+            let mut candidate = SessionContext {
+                checkpoint: loaded.context.checkpoint.clone(),
+                messages: Arc::new((*loaded.context.messages).clone()),
+                last_usage: loaded.context.last_usage.clone(),
+            };
+            let mut candidate_messages = (*candidate.messages).clone();
             candidate_messages.push(input.message.clone());
-            let candidate_messages = maybe_compact_messages(
-                self.runtime,
-                self.context,
-                self.chat_id,
-                &candidate_messages,
-                llm,
-                prompt_ctx,
-                config,
-            )
-            .await?;
+            candidate.messages = Arc::new(candidate_messages);
 
             let persist_result = crate::agent_loop::session::commit_user_turn_input(
                 self.runtime,
                 self.context.scope,
                 stored_message.clone(),
-                &candidate_messages,
+                candidate.clone(),
                 loaded.session_revision,
                 &self.turn_id,
                 config_snapshot,
@@ -119,7 +125,7 @@ impl<'a> TurnPersistence<'a> {
                 }
             };
 
-            return Ok((Arc::new(persisted.messages), Some(persisted.revision)));
+            return Ok((persisted.context, Some(persisted.revision)));
         }
 
         Err(EgoPulseError::Storage(
@@ -131,16 +137,30 @@ impl<'a> TurnPersistence<'a> {
     pub(crate) async fn persist_final(
         &self,
         final_message_id: &str,
-        messages: Arc<Vec<Message>>,
+        mut context: SessionContext,
+        measured: Option<crate::agent_loop::compaction::MeasuredUsage>,
         session_revision: Option<i64>,
         on_event: &EventEmitter,
-        response: (String, Option<String>),
+        answer: FinalAnswer,
     ) -> Result<String, EgoPulseError> {
-        let (final_content, reasoning_content) = response;
+        let FinalAnswer {
+            content: final_content,
+            reasoning_content,
+            finish_reason,
+        } = answer;
         let mut assistant_message = Message::text("assistant", final_content.clone());
         assistant_message.reasoning_content = reasoning_content;
-        let mut updated = Arc::try_unwrap(messages).unwrap_or_else(|arc| (*arc).clone());
+        assistant_message.finish_reason = finish_reason;
+        let mut updated = (*context.messages).clone();
         updated.push(assistant_message.clone());
+        let assistant_index = updated.len() - 1;
+        context.messages = Arc::new(updated);
+        if let Some(anchor) = measured
+            .as_ref()
+            .and_then(|measured| measured.anchor(assistant_index))
+        {
+            context.last_usage = Some(anchor);
+        }
 
         let mut stored = StoredMessage::assistant(
             self.chat_id,
@@ -149,12 +169,13 @@ impl<'a> TurnPersistence<'a> {
         );
         stored.id = final_message_id.to_string();
         stored.turn_id = Some(self.turn_id.clone());
+        stored.finish_reason = finish_reason.map(|reason| reason.as_str().to_string());
         let _persisted = persist_phase(
             self.runtime,
             self.context.scope,
             stored,
             assistant_message,
-            &updated,
+            context,
             session_revision,
         )
         .await?;
@@ -166,6 +187,7 @@ impl<'a> TurnPersistence<'a> {
             // streamed under — delivery adopts nothing.
             assistant_message_id: final_message_id.to_string(),
             text: final_content.clone(),
+            finish_reason,
             terminal: false,
         });
         Ok(final_content)
@@ -176,26 +198,41 @@ impl<'a> TurnPersistence<'a> {
         &self,
         assistant_message_id: &str,
         assistant_phase: &AssistantToolPhase,
-        mut messages: Vec<Message>,
+        mut context: SessionContext,
+        measurement: &RequestMeasurement,
         session_revision: Option<i64>,
     ) -> Result<PersistedTurn, EgoPulseError> {
         let assistant_message = assistant_phase.assistant_message.clone();
+        let mut messages = (*context.messages).clone();
         messages.push(assistant_message.clone());
+        let assistant_index = messages.len() - 1;
+        context.messages = Arc::new(messages);
+        if let Some(anchor) = assistant_phase
+            .usage
+            .as_ref()
+            .and_then(|usage| measurement.anchor(assistant_index, usage))
+        {
+            context.last_usage = Some(anchor);
+        }
 
+        let mut stored = StoredMessage {
+            id: assistant_message_id.to_string(),
+            turn_id: Some(self.turn_id.clone()),
+            ..StoredMessage::assistant(
+                self.chat_id,
+                self.context.agent_id.clone(),
+                assistant_phase.assistant_preview.clone(),
+            )
+        };
+        stored.finish_reason = assistant_message
+            .finish_reason
+            .map(|reason| reason.as_str().to_string());
         persist_phase(
             self.runtime,
             self.context.scope,
-            StoredMessage {
-                id: assistant_message_id.to_string(),
-                turn_id: Some(self.turn_id.clone()),
-                ..StoredMessage::assistant(
-                    self.chat_id,
-                    self.context.agent_id.clone(),
-                    assistant_phase.assistant_preview.clone(),
-                )
-            },
+            stored,
             assistant_message,
-            &messages,
+            context,
             session_revision,
         )
         .await
@@ -205,7 +242,7 @@ impl<'a> TurnPersistence<'a> {
     pub(crate) async fn persist_tool_results(
         &self,
         assistant_message_id: &str,
-        messages: Vec<Message>,
+        mut context: SessionContext,
         tool_result_phase: ToolResultPhase,
         session_revision: Option<i64>,
     ) -> Result<PersistedTurn, EgoPulseError> {
@@ -216,12 +253,13 @@ impl<'a> TurnPersistence<'a> {
         if tool_messages.is_empty() {
             return Ok(PersistedTurn {
                 revision: session_revision.unwrap_or(0),
-                messages,
+                context,
             });
         }
 
-        let mut messages_with_tools = messages;
+        let mut messages_with_tools = (*context.messages).clone();
         messages_with_tools.extend(tool_messages.iter().cloned());
+        context.messages = Arc::new(messages_with_tools.clone());
         let mut tool_summary = StoredMessage::tool_result_preview(
             self.chat_id,
             self.context.agent_id.clone(),
@@ -234,7 +272,7 @@ impl<'a> TurnPersistence<'a> {
             self.context.scope,
             tool_summary,
             tool_messages,
-            &messages_with_tools,
+            context,
             session_revision,
         )
         .await
@@ -248,7 +286,7 @@ impl<'a> TurnPersistence<'a> {
     /// update is handled by reloading the latest committed snapshot once.
     pub(crate) async fn commit_staged_user_messages(
         &self,
-        messages: Arc<Vec<Message>>,
+        mut context: SessionContext,
         session_revision: Option<i64>,
         config_snapshot: &crate::config::manager::ConfigSnapshot,
         on_event: &EventEmitter,
@@ -263,15 +301,13 @@ impl<'a> TurnPersistence<'a> {
             if staged.is_empty() {
                 return Ok(PersistedTurn {
                     revision: 0,
-                    messages: (*messages).clone(),
+                    context,
                 });
             }
             return Err(EgoPulseError::Storage(StorageError::Conflict(
                 "staged follow-up requires an existing session snapshot".to_string(),
             )));
         };
-        let mut current_messages = messages;
-
         for attempt in 0..2 {
             let turn_id = self.turn_id.clone();
             let staged =
@@ -280,13 +316,10 @@ impl<'a> TurnPersistence<'a> {
                 })
                 .await?;
             if staged.is_empty() {
-                return Ok(PersistedTurn {
-                    revision,
-                    messages: (*current_messages).clone(),
-                });
+                return Ok(PersistedTurn { revision, context });
             }
 
-            let mut candidate = (*current_messages).clone();
+            let mut candidate = (*context.messages).clone();
             for message in &staged {
                 candidate.push(Message::text(
                     "user",
@@ -297,8 +330,13 @@ impl<'a> TurnPersistence<'a> {
                     ),
                 ));
             }
+            let candidate_context = SessionContext {
+                checkpoint: context.checkpoint.clone(),
+                messages: Arc::new(candidate.clone()),
+                last_usage: context.last_usage.clone(),
+            };
             let session_json =
-                serialize_snapshot(Arc::clone(&self.runtime.assets), candidate.clone())
+                serialize_snapshot(Arc::clone(&self.runtime.assets), candidate_context.clone())
                     .await
                     .map_err(|error| match error {
                         EgoPulseError::Storage(storage) => storage,
@@ -322,7 +360,7 @@ impl<'a> TurnPersistence<'a> {
                     }
                     return Ok(PersistedTurn {
                         revision: committed.revision,
-                        messages: candidate,
+                        context: candidate_context,
                     });
                 }
                 Err(StorageError::SessionSnapshotConflict) if attempt == 0 => {
@@ -333,7 +371,7 @@ impl<'a> TurnPersistence<'a> {
                         config_snapshot.config.max_history_messages,
                     )
                     .await?;
-                    current_messages = loaded.messages;
+                    context = loaded.context;
                     revision = loaded.session_revision.ok_or_else(|| {
                         EgoPulseError::Storage(StorageError::SessionSnapshotConflict)
                     })?;
@@ -350,6 +388,7 @@ impl<'a> TurnPersistence<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::FinalAnswer;
     use crate::agent_loop::event::{AgentEvent, EventEmitter};
     use crate::agent_loop::process_turn;
     use crate::agent_loop::test_support::{
@@ -540,15 +579,24 @@ mod tests {
         persistence
             .persist_final(
                 &final_id,
-                Arc::new(vec![
-                    Message::text("user", "do it"),
-                    Message::text("assistant", "done"),
-                ]),
+                crate::agent_loop::session_snapshot::SessionContext {
+                    checkpoint: None,
+                    messages: Arc::new(vec![
+                        Message::text("user", "do it"),
+                        Message::text("assistant", "done"),
+                    ]),
+                    last_usage: None,
+                },
+                None,
                 Some(revision),
                 &EventEmitter::new(move |event| {
                     event_log.lock().expect("events").push(event);
                 }),
-                ("done".to_string(), None),
+                FinalAnswer {
+                    content: "done".to_string(),
+                    reasoning_content: None,
+                    finish_reason: None,
+                },
             )
             .await
             .expect("persist final");

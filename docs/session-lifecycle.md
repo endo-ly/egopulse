@@ -8,8 +8,8 @@
 2. [保存モデル](#2-保存モデル)
 3. [Turn 開始時の復元](#3-turn-開始時の復元)
 4. [Turn 中の保存](#4-turn-中の保存)
-5. [Safety Compaction](#5-safety-compaction)
-6. [Fallback](#6-fallback)
+5. [Context Compaction](#5-context-compaction)
+6. [Fallback と Context Overflow](#6-fallback-と-context-overflow)
 7. [Archive](#7-archive)
 8. [Conversation Scope による DB Routing](#8-conversation-scope-による-db-routing)
 9. [Conflict Retry](#9-conflict-retry)
@@ -135,7 +135,7 @@ execute_scheduled_turn():
 
 - 役割: 表示用・一覧用の message レコード
 - 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`, `seq`, `turn_id`
-- `/new` や compaction では削除されない。セッションクリアは `sessions.messages_json` のリセットのみ行う
+- `/new` や compaction では削除されない。`/new` は `sessions.messages_json` を空の `ContextSnapshot` エンベロープ（`messages: []`）へ置き換える
 
 `seq IS NOT NULL` の committed conversation history は append-only かつ immutable であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。staged row は commit 時に `seq` が付与され、terminal Turn への promotion 時には削除される場合がある。
 
@@ -154,7 +154,14 @@ Tool 実行中の human follow-up は staged message として保存され、`tu
 - 役割: 次ターン再開用の session snapshot
 - 主な列: `chat_id`, `messages_json`, `updated_at`
 
-`messages_json` には LLM 入力に近い `Message` 配列が入る。tool call、tool result、multimodal image ref もここに含まれる。
+`messages_json` は `ContextSnapshot` エンベロープ（`version` / `checkpoint` / `messages` / `last_usage`）を JSON で持つ。
+
+- `version`: 必須の snapshot バージョン。不明または欠落したバージョンは復元時にエラーとする
+- `messages`: LLM 入力に近い保持メッセージ。tool call、tool result、multimodal image ref を含む
+- `checkpoint`: 畳んだ履歴の要約とファイル一覧。`null` なら未圧縮
+- `last_usage`: 直近の実測 usage と、それがどのメッセージまでを覆うかのアンカー
+
+`messages_json` には checkpoint をメッセージとして重複保存しない。checkpoint はリクエスト構築時に参照用メッセージへ投影する。`/new` も同じエンベロープで空の snapshot を保存し、次の Turn はそのまま復元できる。
 
 ### `tool_calls`
 
@@ -167,12 +174,13 @@ Tool 実行中の human follow-up は staged message として保存され、`tu
 
 turn 開始時は次の順で session を復元する。
 
-1. `sessions.messages_json` があればそれを使う
-2. JSON を `Message` 配列へ戻す
-3. **空配列 `[]` は「意図的クリア」として扱い、フォールバックせず空のまま返す**
+1. `sessions.messages_json` があればそれを `ContextSnapshot` として読む
+2. `messages` を `Message` 配列へ戻し、`checkpoint` と `last_usage` を取り出す
+3. **`messages` が空（意図的クリア）でもフォールバックせず、そのまま返す**
 4. image は `input_image_ref` から asset store 経由で hydrate する
-5. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う
-6. snapshot が無い（`messages_json = None`）、または壊れている場合だけ `messages` テーブルから recent history を組み立てる
+5. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う（補った場合は usage anchor を破棄する）
+6. snapshot が無い（`messages_json = None`）場合だけ `messages` テーブルから recent history を組み立てる
+7. snapshot が存在するのに解析できない場合は、データ欠落を隠さず明示的な保存データエラーとして扱う
 
 ### 原則
 
@@ -238,19 +246,19 @@ AgentLoop は final response と最新の session snapshot を `AgentLoopResult`
 
 ストリーム内で provider が `error` / `response.failed` を通知した場合や、`finish_reason` が `error` の場合は、それまでに届いた本文があっても成功として扱わない。HTTP 200 の後に起きた失敗は、`error_type` があれば `code` より優先し、対応する HTTP status（一時的な失敗は 429/5xx、恒久的な失敗は 4xx）に写像する。未知の失敗は 502 とし、再試行可否は共通の判定に委ねる。完了イベントを受け取る前にストリームが終了した場合は `incomplete_stream` として再試行対象にする。終了イベントが `incomplete` を報告した場合や `response.status` が `failed`、Chat Completions の `finish_reason` が `length` / `content_filter` / 未知の理由の場合は、生成が打ち切られた確定的な失敗として `incomplete_response` を返し、再試行しない。`insufficient_system_resource` / `aborted` は推論側の中断として再試行対象にする。SSE の `data:` が JSON として不正な場合は欠落した本文を完成応答にせず失敗させる。
 
-1 リクエストの総時間には別に 600 秒の上限がある。Turn / Pulse は 300 秒の iteration deadline、compaction は `compaction_timeout_secs`、単発 ask は 300 秒の総予算で先に打ち切られるため、この上限が実効するのは Sleep の各試行だけである。Sleep は再試行と待機を含む 20 分の総予算も持つ。
+1 リクエストの総時間には別に 600 秒の上限がある。Turn / Pulse は 300 秒の iteration deadline、compaction は 600 秒の予算、単発 ask は 300 秒の総予算で先に打ち切られるため、この上限が実効するのは Sleep の各試行だけである。Sleep は再試行と待機を含む 20 分の総予算も持つ。
 
 試行回数の記録とバックオフ待機も同じ期限の内側で行う。これらは provider から見えない処理であり、外に置くと DB 待ちが長い場合に上限を超える。期限に到達した場合は、その時点までの実際のエラーをそのまま返す。
 
 turn 中の保存は phase ごとに進む。
 
-1. user message を session 末尾に追加する
+1. user message を context 末尾に追加する
 2. 必要なら compaction する
-3. user-phase snapshot を保存する
+3. user-phase snapshot（checkpoint / 保持メッセージ / 使用量アンカー）を 1 トランザクションで保存する
 4. assistant reply / tool call / tool result を進める
 5. 各 phase の結果を通常の persistence に流す
 
-compaction は保存の別系統ではなく、「保存前に session を整形する段」として扱う。
+compaction は保存の別系統ではなく、「保存前に context を整形する段」として扱う。checkpoint・保持メッセージ・使用量アンカーは常に単一の snapshot 更新として保存し、途中結果だけを先に書き込まない。
 
 ### Tool 実行中の human follow-up
 
@@ -272,64 +280,207 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 
 ---
 
-## 5. Safety Compaction
+## 5. Context Compaction
 
-長い会話で context window 上限に近づく前に、中間文脈を reference-only summary へ畳み、最新依頼・直近文脈・tool call/result の整合性を保つ安全装置。
+長い会話で context window 上限に近づく前に、畳んだ履歴を構造化された checkpoint 要約へ置き換え、直近の会話は原文のまま残す安全装置。
 
 ### 目的
 
 1. context window 上限による API エラーを防ぐ
-2. 中間会話の要点を reference-only summary として維持する
-3. 最新ユーザーメッセージ・直近 tool block はそのまま残す
+2. 畳んだ範囲の要点を、後続のモデルが読める参照用 checkpoint として維持する
+3. 直近の会話・tool call / tool result の参照関係を原文のまま保つ
+4. 長い 1 ターンの途中で切る場合も、そのターンの前半を独立して要約する
 
 ### Trigger
 
-最初の LLM 呼び出し前と、tool result 追加後の次回 LLM 呼び出し前に判定する。推定 prompt tokens が usable context の `compaction_threshold_ratio`（デフォルト 80%）に達したら発火。
+自動判定は Agent Loop の model 送信直前の 1 箇所に集約する。入力の保存（`TurnPersistence::persist_user_input`）は判定を行わない。どの経路でも「これから送るリクエスト」に対して判定し、判定に使う文脈と実送信の文脈を一致させる。
 
-推定は会話量の概算を出し、LLM レスポンスに含まれる実測 usage で補正する。実測が返る provider では、日本語や tool schema の影響で概算が小さく出る場合も、以後の判定が実際の使用量に近づく。
-
-まだ実測がない場合（未知の provider/model の初回ターン等）は、保守係数 `DEFAULT_FACTOR`（1.3）を適用して少し多めに見積もる。補正値は `llm_usage_logs` に観測（生推定値 `estimated_tokens` と実測 `input_tokens` のペア）として永続化し、再起動時に最近 N 件から EMA で再構築する。これにより再起動後も学習済みの補正状態が維持され、コールドスタート時の過大 DEFAULT による誤発火を防ぐ。外部 tokenizer は使わない。
-
-### Algorithm
-
-**usable context 算出**: `context_window_tokens - CONTEXT_RESERVE_TOKENS(8192)`。reserve は出力生成・tool schema・system/margin の内部予約。
-
-**分割**: `tool_safe_split_at` で message list を old / recent の 2 領域に分ける。境界は tool call/result block を不可分として保護。
-
-| 領域 | 説明 |
+| 契機 | タイミング |
 |---|---|
-| **old** | 古いメッセージ。summary 対象 |
-| **recent** | `compact_keep_recent`（下限）以上の直近メッセージ。最新 user message と tool call/result block を保護 |
+| 通常のユーザー入力 | 入力の原子的保存が終わった後、Agent Loop が最初の model 呼び出しを行う直前 |
+| Tool 実行後 | tool 結果の保存が終わり、次の model 呼び出しを行う直前 |
+| Durable Turn 再開 | `input_committed` / `tools_completed` から再開し、次の model 呼び出しを行う直前 |
+| 手動 | `/compact [instructions]`。閾値と `enabled` を無視する |
+| Context Overflow | Provider が context window 超過を返したとき |
+| 容量不足 | 推定入力が context window を埋め、API の最小出力すら確保できないとき。リクエストは送信しない |
+| 実測の超過 | 正常応答の `input_tokens` が context window を超えたとき。閾値判定を待たずに圧縮し、応答は再生成しない |
+| 出力打ち切り | `length` で意図した出力上限より手前で終わったとき（実測 usage がある場合） |
 
-**要約入力**: old を text 化。画像は `[image]`、tool call は `[tool_use: ...]`、tool result は要点化（古いものは内容を軽量化）。`compaction_target_ratio` に基づく summarizer budget を超えないよう全文を切り詰める。summary 生成後も目標サイズを超える場合は、recent を保護したまま summary 本文だけをさらに縮める。
+`compaction.enabled = false` では、閾値・Context Overflow・容量不足・実測の超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` だけは実行できる。
 
-**要約呼び出し**: 専用 system prompt（[system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照）+ 会話要約要求 + old dump。
+発火条件は次の 1 式のみ。
 
-**Secret redaction**: 要約入力・出力の両方に三層 redaction（値・prefix・文脈）を適用し、summary やログに credential が残らないことを保証する。詳細は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照。
+```text
+should_compact = enabled && context_tokens > context_window - reserve_tokens
+```
 
-**Compact 後の形**:
-1. `user`: reference-only ヘッダー付き summary（ヘッダー全文は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト)参照）
-2. Tail messages（直近メッセージ・tool block をそのまま保持）
+- `context_window` は、明示された `context_window_tokens` → 同梱モデルカタログの `contextWindow` → 未知モデルの既定値 `128000` の順で解決する。カタログは参照実装が公開するプロバイダーデータから生成し、全モデル共通の値をユーザーが設定しないと動かない設計にはしない
+- `reserve_tokens` / `keep_recent_tokens` は、対象モデルの `compaction.model_overrides["provider/model"]` → 全体値 → 既定値の順で解決する。`enabled` は全体設定のみ
+- `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）に、計測時からの request overhead の差分と、その後に追加されたメッセージの推定値を足す
+- 実測 usage が無い、または request shape（system prompt / tool 定義 / model）が計測時と変わった場合はリクエスト全体を推定する
+- 判定に使う request-only メッセージは、実際に送るリクエストと同じものを使う
+- `reserve_tokens` は 0 を含む非負整数を受け付ける。`context_window <= reserve_tokens` でも設定エラーにしない。その場合 `context_window - reserve_tokens` は 0 として扱う
+- Provider が正常終了しても、報告された `input_tokens` が `context_window` を超えていれば、閾値判定を待たずに圧縮する。最終応答なら応答を確定した直後、Tool 呼び出しなら次の model 呼び出しの直前に行い、その応答を作り直すことはしない。圧縮に失敗しても応答は破棄しない
 
-**Role 補正**: 同じ role の plain-text message で `tool_calls` 空かつ `tool_call_id` が `None` の場合のみ merge。末尾が assistant なら除去。
+### Token 推定
 
----
+外部 tokenizer は使わない。メッセージ 1 件の文字数（content / reasoning / tool call 名・引数。画像は 1 枚 4,800 文字相当）を `CHARS_PER_TOKEN_ESTIMATE = 4` で割り、切り上げる。role 名は数えない。文字数は UTF-16 コード単位で数える（絵文字などの補助平面文字を 1 文字として扱う）。
 
-## 6. Fallback
+system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
 
-要約は best effort。失敗時は session を壊さないことを優先する。
+Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。Codex Backend は `max_output_tokens` に対応しないため送信しない。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
+
+補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
+
+補正係数は実測値からの差分にだけ掛ける。リクエストが計測時と同じで追加メッセージも無ければ、係数の値に関係なく投影値は実測値と一致する。
+
+### 保持範囲の選択
+
+新しい側から 1 件ずつ推定 token を積み上げ、`keep_recent_tokens`（既定 20000）に達した位置を境界候補にする。
+
+1. 境界は `user` または `assistant` のメッセージに限る。`tool` 結果を先頭とする分割は禁止する
+2. 積み上げが境界に達したら、その位置以降で最初の候補を境界にする
+3. 末尾の tool 結果だけで予算を超える場合は、手前の assistant tool call を境界にする（先頭へは戻さない）
+4. 履歴全体が予算内なら境界は先頭になり、要約対象が無いので No-op
+
+境界が `user` なら通常のターン境界、`assistant` なら 1 ターンの途中分割（split turn）になる。
+
+### 要約範囲
+
+| 範囲 | 内容 |
+|---|---|
+| 履歴 | 前回 checkpoint より後の、保持範囲より前の全メッセージ |
+| ターン前半 | split turn のとき、そのターン開始 `user` から境界までのメッセージ |
+| 保持 | 境界以降のメッセージ。tool call / tool result は対応を保ったまま原文で残す |
+
+- 履歴は初回なら新規要約、前回 checkpoint があれば `<previous-summary>` として別入力に渡し更新する。前回要約を会話の 1 件目として再利用しない
+- split turn では履歴要約とターン前半要約を別リクエストで生成し、`\n\n---\n\n**Turn Context (split turn):**\n\n` で連結する。片方でも失敗したら何も commit しない
+- 要約入力は role ごとにタグ付けしたプレーンテキスト（`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` / `[Tool result]:` / `[Tool error]:`）。reasoning は含めない
+- Tool Result は各件の先頭 2,000 文字と省略文字数を要約対象にする
+- 要約対象が入力上限を超える場合はメッセージ境界で古い部分から分割する。単一メッセージが収まらない場合は役割と継続を明示して分割し、各段階の要約を次の入力に引き継ぐ。全範囲の要約に成功した場合だけ checkpoint を作成する
+- 要約リクエストを組み立てる前に、会話・前回 checkpoint・追加指示を Config 由来の秘密値と既知パターンでサニタイズする。LLM が生成した要約の保存前サニタイズとは別に、送信入力そのものを保護する
+
+### 要約リクエストの入力上限
+
+要約リクエスト自身が context window を超えないよう、送信前にプロンプト全体の上限を決める。上限は対象モデルの `context_window` から、出力に必要な容量として `max_output_tokens` を引いて求める。`max_output_tokens` が context window の半分を超える設定では、入力の余地を残すため半分を上限に予約する。
+
+- system prompt・固定テンプレート・前回 checkpoint・追加指示・会話を含めた推定が上限以内になるよう調整する
+- 固定部分が上限に収まる場合は、残りを会話テキストの予算にする
+- 前回 checkpoint が大きい場合は内容を先に段階的に再要約する。追加指示は省略せず、容量に収まる会話を古い順に要約する
+- 分割と再試行を含む要約処理全体の上限は 600 秒とする。分割リクエストの回数は固定せず、この時間内で処理する
+- 前回 checkpoint の再要約後も入力に収まらない場合、再要約は最大 3 回とし、収まらなければ失敗として元の context を保持する
+- 入力予算は UTF-16 文字数から求めた推定値ではなく、通常の Compaction と同じ `UsageCalibrator` の `compaction` 補正係数で実測トークンへ換算する。実測前は保守的な既定係数を使い、補正後も context window は超えない
+- provider が容量超過を返した場合は、入力予算を現在の半分以下に縮めて最大 2 回再送する。それでも超過する場合は要約失敗として扱い、checkpoint を保存せず元の context を保持する
+- 固定部分と会話の先頭が収まらない場合は入力容量不足として終了し、元の context を保持する
+- 要約モデルの出力上限や API 最小出力の扱いは通常の LLM リクエストと同じ
+
+### 要約プロンプト
+
+`src/agent_loop/compaction.rs` 内に 3 種類の定数を置く。形式は日常会話・相談・技術作業・Tool 実行に共通で、Goal や Next Steps の捏造を促さない。
+
+| 用途 | 定数 |
+|---|---|
+| 要約システム | `SUMMARIZATION_SYSTEM_PROMPT` |
+| 初回 | `INITIAL_SUMMARY_PROMPT` |
+| 更新 | `UPDATE_SUMMARY_PROMPT` |
+| ターン前半 | `TURN_PREFIX_SUMMARY_PROMPT` |
+
+要約本文は `## 会話の経緯` / `## 共有された情報` / `## 重要な参照情報` の 3 節。該当が無い節は省略し、空の箇条書きを作らない。会話の使用言語を引き継ぐ。
+
+`/compact` の追加指示は各プロンプトの末尾へ `Additional focus: ...` として付与する。
+
+### Tool ファイル操作の追跡
+
+要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。`write` と `edit` は、Tool Result がエラーでも書き込み途中でファイルが変わった可能性があるため modified にする。実行前に拒否された呼び出し（`invalid_arguments` あり）はファイルへ触れていないため除外する。`read` は成功した Tool Result があるものだけを read-only にする。modified に含まれるファイルは read-only に重複計上しない。前回 checkpoint の一覧を引き継ぎ、リクエスト時に要約末尾へ `<read-files>` / `<modified-files>` として付ける。該当が無ければ何も付けない。
+
+### Checkpoint と保持メッセージ
+
+- checkpoint は `summary` / `tokens_before` / `read_files` / `modified_files` を持つ
+- 圧縮後の推定入力を、次リクエストと同じ生のトークン推定・解決済みの `max_output_tokens`・API 最小出力で検証する。API の最小出力枠を確保できない場合は `LlmError::OutputCapacityExceeded`、`max_output_tokens` 自体が最小出力を下回る場合は `LlmError::OutputLimitBelowApiMinimum` として失敗し、元の context を保持する
+- 圧縮に成功したら、model へ送る前に checkpoint・保持メッセージ・`last_usage = None` を `chats.revision` の CAS で 1 回の snapshot 更新として確定する。永続化に失敗した場合は未保存の圧縮結果で model を呼ばない
+- snapshot が同時更新されていた場合は上書きせず、Turn を競合として終了する。Tool を再実行する自動リトライは行わない
+- 次のリクエストでは checkpoint を参照用の 1 メッセージへ投影し、その後ろに保持メッセージを連結する
+- 投影メッセージの先頭には `[CONTEXT CHECKPOINT — REFERENCE ONLY]` ヘッダーを付け、過去の指示を現在の指示へ昇格させない
+- 保持メッセージの結合・並べ替え・末尾 assistant の削除は行わない
+- 要約の長さ調整は行わない。長さはプロンプトで誘導し、事後の切り詰めをしない
+
+### 使用量アンカー
+
+`ContextUsageAnchor` に「どのメッセージまでの計測か」（`after_message_index`）、`input_tokens` / `output_tokens`、`request_overhead_tokens`、`model_key`、`request_shape_hash` を保存する。
+
+provider の usage はリクエスト全体の token 数である。そのため会話メッセージ以外（system prompt / tool 定義 / checkpoint / request-only メッセージ）の推定値を `request_overhead_tokens` として併せて保存する。投影は次の差分化で行う。
+
+```text
+projected = measured + calibrated(trailing + current_overhead - measured_overhead)
+```
+
+`current_overhead - measured_overhead` は負になり得るため、符号付きで計算し、最終値だけ 0 で clamp する。channel context や retry 修正が計測後に増減しても、その差分が判定へ反映される。
+
+空応答の再試行で runtime guard を足して再送した場合、usage はその再送リクエストのものになる。`ModelRunner` は実際に送った追加メッセージを呼び出し元へ返し、その分を `request_overhead_tokens` に含める。対応が取れない usage はアンカーとして採用しない。
+
+provider が返した usage の `input_tokens` と `output_tokens` がどちらも 0 の場合は、計測値として採用しない。既存の有効なアンカーがあれば維持し、保存済み snapshot に全ゼロのアンカーが残っている場合も投影時に無効として扱い、リクエスト全体の推定へ戻す。
+
+`request_shape_hash` は system prompt / tool 定義 / model だけを対象にし、channel context などの一時メッセージは含めない。これらの増減は `request_overhead_tokens` の差で扱うため、hash に含めると毎回アンカーが無効になる。
+
+次の場合に破棄し、全体推定へ戻す。
+
+- checkpoint を新規作成したとき
+- snapshot 競合で保持メッセージを組み直したとき
+- tool output の補修でメッセージ数が変わったとき
+- Sleep Batch が snapshot を切り詰めたとき
+- request shape（system prompt / tool 定義 / model）が変わったとき
+- アンカーが全ゼロの usage しか持たないとき
+
+## 6. Fallback と Context Overflow
+
+要約は best effort。失敗時は snapshot を壊さないことを優先する。
 
 | 障害パターン | 動作 |
 |---|---|
-| Summarizer Error | 元の messages をすべてそのまま保持 |
-| Summarizer Timeout | `compaction_timeout_secs` 超過 → 元の messages をすべてそのまま保持 |
-| Empty Summary | 要約結果が空 → 元の messages をすべてそのまま保持 |
+| 要約対象なし | No-op。checkpoint と保持メッセージを変更しない |
+| 要約リクエスト失敗（retry 枯渇を含む） | 呼び出し元へエラーを返す。自動 compaction は warn を残して元の context のまま続行し、`/compact` は失敗を応答する |
+| 要約が空 | 同上（`LlmError::InvalidResponse`） |
+| 要約が tool call を返した | 同上（`LlmError::InvalidResponse`） |
+| 要約が出力上限で途切れた（`IncompleteResponse`） | 呼び出し元へエラーを返す。再試行しない |
+| split turn の片方だけ成功 | 何も commit しない |
+| 要約中に snapshot が更新された | 古い結果を適用せず、最新 snapshot で選択し直す |
 
----
+要約リクエストは LLM client のリクエスト上限（600 秒）と試行回数上限（3 回）を共有し、backoff と `Retry-After` 待機もその内側で行う。
+
+### Context Overflow と容量不足からの復旧
+
+Provider の 400 を一律に context 超過とはみなさない。Provider 境界（`src/llm/api_error.rs`）で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。rate limit・throttling・`too many requests` は、token に言及していても除外する。Agent Loop はこの variant だけを復旧対象にし、provider 固有の文言を知らない。
+
+1. 出力を公開していない場合に限り、`CompactionReason::Overflow` で圧縮する
+2. 圧縮できたら checkpoint を CAS で保存し、`turn_runs.model_request_hash` を新しいリクエストの hash へ更新して、同じ model iteration を 1 回だけ再送する（Turn は開始し直さない）
+3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（無限に繰り返さない）
+
+送信前の容量不足（`LlmError::OutputCapacityExceeded`）も同じ 1 回の復旧対象にする。推定入力が窓を埋めているため、API の最小出力を確保できないリクエストは送らず、compaction 後の再送で解消を試みる。解消できなければ容量不足として終了する。
+
+HTTP 413 は本文が空、`Payload Too Large` の HTML、JSON でないプロキシ応答でも context 超過として扱う。400 / 422 は構造化 `code` / `type` か明確な context 超過表現がある場合だけ分類し、任意の 400 を context 超過にしない。429 と rate limit / throttling は token に言及していても除外する。
+
+### 出力打ち切り（`length`）からの復旧
+
+Provider の出力上限で生成が終わった場合、`finish_reason=length` / `response.incomplete(max_output_tokens)` と実測 usage、生成済み本文を保持したまま Agent Loop へ返す（`IncompleteResponse` へ潰さない）。
+
+判定には、モデルメタデータから解決した**意図した最大出力トークン**（`max_output_tokens`）を使う。リクエスト時に context window へ収めるため切り下げても、意図値は維持する。
+
+1. `compaction.enabled = true` かつ復旧未実施で、実測 `output_tokens < max_output_tokens` なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
+2. 意図した上限まで生成し切った `length`、usage が無い場合、`enabled = false`、2 回目の打ち切りでは再送しない
+3. 要約に失敗した場合も含め、復旧しない場合は生成済みの通常テキストは破棄せず final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
+4. `finish_reason` は Session snapshot と `messages` テーブルの両方に保存する。`GET /api/history`、SSE / WebSocket の最終応答、TUI の完了通知、Discord / Telegram の配送本文は同じ値を使い、再受付・再接続・再読み込みでも打ち切り状態が失われない。テキストのみのチャネルには回答の後ろに注意文を付ける
+5. Tool Call を含む打ち切りは、未完成の呼び出しを実行しない。復旧する場合は圧縮後のリクエストを送り直し、Tool の副作用は発生させない。復旧しない場合は、既存の Tool 結果経路で各呼び出しを失敗結果として保存し、Tool Call と結果の対応を保ったまま次の model step へ渡す。同じターンで 2 回目の打ち切り Tool Call が発生した場合は失敗結果を追加せず、本文があれば final として保存する
+6. 復旧して再送する場合は、途中出力を公開済みのときだけ `AssistantMessageDiscarded` を 1 回通知する。復旧せず部分応答を保持する場合は破棄通知を送らない
+
+要約リクエスト自身が `length` で途切れた場合は checkpoint を確定せず、呼び出し元へ失敗を返す。
+
+再送するリクエストは、保存済みの会話と request-only メッセージ（宣言のみ応答への修正指示、runtime guard）から組み直す。修正指示は会話の外側にあるため、圧縮で会話が置き換わっても失われない。
+
+Tool 実行済みのターンでも再実行するのは model 推論だけであり、実行済み Tool は再実行しない。Context Overflow の再送では、公開済みの途中出力がある場合は再送しない（`length` の復旧は、途中出力を公開済みの場合だけ破棄イベントを伴って再送する）。
 
 ## 7. Archive
 
-compaction 発火時は、compact 前の全文会話を markdown として archive する。
+compaction 発火時は、compact 前の context を markdown として archive する。
 
 ### 出力先
 
@@ -337,35 +488,20 @@ compaction 発火時は、compact 前の全文会話を markdown として archi
 <state_root>/runtime/groups/<channel>/<chat_id>/conversations/<timestamp>-<unique_suffix>.md
 ```
 
-（`state_root` は通常 `~/.egopulse`。`runtime/groups/` 配下に配置される）
+（`state_root` は通常 `~/.egopulse`。Secret スコープは `runtime/secret_groups/` 配下）
 
-### 目的
+### 内容
 
-- compact 前の verbatim context を後から追えるようにする
-- デバッグや監査で元の会話を確認できるようにする
-
-### 秘匿情報に関する注意
-
-archive はローカル監査用の sensitive artifact であるが、**secret redaction を適用する**。
-要約入力・出力と同様に、起動時に Config から収集したシークレット値（API キー、auth トークン等）、well-known パターン（`sk-`, `ghp_` 等）、文脈（`KEY=VALUE` のキー名、`Authorization`、URL クエリ）の三層リダクションを archive 全文に適用し、`[REDACTED:key]` / `[REDACTED:secret]` に置換する。
-
-さらに、archive ファイルのパーミッションは `0600`（owner 読み書きのみ）に設定される。
-
-### 形式
-
-各 message を次の形式で保存する。
-
-```md
-## user
-
-...
-
----
-```
+- 既存 checkpoint があれば、その参照メッセージを先頭に含める
+- 保持メッセージを続けて `## role` + 本文 + `---` の形式で保存する
+- 三層 redaction（値・prefix・文脈）を適用し、credential を `[REDACTED:key]` / `[REDACTED:secret]` へ置換する
+- ファイルパーミッションは `0600`
+- temp ファイルへ書いてから rename する原子的書き込み。同名ファイルは上書きしない（冪等キー）
+- archive 失敗は warn に留め、compaction 自体は続行する（`messages` テーブルが全文履歴を保持している）
 
 ### Sleep Batch での Archive
 
-Sleep Batch も session クリア前に `archive_conversation_blocking`（compaction モジュールの共有関数）を呼び出し、同一形式でアーカイブする。
+Sleep Batch も session クリア前に `archive_conversation_blocking`（compaction モジュールの共有関数）を呼び、同じ形式でアーカイブする。checkpoint がある場合はその参照メッセージも archive に含める。
 
 ---
 
@@ -420,8 +556,9 @@ stale snapshot に単純 append だけを再試行すると、compaction 前の 
 
 | フェーズ | 動作 |
 |---|---|
-| 最初の user-phase retry | compaction-aware |
-| 以降の assistant / tool phase retry | compaction はすでに終わっている前提で通常 persist |
+| 最初の user-phase retry | compaction-aware（最新 snapshot の checkpoint と使用量アンカーから再評価） |
+| 以降の assistant / tool phase retry | compaction はすでに終わっている前提で通常 persist。使用量アンカーはメッセージ位置が変わるため破棄する |
+| `/compact` | `chats.revision` の CAS で保存し、競合したら何も保存せず再実行を促す |
 
 ## 10. Durable Turn State
 
@@ -510,18 +647,21 @@ Session Lifecycle に関連する設定フィールドは [config.md §3.1](./co
 
 | 設定 | デフォルト | 役割 |
 |------|-----------:|------|
-| `compaction_timeout_secs` | `180` | 要約 compaction の timeout 秒数 |
+| `compaction.enabled` | `true` | 自動 compaction の有効化。`false` では閾値・overflow・実測超過・出力打ち切りの自動復旧をすべて停止する（`/compact` は実行可能） |
+| `compaction.reserve_tokens` | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数 |
+| `compaction.keep_recent_tokens` | `20000` | 原文のまま保持する直近履歴の下限 token 数 |
+| `compaction.model_overrides` | `{}` | `provider/model` をキーに `reserve_tokens` / `keep_recent_tokens` を個別に上書きする |
 | `max_history_messages` | `50` | snapshot が使えない時に `messages` テーブルから復元する件数 |
-| `default_context_window_tokens` | `32768` | context window トークン数のフォールバック値 |
-| `compaction_threshold_ratio` | `0.80` | 推定 prompt tokens が usable context のこの割合に達したら compaction 発火 |
-| `compaction_target_ratio` | `0.40` | compaction 後の目標 token 量（usable context に対する割合） |
-| `compact_keep_recent` | `20` | Tail としてそのまま残す直近メッセージ数の下限 |
+| `providers.<id>.models.<model>.context_window_tokens` | モデルカタログ / `128000` | context window の明示上書き |
+| `providers.<id>.models.<model>.max_output_tokens` | モデルカタログ / `16384` | 意図する最大出力トークンの明示上書き |
 
 ### Validation
 
-- `compaction_timeout_secs >= 1`
+- `compaction.reserve_tokens` は 0 を含む非負整数
+- `compaction.keep_recent_tokens` は 0 を含む非負整数
+- `compaction.model_overrides` の各値も同じ規則。キーは `provider/model` の完全一致（大文字小文字を区別し、`/` を含むモデル ID もそのまま扱う）
+- `compaction.enabled` は全体設定のみ
 - `max_history_messages >= 1`
-- `default_context_window_tokens >= 1` かつ `<= 1,000,000`
-- `compaction_threshold_ratio`: `(0, 1]`
-- `compaction_target_ratio`: `(0, threshold)`
-- `compact_keep_recent >= 1`
+- `context_window_tokens` はモデルごとに `>= 1`
+- `max_output_tokens` はモデルごとに `>= 1`
+- `reserve_tokens` と `context_window_tokens` の大小関係は検証しない（実行時に `saturating_sub` で 0 として扱う）

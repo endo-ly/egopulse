@@ -7,7 +7,6 @@ pub(crate) mod dependencies;
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
-use crate::agent_loop::compaction::{PromptContext, maybe_compact_messages};
 use crate::agent_loop::event::{AgentEvent, EventEmitter};
 use crate::agent_loop::message_format::{format_channel_log_message, format_direct_input};
 use crate::agent_loop::turn::lifecycle::{
@@ -19,6 +18,7 @@ use crate::agent_loop::turn::persistence::TurnPersistence;
 use crate::agent_loop::TurnDependencies;
 use crate::agent_loop::loop_runner::AgentLoop;
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
+use crate::agent_loop::session_snapshot::SessionContext;
 use crate::conversation::{ConversationScope, SurfaceContext};
 use crate::error::EgoPulseError;
 use crate::llm::{LlmProvider, Message, ToolDefinition};
@@ -78,7 +78,6 @@ pub(super) struct PreparedTurn {
     pub(super) system_prompt: String,
     pub(super) channel_llm: Arc<dyn LlmProvider>,
     pub(super) tool_defs: Arc<Vec<ToolDefinition>>,
-    pub(super) tools_json: Option<String>,
     pub(super) user_message: Message,
     pub(super) input_message_id: String,
     pub(super) received_at: String,
@@ -374,11 +373,13 @@ impl TurnExecutor<'_> {
                     turn_id,
                     assistant_message_id,
                     text,
+                    finish_reason,
                 } => {
                     self.on_event.emit(AgentEvent::FinalResponse {
                         turn_id,
                         assistant_message_id,
                         text: text.clone(),
+                        finish_reason,
                         terminal: false,
                     });
                     return Ok(text);
@@ -393,6 +394,7 @@ impl TurnExecutor<'_> {
                         assistant_message_id: assistant_message_id
                             .unwrap_or_else(|| notice_message_id(&turn_id)),
                         text: text.clone(),
+                        finish_reason: None,
                         terminal: false,
                     });
                     return Ok(text);
@@ -410,6 +412,7 @@ impl TurnExecutor<'_> {
                         assistant_message_id: assistant_message_id
                             .unwrap_or_else(|| notice_message_id(&turn_id)),
                         text: text.clone(),
+                        finish_reason: None,
                         terminal: false,
                     });
                     return Ok(text);
@@ -428,31 +431,18 @@ impl TurnExecutor<'_> {
                         Some(&received_at),
                     )
                     .await?;
-                let prompt_ctx = PromptContext {
-                    system_prompt: &prepared.system_prompt,
-                    tools_json: prepared.tools_json.as_deref(),
-                    has_tools: !prepared.tool_defs.is_empty(),
-                };
-
-                // 段階2: 直接入力を保存し、必要なら直後に会話履歴を圧縮する。
-                // user message の保存と input_committed 遷移は同一 transaction で行う。
-                let (messages, session_revision) = self
-                    .persist_user_input(&prepared, user_input, &prompt_ctx)
-                    .await?;
+                // 段階2: 直接入力を保存する。user message の保存と
+                // input_committed 遷移は同一 transaction で行う。会話履歴の
+                // 圧縮は Agent Loop が model 送信直前に判断する。
+                let (context, session_revision) =
+                    self.persist_user_input(&prepared, user_input).await?;
 
                 // 段階3: 一時的なチャネル背景情報を、保存済みセッションとは別に読み込む。
                 let channel_context_msg = load_channel_context(self.state, self.context).await;
 
                 // 段階4: 最終応答が得られるまで、LLM 呼び出しとツール実行を反復する。
-                self.run_agent_loop(
-                    &prepared,
-                    prompt_ctx,
-                    channel_context_msg,
-                    messages,
-                    session_revision,
-                    1,
-                )
-                .await
+                self.run_agent_loop(&prepared, channel_context_msg, context, session_revision, 1)
+                    .await
             }
             .await;
 
@@ -502,14 +492,9 @@ impl TurnExecutor<'_> {
                     received_at,
                 )
                 .await?;
-            let prompt_ctx = PromptContext {
-                system_prompt: &prepared.system_prompt,
-                tools_json: prepared.tools_json.as_deref(),
-                has_tools: !prepared.tool_defs.is_empty(),
-            };
             // Reload the persisted session snapshot; do NOT re-persist the user
             // message. Only the tools_completed boundary re-runs the staged
-            // follow-up commit and post-tool compaction.
+            // follow-up commit.
             let loaded = load_messages_for_turn_with_limit(
                 self.state,
                 self.context.scope,
@@ -517,55 +502,29 @@ impl TurnExecutor<'_> {
                 snapshot.config.max_history_messages,
             )
             .await?;
-            let (messages, session_revision, start_iteration) = match resume_mode {
-                ResumeMode::InputCommitted => {
-                    (loaded.messages, loaded.session_revision, 1)
-                }
+            let (context, session_revision, start_iteration) = match resume_mode {
+                ResumeMode::InputCommitted => (loaded.context, loaded.session_revision, 1),
                 ResumeMode::ToolsCompleted { start_iteration } => {
-                    let persistence = TurnPersistence::new(
-                        self.state,
-                        self.context,
-                        chat_id,
-                        &turn_run.turn_id,
-                    );
+                    let persistence =
+                        TurnPersistence::new(self.state, self.context, chat_id, &turn_run.turn_id);
                     let persisted = persistence
                         .commit_staged_user_messages(
-                            loaded.messages,
+                            loaded.context,
                             loaded.session_revision,
                             snapshot,
                             &self.on_event,
                         )
                         .await?;
-                    let compacted = match maybe_compact_messages(
-                        self.state,
-                        self.context,
-                        chat_id,
-                        &persisted.messages,
-                        &prepared.channel_llm,
-                        &prompt_ctx,
-                        &snapshot.config,
-                    )
-                    .await
-                    {
-                        Ok(messages) => messages,
-                        Err(error) => {
-                            warn!(
-                                error = %error,
-                                turn_id = %turn_run.turn_id,
-                                "message compaction failed during tools_completed recovery; continuing with uncompacted messages"
-                            );
-                            persisted.messages
-                        }
-                    };
-                    (Arc::new(compacted), Some(persisted.revision), start_iteration)
+                    let context = persisted.context;
+                    let revision = persisted.revision;
+                    (context, Some(revision), start_iteration)
                 }
             };
             let channel_context_msg = load_channel_context(self.state, self.context).await;
             self.run_agent_loop(
                 &prepared,
-                prompt_ctx,
                 channel_context_msg,
-                messages,
+                context,
                 session_revision,
                 start_iteration,
             )
@@ -689,7 +648,6 @@ impl TurnExecutor<'_> {
         let mcp_scope =
             crate::tools::mcp::McpScope::for_agent(&config_snapshot.config, &self.context.agent_id);
         let tool_defs = self.state.tools.definitions_async(&mcp_scope).await;
-        let tools_json = serde_json::to_string(&tool_defs).ok();
 
         // The Turn's input message keeps the canonical request key as its
         // id, so the persisted row matches the client's optimistic entry by
@@ -703,7 +661,6 @@ impl TurnExecutor<'_> {
             system_prompt,
             channel_llm,
             tool_defs,
-            tools_json,
             user_message,
             input_message_id,
             received_at,
@@ -715,8 +672,7 @@ impl TurnExecutor<'_> {
         &self,
         prepared: &PreparedTurn,
         user_input: &str,
-        prompt_ctx: &PromptContext<'_>,
-    ) -> Result<(Arc<Vec<Message>>, Option<i64>), EgoPulseError> {
+    ) -> Result<(SessionContext, Option<i64>), EgoPulseError> {
         self.persistence(prepared)
             .persist_user_input(
                 persistence::UserInput {
@@ -725,8 +681,6 @@ impl TurnExecutor<'_> {
                     input: user_input,
                     received_at: &prepared.received_at,
                 },
-                &prepared.channel_llm,
-                prompt_ctx,
                 prepared.config_snapshot.as_ref(),
             )
             .await
@@ -735,9 +689,8 @@ impl TurnExecutor<'_> {
     async fn run_agent_loop(
         &self,
         prepared: &PreparedTurn,
-        prompt_ctx: PromptContext<'_>,
         channel_context_msg: Option<Message>,
-        messages: Arc<Vec<Message>>,
+        context: SessionContext,
         session_revision: Option<i64>,
         start_iteration: usize,
     ) -> Result<String, EgoPulseError> {
@@ -745,11 +698,10 @@ impl TurnExecutor<'_> {
             self.state,
             self.context,
             prepared,
-            prompt_ctx,
             channel_context_msg,
             self.on_event.clone(),
         )
-        .run(messages, session_revision, start_iteration)
+        .run(context, session_revision, start_iteration)
         .await?;
 
         self.persist_agent_loop_result(prepared, result).await
@@ -760,15 +712,19 @@ impl TurnExecutor<'_> {
         prepared: &PreparedTurn,
         result: crate::agent_loop::loop_runner::AgentLoopResult,
     ) -> Result<String, EgoPulseError> {
-        let messages = result.messages;
         let response = self
             .persistence(prepared)
             .persist_final(
                 &result.final_message_id,
-                messages,
+                result.context,
+                result.usage,
                 result.session_revision,
                 &self.on_event,
-                (result.final_content, result.reasoning_content),
+                persistence::FinalAnswer {
+                    content: result.final_content,
+                    reasoning_content: result.reasoning_content,
+                    finish_reason: result.finish_reason,
+                },
             )
             .await?;
         let lifecycle = self.lifecycle(&prepared.turn_id);
@@ -967,6 +923,7 @@ mod tests {
                 invalid_arguments: None,
             }],
             tool_call_id: None,
+            finish_reason: None,
         };
         let tool_result = crate::llm::Message {
             role: "tool".to_string(),
@@ -974,14 +931,19 @@ mod tests {
             reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: Some("recovery-tool".to_string()),
+            finish_reason: None,
         };
         let initial_snapshot = crate::agent_loop::session::serialize_snapshot(
             Arc::clone(&state.assets),
-            vec![
-                crate::llm::Message::text("user", "original input"),
-                assistant_tool.clone(),
-                tool_result.clone(),
-            ],
+            crate::agent_loop::session_snapshot::SessionContext {
+                checkpoint: None,
+                messages: Arc::new(vec![
+                    crate::llm::Message::text("user", "original input"),
+                    assistant_tool.clone(),
+                    tool_result.clone(),
+                ]),
+                last_usage: None,
+            },
         )
         .await
         .expect("initial snapshot");
@@ -1044,12 +1006,16 @@ mod tests {
         );
         let recovery_snapshot = crate::agent_loop::session::serialize_snapshot(
             Arc::clone(&state.assets),
-            vec![
-                crate::llm::Message::text("user", "original input"),
-                assistant_tool,
-                tool_result,
-                committed_followup,
-            ],
+            crate::agent_loop::session_snapshot::SessionContext {
+                checkpoint: None,
+                messages: Arc::new(vec![
+                    crate::llm::Message::text("user", "original input"),
+                    assistant_tool,
+                    tool_result,
+                    committed_followup,
+                ]),
+                last_usage: None,
+            },
         )
         .await
         .expect("recovery snapshot");

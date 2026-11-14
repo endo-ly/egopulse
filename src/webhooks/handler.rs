@@ -259,12 +259,8 @@ mod tests {
             )]),
             state_root: "/tmp/test".to_string(),
             log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
+            compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.8,
-            compaction_target_ratio: 0.4,
             channels: std::collections::HashMap::from([(
                 ChannelName::new("discord"),
                 ChannelConfig {
@@ -312,12 +308,8 @@ mod tests {
             )]),
             state_root: "/tmp/test".to_string(),
             log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
+            compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.8,
-            compaction_target_ratio: 0.4,
             channels: std::collections::HashMap::from([(
                 ChannelName::new("telegram"),
                 ChannelConfig {

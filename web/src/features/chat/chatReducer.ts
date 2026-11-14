@@ -4,6 +4,8 @@ export interface ChatEventMessage {
   id: string;
   role: string;
   content: Array<{ type: string; text: string }>;
+  /** Present on a done frame whose answer stopped at the output limit. */
+  finish_reason?: string | null;
 }
 
 interface ChatEventBase {
@@ -186,10 +188,17 @@ export function reduceChatEvent(
       if (event.message && extractText(event.message)) {
         const id = event.message.id;
         const content = extractText(event.message);
+        const finishReason = event.message.finish_reason ?? null;
         messages = messages.some((m) => m.id === id)
           ? messages.map((m) =>
               m.id === id
-                ? { ...m, content, runId: event.runId, sender_id: agentId }
+                ? {
+                    ...m,
+                    content,
+                    runId: event.runId,
+                    sender_id: agentId,
+                    finish_reason: finishReason,
+                  }
                 : m,
             )
           : [
@@ -201,6 +210,7 @@ export function reduceChatEvent(
                 content,
                 timestamp: new Date().toISOString(),
                 message_kind: "message",
+                finish_reason: finishReason,
                 runId: event.runId,
               },
             ];

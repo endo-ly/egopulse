@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -184,18 +184,33 @@ struct SerializableDb {
 }
 
 #[derive(Serialize)]
+struct SerializableCompaction {
+    /// The default is `true`, so only a disabled setting needs persisting.
+    #[serde(skip_serializing_if = "is_default_bool_true")]
+    enabled: bool,
+    reserve_tokens: usize,
+    keep_recent_tokens: usize,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    model_overrides: BTreeMap<String, SerializableCompactionModelOverride>,
+}
+
+#[derive(Serialize)]
+struct SerializableCompactionModelOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reserve_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keep_recent_tokens: Option<usize>,
+}
+
+#[derive(Serialize)]
 struct SerializableConfig {
     default_provider: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_model: Option<String>,
     state_root: String,
     log_level: String,
-    compaction_timeout_secs: u64,
+    compaction: SerializableCompaction,
     max_history_messages: usize,
-    compact_keep_recent: usize,
-    default_context_window_tokens: usize,
-    compaction_threshold_ratio: f64,
-    compaction_target_ratio: f64,
     providers: HashMap<String, SerializableProvider>,
     channels: HashMap<String, SerializableChannel>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -480,12 +495,26 @@ impl From<&Config> for SerializableConfig {
             default_model: config.default_model.clone(),
             state_root: config.state_root.clone(),
             log_level: config.log_level.clone(),
-            compaction_timeout_secs: config.compaction_timeout_secs,
+            compaction: SerializableCompaction {
+                enabled: config.compaction.enabled,
+                reserve_tokens: config.compaction.reserve_tokens,
+                keep_recent_tokens: config.compaction.keep_recent_tokens,
+                model_overrides: config
+                    .compaction
+                    .model_overrides
+                    .iter()
+                    .map(|(key, settings)| {
+                        (
+                            key.clone(),
+                            SerializableCompactionModelOverride {
+                                reserve_tokens: settings.reserve_tokens,
+                                keep_recent_tokens: settings.keep_recent_tokens,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
             max_history_messages: config.max_history_messages,
-            compact_keep_recent: config.compact_keep_recent,
-            default_context_window_tokens: config.default_context_window_tokens,
-            compaction_threshold_ratio: config.compaction_threshold_ratio,
-            compaction_target_ratio: config.compaction_target_ratio,
             providers,
             channels,
             default_agent: Some(config.default_agent.to_string()),
@@ -1034,12 +1063,8 @@ mod tests {
             providers,
             state_root: "/tmp/egopulse".to_string(),
             log_level: "info".to_string(),
-            compaction_timeout_secs: 180,
+            compaction: crate::config::CompactionConfig::default(),
             max_history_messages: 50,
-            compact_keep_recent: 20,
-            default_context_window_tokens: 32768,
-            compaction_threshold_ratio: 0.80,
-            compaction_target_ratio: 0.40,
             channels,
             default_agent: AgentId::new("default"),
             agents,

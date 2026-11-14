@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use crate::agent_loop::compaction::force_compact;
+use crate::agent_loop::compaction::{
+    CompactionOutcome, CompactionReason, CompactionRequest, PromptContext, compact,
+};
 use crate::agent_loop::session::{load_messages_for_turn_with_limit, resolve_chat_id};
 use crate::config::{AgentId, ChannelName, Config, ProviderId};
 use crate::conversation::{ConversationScope, SurfaceContext};
@@ -127,7 +129,7 @@ pub(crate) async fn handle_slash_command(
         .map(|(cmd, _)| cmd)
         .unwrap_or(raw_command);
     let command = bare_command.to_ascii_lowercase();
-    let _args = parts.get(1).copied().unwrap_or("");
+    let args = parts.get(1).copied().unwrap_or("");
 
     if !is_catalog_command(&command) {
         return None;
@@ -135,7 +137,7 @@ pub(crate) async fn handle_slash_command(
 
     match command.as_str() {
         "/new" => handle_new(state, context.scope, chat_id).await,
-        "/compact" => handle_compact(state, chat_id, context).await,
+        "/compact" => handle_compact(state, chat_id, context, args).await,
         "/status" => handle_status(state, chat_id, context, sender_id).await,
         "/skills" => Some(handle_skills(state)),
         "/restart" => Some(handle_restart()),
@@ -221,6 +223,7 @@ async fn handle_compact(
     state: &AppState,
     chat_id: i64,
     context: &SurfaceContext,
+    instructions: &str,
 ) -> Option<String> {
     let config_snapshot = state.config_manager.current_blocking();
     let runtime = state.turn_dependencies();
@@ -235,46 +238,72 @@ async fn handle_compact(
         Ok(loaded) => loaded,
         Err(e) => return Some(format!("Failed to load session: {e}")),
     };
-    if loaded.messages.is_empty() {
+    if loaded.context.messages.is_empty() {
         return Some("Session is empty.".to_string());
     }
 
-    let count = loaded.messages.len();
+    let count = loaded.context.messages.len();
     let llm = match runtime.llm_for_context_with_snapshot(context, &config_snapshot) {
         Ok(llm) => llm,
         Err(e) => return Some(format!("Failed to get LLM provider: {e}")),
     };
-
-    match force_compact(
+    let system_prompt = crate::agent_loop::prompt::build_system_prompt_with_config(
         &runtime,
         context,
-        chat_id,
-        &loaded.messages,
-        &llm,
         &config_snapshot.config,
+    );
+    let mcp_scope =
+        crate::tools::mcp::McpScope::for_agent(&config_snapshot.config, &context.agent_id);
+    let tool_defs = runtime.tools.definitions_async(&mcp_scope).await;
+    let tools_json = serde_json::to_string(&tool_defs).ok();
+    let instructions = instructions.trim();
+    let instructions = (!instructions.is_empty()).then_some(instructions);
+    let request = CompactionRequest {
+        state: &runtime,
+        context,
+        chat_id,
+        llm: &llm,
+        prompt: PromptContext {
+            system_prompt: &system_prompt,
+            tools_json: tools_json.as_deref(),
+            has_tools: !tool_defs.is_empty(),
+        },
+        config: &config_snapshot.config,
+        request_only_messages: Vec::new(),
+    };
+
+    let compacted = match compact(
+        &request,
+        &loaded.context,
+        CompactionReason::Manual,
+        instructions,
     )
     .await
     {
-        Ok(compacted) => {
-            let json = match serde_json::to_string(&compacted) {
-                Ok(j) => j,
-                Err(e) => return Some(format!("Failed to serialize compacted session: {e}")),
-            };
-            match call_blocking(state.db_for(context.scope), move |db| {
-                db.save_session(chat_id, &json)
-            })
-            .await
-            {
-                Ok(_) => Some(format!(
-                    "Compacted {count} messages to {}.",
-                    compacted.len()
-                )),
-                Err(e) => Some(format!(
-                    "Compacted {count} messages but failed to save session: {e}"
-                )),
-            }
+        Ok(CompactionOutcome::Compacted(context)) => context,
+        Ok(CompactionOutcome::Unchanged) => {
+            return Some("Nothing to compact in this session.".to_string());
         }
-        Err(error) => Some(format!("Compaction failed: {error}")),
+        Err(error) => return Some(format!("Compaction failed: {error}")),
+    };
+
+    let kept = compacted.messages.len();
+    let saved = crate::agent_loop::session::persist_compacted_context(
+        &runtime,
+        context.scope,
+        chat_id,
+        compacted,
+        loaded.session_revision,
+    )
+    .await;
+    match saved {
+        Ok(Some(_)) => Some(format!("Compacted {count} messages to {kept}.")),
+        Ok(None) => Some(
+            "Session changed while compacting; nothing was saved. Run /compact again.".to_string(),
+        ),
+        Err(error) => Some(format!(
+            "Compacted {count} messages but failed to save: {error}"
+        )),
     }
 }
 
@@ -863,11 +892,59 @@ mod tests {
         }
     }
 
+    /// Provider that rejects every summarization request.
+    struct FailingSummarizer;
+
+    #[async_trait]
+    impl LlmProvider for FailingSummarizer {
+        fn provider_name(&self) -> &str {
+            "test"
+        }
+
+        fn model_name(&self) -> &str {
+            "test-model"
+        }
+
+        async fn send_message(
+            &self,
+            _system: &str,
+            _messages: Arc<Vec<Message>>,
+            _tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+        ) -> Result<MessagesResponse, LlmError> {
+            Err(LlmError::ApiError {
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body_preview: "invalid request".to_string(),
+                retry_after_secs: None,
+            })
+        }
+
+        async fn send_message_streaming(
+            &self,
+            system: &str,
+            messages: Arc<Vec<Message>>,
+            tools: Option<std::sync::Arc<Vec<crate::llm::ToolDefinition>>>,
+            on_delta: &(dyn Fn(String) + Send + Sync),
+        ) -> Result<MessagesResponse, LlmError> {
+            let _ = on_delta;
+            self.send_message(system, messages, tools).await
+        }
+    }
+
     fn build_test_state() -> (AppState, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = test_config(dir.path().to_str().expect("utf8").to_string());
         let state = build_state(config, Box::new(NoOpProvider));
         (state, dir)
+    }
+
+    /// Seeds a session long enough that manual compaction has a boundary.
+    async fn seed_compactable_session(state: &AppState, chat_id: i64) {
+        let messages = vec![
+            Message::text("user", "old question"),
+            Message::text("assistant", "old answer ".repeat(10_000)),
+            Message::text("user", "fresh question"),
+        ];
+        crate::agent_loop::session::save_test_session(&state.assets, &state.db, chat_id, messages);
     }
 
     async fn create_test_chat(state: &AppState, key: &str) -> i64 {
@@ -919,8 +996,9 @@ mod tests {
                         seq: None,
                         turn_id: None,
                         parent_message_id: None,
+                        finish_reason: None,
                     },
-                    r#"[{"role":"user","content":"hello"}]"#,
+                    &crate::test_util::session_envelope(r#"[{"role":"user","content":"hello"}]"#),
                     None,
                 )
             }
@@ -943,43 +1021,107 @@ mod tests {
         assert_eq!(messages.len(), 1, "message records should be preserved");
         assert_eq!(messages[0].content, "hello");
 
-        // session snapshot should be empty
+        // The snapshot is replaced by a restorable empty ContextSnapshot, not
+        // the legacy bare array.
         let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
             db.load_session_snapshot(chat_id, 10)
         })
         .await
         .expect("snapshot");
+        let cleared: serde_json::Value = serde_json::from_str(
+            snapshot
+                .messages_json
+                .as_deref()
+                .expect("cleared snapshot body"),
+        )
+        .expect("valid cleared snapshot");
         assert_eq!(
-            snapshot.messages_json.as_deref(),
-            Some(r#"[]"#),
-            "session snapshot should be cleared to empty array"
+            cleared["version"],
+            serde_json::json!(crate::storage::SESSION_SNAPSHOT_VERSION),
+            "the cleared snapshot must keep the envelope version"
         );
+        assert_eq!(
+            cleared["messages"],
+            serde_json::json!([]),
+            "session snapshot should be cleared to an empty ContextSnapshot"
+        );
+
+        // The following Turn must be able to restore this snapshot.
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("the next turn should restore the cleared session");
+        assert!(loaded.context.messages.is_empty());
+        assert!(loaded.context.checkpoint.is_none());
     }
 
     #[tokio::test]
-    async fn handle_compact_returns_count() {
-        // Arrange
-        let (state, _dir) = build_test_state();
-        let chat_id = create_test_chat(&state, "test-compact").await;
-
-        let messages = vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "hi"),
-        ];
-        let json = serde_json::to_string(&messages).expect("json");
-        call_blocking(Arc::clone(&state.db), {
-            move |db| db.save_session(chat_id, &json)
-        })
-        .await
-        .expect("save session");
+    async fn handle_compact_runs_when_automatic_compaction_is_disabled() {
+        // Arrange: `enabled` only controls automatic compaction.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(dir.path().to_str().expect("utf8").to_string());
+        config.compaction.enabled = false;
+        let state = build_state(config, Box::new(NoOpProvider));
+        let chat_id = create_test_chat(&state, "test-compact-disabled").await;
+        seed_compactable_session(&state, chat_id).await;
 
         // Act
         let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
 
-        // Assert
+        // Assert: the command reports the compaction and persists it.
         let response = result.expect("response");
-        assert!(response.contains("Compacted"), "response: {response}");
-        assert!(response.contains("2 messages"), "response: {response}");
+        assert_eq!(response, "Compacted 3 messages to 2.");
+
+        let loaded = crate::agent_loop::session::load_messages_for_turn(
+            &state.turn_dependencies(),
+            ConversationScope::Normal,
+            chat_id,
+        )
+        .await
+        .expect("the next turn should restore the compacted session");
+        let checkpoint = loaded.context.checkpoint.expect("saved checkpoint");
+        assert!(checkpoint.summary.contains("summary"));
+        assert_eq!(loaded.context.messages.len(), 2);
+        assert_eq!(loaded.context.messages[0].role, "assistant");
+        assert_eq!(
+            loaded.context.messages[1].content.as_text_lossy(),
+            "fresh question"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_compact_reports_a_summarization_failure() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(dir.path().to_str().expect("utf8").to_string());
+        let state = build_state(config, Box::new(FailingSummarizer));
+        let chat_id = create_test_chat(&state, "test-compact-failure").await;
+        seed_compactable_session(&state, chat_id).await;
+
+        // Act
+        let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
+
+        // Assert: the failure is reported instead of "Nothing to compact".
+        let response = result.expect("response");
+        assert!(
+            response.starts_with("Compaction failed:"),
+            "response: {response}"
+        );
+        let snapshot = call_blocking(Arc::clone(&state.db), move |db| {
+            db.load_session_snapshot(chat_id, 10)
+        })
+        .await
+        .expect("snapshot");
+        assert!(
+            snapshot
+                .messages_json
+                .as_deref()
+                .is_some_and(|json| json.contains("fresh question")),
+            "a failed compaction must keep the original session"
+        );
     }
 
     #[tokio::test]
@@ -1132,16 +1274,7 @@ mod tests {
         let (state, _dir) = build_test_state();
         let chat_id = create_test_chat(&state, "test-compact-agent").await;
 
-        let messages = vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "hi"),
-        ];
-        let json = serde_json::to_string(&messages).expect("json");
-        call_blocking(Arc::clone(&state.db), {
-            move |db| db.save_session(chat_id, &json)
-        })
-        .await
-        .expect("save session");
+        seed_compactable_session(&state, chat_id).await;
 
         // Act
         let result = handle_slash_command(&state, chat_id, &test_context(), "/compact", None).await;
@@ -1259,16 +1392,7 @@ mod tests {
         let (state, _dir) = build_test_state();
         let chat_id = create_test_chat(&state, "test-compact-surface").await;
 
-        let messages = vec![
-            Message::text("user", "hello"),
-            Message::text("assistant", "hi"),
-        ];
-        let json = serde_json::to_string(&messages).expect("json");
-        call_blocking(Arc::clone(&state.db), {
-            move |db| db.save_session(chat_id, &json)
-        })
-        .await
-        .expect("save session");
+        seed_compactable_session(&state, chat_id).await;
 
         let context = SurfaceContext {
             channel: "cli".to_string(),

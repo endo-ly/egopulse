@@ -1,5 +1,6 @@
 pub(crate) mod loader;
 pub(crate) mod manager;
+pub(crate) mod model_metadata;
 pub(crate) mod persist;
 pub(crate) mod resolve;
 pub(crate) mod secret_ref;
@@ -9,6 +10,7 @@ pub(crate) mod web_fetch;
 pub(crate) use loader::is_valid_base_url;
 pub(crate) use loader::resolve_state_root;
 pub(crate) use manager::ConfigManager;
+pub(crate) use model_metadata::{ModelMetadata, ModelValueSource};
 pub use resolve::default_config_path;
 pub(crate) use resolve::default_state_root;
 pub use types::*;

@@ -412,8 +412,9 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 1. 各 source session について `event_extraction` checkpoint のみを確認する
 2. checkpoint が無い、または最新 message が checkpoint より新しければアーカイブしない
 3. 最新 message が checkpoint 以下なら、そのセッションをアーカイブ対象とする
-4. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（`messages_json` 全体）
-5. `sessions.messages_json` を直近4件の `user` / `assistant` テキスト発話に切り詰める。`tool` role と `tool_calls` を持つ `assistant` は除外（`messages` テーブルは無傷）
+4. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（checkpoint の参照メッセージ + 保持メッセージ）
+5. `sessions.messages_json` を直近4件の `user` / `assistant` テキスト発話に切り詰め、checkpoint と使用量アンカーをクリアする。`tool` role と `tool_calls` を持つ `assistant` は除外（`messages` テーブルは無傷）
+6. 解析に失敗した snapshot は空配列とみなさず、エラーとして run を `running` のまま残す
 6. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップ
 7. アーカイブ失敗時は run を `running` のまま残し、次回の scheduler cycle または startup recovery で再試行する
 

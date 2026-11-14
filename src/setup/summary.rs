@@ -232,30 +232,14 @@ pub(crate) fn save_config(
             .as_ref()
             .map(|c| c.log_level.clone())
             .unwrap_or_else(|| "info".to_string()),
-        compaction_timeout_secs: existing_config
+        compaction: existing_config
             .as_ref()
-            .map(|c| c.compaction_timeout_secs)
-            .unwrap_or(180),
+            .map(|c| c.compaction.clone())
+            .unwrap_or_default(),
         max_history_messages: existing_config
             .as_ref()
             .map(|c| c.max_history_messages)
             .unwrap_or(50),
-        compact_keep_recent: existing_config
-            .as_ref()
-            .map(|c| c.compact_keep_recent)
-            .unwrap_or(20),
-        default_context_window_tokens: existing_config
-            .as_ref()
-            .map(|c| c.default_context_window_tokens)
-            .unwrap_or(32768),
-        compaction_threshold_ratio: existing_config
-            .as_ref()
-            .map(|c| c.compaction_threshold_ratio)
-            .unwrap_or(0.80),
-        compaction_target_ratio: existing_config
-            .as_ref()
-            .map(|c| c.compaction_target_ratio)
-            .unwrap_or(0.40),
         channels,
         default_agent: crate::config::AgentId::new(&agent_id),
         agents,

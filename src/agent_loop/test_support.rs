@@ -3,6 +3,9 @@
 use std::sync::Arc;
 
 use crate::conversation::SurfaceContext;
+use crate::llm::tokens::{
+    estimate_message_tokens, estimate_text_tokens, max_output_tokens_for_request,
+};
 use crate::llm::{LlmProvider, Message};
 use crate::runtime::AppState;
 
@@ -58,6 +61,13 @@ pub(crate) struct FakeProvider {
     pub(crate) responses: std::sync::Mutex<Vec<crate::llm::MessagesResponse>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct TestOutputLimits {
+    pub(crate) context_window: usize,
+    pub(crate) max_output_tokens: usize,
+    pub(crate) minimum_output_tokens: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct RecordingProvider {
     responses:
@@ -67,6 +77,7 @@ pub(crate) struct RecordingProvider {
     seen_tools: Arc<std::sync::Mutex<Vec<Option<Vec<crate::llm::ToolDefinition>>>>>,
     delays_ms: Arc<std::sync::Mutex<Vec<u64>>>,
     streaming_delta: Option<String>,
+    output_limits: Option<TestOutputLimits>,
 }
 
 #[async_trait::async_trait]
@@ -148,6 +159,31 @@ impl LlmProvider for RecordingProvider {
     fn model_name(&self) -> &str {
         "test-model"
     }
+
+    fn request_output_limit(
+        &self,
+        system: &str,
+        tools_json: Option<&str>,
+        messages: &[&Message],
+    ) -> Result<Option<usize>, crate::error::LlmError> {
+        let Some(limits) = self.output_limits else {
+            return Ok(None);
+        };
+        let prompt_tokens = estimate_text_tokens(system)
+            + tools_json.map(estimate_text_tokens).unwrap_or_default()
+            + messages
+                .iter()
+                .map(|message| estimate_message_tokens(message))
+                .sum::<usize>();
+        max_output_tokens_for_request(
+            limits.context_window,
+            prompt_tokens,
+            limits.max_output_tokens,
+            limits.minimum_output_tokens,
+        )
+        .map(Some)
+        .map_err(Into::into)
+    }
 }
 
 impl RecordingProvider {
@@ -167,11 +203,17 @@ impl RecordingProvider {
             seen_tools: Arc::new(std::sync::Mutex::new(Vec::new())),
             delays_ms: Arc::new(std::sync::Mutex::new(delays_ms)),
             streaming_delta: None,
+            output_limits: None,
         }
     }
 
     pub(crate) fn with_streaming_delta(mut self, delta: &str) -> Self {
         self.streaming_delta = Some(delta.to_string());
+        self
+    }
+
+    pub(crate) fn with_output_limits(mut self, limits: TestOutputLimits) -> Self {
+        self.output_limits = Some(limits);
         self
     }
 
@@ -194,13 +236,76 @@ pub(crate) fn test_config(state_root: String) -> crate::config::Config {
 
 pub(crate) fn test_config_with_compaction(
     state_root: String,
-    compact_keep_recent: usize,
+    keep_recent_tokens: usize,
 ) -> crate::config::Config {
     let mut config = crate::test_util::test_config(&state_root);
-    config.compact_keep_recent = compact_keep_recent;
-    config.default_context_window_tokens = 9000;
-    config.compaction_threshold_ratio = 0.01;
+    config.compaction.keep_recent_tokens = keep_recent_tokens;
+    config.compaction.reserve_tokens = 512;
+    set_context_window(&mut config, 9_000);
     config
+}
+
+/// Returns a config whose compaction window triggers on a small conversation.
+pub(crate) fn test_config_with_compaction_window(
+    state_root: String,
+    keep_recent_tokens: usize,
+    context_window_tokens: usize,
+) -> crate::config::Config {
+    let mut config = test_config_with_compaction(state_root, keep_recent_tokens);
+    set_context_window(&mut config, context_window_tokens);
+    config
+}
+
+pub(crate) fn build_state_with_compaction_window(
+    state_root: &std::path::Path,
+    context_window_tokens: usize,
+    llm: Box<dyn LlmProvider>,
+) -> AppState {
+    let config = test_config_with_compaction_window(
+        state_root.to_string_lossy().into_owned(),
+        1,
+        context_window_tokens,
+    );
+    build_state(config, llm)
+}
+
+/// Sets the context window of the model used by the test LLM.
+///
+/// The mock providers report `test/test-model`, so an explicit entry for that
+/// pair is what the loop resolves. The default provider's entry is updated too
+/// so a test that resolves through the configuration sees the same window.
+fn set_context_window(config: &mut crate::config::Config, context_window_tokens: usize) {
+    use crate::config::{ModelConfig, ProviderConfig, ProviderId, secret_ref::ResolvedValue};
+
+    let test_provider = config
+        .providers
+        .entry(ProviderId::new("test"))
+        .or_insert_with(|| {
+            ProviderConfig::new(
+                "Test".to_string(),
+                "https://api.openai.com/v1".to_string(),
+                Some(ResolvedValue::Literal("sk-test".to_string())),
+                "test-model".to_string(),
+                std::collections::HashMap::new(),
+            )
+        });
+    test_provider.models.insert(
+        "test-model".to_string(),
+        ModelConfig {
+            context_window_tokens: Some(context_window_tokens),
+            ..ModelConfig::default()
+        },
+    );
+
+    let provider = config
+        .providers
+        .get_mut(&ProviderId::new("openai"))
+        .expect("test provider");
+    provider
+        .models
+        .get_mut("gpt-4o-mini")
+        .expect("test model")
+        .context_window_tokens = Some(context_window_tokens);
 }
 
 pub(crate) fn cli_context(session: &str) -> SurfaceContext {
@@ -221,6 +326,7 @@ pub(crate) fn tool_result_message(status: &str, result: &str) -> Message {
         reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: Some("call-1".to_string()),
+        finish_reason: None,
     }
 }
 

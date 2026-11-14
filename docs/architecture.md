@@ -102,7 +102,7 @@ src/
 │   ├── loop_runner.rs   # AgentLoop、LoopState、iteration policy
 │   ├── model_step.rs    # 1 回の LLM 呼び出し、分類、retry、usage
 │   ├── tool_execution.rs # Tool 実行、ledger、Tool Result 構築
-│   ├── compaction.rs    # コンテキスト圧縮 + アーカイブ
+│   ├── compaction.rs    # コンテキスト圧縮（checkpoint 要約）+ アーカイブ
 │   ├── response_guard.rs # empty / declarative response guard
 │   ├── message_format.rs # Message / Tool Result の表現変換
 │   ├── event.rs         # AgentEvent 型
@@ -145,12 +145,15 @@ src/
 │   ├── responses.rs     # Responses API 呼び出し
 │   ├── messages.rs      # Messages API 呼び出し
 │   ├── sse.rs           # SSE ストリーム解析
+│   ├── tokens.rs        # UTF-16 文字数ベースの token 推定、出力上限の clamp
+│   ├── model_catalog.rs # 生成済みモデルカタログの読込（context window / 最大出力）
 │   ├── calibration.rs   # prompt token 推定補正 (EMA)
 │   └── codex_auth.rs    # Codex auth 解決、AUTH_CACHE
 │
 ├── config/              # 設定管理
 │   ├── mod.rs           # 型定義、公開ファサード
 │   ├── types.rs         # Config 型定義
+│   ├── model_metadata.rs # 明示設定・カタログ・既定値からのモデル上限解決
 │   ├── manager.rs       # ConfigManager (snapshot + 更新境界)
 │   ├── loader.rs        # YAML 読み込み、正規化、検証
 │   ├── persist.rs       # YAML 書き出し、アトミック書込
@@ -314,16 +317,18 @@ TurnExecutor
   ├─ Turn preparation
   ├─ TurnPersistence::persist_user_input
   ├─ AgentLoop::run
+  │    ├─ compaction decision for the request about to be sent
+  │    ├─ checkpoint persistence (CAS) before the model call
   │    ├─ ModelRunner::run_with_retry
   │    ├─ TurnPersistence::persist_tool_call
   │    ├─ ToolExecutor::execute
   │    ├─ TurnPersistence::persist_tool_results
-  │    └─ compaction and next iteration
+  │    └─ next iteration
   ├─ TurnPersistence::persist_final
   └─ TurnLifecycle::complete
 ```
 
-`AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
+`AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。compaction の判定と checkpoint の永続化は `AgentLoop` が model 送信直前に行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
 
 ---
 
@@ -343,7 +348,7 @@ TurnExecutor
       │
       ├─ 5a. chat_id を解決 (chats テーブルを upsert)
       ├─ 5b. session snapshot をロード (sessions テーブル)
-      ├─ 5c. Safety Compaction 判定 (token estimate >= threshold)
+      ├─ 5c. Context Compaction 判定 (context_tokens > context_window - reserve_tokens)
       │
       ├─ 5d. system prompt を構築
       │      ├ SOUL.md (agent → channel → global の順に解決)

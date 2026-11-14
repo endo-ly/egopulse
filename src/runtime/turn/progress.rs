@@ -515,6 +515,7 @@ mod tests {
             assistant_message_id: "turn:turn-test:assistant:1".to_string(),
             text: "done".to_string(),
             terminal: false,
+            finish_reason: None,
         })
         .unwrap();
         drop(tx);
@@ -910,6 +911,7 @@ mod tests {
             assistant_message_id: "turn:t1:assistant:2".to_string(),
             text: "完了した結果をお伝えします".to_string(),
             terminal: false,
+            finish_reason: None,
         })
         .unwrap();
         let () = handle.await.unwrap();

@@ -8,6 +8,12 @@ use rusqlite::Connection;
 
 use crate::error::StorageError;
 
+/// Version of the persisted `ContextSnapshot` envelope.
+///
+/// The storage layer writes this version when an empty snapshot is produced
+/// for `/new`; the agent loop uses the same value for every saved snapshot.
+pub(crate) const SESSION_SNAPSHOT_VERSION: u32 = 1;
+
 /// Maximum durable-pending turns (`turn_runs` in `accepted`/`input_committed`)
 /// allowed per session. Enforced atomically with the accept INSERT so a
 /// capacity rejection never leaves a runnable row.
@@ -106,7 +112,7 @@ pub(crate) use turn::{AcceptOutcome, AcceptTurnParams, TurnRun, turn_failure_mes
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StageToolFollowupOutcome {
     /// The message is durably present in `messages`.
-    Accepted(StoredMessage),
+    Accepted(Box<StoredMessage>),
     /// There is no unique `tools_pending` Turn for this chat.
     NoToolPhase,
 }
@@ -235,6 +241,9 @@ pub(crate) struct StoredMessage {
     /// Parent message referenced by this row (e.g. a Tool Result to its
     /// issuing assistant message).
     pub parent_message_id: Option<String>,
+    /// Why the model stopped early, when this row is a truncated answer.
+    /// A NULL means the message ended on its own (or predates the column).
+    pub finish_reason: Option<String>,
 }
 
 impl StoredMessage {
@@ -257,6 +266,7 @@ impl StoredMessage {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         }
     }
 
@@ -776,8 +786,8 @@ pub(crate) struct LlmUsageLogEntry<'a> {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub request_kind: &'a str,
-    /// Raw prompt estimate (chars / 3) for the call. Used to rebuild
-    /// calibration factors on startup. Required for every row.
+    /// Raw prompt estimate (UTF-16 code units divided by 4) for the call.
+    /// Used to rebuild calibration factors on startup. Required for every row.
     pub estimated_tokens: i64,
     /// Whether the request payload included tool definitions.
     pub has_tools: bool,

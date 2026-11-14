@@ -42,6 +42,11 @@ export const MessageBubble = memo(function MessageBubble({
           <>{message.content}</>
         )}
       </div>
+      {message.finish_reason === "max_output_tokens" && (
+        <div className="message-truncation-notice" role="status">
+          The response stopped at the output limit, so it may be incomplete.
+        </div>
+      )}
     </div>
   );
 });

@@ -8,6 +8,8 @@ pub(crate) enum Block {
     User(String),
     Assistant(String),
     Tool(ToolBlock),
+    /// A non-error status line, such as a truncated answer's notice.
+    Notice(String),
     Error(String),
 }
 
@@ -166,12 +168,18 @@ impl Transcript {
                     active.buffer.clear();
                 }
             }
-            TurnEvent::FinalResponse { text } => {
+            TurnEvent::FinalResponse {
+                text,
+                finish_reason,
+            } => {
                 let active = self.active.take().unwrap_or_default();
                 for card in active.tool_cards {
                     self.commit(Block::Tool(card));
                 }
                 self.commit(Block::Assistant(text));
+                if let Some(reason) = finish_reason {
+                    self.commit(Block::Notice(reason.notice().to_string()));
+                }
             }
             TurnEvent::Error { message } => {
                 let active = self.active.take().unwrap_or_default();
@@ -273,6 +281,7 @@ fn summarize_json(value: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use crate::runtime::local_api::protocol::TurnEvent;
+
     use serde_json::json;
 
     #[test]
@@ -395,6 +404,7 @@ mod tests {
 
         // Act
         transcript.apply_turn_event(TurnEvent::FinalResponse {
+            finish_reason: None,
             text: "**final**".to_string(),
         });
 
@@ -405,6 +415,28 @@ mod tests {
         assert_eq!(
             pending.last(),
             Some(&Block::Assistant("**final**".to_string()))
+        );
+    }
+
+    #[test]
+    fn truncated_final_response_commits_a_notice_after_the_answer() {
+        // Arrange
+        let mut transcript = Transcript::new();
+        transcript.begin_turn("hello");
+
+        // Act
+        transcript.apply_turn_event(TurnEvent::FinalResponse {
+            text: "partial".to_string(),
+            finish_reason: Some(crate::llm::TruncationReason::MaxOutputTokens),
+        });
+
+        // Assert
+        let pending = transcript.drain_pending();
+        assert_eq!(
+            pending.last().map(
+                |block| matches!(block, Block::Notice(text) if text == crate::llm::TruncationReason::MaxOutputTokens.notice())
+            ),
+            Some(true)
         );
     }
 
@@ -440,6 +472,7 @@ mod tests {
             text: "after".to_string(),
         });
         transcript.apply_turn_event(TurnEvent::FinalResponse {
+            finish_reason: None,
             text: "after".to_string(),
         });
 
@@ -487,6 +520,7 @@ mod tests {
             text: "done".to_string(),
         });
         transcript.apply_turn_event(TurnEvent::FinalResponse {
+            finish_reason: None,
             text: "done".to_string(),
         });
 

@@ -413,7 +413,14 @@ fn map_agent_event(event: AgentEvent) -> TurnEvent {
             timestamp,
         },
         AgentEvent::AssistantMessageDiscarded { .. } => TurnEvent::AssistantDiscarded,
-        AgentEvent::FinalResponse { text, .. } => TurnEvent::FinalResponse { text },
+        AgentEvent::FinalResponse {
+            text,
+            finish_reason,
+            ..
+        } => TurnEvent::FinalResponse {
+            text,
+            finish_reason,
+        },
         AgentEvent::Error { message, .. } => TurnEvent::Error { message },
     }
 }
@@ -681,6 +688,7 @@ mod tests {
             seq: None,
             turn_id: None,
             parent_message_id: None,
+            finish_reason: None,
         };
         state
             .db
@@ -894,11 +902,9 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, TurnEvent::Delta { text } if text == "one"))
         );
-        assert!(
-            events.lock().expect("events").iter().any(
-                |event| matches!(event, TurnEvent::FinalResponse { text } if text == "one two")
-            )
-        );
+        assert!(events.lock().expect("events").iter().any(
+            |event| matches!(event, TurnEvent::FinalResponse { text, .. } if text == "one two")
+        ));
         state.supervisor.shutdown().await;
     }
 
@@ -1090,7 +1096,7 @@ mod tests {
                 .iter()
                 .any(|event| matches!(
                     event,
-                    TurnEvent::FinalResponse { text } if text == "ok"
+                    TurnEvent::FinalResponse { text, .. } if text == "ok"
                 )),
             "cross-channel observer did not receive the final response"
         );
@@ -1238,6 +1244,7 @@ mod tests {
                     invalid_arguments: None,
                 }],
                 tool_call_id: None,
+                finish_reason: None,
             },
             Message {
                 role: "tool".to_string(),
@@ -1247,6 +1254,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-1".to_string()),
+                finish_reason: None,
             },
         ];
 

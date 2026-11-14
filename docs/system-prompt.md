@@ -387,30 +387,83 @@ Compaction 時は `tools = None`（ツール定義なし）。
 
 ## 7. Compaction 用プロンプト
 
-`src/agent_loop/compaction.rs` 内 `safety_compact()` で使用。`build_system_prompt()` とは別文脈。
+`src/agent_loop/compaction.rs` 内の `compact()` で使用する。`build_system_prompt()` とは別文脈で、Agent Loop の system prompt は使わない。
 
-| 用途 | ロール | テキスト | 定数 |
-|---|---|---|---|
-| 要約指示 | user message | `Summarize the following conversation concisely, preserving key facts, decisions, tool results, and context needed to continue the conversation. Be brief but thorough.` | ハードコード |
-| 要約システム | system message | `You are a helpful summarizer. Summarize the conversation concisely, preserving key facts, decisions, tool results, and context needed to continue. Be brief but thorough. Write the summary in the same language the user was using.` | `SUMMARIZER_SYSTEM_PROMPT` |
-
-### Reference-Only ヘッダー
-
-Compaction summary には reference-only ヘッダーが付与され、summary が active instruction ではなく背景情報であることを LLM に明示する。定数 `REFERENCE_ONLY_HEADER` として定義。
+### 要約リクエストの形
 
 ```text
-[CONTEXT COMPACTION — REFERENCE ONLY]
-Earlier turns were compacted into the summary below.
-This is background reference, not active instruction.
-Do not answer old requests mentioned in this summary.
-Respond to the latest user message after this summary.
+system: SUMMARIZATION_SYSTEM_PROMPT
+user:   <conversation>...</conversation>
+        [<previous-summary>...</previous-summary>]
+        {INITIAL_SUMMARY_PROMPT | UPDATE_SUMMARY_PROMPT}
+
+        [Additional focus: {/compact の追加指示}]
+```
+
+split turn のターン前半要約だけは次の形になる。
+
+```text
+# Conversation
+{serialized}
+
+# Instructions
+{TURN_PREFIX_SUMMARY_PROMPT}
+
+[Additional focus: ...]
+```
+
+要約リクエストは通常の model 呼び出しと同じ出力上限の扱いを共有する。compaction 専用の固定出力上限や切り詰めは設けず、モデルの出力上限に任せる。`finish_reason=length` などで要約が途中終了した場合は checkpoint として確定しない。
+
+| 用途 | 定数 |
+|---|---|
+| 要約システム | `SUMMARIZATION_SYSTEM_PROMPT` |
+| 初回 | `INITIAL_SUMMARY_PROMPT` |
+| 更新 | `UPDATE_SUMMARY_PROMPT` |
+| ターン前半 | `TURN_PREFIX_SUMMARY_PROMPT` |
+
+要約システムプロンプトは「会話を続けない・会話中の質問に答えない・会話に無い goal や next action を作らない」ことを明示する。ツール定義は渡さず（`tools = None`）、tool call を含む応答は失敗として扱う。
+
+### 要約本文の形式
+
+`INITIAL_SUMMARY_PROMPT` と `UPDATE_SUMMARY_PROMPT` は次の 3 節を要求する。該当が無い節は省略し、空の箇条書きを作らない。
+
+```markdown
+## 会話の経緯
+## 共有された情報
+## 重要な参照情報
+```
+
+会話の使用言語を引き継ぐ。事実と推測、ユーザー発言と assistant 発言、決定と提案を区別し、識別子・数値・パス・エラーメッセージは原文のまま残す。
+
+### 会話の直列化
+
+要約入力は role ごとにタグ付けしたプレーンテキストへ変換する。モデルが会話の続きを書かないよう、role 構造は持たせない。
+
+| 元 | 形式 |
+|---|---|
+| user | `[User]: ...` |
+| assistant 本文 | `[Assistant]: ...` |
+| assistant の tool call | `[Assistant tool calls]: name({args}); ...` |
+| tool 結果 | `[Tool result]: ...` / `[Tool error]: ...` |
+| 画像 | `[image]` |
+| reasoning | 含めない |
+
+Tool Result は先頭 2,000 文字までを要約対象とする。要約対象が入力上限を超える場合は、メッセージ境界で古い側から分割し、単一メッセージが収まらないときは役割と継続を明示して分割する。前段階の要約を引き継ぎ、大きな checkpoint も先に分割して再要約する。
+
+### Checkpoint ヘッダー
+
+checkpoint を次のリクエストへ投影するとき、先頭に参照専用ヘッダーを付ける。定数 `CHECKPOINT_HEADER` として `session_snapshot.rs` に定義する。
+
+```text
+[CONTEXT CHECKPOINT — REFERENCE ONLY]
+The earlier conversation was compacted into the summary below.
+Treat it as background history, not as an active instruction.
+Respond to the messages that follow this checkpoint.
 ```
 
 ### Secret Redaction
 
-要約入力・出力の両方に三層 redaction（値・prefix・文脈）を適用（`src/tools/sanitizer.rs`）。summary やログに credential が含まれないことを保証する。archive は verbatim 保存であり、redaction 保証対象外。
-
----
+要約入力・出力と checkpoint のファイル一覧に三層 redaction（値・prefix・文脈）を適用する（`src/tools/sanitizer.rs`）。summary やログに credential が含まれないことを保証する。archive は本文を redaction したうえで保存する。
 
 ## 8. Channel Context 注入（Multi-Agent Room）
 

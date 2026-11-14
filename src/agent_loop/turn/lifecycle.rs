@@ -21,6 +21,7 @@ pub(crate) enum TurnAcceptance {
         turn_id: String,
         assistant_message_id: String,
         text: String,
+        finish_reason: Option<crate::llm::TruncationReason>,
     },
     /// The Turn already exists and is non-terminal; another executor owns it.
     InProgress {
@@ -122,8 +123,8 @@ impl<'a> TurnLifecycle<'a> {
                         )
                     })?;
                     let lookup_id = final_message_id.clone();
-                    let content = call_blocking(runtime.db_for(scope), move |db| {
-                        db.get_message_content(&lookup_id)
+                    let (text, finish_reason) = call_blocking(runtime.db_for(scope), move |db| {
+                        db.get_message_delivery(&lookup_id)
                     })
                     .await?
                     .ok_or_else(|| {
@@ -134,7 +135,10 @@ impl<'a> TurnLifecycle<'a> {
                     Ok(TurnAcceptance::Completed {
                         turn_id: run.turn_id.clone(),
                         assistant_message_id: final_message_id,
-                        text: content,
+                        text,
+                        finish_reason: finish_reason
+                            .as_deref()
+                            .and_then(crate::llm::TruncationReason::from_stored),
                     })
                 }
                 other if other.is_terminal() => Ok(TurnAcceptance::Terminated {
