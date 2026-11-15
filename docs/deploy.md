@@ -66,10 +66,6 @@ Rust toolchain が必要。未導入の場合は [rustup](https://rustup.rs/) �
 
 ソースビルド・開発・CI・Release は `rust-toolchain.toml` の Rust 1.95.0 を使用する。rustup はリポジトリ内で指定バージョンを選択し、必要なコンポーネントをインストールする。ツールチェーンの更新は Clippy・テストを含む品質チェックと合わせて行う。
 
-> **Rust toolchain / Rustup とは？**
-> - **Rust toolchain**: Rust コンパイラ(`rustc`)、ビルドツール(`cargo`)、標準ライブラリなどの一式
-> - **Rustup**: toolchain のインストール・バージョン管理を行う公式ツール
-
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
@@ -140,36 +136,29 @@ channels:
 openssl rand -base64 32
 ```
 
-サンプルは [`egopulse.config.example.yaml`](../egopulse.config.example.yaml) を参照。
+サンプル: [`egopulse.config.example.yaml`](../egopulse.config.example.yaml)
 
 ### 3.2 固定ディレクトリ
 
-EgoPulse は以下の固定ディレクトリを使用する。
-
-```bash
-mkdir -p "$HOME/.egopulse/data" "$HOME/.egopulse/workspace"
-```
+`$HOME/.egopulse/` 配下の配置（`runtime/`、`workspace/` など）は Runtime が自動で作成する。詳細は [directory.md](./directory.md) を参照。
 
 ## 4. systemd 常駐
 
 systemd で常駐化し、障害時は自動復旧させる。
 
-### 4.1 サービス登録（自動インストール）
+### 4.1 前景実行とサービス登録
 
-systemd に登録せず、その場で有効チャネルを前景実行する。
+systemd に登録せず前景実行する:
 
 ```bash
 egopulse run
 ```
 
-systemd unit ファイルの自動生成・配置・有効化まで一括実行する。
-すでにインストール済みの場合は unit を更新してサービスを再起動する。
+systemd unit ファイルの自動生成・配置・有効化まで一括実行する。すでにインストール済みの場合は unit を更新してサービスを再起動する。unit は Config のパスを持たない。Runtime は固定の場所（`~/.egopulse/egopulse.config.yaml`）から Config を読む。
 
 ```bash
 egopulse gateway install
 ```
-
-unit は Config のパスを持たない。Runtime は固定の場所（`~/.egopulse/egopulse.config.yaml`）から Config を読む。
 
 削除:
 
@@ -226,7 +215,7 @@ Environment=HOME=%h
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=%h/.egopulse %h/.egopulse/data %h/.egopulse/workspace
+ReadWritePaths=%h/.egopulse
 ProtectHome=false
 
 [Install]

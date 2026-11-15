@@ -177,7 +177,7 @@ Agent タブの Memory でも同じコンポーネントを使う。
 
 ## 6. Intention の編集
 
-intention の追加・変更・削除・有効化 / 無効化は、`pulse` ツールと同じ操作（`add` / `update` / `remove` / `enable` / `disable`）を API として呼び出す。PULSE.yaml を直接書き換える経路は設けない（[pulse.md §3](../pulse.md#3-ファイル責務) の「書き込みはツール経由のみ」に従う）。編集は Pulse 区画の定義（§3）から行う。
+intention の追加・変更・削除・有効化 / 無効化は、`pulse` ツールと同じ操作（`add` / `update` / `remove` / `enable` / `disable`）を API として呼び出す。PULSE.yaml を直接書き換える経路は設けない（書き込みはツール経由のみ、[pulse.md §3](../pulse.md#3-ファイル責務)）。編集は Pulse 区画の定義（§3）から行う。
 
 ---
 

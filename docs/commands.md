@@ -27,7 +27,9 @@ CLI サブコマンドとチャットスラッシュコマンドの完全仕様�
 | `egopulse events extract` | `[--agent] [--from] [--to]` | 過去セッションからエピソードイベントを再抽出（バックフィル） | 必須 |
 | `egopulse update` | なし | 最新リリースに更新 | 不要 |
 
-`-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は、TTY でない stdin から読み込む。`PROMPT` と stdin の両方がある場合は、両者を空行 2 つで連結する。headless 実行の `--session` は指定セッションを再開し、`--continue` は最終更新セッションを再開する。引数なしの `egopulse` は起動済み Runtime の Local API に接続し、`--session` が指定されていればそのセッションを開き、省略時は最終更新セッションまたは新規コンテキストを Inline TUI で開く。Runtime が起動していない場合は自動起動せず、`egopulse gateway start` または `egopulse run` を案内する。`--session` は保存済みセッションの `surface_thread`（`external_chat_id` から `{channel}:` 接頭辞と `:agent:{agent_id}` 接尾辞を除いた値）と一致した場合にそのセッションを開き、一致しない場合はその名前の新規セッションとして扱う。表示名（`chat_title`）を変更しても `surface_thread` は変わらないため、`--session` の指定はリネームの影響を受けない。headless の成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。プロンプトがない場合は終了コード 2、それ以外のエラーは 1、Ctrl-C は 0 で終了する。
+- `-p` / `--print` は非対話モードを起動する。`PROMPT` を省略した場合は TTY でない stdin から読み込み、両方ある場合は空行 2 つで連結する。成功時は応答本文だけを stdout、ログとエラーは stderr に出力する。終了コード: プロンプトなし `2`、その他のエラー `1`、Ctrl-C `0`
+- `--session` は指定セッションを、`--continue` は最終更新セッションを再開する。`--session` の照合は保存済みセッションの `surface_thread`（`external_chat_id` から `{channel}:` 接頭辞と `:agent:{agent_id}` 接尾辞を除いた値）で行い、一致しない場合はその名前の新規セッションとして扱う。表示名（`chat_title`）を変更しても `surface_thread` は変わらないため、リネームの影響を受けない
+- 引数なしの `egopulse` は起動済み Runtime の Local API に接続し、`--session` があればそのセッションを、省略時は最終更新セッションまたは新規コンテキストを Inline TUI で開く。Runtime が起動していない場合は自動起動せず、`egopulse gateway start` または `egopulse run` を案内する
 
 ### 1.2 グローバルオプション
 
@@ -170,7 +172,7 @@ Telegram / Discord / TUI / Web チャット のいずれかで `/` から始ま�
 
 #### `/status`
 
-**現在**のセッション・チャネル状態を表示する。`egopulse gateway status` がライブランタイム情報を参照するのに対し、`/status` はセッションコンテキスト内の動的な情報を表示する。
+セッション・チャネル状態を表示する。ライブランタイム情報の `egopulse gateway status`（§1.6）と異なり、セッションコンテキスト内の情報を扱う。
 
 ```
 Status
@@ -179,10 +181,6 @@ Provider: openrouter
 Model: gpt-5
 Session: active (12 messages)
 ```
-
-#### `/restart`
-
-未実装。`"Not implemented yet."` を返すだけで、プロセス再起動・systemd 操作は行わない。
 
 #### `/skills`
 
@@ -197,9 +195,7 @@ Available skills:
 
 ### 2.4 コマンドハンドリングルール
 
-- `/` で始まる入力はすべてスラッシュコマンドとして処理される
-- Telegram グループでは `@botname /model` のようにメンションを前置してもコマンドとして認識される
-- Discord ギルドでは `@EgoPulse /model` のようにメンションを前置してもコマンドとして認識される
+- `/` で始まる入力はすべてスラッシュコマンドとして処理される。Telegram / Discord のグループではメンションを前置しても（`@botname /model`）コマンドとして認識される
 - スラッシュコマンドはエージェントループに入らず、セッション履歴にも記録されない
 - 未定義のコマンドは `"Unknown command."` を返す
 

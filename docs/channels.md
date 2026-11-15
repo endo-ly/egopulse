@@ -35,9 +35,7 @@ pub(crate) trait ChannelAdapter: Send + Sync {
 
 ### Channel Input Boundary
 
-Discord / Telegram などの受信チャネルは、プラットフォーム固有の受信判定、mention 解析、添付ファイル取得を行った後、runtime の `channel_input` に正規化済み入力を渡す。
-
-`runtime/channel_input.rs` は以下の EgoPulse 共通処理を担う。
+Discord / Telegram などの受信チャネルは、プラットフォーム固有の受信判定、mention 解析、添付ファイル取得を行った後、runtime 側の共通入力境界へ正規化済み入力を渡す。共通入力境界は以下を担う。
 
 - `SurfaceContext` の構築と `ConversationScope` の反映
 - Multi-Agent Room の人間メッセージを Channel Log に保存
@@ -47,15 +45,13 @@ Discord / Telegram などの受信チャネルは、プラットフォーム固�
 
 ### チャネル横断の設定オーバーライド
 
-各チャネルはグローバル設定に対して以下をオーバーライドできる：
+| 設定項目 | 決まり方 |
+|---|---|
+| エージェント選択 | チャネル設定（DM は `default_agent`、チャネル設定の `agents` リスト、Multi-Agent Room は @mention） |
+| プロバイダー / モデル | Agent 設定。チャネル単位の指定は Agent の `profiles`（[config.md §3.11](./config.md#311-エージェント定義agentsid)）だけが行う |
+| 人格 (`SOUL.md`) | Agent 設定（エージェント別 → グローバル） |
 
-| 設定項目 | Web | Discord | Telegram | Voice |
-|---------|:---:|:-------:|:--------:|:-----:|
-| エージェント選択 | ○ | ○ | ○ | ○ |
-| プロバイダー / モデル | Agent設定 | Agent設定 | Agent設定 | Agent設定 |
-| 人格 (`SOUL.md`) | ○ | ○ | ○ | ○ |
-
-モデル解決の優先順位は [config.md §4](./config.md#4-モデル解決チェーン) を参照。
+モデル解決の優先順位は [config.md §4](./config.md#4-モデル解決チェーン)。
 
 ---
 
@@ -68,16 +64,18 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 
 ### データフロー
 
-- **メッセージ受信**: HTTP POST `/api/send_stream` または WebSocket `chat.send`。通常メッセージは共通のWeb入力境界からdurable Turnとして `TurnScheduler` へ投入する
-- **ストリーミング**: RunHub を介した publish/subscribe モデル
-- **セッション更新通知**: durable な会話保存の完了後、接続中の WebSocket クライアントへ `session_updated` を配信する。クライアントはセッション一覧と対象履歴を再取得する。イベントの取りこぼしを検出した場合は `resync` で再同期を要求する。定期ポーリングはフォールバックとして残る
-- **履歴のページング**: `GET /api/history` は `messages.seq` をカーソルに 300 行ずつ返す。Web UI は最新ページを表示し、上端付近で古いページを追加取得する。先頭到達・読み込み中・失敗時の再試行はタイムライン上部に表示し、prepend 時はスクロール位置を維持する。画面外のメッセージ行は `content-visibility` でレイアウト・描画コストを抑える
-- **Pulse の表示**: Pulse 通知は配送先チャネルへ最終応答だけが届くのに対し、セッション履歴には Activation の経過（合成入力・途中発話・ツールカード）も保存される。Web UI は経過を最終応答の下に折りたたみ、最終応答の本文の上に intention 名を 1 行だけ表示する。この行を開くとその通知の経過をその場で表示する。開閉状態は保存しない。折りたたみは `GET /api/history` の `pulse`（`run_id` / `role`）による。最終応答が読み込まれていない経過は通常の行として表示する
-- **検索範囲**: コマンドパレットのメッセージ検索は読み込み済みの履歴のみを対象とする。対象はタイムラインの最上位の行で、折りたたまれた Pulse の経過は含まない。全履歴検索は `GET /api/history` のページングとは別の機能である
-- **再接続**: SSEは `last_event_id`、WebSocketは `run.subscribe` によるイベントリプレイ対応（最大 512 イベント、5 分 TTL）。run が保持期間切れの場合は `run_not_found` を返し、クライアントは永続化済み履歴から再構築する
-- **応答**: WebAdapter の `send_text` は no-op。通常の返答は SSE/WS のストリーミングで届け、Pulse など他起点の通知は通常セッションへの永続化で届ける。永続化後は WebSocket `session_updated` と履歴ポーリングで Web UI に反映される
-- **添付ファイル配信**: `send_attachment` は WebAdapter が `state_root/runtime/attachments/` にスナップショットを保存し、ツール結果に `attachments` メタデータを返す。Web UI は成功した `send_attachment` を添付カードとして描画し、再生・ダウンロード時に `GET /api/attachments/{id}` を Bearer 認証で取得する。音声は標準プレイヤーで再生し、それ以外はダウンロードになる。保存先は workspace 外で、エージェントからは変更できない。1 ファイル 50 MiB 上限。保存期間は無期限（自動削除なし）で、DB バックアップには含まれないため、必要なら `runtime/attachments/` を別途バックアップする
-- **既存チャットのagent**: `chat:{id}` を指定した再開時は、`chats.agent_id` を使用する。新規Webセッションだけが `default_agent` を使用する。
+| 経路 | 契約 |
+|---|---|
+| メッセージ受信 | HTTP POST `/api/send_stream` または WebSocket `chat.send`。通常メッセージは共通の Web 入力境界から durable Turn として `TurnScheduler` へ投入する |
+| ストリーミング | RunHub を介した publish/subscribe モデル |
+| セッション更新通知 | durable な会話保存の完了後、WebSocket で `session_updated` を配信する。クライアントはセッション一覧と対象履歴を再取得し、取りこぼし検出時は `resync` で再同期を要求する。定期ポーリングはフォールバック |
+| 履歴のページング | `GET /api/history` は `messages.seq` をカーソルに 300 行ずつ返す。Web UI は最新ページを表示し、上端付近で古いページを追加取得する。prepend 時はスクロール位置を維持し、画面外の行は `content-visibility` で描画コストを抑える |
+| Pulse の表示 | Pulse 通知は配送先チャネルへ最終応答だけが届くのに対し、セッション履歴には Activation の経過（合成入力・途中発話・ツールカード）も保存される。履歴の `pulse`（`run_id` / `role`）が折りたたみ表示の根拠（表示の詳細は [webui/chat.md](./webui/chat.md)） |
+| 検索範囲 | コマンドパレットのメッセージ検索は読み込み済みの履歴のみが対象で、折りたたまれた Pulse の経過は含まない |
+| 再接続 | SSE は `last_event_id`、WebSocket は `run.subscribe` でイベントリプレイ（最大 512 イベント、5 分 TTL）。保持期間切れは `run_not_found` を返し、クライアントは永続化済み履歴から再構築する |
+| 応答 | `send_text` は no-op。通常の返答は SSE / WS ストリーミングで届け、Pulse 等他起点の通知はセッションへの永続化で届ける。永続化後は `session_updated` と履歴ポーリングで反映される |
+| 添付ファイル配信 | `send_attachment` は `runtime/attachments/` にスナップショットを保存し、ツール結果に `attachments` メタデータを返す。Web UI は添付カードとして描画し、再生・ダウンロードは `GET /api/attachments/{id}` を Bearer 認証で取得する。保存先は workspace 外でエージェントから変更できず、1 ファイル 50 MiB 上限・無期限保持。DB バックアップに含まれないため必要なら別途バックアップする |
+| 既存チャットの agent | `chat:{id}` を指定した再開時は `chats.agent_id` を使用する。新規 Web セッションだけが `default_agent` を使用する |
 
 ### セッション管理
 
@@ -95,9 +93,11 @@ Web UI はセッションを人間が読める単位で整理できる。
 ### 制約
 
 - 認証トークン未設定時は `/api/*` へのアクセスができない
-- WebSocket 最大接続数: 64
-- WebSocket 最大メッセージサイズ: 64KB
-- Webの ordinary message はRESTとWebSocketの入口にかかわらず共通 TurnScheduler に投入され、同一 session では FIFO で実行される。active run と同一 session の Tool 実行中は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じinteractionへ引き継がれる。共有observer interaction内の途中Turnの `done` / `error` は非終端として同じRunHubへ流れ、最後のTurnの `terminal: true` でだけ購読を終了する。ACKが不明な送信の明示的な再送では、未変更の同じdraftに限り同じ durable `request_id` / `request_key` を使い、WebSocketのRPC IDはattemptごとに変える。draft編集や別sessionの送信は新しいidentityを使い、別本文の同じrequest identity再利用は `409 Conflict` として拒否される。slash command はdurableな未完了Turnを持つsessionでは `busy` となり、busy確認からcommand完了まで通常入力と同じsession排他を保持する
+- WebSocket 最大接続数: 64。最大メッセージサイズ: 64KB
+- ordinary message は REST / WebSocket どちらの入口でも共通 `TurnScheduler` に durable 投入され、同一 session は FIFO で直列化される
+- active run と同一 session の Tool 実行中の入力は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じ interaction へ引き継がれる。共有 observer interaction 内の途中 Turn の `done` / `error` は非終端として同じ RunHub へ流れ、最後の Turn の `terminal: true` でのみ購読を終了する
+- ACK 不明な送信の明示的な再送は、未変更の同じ draft に限り同じ durable `request_id` / `request_key` を使い、WebSocket の RPC ID は attempt ごとに変える。draft 編集や別 session の送信は新しい identity を使い、別本文での同じ request identity 再利用は `409 Conflict` で拒否する
+- slash command は durable な未完了 Turn を持つ session では `busy` となり、busy 確認から command 完了まで通常入力と同じ session 排他を保持する
 
 ---
 
@@ -114,11 +114,16 @@ Web UI はセッションを人間が読める単位で整理できる。
 - **メッセージ受信**: `Handler::message()` がトリガー
 - **添付ファイル**: `workspace/media/inbound/` に自動ダウンロード
 - **エージェント選択**:
-  - DM → グローバル `default_agent`
-  - Single-Agent チャネル（`multi_agent: false`）→ `channels[channel_id].agents[0]` に紐づく Bot のみ受信し、その先頭 Agent が応答。`agents[1..]` は人間入力の入口にはならない
-  - Multi-Agent Room（`multi_agent: true`）→ @mention された Bot に紐づくエージェントを特定。mention なし → 応答なし（Channel Log のみ保存）
+
+| 入力 | 応答する agent |
+|---|---|
+| DM | グローバル `default_agent` |
+| Single-Agent チャネル（`multi_agent: false`） | `agents[0]` に紐づく Bot のみ受信し、その Agent が応答。`agents[1..]` の Bot は人間入力の入口にならない |
+| Multi-Agent Room（`multi_agent: true`、@mention あり） | @mention された Bot に紐づく Agent |
+| Multi-Agent Room（mention なし） | 応答なし（Channel Log のみ保存） |
+
 - **メッセージ振り分け**:
-  - **ヒューマンメッセージ**: `require_mention` 設定に従う。受け入れられたヒューマンメッセージは該当チャンネル/スレッドのボットチェーン状態をリセットする
+  - **ヒューマンメッセージ**: `require_mention` 設定に従う。この設定はヒューマンメッセージにのみ適用される。受け入れられたヒューマンメッセージは該当チャンネル/スレッドのボットチェーン状態をリセットする
   - **他ボットからのメッセージ**: 自ボットへの明示的な @mention がある場合のみ受け入れる（`require_mention` 設定は適用されない）。ボット間チェーン深度が上限に達している場合は拒否される
   - **自ボットのメッセージ**: 常に無視される
 - **ボット間チェーンガード**: チャンネル/スレッドごとにボット→ボットの連鎖を追跡。チェーン深度は内部上限（5）と TTL（300 秒）で管理され、ヒューマンメッセージの受信でリセットされる
@@ -127,15 +132,9 @@ Web UI はセッションを人間が読める単位で整理できる。
 
 ### 制約
 
-- 1 メッセージ 2000 文字（自動分割）
-- HTTP タイムアウト 10 秒
-- レート制限時は 3 回までリトライ
+- 1 メッセージ 2000 文字（自動分割）。HTTP タイムアウト 10 秒。レート制限時は 3 回までリトライ
 - `channels` マップに含まれるチャンネルのみ応答。マップが空の場合ギルドメッセージは全拒否（DM は常に許可）
 - Single-Agent チャネルでは `agents[0].discord_bot` に紐づく Bot のみギルドメッセージを処理する。`agents[1..]` に紐づく Bot や別 Bot は、同じチャンネルに参加していても無視する
-- **ヒューマンメッセージ**: `require_mention: true` のチャンネルでは自ボットへの @mention なしで応答しない。`require_mention` 設定はヒューマンメッセージにのみ適用される
-- **ボットメッセージ**: 自ボットへの明示的な @mention がある場合のみ処理される。自ボット自身のメッセージは常に無視される
-- **送信 mention**: Bot 応答に含まれる明示的なユーザー mention は Discord 側で mention として解釈される。role / everyone mention は送信時に許可しない
-- **ボット間チェーンガード**: チャンネル/スレッドごとにボット→ボットの連鎖を追跡し、内部深度上限（5）または TTL（300 秒）で自動停止する。受け入れられたヒューマンメッセージは該当チャンネル/スレッドのチェーン状態をリセットする
 - Slash command は `channels` に含まれるチャンネルであれば常に有効（mention やチェーンガードの対象外）
 - **既知の挙動**: 同一 Bot に複数 Agent が紐づく Multi-Agent Room では、mention だけでは Agent を一意に決定できないため、該当 Bot に紐づく候補のうち `agents` 順で最初の Agent が応答する
 
@@ -215,27 +214,26 @@ Agent Session の LLM 呼び出し時に、対象エージェントへの直接�
 
 ### データフロー
 
-- **メッセージ受信**: `TelegramHandler` がルーティング判定後に `handle_message()` で処理
-- **ルーティング**:
-  - DM → `default_agent` が応答
-  - Single-Agent チャネル → バインドされたエージェントが応答
-  - Multi-Agent ルーム → @mention された Bot のエージェントが応答。非メンション時は Channel Log のみ記録
+- **メッセージ受信**: ルーティング判定後に処理する。ルーティングは Discord（§3）と同一:
+
+| 入力 | 応答する agent |
+|---|---|
+| DM | `default_agent` |
+| Single-Agent チャネル | バインドされた Agent |
+| Multi-Agent ルーム（@mention あり） | @mention された Bot の Agent |
+| Multi-Agent ルーム（非メンション） | 応答なし（Channel Log のみ記録） |
+
 - **Bot Chain State**: Bot-to-bot 連鎖をチャット単位で追跡（最大深さ 5、TTL 300秒）
 - **添付ファイル**: 写真（最大サイズのものを選択）・ドキュメント・音声を `workspace/media/inbound/` にダウンロード
 - **TurnScheduler**: Discord と同様に `ScheduledTurn` 経由でターンを実行。同チャットの同時ターンを直列化
 - **Channel Log**: Multi-Agent ルームでは人間メッセージを Channel Log に保存
-- **アクセス制御**:
-  - `channels` マップに含まれるチャットのみ応答
-  - `require_mention: false`（デフォルト）= 即応答
-  - `require_mention: true` = @mention または `/command@botname` 必須
+- **アクセス制御**: `channels` マップに含まれるチャットのみ応答。`require_mention: false`（デフォルト）= 即応答、`true` = @mention または `/command@botname` 必須
 - **応答**: 4096 文字制限に合わせて自動分割送信
 
 ### 制約
 
 - 1 メッセージ 4096 文字（自動分割）
-- グループでは `channels` マップ外のチャットに応答しない
-- `require_mention: true` のチャットでは @mention なしで応答しない
-- チャネル（Channel）メッセージは無視
+- グループでは `channels` マップ外のチャットに応答しない。チャネル（Channel）メッセージは無視
 - チャネルプロバイダーが Telegram 未対応の場合あり（プロバイダー側の制限）
 
 ### ツール進捗表示
@@ -387,7 +385,7 @@ Webhook は会話チャネルではなく、外部イベントの trigger とし
 
 ### 接続方式
 
-HTTP POST `POST /api/webhooks/{receiver_id}`。認証・payload 仕様・target validation・エラーコードは [api.md §2.10](./api.md#210-webhook) を、設定は [config.md §3.12](./config.md#312-webhook-設定) を参照。
+HTTP POST `POST /api/webhooks/{receiver_id}`。認証・payload・エラーは [api.md §2.10](./api.md#210-webhook)、設定は [config.md §3.12](./config.md#312-webhook-設定)。
 
 ### データフロー
 
@@ -403,9 +401,9 @@ Webhook sender
   → agent response は target channel adapter で送信
 ```
 
-`202` は in-memory scheduler への受付成功ではなく、`turn_runs` への accepted commit 完了を意味する。commit 後の in-memory 容量不足は拒否とは扱わず、dispatcher が deferred で再投入する。`429` の理由コード・recovery 範囲などの契約詳細は [api.md §2.10](./api.md#210-webhook) に一元化している。
+`202` は in-memory scheduler への受付成功ではなく、`turn_runs` への accepted commit 完了を意味する。commit 後の in-memory 容量不足は拒否とは扱わず、dispatcher が deferred で再投入する。`429` の理由コードと recovery 範囲は [api.md §2.10](./api.md#210-webhook)。
 
-`SurfaceContext.channel` は `webhook` ではなく target channel を使用する。scope（Secret / Normal）の決定規則は [api.md §2.10](./api.md#210-webhook) の Target 解決・Validation を参照。
+`SurfaceContext.channel` は `webhook` ではなく target channel を使用する。scope（Secret / Normal）は target channel の `secret` 設定から決まる（[api.md §2.10](./api.md#210-webhook) の Target validation）。
 
 ### Channel Log
 

@@ -26,19 +26,7 @@ Pulse（注意活性化機構）の仕様。時間・外界・記憶からの si
 
 **Pulse は、EgoPulse における Attention Activation Layer である。**
 
-Pulse は、単なる cron、通知機能、LLM 定期呼び出しではない。
-時間・外界・記憶・将来的な State から発生する signal を受け取り、**いま意識へ上げるべきもの**を選び、必要な agent を短く活性化する仕組みである。
-
-```text
-Pulse =
-  Signal
-  → Attention Gate
-  → Activation
-  → Output
-  → Runtime Record
-```
-
-現在の signal source は **Temporal Intention** のみである。
+時間・外界・記憶・将来的な State から発生する signal を受け取り、**いま意識へ上げるべきもの**を選び、必要な agent を短く活性化する。signal source は現行では **Temporal Intention** のみ（最小フローは §2、将来の拡張点は §12）。
 
 Pulse の本質は次の一文に集約される。
 
@@ -58,17 +46,6 @@ Pulse の本質は次の一文に集約される。
 | 通常 Turn | ユーザー入力への応答 | 会話メッセージ | 応答・ツール実行 |
 | Sleep Batch | 経験を長期記憶へ畳む | 会話履歴・記憶ファイル | episodic / semantic memory |
 | Pulse | 注意を活性化する | 時間・記憶・signal | PULSE_OK / 通知 |
-
-```text
-通常 Turn:
-  人間から明示的に呼ばれて応答する
-
-Sleep:
-  経験を沈め、記憶へ畳む
-
-Pulse:
-  時間・記憶・外界から、意識へ浮上すべきものを選ぶ
-```
 
 ### 1.3 Pulse の第一原則
 
@@ -227,7 +204,7 @@ Temporal Intention の中身は config に置かない。
 
 Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エージェントは会話の中で「毎日 9時にこれを確認して」「明日の 10時にリマインドして」と言われると、このツールで intention を設定する。ファイルへの書き込みはすべてツール経由とし、エージェントが PULSE.yaml を直接 write/edit することはない。
 
-**実装**: [`src/tools/pulse.rs`](../src/tools/pulse.rs)。ツール description 自体がエージェント向けの Pulse 知識の正本である（system prompt や skill への Pulse 専門セクションは存在しない）。
+実装は [`src/tools/pulse.rs`](../src/tools/pulse.rs)。ツール description がエージェント向け Pulse 知識の唯一の正本であり、system prompt や skill には Pulse 専門セクションを設けない。
 
 | op | 引数 | 動作 |
 |---|---|---|
@@ -239,17 +216,19 @@ Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エー�
 
 挙動の固定ルール:
 
-- **バリデーションエラーはツールエラー文字列として返る**（`HH:MM` 不正、id 重複、`interval_days < 1`、曜日不正、非対応チャネル等）。エージェントは会話の中で自己修正できる
-- **Secret 会話からは利用できない**: Pulse の実行・配送は Normal スコープで行われるため、Secret 会話からの呼び出しはエラーになる（秘匿内容の意図しない漏洩を防ぐ）。Pulse の設定は通常の会話から行う
-- **書き込みは serialize → parse round-trip → atomic rename**。ツールが書いたファイルがパースできない状態は原理的に発生しない
-- **並行書き込みは直列化される**: load → 変更 → save をプロセス共通の排他ゲート内で行うため、複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない
-- **`add` の delivery デフォルトは現在の会話**。TUI / CLI など送信可能チャネル以外で頼まれた場合は intention を作らず、Discord / Telegram / Web の配送先を問い返す。Web の配送先は WebUI のセッション ID（`chat:{id}`）で指定する
-- **同日の再発火はしない**: daily の `due_key` は日付単位のため、09:00 発火済みの日に 10:00 に変更しても当日は再発火しない。再発火させたい場合は id を変える
-- **発火見込みの表示は scheduler と同じ判定**: `list` / `add` の次回発火テキストは、カレンダー候補（`estimate_next_due`）に実行履歴（`pulse_runs` / due_key）を加えた scheduler と同一の判定で作る。時刻到達かつ未実行は `due now (pending next scan)`、候補が実行済み期間に属する場合は `already attempted for current period`（`interval` は翌日に再試行できるので、代わりに翌日の時刻を次回発火として示す）、`once` 実行済みは `already attempted (no automatic retry)` と表示する。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す
-- **`once` は成功時に自動アーカイブされる**: run 成功後、実行時点の内容が現在の PULSE.yaml と一致する場合にのみ PULSE.yaml から除去される。activation 中にユーザーが再スケジュールした場合はそちらを優先して残す。失敗・skipped の場合はファイルに残り、`list` で可視化されるため、エージェントが原因を説明して `remove` → `add` で再設定する。自動リトライはしない
-- **v1 は自 agent のみ操作可能**（他 agent の PULSE.yaml は操作しない）。将来的な委譲拡張の余地は `agent_id` 引数の追加として残す
-- 編集は次の tick で反映される。再起動は不要。保存が成功すると scheduler へ起床信号が送られるため、`once` を追加した場合も次の tick を待たずに指定時刻へ起床する
-- Pulse Activation 中の自己編集も許可される（activation が active turn を保持するため、通常 turn との書き込み競合は発生しない）
+| ルール | 内容 |
+|---|---|
+| バリデーションエラー | ツールエラー文字列として返る（`HH:MM` 不正、id 重複、`interval_days < 1`、曜日不正、非対応チャネル等）。エージェントは会話の中で自己修正できる |
+| Secret 会話 | 呼び出しはエラー。Pulse の実行・配送は Normal スコープで行われるため、設定は通常の会話から行う |
+| 書き込み | serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は原理的に発生しない |
+| 並行書き込み | load → 変更 → save をプロセス共通の排他ゲート内で直列化。複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない |
+| `add` の配送先デフォルト | 現在の会話。送信可能チャネル以外（TUI / CLI）で頼まれた場合は intention を作らず、Discord / Telegram / Web の配送先を問い返す。Web はセッション ID `chat:{id}` |
+| 同日の再発火 | daily の `due_key` は日付単位のため、発火済みの日に時刻を変更しても当日は再発火しない（§5.2）。再発火させたい場合は id を変える |
+| 発火見込みの表示 | scheduler と同じ判定。時刻到達かつ未実行は `due now (pending next scan)`、実行済み期間は `already attempted for current period`（`interval` は翌日の時刻を次回発火として示す）、`once` 実行済みは `already attempted (no automatic retry)`。無効な agent・intention には表示しない。実行履歴の参照に失敗した場合は該当行に `error`、`list` 全体はツールエラー |
+| `once` の自動アーカイブ | 成功時に PULSE.yaml から除去する。失敗・skipped・activation 中の変更時の扱いは §4.4 |
+| 操作対象 | 自 agent の PULSE.yaml のみ。将来の委譲拡張は `agent_id` 引数の追加 |
+| 反映 | 次の tick で反映。再起動不要。保存が成功すると scheduler へ起床信号が送られるため、`once` を追加した場合も次の tick を待たずに指定時刻へ起床する |
+| Activation 中の自己編集 | 許可。activation が active turn を保持するため、通常 turn との書き込み競合は発生しない |
 
 ---
 
@@ -417,16 +396,7 @@ Pulse Gate v1 =
 
 ### 7.1 目的
 
-Pulse は agent 単位で発火するが、結果はユーザーが普段その agent と会話している場所へ出したい。
-
-そのため、Pulse は Home Surface を解決してから通知する。
-
-**Home Surface** は、その agent が Pulse の結果を出す標準の会話場所である。
-
-```text
-Home Surface =
-  agent が普段会話している channel / chat / session
-```
+Pulse は agent 単位で発火するが、結果はその agent が普段会話している場所へ出したい。そこで、agent が Pulse の結果を出す標準の会話場所 **Home Surface** を解決してから通知する。
 
 ### 7.2 解決ルール
 
@@ -460,8 +430,6 @@ Pulse 通知を通常 session に保存すると、その chat の `last_message
 そのため、一度 Pulse が発話した chat は Home Surface として維持されやすい。
 
 ユーザーが別の場所で同じ agent と会話すれば、その chat が新しい Home Surface になる。
-
-これは自然な挙動である。
 
 Web の自動解決は、WebUI でアーカイブされたセッションも候補に含む。アーカイブは一覧表示の制御であり履歴・配送は保持されるため、配送先を変えたい場合は intention の `delivery` に別の会話を明示するか、Pulse を無効化する。
 
@@ -546,7 +514,7 @@ Capsule (user message) には long-term memory を含めない。
 - 通常セッションと system prompt が完全一致 → prompt cache が最大効率で hit する
 - agent の人格・記憶・スキルが Pulse でも一貫して利用可能
 
-各 LLM 呼び出しは、通常 Turn と同じ共通リトライ判定（`llm::retry`）で一過性エラー（送信失敗・429・5xx）を最大 3 回まで試行する。Pulse は全エージェントを逐次スキャンするため、待機時間（サーバーの `Retry-After` を含む）が 60 秒を超えるリトライは行わず、その Activation を即座に `failed` とする。これによりプロバイダのクォータ枯渇時に後続の Pulse が止まらない。
+各 LLM 呼び出しは、通常 Turn と同じ共通リトライ判定で一過性エラー（送信失敗・429・5xx）を最大 3 回まで試行する。Pulse は全エージェントを逐次スキャンするため、待機時間（サーバーの `Retry-After` を含む）が 60 秒を超えるリトライは行わず、その Activation を即座に `failed` とする。これによりプロバイダのクォータ枯渇時に後続の Pulse が止まらない。
 
 Pulse の生成途中の delta は破棄し、外部公開済み出力として扱わない。途中でストリームが中断しても同じ LLM 呼び出しを再試行でき、最終応答が空の場合も共通の runtime guard による回復を行う。通常 Turn は delta を外部公開した時点で再試行を抑止する。いずれも実行済み Tool や Activation 全体を再実行しない。
 
@@ -572,7 +540,6 @@ Pulse の出力は 2 種類だけ。
 | その他の本文 | 通知あり | Home Surface へ送信し、通常 session に保存する（Web では保存そのものが配送） | `notify` |
 
 `PULSE_OK` は case-insensitive で前後空白を trim して判定する（空文字も silent 扱い）。
-LLM の出力揺れを許容しつつ、実質的な誤検知は避ける。
 
 ### 9.2 通知本文の保存
 
@@ -633,11 +600,6 @@ User:
 | 出力 | 普段の会話場所、つまり Home Surface に出す |
 | 保存 | 通知経路の activation 会話だけ、通常 session に保存する |
 
-```text
-Pulse は普段の部屋で声を出す。
-ただし、考える時は Pulse Capsule で考える。
-```
-
 ---
 
 ## 10. DB 仕様
@@ -695,11 +657,7 @@ CREATE INDEX idx_pulse_runs_chat_id
 
 ## 11. Sleep Scheduler との分離方針
 
-Sleep を Pulse に吸収しない。
-Pulse を Sleep Scheduler に寄せすぎない。
-
-Sleep は記憶変換バッチであり、Pulse は注意活性化である。
-両者は同じ scheduler 系の仲間だが、同じドメインではない。
+Sleep（記憶変換バッチ）と Pulse（注意活性化）は同じ scheduler 系ではあるが、別ドメインとして分離する。
 
 ### 11.1 実装構成
 
@@ -743,32 +701,7 @@ src/
 
 ## 12. 将来の展望
 
-### 12.1 Phase 展開
-
-```text
-Phase 1: Temporal Pulse
-  PULSE.yaml の Temporal Intention を due 判定して起動する。
-  結果は Home Surface に出し、通知経路の会話を通常 session に保存する。
-
-Phase 2: Pulse Inbox / Notification Router
-  すべてをチャットへ流さず、内部 inbox / notification level を導入する。
-
-Phase 3: Signal Ingress
-  Webhook / GitHub / Proxmox / SwitchBot / EgoGraph などを PulseSignal として受け取る。
-
-Phase 4: Attention Gate
-  salience score / cooldown / duplicate suppression / tiny LLM judge を導入する。
-
-Phase 5: State
-  Trait とは別に、agent の runtime state を導入する。
-
-Phase 6: Autonomous Pulse
-  内発的 signal から、自ら探索対象・改善候補・創作種を見つける。
-```
-
-### 12.2 将来の内部モデル
-
-現行では `TemporalDue` しか使わないが、内部型は拡張を塞がない。
+signal source は将来の拡張に備えて、pipeline の先頭へ接続する形を維持する。
 
 ```rust
 enum PulseSignalKind {
@@ -783,66 +716,8 @@ enum PulseSignalKind {
 }
 ```
 
-Pulse pipeline は最初から次の形を維持する。
-
-```text
-PulseSignal
-  ↓
-AttentionGate
-  ↓
-HomeSurfaceResolver
-  ↓
-PulseCapsule
-  ↓
-Activation
-  ↓
-InlineOutput
-  ↓
-PulseRecord
-```
-
-### 12.3 State との接続
-
-将来の State は、Pulse の signal source になる。
-
-| 概念 | 役割 |
-|---|---|
-| Trait | 静的な性格傾向 |
-| State | その時点の内的状態 |
-| Pulse | State や外界から attention を活性化する機構 |
-
-現行では State は未実装。
-ただし、`PulseSignalKind::StateShift` のように将来の接続点だけを思想として残す。
-
-### 12.4 Notification の発展
-
-現行は Home Surface への Inline Output のみ。
-
-将来は以下へ拡張する。
-
-```text
-PulseOutput
-  ↓
-Notification Router
-  ├─ silent
-  ├─ log_only
-  ├─ pulse_inbox
-  ├─ notify
-  ├─ urgent
-  └─ approval_required
-```
-
-Multi-agent 構成では、sub-agent が直接ユーザーへ通知するのではなく、最終的には Lyre が調律する。
-
-```text
-Sub-agent Pulse
-  ↓
-Pulse Inbox
-  ↓
-Lyre
-  ↓
-User
-```
+- State（agent のその時点の内的状態。Trait は静的な性格傾向）は未実装。`PulseSignalKind::StateShift` の接続点だけを残す
+- 通知は Home Surface への Inline Output のみ。将来の Notification Router（`silent` / `log_only` / `pulse_inbox` / `notify` / `urgent` / `approval_required`）と multi-agent 構成での inbox 調律は拡張方向として残す
 
 ---
 

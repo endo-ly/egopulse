@@ -77,11 +77,7 @@
 
 ## 2. 各ディレクトリの責務
 
-### 2.1 リポジトリの TUI 実装
-
-TUI は `src/channels/tui/` に責務別に分割されている。Inline viewport のライフサイクルとイベントループを `mod.rs`、crossterm イベント変換を `event.rs`、入力状態機械を `composer.rs`、会話とストリーミング状態を `transcript.rs`、Markdown 表示を `markdown.rs`、セッション選択を `sessions.rs`、ratatui 描画を `draw.rs` が担当する。Runtime 接続と Session / Turn 操作は `src/runtime/local_api/` の Client / Protocol を利用する。確定済みブロックは端末スクロールバックへ出力し、viewport はアクティブターンと入力欄を描画する。
-
-### 2.2 直下 — 設定・人格・ルール・MCP
+### 2.1 直下 — 設定・人格・ルール・MCP
 
 | パス | 責務 |
 |---|---|
@@ -94,7 +90,7 @@ TUI は `src/channels/tui/` に責務別に分割されている。Inline viewpo
 | `mcp.json` | MCP サーバー定義 |
 | `mcp.d/` | MCP 追加設定ファイル群 |
 
-#### agents/{agent_id}/memory/ — 長期記憶（Phase 1）
+#### agents/{agent_id}/memory/ — 長期記憶
 
 エージェントごとの長期記憶ファイルを配置する。記憶は読み込み専用で、system prompt の Long-term Memory セクションに注入される。
 
@@ -103,7 +99,7 @@ agents/
 └── {agent_id}/
     ├── SOUL.md            # エージェント個別の SOUL
     ├── AGENTS.md          # エージェント個別の Memories
-    └── memory/            # 長期記憶（Phase 1）
+    └── memory/            # 長期記憶
         ├── episodic.md    # エピソード記憶
         └── semantic.md    # 意味記憶
 ```
@@ -113,7 +109,7 @@ agents/
 | `episodic.md` | 過去のやり取りや出来事の記録 | 存在しない場合はセクションごと省略 |
 | `semantic.md` | 知識や概念の定義、学習済み情報 | 存在しない場合はセクションごと省略 |
 
-### 2.3 skills/ — 組み込みスキル
+### 2.2 skills/ — 組み込みスキル
 
 EgoPulse に同梱されるスキル。バイナリのアップデートで上書きされる。
 
@@ -138,7 +134,7 @@ skills/
 - `docs/` 配下の全ファイルは `references/` 下に相対パス維持でコピーされる
 - 生成されたファイルは `$OUT_DIR` に置かれ、repo にはコミットされない
 
-### 2.4 runtime/ — 永続状態
+### 2.3 runtime/ — 永続状態
 
 | パス | 責務 |
 |---|---|
@@ -147,7 +143,7 @@ skills/
 | `attachments/` | `send_attachment` が Web へ配信したファイルのスナップショット。`{uuid}.{ext}` で保存し、元の workspace ファイルから独立する。保存期間は無期限（自動削除なし）。DB バックアップ（`runtime/backups/`）には含まれないため、必要ならこのディレクトリを別途バックアップする |
 | `groups/` | チャット別永続データのルート |
 
-### 2.5 runtime/groups/ — チャット別アーカイブ
+### 2.4 runtime/groups/ — チャット別アーカイブ
 
 チャット毎に独立したディレクトリを持ち、会話アーカイブを配置する。
 
@@ -161,9 +157,9 @@ groups/
 |---|---|
 | `{channel}/{chat_id}/conversations/` | compaction によって生成される過去会話のアーカイブファイル |
 
-> **注**: チャット別 `AGENTS.md`（`runtime/groups/{channel}/{chat_id}/AGENTS.md`）はアーカイブ目的で残存する可能性があるが、system prompt 構築時には読み込まれない。ルールはグローバル `AGENTS.md` + エージェント別 `agents/{agent_id}/AGENTS.md` の2層累積構造に移行済み。
+> **注**: チャット別 `AGENTS.md`（`runtime/groups/{channel}/{chat_id}/AGENTS.md`）はアーカイブ目的で残存する可能性があるが、system prompt 構築時には読み込まれない。ルールはグローバル `AGENTS.md` + エージェント別 `agents/{agent_id}/AGENTS.md` の2層累積。
 
-### 2.6 workspace/ — エージェント作業領域
+### 2.5 workspace/ — エージェント作業領域
 
 全チャットで共有されるエージェントの作業領域。
 
@@ -174,7 +170,7 @@ groups/
 
 エージェントが read / write / edit / grep / find ツールで相対パスを指定した場合、この `workspace/` を基準に解決される。bash ツールの `current_dir` もここになる。
 
-### 2.7 スキルの2層構造
+### 2.6 スキルの2層構造
 
 | パス | 種別 | 管理者 |
 |---|---|---|

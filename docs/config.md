@@ -253,7 +253,7 @@ web_fetch:
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `default_provider` | `string` | **必須** | なし | `providers` マップ内のキーを参照。起動時に使用するプロバイダーを決定 |
-| `default_model` | `string \| null` | 任意 | `null` | プロバイダーの `default_model` をグローバルに上書き。`null` の場合プロバイダー定義に従う |
+| `default_model` | `string \| null` | 任意 | `null` | プロバイダーの `default_model` をグローバルに上書き。`null` ならプロバイダー定義の値 |
 | `default_agent` | `string` | 任意 | `"default"` | 使用するエージェントの ID。`agents` マップ内のキーを参照 |
 | `state_root` | `string` | 任意 | `~/.egopulse` | Runtime の状態ディレクトリ。絶対パスのみ指定でき、Runtime と TUI は同じディレクトリから Local API endpoint を解決する |
 | `timezone` | `string` | 任意 | `"UTC"` | IANA タイムゾーン（例: `Asia/Tokyo`）。全サブシステム（sleep batch、pulse、会話タイムスタンプ）で使用 |
@@ -428,7 +428,7 @@ STT 済みテキストを同期 HTTP API で agent runtime へ接続する設定
 - `enabled: true` かつ `channels.web.enabled: false` の場合は起動エラー
 - `auth_token` は `channels.web.auth_token` へ fallback しない
 
-HTTP 契約と責務境界は [api.md §2.8](./api.md#28-voice-turn) を参照。設定例は §2 の完全 YAML 例を参照。
+HTTP 契約と責務境界は [api.md §2.8](./api.md#28-voice-turn)。設定例は §2。
 
 ### 3.7 Sleep Batch 設定（`sleep_batch`）
 
@@ -446,7 +446,7 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 | `sleep_batch.retry.max_attempts` | `uint` | 任意 | `3` | 初回を含む最大試行回数（1 以上） |
 | `sleep_batch.retry.interval_minutes` | `uint` | 任意 | `5` | 再試行間隔（分） |
 
-`retry` は実行全体がエラーで終わったときの再実行設定である。LLM リクエスト単位の一時的な失敗（無応答、429、5xx、完了イベントなしのストリーム終了）は共有の再試行方針で扱う。`Retry-After` を優先し、なければ指数バックオフを使い、初回を含めて最大 3 回試行する。`Retry-After` が 120 秒を超える場合は再試行せず、そのリクエストを失敗として扱う。出力上限や content filter、未知の終了理由による確定的な打ち切り（`finish_reason` の `length` / `content_filter`、`response.incomplete` / `failed`）も再試行しない。`insufficient_system_resource` / `aborted` は一時的な中断として再試行する。再試行と待機を含む Sleep の 1 リクエストの総時間は 20 分で打ち切る。Turn / Pulse / Compaction / 単発 ask も同じ方針を使い、期限は呼び出し元が決める。
+`retry` は run 全体がエラーで終わったときの再実行設定。LLM リクエスト単位の一時的な失敗の扱いは共有の再試行方針（[session-lifecycle.md §4](./session-lifecycle.md#4-turn-中の保存)）。
 
 ### 3.8 Pulse 設定（`pulse`）
 
@@ -491,13 +491,13 @@ SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md
 
 ### 3.11 エージェント定義（`agents.<id>`）
 
-`agents` はキーがエージェント ID のマップ。複数定義可能。
+`agents` はキーがエージェント ID のマップ。複数定義可能。provider / model の解決は §4 のモデル解決チェーン。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `label` | `string` | 任意 | エージェント ID | UI 上の表示名 |
 | `provider` | `string \| null` | 任意 | `null` | エージェント固有のプロバイダー ID。`null` なら `default_provider` |
-| `model` | `string \| null` | 任意 | `null` | エージェント固有のモデル名。`null` ならモデル解決チェーンに従う |
+| `model` | `string \| null` | 任意 | `null` | エージェント固有のモデル名。省略時は解決チェーンの下位（§4） |
 | `reasoning_effort` | `string \| null` | 任意 | `null` | エージェント固有の推論量。設定時は Chat Completions の `reasoning_effort`、Responses API の `reasoning.effort` へそのまま渡す |
 | `discord_bot` | `string \| null` | 任意 | `null` | このエージェントが紐づく Discord Bot ID。`channels.discord.bots` のキーを参照 |
 | `telegram_bot` | `string \| null` | 任意 | `null` | このエージェントが紐づく Telegram Bot ID。`channels.telegram.telegram_bots` のキーを参照 |
@@ -509,22 +509,9 @@ SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
 | `provider` | `string \| null` | 任意 | `null` | このチャネルでのプロバイダー ID。省略時は `agent.provider` を引き継ぐ |
-| `model` | `string \| null` | 任意 | `null` | このチャネルでのモデル名。省略時はモデル解決チェーンに従う |
+| `model` | `string \| null` | 任意 | `null` | このチャネルでのモデル名。省略時は解決チェーンの下位（§4） |
 
-`profiles` の利用例（完全な実装例は §2 を参照）:
-
-```yaml
-agents:
-  lyre:
-    label: Lyre
-    provider: sakura
-    model: preview/Kimi-K2.6
-    discord_bot: lyre
-    profiles:
-      voice:
-        provider: openrouter
-        model: gpt-4.1-mini
-```
+`profiles` の利用例は §2。
 
 `reasoning_effort` は Agent 単位の設定であり、`profiles` のプロバイダー・モデル切り替えには影響されない。同じモデルを利用する Agent ごとに異なる推論量を指定できる。
 
@@ -542,19 +529,7 @@ agents:
     reasoning_effort: high
 ```
 
-`mcp_servers` は、その Agent に公開される MCP tool を server 単位で絞る。`mcp.json` の server 定義は全 Agent 共通で接続され、公開範囲だけが Agent ごとに変わる。省略時は全 server、空リストは MCP tool なし。tool 名ではなく server 名（`mcpServers` のキー）を指定する。
-
-```yaml
-agents:
-  reviewer:
-    label: Reviewer
-    mcp_servers: [github, filesystem]
-  assistant:
-    label: Assistant
-    mcp_servers: []
-```
-
-公開範囲の判定は Turn 開始時の snapshot で行う。詳細は [mcp.md](./mcp.md#agent-別の公開範囲) を参照。
+`mcp_servers` は、その Agent に公開される MCP server を server 単位で絞る（tool 名ではなく `mcpServers` のキーを指定する）。公開範囲の判定は Turn 開始時の snapshot で行う。詳細は [mcp.md](./mcp.md#agent-別の公開範囲)。
 
 ---
 
@@ -598,7 +573,7 @@ webhooks:
 - `target.channel` は Config 上の `channels` 定義ではなく、起動中 `ChannelRegistry` の登録状態で判定する
 - Web target は `channels.web.enabled` が有効で `WebAdapter` が登録されている場合のみ受け付ける
 - `target.channel == "voice"` は対象外（Voice は同期 HTTP response を正規応答経路とするため）
-- Discord / Telegram target は、`target.thread` が対応する `channels.<channel>.discord_channels` / `telegram_channels` の登録エントリに解決できる必要がある。解決できない（数値として parse 不能・未登録 thread・channel map 欠落）場合は `Normal` へ降格せず、受付時に `400 invalid_target_scope` として拒否する
+- Discord / Telegram target は、`target.thread` が対応する `channels.discord.channels` / `channels.telegram.telegram_channels` の登録エントリに解決できる必要がある。解決できない（数値として parse 不能・未登録 thread・channel map 欠落）場合は `Normal` へ降格せず、受付時に `400 invalid_target_scope` として拒否する
 - 解決できた channel の `secret` 値から `ConversationScope` を決定する（`secret: true` なら `Secret`）。Web target は常に `Normal`
 
 ---
@@ -757,14 +732,14 @@ Config YAML の値を環境変数で上書き可能。環境変数が設定さ�
 |---|---|---|
 | 設定ファイル | `~/.egopulse/egopulse.config.yaml` | 固定。CLI オプション・環境変数で変更不可 |
 | シークレットファイル | `~/.egopulse/.env` | 設定ファイルと同じディレクトリに置く。`state_root` を変更しても場所は変わらない。`KEY=VALUE`（1 行 1 エントリ、`#` コメント対応）。パーミッション `0600`。`source: env` の SecretRef、skill の `required_env`、MCP 設定の秘密参照が参照する（§5） |
-| データディレクトリ | `~/.egopulse/data` | SQLite 等 |
-| ワークスペース | `~/.egopulse/workspace` | セッション・履歴データ |
+| データディレクトリ | `~/.egopulse/runtime/` | DB、socket、attachments 等の永続状態（[directory.md](./directory.md)） |
+| ワークスペース | `~/.egopulse/workspace` | エージェントの作業領域 |
 
 ---
 
 ## 9. セットアップウィザード
 
-`egopulse setup` で起動する対話型設定ウィザード（dialoguer ベースの順次プロンプト）。
+`egopulse setup` で起動する対話型設定ウィザード。
 Agent-First 設計に基づき、エージェント名を最初に問い、LLM と対話するために必要な最小限の項目のみを順次収集する。
 通常の text / select / confirm 入力はターミナル上に表示し、API key / Discord Bot Token / Telegram Bot Token のみ hidden 入力にする。
 
@@ -847,7 +822,7 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 | Q6 Discord | 既存 `channels.discord.enabled` |
 | Q7 Telegram | 既存 `channels.telegram.enabled` |
 
-既存 YAML のパースエラー時は Q1 の前に警告表示 + `Continue with empty defaults?` で確認する（黙殺は廃止）。`WEB_AUTH_TOKEN` と `state_root` は事前入力対象外だが上書きされない。
+既存 YAML のパースエラー時は Q1 の前に警告表示 + `Continue with empty defaults?` で確認する。`WEB_AUTH_TOKEN` と `state_root` は事前入力対象外だが上書きされない。
 
 ---
 
@@ -982,3 +957,4 @@ Provider cache key に Config revision を含める。credential や base URL �
 |---|---|---|
 | DB schema version | `db_meta.schema_version`（[db.md](./db.md#db_meta)） | SQLite スキーマのマイグレーション版数。未対応版は起動を拒否 |
 | Config revision | `ConfigSnapshot.revision` | 設定世代の識別番号。同一 revision は同一 Config 内容を保証 |
+| Local API protocol version | handshake の `protocol`（[api.md](./api.md)） | TUI ↔ Runtime の WebSocket 接続版数。不一致時は接続を拒否 |

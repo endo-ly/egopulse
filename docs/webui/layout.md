@@ -61,7 +61,7 @@ Agents と Footer の間の領域。表示中の画面に応じて内容を切�
 - 行末の `⋯` / 右クリックで Rename / Pin / Archive / Copy session ID
 - ヘッダーに channel フィルタ（`All` / `Web` / `Discord` / `Telegram` / `CLI` / `TUI` / `Voice`）と New Session（`+`）
 - New Session は名前（任意）を入力して draft セッションを作り Chat へ遷移する。chat レコードは初回送信時に作成され、名前もその ACK で保存する
-- リアルタイム更新（`session_updated` 受信時の再取得と 60 秒ポーリングのフォールバック）は [chat.md §7.2](./chat.md#72-リアルタイム更新) に従う
+- リアルタイム更新（`session_updated` 受信時の再取得と 60 秒ポーリングのフォールバック）は [chat.md §7.2](./chat.md#72-リアルタイム更新)
 
 ### 2.7 Collapse
 
@@ -88,13 +88,13 @@ Mobile（< 640px）のみ表示する高さ 44px のバー。
 
 | 画面 | URL | スコープ |
 |---|---|---|
-| Chat | `/agents/:agentId/chat`（セッション選択時 `/s/:sessionKey`） | agent |
-| Agent | `/agents/:agentId`、`/agents/:agentId/:section` | agent |
-| Schedule | `/agents/:agentId/schedule`（Activity）、`/schedule/runs/{pulse\|sleep}/:runId`、`/schedule/pulse/:intentionId`、`/schedule/sleep`（[schedule.md §7](./schedule.md#7-url-構造)） | agent |
-| Metrics | `/metrics`（期間・agent フィルタは `?range=&agent=`） | global |
-| Config | `/config`（General）、`/config/:section`（そのセクションへスクロール） | global |
+| [Chat](./chat.md) | `/agents/:agentId/chat`（セッション選択時 `/s/:sessionKey`） | agent |
+| [Agent](./agent.md) | `/agents/:agentId`、`/agents/:agentId/:section` | agent |
+| [Schedule](./schedule.md) | `/agents/:agentId/schedule`（Activity）、`/schedule/runs/{pulse\|sleep}/:runId`、`/schedule/pulse/:intentionId`、`/schedule/sleep`（[schedule.md §7](./schedule.md#7-url-構造)） | agent |
+| [Metrics](./metrics.md) | `/metrics`（期間・agent フィルタは `?range=&agent=`） | global |
+| [Config](./config.md) | `/config`（General）、`/config/:section`（そのセクションへスクロール） | global |
 
-`/` は既定 agent の Chat を表示する。Config は1ページなので、`:section` は初期表示のスクロール先（直リンク・戻る / 進む）を表し、ページをスクロールしただけでは URL を書き換えない。各画面の詳細は個別ドキュメントを参照。
+`/` は既定 agent の Chat を表示する。Config は1ページなので、`:section` は初期表示のスクロール先（直リンク・戻る / 進む）を表し、ページをスクロールしただけでは URL を書き換えない。
 
 ---
 

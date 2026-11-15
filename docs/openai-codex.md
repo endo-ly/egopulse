@@ -6,7 +6,7 @@ Responses API に似ているが完全互換ではないため、通常の OpenA
 
 ## 注意点と対策
 
-| 注意点 | 今の実装での対策 |
+| 注意点 | 対策 |
 |---|---|
 | Codex backend は streaming 必須 | Codex provider では常に `stream: true` を付ける |
 | Codex backend は保存前提の Responses API ではない | Codex provider では常に `store: false` を付ける |
@@ -74,9 +74,7 @@ tools がある場合:
 
 ## SSE Parsing
 
-最終 `response.completed` だけを本文ソースにしない。
-
-今の実装では、SSE 全体を走査して以下を保持する。
+最終 `response.completed` だけを本文ソースにしない。SSE 全体を走査して以下を保持する。
 
 | Event | 扱い |
 |---|---|
@@ -86,7 +84,6 @@ tools がある場合:
 | `response.completed` / `response.done` | final response として保持 |
 
 final response の `output` が空の場合のみ、中間 event で拾った text / item から `output` を補完する。
-final response に `output` がある場合は、それを優先するため二重出力しない。
 
 ## Empty Response Diagnosis
 
@@ -112,21 +109,11 @@ llm_invalid_response: assistant content was empty
 
 ## Verification
 
-Codex provider 周辺を変更したら最低限これを実行する。
+Codex provider 周辺を変更したら最低限これを実行する（サービス反映は [deploy.md §4.5](./deploy.md#45-更新)）。
 
 ```bash
 cargo fmt --check
 cargo test llm::
 cargo check
 cargo clippy --all-targets --all-features -- -D warnings
-```
-
-サービスへ反映する場合:
-
-```bash
-cargo build --release -p egopulse
-systemctl --user stop egopulse
-install -m 0755 target/release/egopulse ~/.local/bin/egopulse
-systemctl --user start egopulse
-systemctl --user --no-pager --full status egopulse
 ```

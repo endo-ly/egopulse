@@ -40,9 +40,13 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 
 ## 2. 事前検査
 
-遮断メッセージは方針の最終判断であることを明示し（`This is a policy decision; do not work around it. Ask the user if access is required.`）、値の読み出しなど回避経路の案内は行わない。エージェント側の規範としても、Core Instructions の Security rules に「遮断は最終判断。別構文・動的パス・スクリプト等での回避を試みず、ユーザーに何が遮断されたかを伝えて確認する」と定義されている。
+遮断メッセージは方針の最終判断を示し（`This is a policy decision; do not work around it. Ask the user if access is required.`）、値の読み出しなど回避経路は案内しない。この方針は Core Instructions の Security rules（「遮断は最終判断。別構文・動的パス・スクリプト等での回避を試みず、ユーザーに確認する」）でもエージェント側の規範として定義する。
 
-1 Turn / 1 Pulse の `guard_denied` が 3 回に達すると、その Run の後続 Tool 実行をすべて停止する。次の model request では Tool 定義を渡さず、「遮断を最終判断として作業を打ち切り、ユーザーに報告する」runtime guard を注入する。LLM が Tool 要求を返した場合も実行層で拒否し、未実行要求は実行台帳へ記録しない。閾値到達は `warn` ログに記録される。Turn は最終報告を返し、Pulse は報告を Notify 出力としてホームチャネルへ送信する。Pulse が報告を生成できない場合や `PULSE_OK` を返した場合は、固定の停止通知を送信する。
+1 Turn / 1 Pulse の `guard_denied` が 3 回に達すると、その Run の後続 Tool 実行をすべて停止する。
+
+- 次の model request では Tool 定義を渡さず、「遮断を最終判断として作業を打ち切り、ユーザーに報告する」runtime guard を注入する。LLM が Tool 要求を返しても実行層で拒否し、未実行要求は実行台帳へ記録しない
+- 閾値到達は `warn` ログに記録する
+- Turn は最終報告を返す。Pulse は報告を Notify 出力としてホームチャネルへ送信し、報告を生成できない場合や `PULSE_OK` を返した場合は固定の停止通知を送信する
 
 ### コマンド検閲
 
@@ -190,9 +194,9 @@ prefix を持たない値や Config に登録されていない値も、周囲�
 
 現時点の出力リダクションは、上記のとおり Config に登録された既知の秘密値と well-known パターンを対象とする。これは「ツール出力経由の偶発的・低レベルな秘密露出」に対する防御であり、Shell ツールの OS sandbox ではない。
 
-- Shell ツール（`bash` / `write` / `edit`）によるプロセス外への秘密書き出しは、本リダクションでは防げない。OS レベルの隔離は現時点では未実施である。
+- Shell ツール（`bash` / `write` / `edit`）によるプロセス外への秘密書き出しは、本リダクションでは防げない。出力をマスクする役割であり、プロセスの隔離は §7 が担う。
 - LLM への Prompt Injection により Agent が秘密値を加工・断片化して出力する経路を完全に封止する保証はない。値ベース・prefix ベース・文脈ベースのリダクションは可能な限り広く覆うが、完全な exfiltration 防止を主張しない。
-- ツール実行そのものを禁止・隔離する境界は事前検査（コマンド・パス検閲）で担う。OS sandbox は現時点では未実施である。
+- ツール実行そのものを禁止・隔離する境界は事前検査（§2）と bash の隔離（§7）で担う。
 
 ---
 
@@ -231,7 +235,7 @@ prefix を持たない値や Config に登録されていない値も、周囲�
 
 ### 5.2 構造的保証
 
-Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）のみ参照し、`ConversationScope::Secret` の DB（`secret.db`）には接続しない。これは実装の省略ではなく構造的保証。スコープはコンテキスト構築時に決定され、コード経路が存在しないため、誤って秘匿内容を処理することはない。
+Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）のみ参照し、`ConversationScope::Secret` の DB（`secret.db`）には接続するコード経路が存在しないため、誤って秘匿内容を処理することはない。
 
 - Secret スコープのチャットメッセージは `episodic.md` 等に昇格しない
 - PULSE は Secret スコープのチャットで発火・投稿しない

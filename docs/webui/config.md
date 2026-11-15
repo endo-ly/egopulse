@@ -26,7 +26,7 @@
 - Header に設定ファイルのパスと revision を表示する
 - 本文上部の sticky なセクションバーと Sidebar の SECTIONS が目次になる。どちらもクリックでそのセクションへスクロールし、スクロール位置に追従して現在地を強調する
 - 各セクションの見出しは「名前 + 説明 + 現在の状態」で始まる。注意が必要な状態（API key 未設定、MCP 接続失敗、Backup 無効）は warning / danger 色にし、セクションバーにも色付きのドットを出す
-- URL（`/config`、`/config/:section`）の扱いは [layout.md §4](./layout.md#4-url-構造) に従う
+- URL（`/config`、`/config/:section`）は [layout.md §4](./layout.md#4-url-構造) の扱い
 - モバイルではセクションバーを横スクロールし、横に広い表はカード内で横スクロールする
 
 ---

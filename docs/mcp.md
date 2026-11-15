@@ -15,11 +15,7 @@ MCP (Model Context Protocol) の設定・接続・ツール動的公開の仕様
 
 ## 1. 目的
 
-静的 built-in tool に加え、workspace や外部サービスに応じた tool を runtime 側で動的に追加する。
-
-1. 既存の MCP ecosystem にある server をそのまま接続
-2. workspace ごとに異なる tool set を切り替え
-3. built-in tool と同じ turn loop で外部 tool を利用
+静的 built-in tool に加え、workspace や外部サービスに応じた tool を runtime 側で動的に追加する。既存の MCP ecosystem の server をそのまま接続し、workspace ごとに tool set を切り替え、built-in tool と同じ turn loop で利用する。
 
 ## 2. 命名
 
@@ -112,6 +108,8 @@ REMOTE_MCP_AUTHORIZATION=Bearer <token>
 
 #### `stdio`
 
+上の Config Shape の例が stdio である。`request_timeout_secs` を添える例:
+
 ```json
 {
   "mcpServers": {
@@ -144,7 +142,7 @@ REMOTE_MCP_AUTHORIZATION=Bearer <token>
 
 ### `stdio`
 
-subprocess を起動して MCP server に接続。`cwd` は workspace root に固定。接続後に `list_all_tools()` を実行。
+subprocess を起動して MCP server に接続。`cwd` は workspace root に固定。
 
 subprocess は専用の process group のリーダーとして起動する。`npx` / `uv run` などのランチャーが実際の server を孫プロセスとして起動する場合も、終了時は process group ごと停止する。
 
@@ -152,17 +150,17 @@ Runtime の停止時は、実行中 Turn の drain 後に全 server を並行し
 
 ### `streamable_http`
 
-HTTP client transport で接続。`endpoint` に接続し `headers` を付与。`Authorization` は専用ハンドリング。`reinit_on_expired_session(true)` 有効。
+HTTP client transport で接続。`endpoint` に接続し `headers` を付与。`Authorization` は専用ハンドリング。server session の期限切れ時には自動で再初期化する。
 
 ## 5. Tool の公開と実行
 
 ### 起動時初期化
 
-MCP は `AppState` 構築時に `McpManager::new()` で初期化される。各 server に接続後、`tools/list` でツール一覧を取得して `cached_tools` に保持する。公開は Turn ごとに `McpManager::all_tool_definitions()` が行う。
+起動時に全 server に接続し、`tools/list` でツール一覧を取得して保持する。以後の tool list はこの取得結果を使い回す（TTL cache は未実装、§6）。
 
 ### 公開
 
-`McpManager` が保持する tool を `ToolRegistry::definitions_async()` が built-in tool と同じ `ToolDefinition` 形式で LLM に公開する。`ToolRegistry` は built-in / MCP の区別なく全 tool を一様に管理する。
+MCP tool は built-in tool と同じ `ToolDefinition` 形式で、区別なく一様に LLM に公開される。
 
 ### Agent 別の公開範囲
 
@@ -196,11 +194,9 @@ sanitize 後の名前が複数の tool で衝突する場合は、server 名と 
 
 ### 実行フロー
 
-1. `ToolRegistry::execute()` が tool 名を受け取る
-2. `mcp_` で始まる名前を `McpManager::execute_tool_by_name()` へ渡す
-3. scope に含まれない server の tool は `not_found` の `unknown tool` となる
-4. `McpManager::execute_tool()` が `call_tool` を送信
-5. MCP response の content を text に整形
+1. tool 名が `mcp_` で始まれば MCP tool として処理する
+2. scope に含まれない server の tool は `not_found` の `unknown tool` となる
+3. `call_tool` を送信し、response の content を text に整形する
 
 ### 入力規則
 
@@ -235,7 +231,7 @@ MCP tool は built-in tool と異なり出力サイズを自己規制しない�
 
 ### 自動再接続（MCP Reconnect Loop）
 
-`spawn_mcp_reconnect_loop()` が runtime 起動時にバックグラウンド task として稼働し、失敗した MCP server の自動再接続を試みる。
+runtime 起動時にバックグラウンド task が稼働し、失敗した server の自動再接続を試みる。
 
 ```text
 loop:
@@ -253,5 +249,5 @@ loop:
 ### 未実装の機能
 
 - health probe の常駐監視: 接続済み server の定期的な死活確認。現在は tool 呼び出しの失敗で初めて検知
-- tool list の TTL cache: 接続時に `list_all_tools()` を1回だけ呼び出し、以降は `cached_tools` を使い回す。server 側がツールを追加・削除しても runtime 再起動まで反映されない
+- tool list の TTL cache: 接続時に `tools/list` を1回だけ呼び出し、以降はその結果を使い回す。server 側がツールを追加・削除しても runtime 再起動まで反映されない
 - `defaultProtocolVersion` / `protocol_version`: config から parse されるが接続時には未使用。常に rmcp デフォルトが使われる

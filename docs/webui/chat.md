@@ -68,7 +68,7 @@ Composer は幅 640px の中央カラムに収め、Timeline 上にオーバー�
 
 ### 3.2 空状態・ロード中
 
-ロード・再取得・失敗・空の基本パターンは [layout.md §6](./layout.md#6-フォーカスロードエラー) に従う。Chat 固有として、新規セッションでメッセージ 0 件のとき Timeline 中央に EmptyState（`Start a conversation with {agentName}`）を表示する。
+ロード・再取得・失敗・空の基本パターンは共通（[layout.md §6](./layout.md#6-フォーカスロードエラー)）。Chat 固有として、新規セッションでメッセージ 0 件のとき Timeline 中央に EmptyState（`Start a conversation with {agentName}`）を表示する。
 
 ### 3.3 メッセージ検索
 
@@ -133,7 +133,7 @@ Pulse によって Home Surface へ送信されたメッセージは、通常の
 Markdown をレンダリングする。
 
 - code (inline)：等幅フォント・小サイズ・半透明黒背景・小 radius
-- code block：[design-system.md §9.9](./design-system.md#99-code-block) に従う。Copy ボタン必須。**20行を超える場合は折りたたみ**、"Show all (N lines)" ボタンで展開
+- code block：[design-system.md §9.9](./design-system.md#99-code-block) の仕様。Copy ボタン必須、**20行超は折りたたみ**で "Show all (N lines)" ボタンで展開
 - リンク：アクセント色、hover で下線
 - 画像：中 radius、最大幅 100%
 
@@ -147,13 +147,13 @@ LLM 応答がストリーミング中のメッセージ（ドラフト状態）�
 
 ### 4.8 応答待機
 
-run が受諾されてから最初の delta または `tool_start` が届くまでの間、timeline 末尾に thinking dots を持つ assistant の行を表示する。ターンヘッダーの要否は §4.2 に従う。応答が始まると最初の delta 行またはツールカード行に置き換わる。
+run が受諾されてから最初の delta または `tool_start` が届くまでの間、timeline 末尾に thinking dots を持つ assistant の行を表示する（avatar と sender label はターンで最初の行だけ、§4.2）。応答が始まると最初の delta 行またはツールカード行に置き換わる。
 
 ---
 
 ## 5. Tool 実行カード
 
-LLM がツールを呼び出したとき、応答メッセージの下（同一の assistant 発言ツリー内）に折りたたみカードを表示する。カードは assistant 行と同じ幅で左揃えにし、ターンヘッダーの要否は §4.2 に従う。
+LLM がツールを呼び出したとき、応答メッセージの下（同一の assistant 発言ツリー内）に折りたたみカードを表示する。カードは assistant 行と同じ幅で左揃えにし、avatar と sender label はターンで最初の行だけ付く（§4.2）。
 
 ### 5.1 States
 

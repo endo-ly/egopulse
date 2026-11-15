@@ -21,8 +21,6 @@
 
 ## 1. 概要
 
-Sleep Batch は、会話セッションを長期記憶へ昇格する処理である。
-
 ### 記憶の構造
 
 `episode_events` が正本であり、2 つの記憶ファイルはそこから導出されるビューである。
@@ -49,7 +47,7 @@ Sleep Batch は、会話セッションを長期記憶へ昇格する処理で�
 Sleep Batch は 3 つの step と publish / finalize で構成される。各 step は独立して成功・失敗・スキップを記録し、失敗しても次の step に進む（best-effort）。
 
 ```text
-collect_sleep_input()
+入力収集とスキップ判定
       │
       ├─ Skip: pending メッセージ ≤ 64 かつ未処理 semantic events なし
       │        → skipped run を記録して終了
@@ -58,10 +56,9 @@ collect_sleep_input()
             pending メッセージ > 64 → 最古の pending セッションを取得（最大20件）
             semantic backlog のみ → セッションなし
              │
-       try_create_sleep_run() で排他チェック + run 作成
-             │ （3つの pending step を DB に原子挿入）
+       run 作成（排他チェック。3つの pending step を DB に原子挿入）
              │
-       prepare_batch_context()
+       コンテキスト準備
              │ LLM プロバイダー解決、メモリ読み込み、トークン予算計算
              │
        event_extraction（best-effort）
@@ -73,13 +70,12 @@ collect_sleep_input()
        semantic_update（best-effort）
              │ checkpoint 以降の episode_events → semantic.md
              │
-       publish_memory_bundle()
+       メモリ公開
              │ episodic.md + semantic.md を原子的に公開
              │
-       finalize_published_run_blocking()
-             │ セッションアーカイブ + checkpoint 判定 + クリア
+       セッションアーカイブ + checkpoint 判定 + クリア
              │
-       finalize_sleep_run() で run 状態集約
+       run 状態集約
 ```
 
 ### step 一覧
@@ -122,17 +118,7 @@ step 名は DB の `step_name` 値を正式名称とする。
 
 ### トークン予算
 
-```rust
-// src/sleep/prompt.rs
-const SLEEP_BATCH_OVERFLOW_RATIO: f64 = 0.80;  // コンテキスト窓の80%まで使用
-const MAX_SLEEP_CHUNK_SESSION_TOKENS: usize = 12_000;
-const MIN_SLEEP_CHUNK_SESSION_TOKENS: usize = 4_000;
-const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
-
-// chunk_token_budget(context_window) = clamp(context_window * 0.8 / 3, 4000, 12000)
-```
-
-プロンプトの文字数上限は `chunk_token_budget(context_window) * ESTIMATED_CHARS_PER_TOKEN` で計算する。
+`chunk_token_budget(context_window) = clamp(context_window × 0.8 ÷ 3, 4000, 12000)`（推定 3 文字/token）。プロンプトの文字数上限はこの値 × 3 で計算する。
 
 ---
 
@@ -229,7 +215,7 @@ const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 
 ### 記憶粒度
 
-データソースと各セクションの生成方法は [7. Episodic Renderer](#7-episodic-renderer) を参照。
+データソースと各セクションの生成方法は [7. Episodic Renderer](#7-episodic-renderer)。
 
 - 現在週（Current Week）: `episode_events`（Event 単位）
 - 過去週・過去月（Recent Weeks / Recent Months）: `episode_rollups`
@@ -307,7 +293,7 @@ const ESTIMATED_CHARS_PER_TOKEN: usize = 3;
 
 ### Episodic Renderer
 
-`episode_events` と `episode_rollups` から純粋な Rust で `episodic.md` を生成する。詳細は [7. Episodic Renderer](#7-episodic-renderer) を参照。
+`episode_events` と `episode_rollups` から純粋な Rust で `episodic.md` を生成する。フォーマットは §7。
 
 ### 実行頻度
 
@@ -332,10 +318,10 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 
 ### 処理内容
 
-1. `start_sleep_step(run_id, SemanticUpdate)` で step を running にする
-2. checkpoint `(agent_id, semantic_update, episode_events, agent_id)` を読む
-3. upper bound を `get_latest_episode_event_cursor(agent_id)` で固定する（同 run の event_extraction が入れた events を含む）
-4. `get_episode_events_after_cursor(agent_id, cursor, upper_bound)` で `ORDER BY encoded_at, id` の events を取得する
+1. step を running にする
+2. semantic_update の checkpoint を読む
+3. upper bound を最新 event cursor で固定する（同 run の event_extraction が入れた events を含む）
+4. cursor から upper bound までの events を `ORDER BY encoded_at, id` で取得する
 5. events が 0 件なら `skipped` で終了する。checkpoint と snapshot は触らない
 6. events を重要度で絞り込まず全件をバッチに分割し、順に LLM へ渡す。各出力の `semantic` を次バッチの入力 semantic として引き継ぐ
 7. 全バッチ成功時は 1 トランザクションで「semantic snapshot 挿入（変更なしでも挿入）＋ checkpoint を最後の event の `(encoded_at, id)` へ前進 ＋ step success」を行う
@@ -501,11 +487,10 @@ renderer は容量制御・圧縮を行わず、該当データを全件描画�
 
 ### 動作概要
 
-1. `start_channels` 起動時に scheduler task を spawn する（ループ内で `sleep_batch.enabled` を判定し、無効なら何もしない）
-2. scheduler は `next_scheduled_run()` で次回実行時刻を計算し、`tokio::time::sleep` で待機
-3. 時刻到達時に `run_scheduled_cycle()` を実行
-4. 各 agent について `active_turns.is_active()` を確認し、アクティブならその回の判定を見送り、理由を `skipped` run として記録する
-5. `run_agent_with_retry()` でリトライ設定に基づき再試行
+1. Runtime 起動時に scheduler task を起動する（ループ内で `sleep_batch.enabled` を判定し、無効なら何もしない）
+2. 次回実行時刻を計算して待機し、時刻到達時に実行サイクルを実行する
+3. 各 agent が対話中（ActiveTurnTracker で active）ならその回の判定を見送り、理由を `skipped` run として記録する
+4. retry 設定に基づき再試行する
 
 ### タイムゾーン対応
 
@@ -568,8 +553,7 @@ config.agents = [a,b]  → 指定 agent のみ
 
 ### 排他制御
 
-- `try_create_sleep_run()` で同一 agent の同時実行を防止
-- 既に running 状態の run がある場合は `None` を返す（呼び出し元で `AlreadyRunning` に変換）
+run 作成時の排他チェックで同一 agent の同時実行を防止する。既に running 状態の run がある場合は `AlreadyRunning` エラーになる。
 
 ### メモリファイル公開（Publication）
 
@@ -622,16 +606,7 @@ Runtime 起動時、`status = running` の Sleep Run を検査する（TurnDispa
 
 ### Secret Redaction
 
-LLM 入力前・出力後の両方で redaction を適用する:
-
-- API キー
-- トークン
-- パスワード
-- 認証情報
-- 環境変数値
-- `.env` 相当の値
-
-redaction 後の内容だけを DB と記憶ファイルに保存する。
+LLM 入力前・出力後の両方で三層 redaction（値・prefix・文脈）を適用する（[security.md §3](./security.md#3-事後処理)）。redaction 後の内容だけを DB と記憶ファイルに保存する。
 
 ### 記憶ファイルの取り扱い
 

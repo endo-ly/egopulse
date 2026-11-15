@@ -70,7 +70,7 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 
 ```
 src/
-├── main.rs              # CLI エントリポイント (ask / chat / run / setup / gateway / update / sleep / events)
+├── main.rs              # CLI エントリポイント (TUI / headless / run / setup / gateway / update / sleep / events)
 ├── lib.rs               # 全モジュールの公開インターフェース
 ├── conversation.rs       # ConversationScope / SurfaceContext
 ├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
@@ -351,7 +351,7 @@ TurnExecutor
       ├─ 5c. Context Compaction 判定 (context_tokens > context_window - reserve_tokens)
       │
       ├─ 5d. system prompt を構築
-      │      ├ SOUL.md (agent → channel → global の順に解決)
+      │      ├ SOUL.md (agent → global の順に解決)
       │      ├ AGENTS.md (global + agent の累積)
       │      └ skills catalog
       │
@@ -453,7 +453,7 @@ deadline 付きで停止する。
 |---------|---------|------|
 | **Channel Adapter** | `channels/adapter.rs` | 全チャネルを統一インターフェースで扱う |
 | **Channel Input Boundary** | `runtime/channel_input.rs` | チャネルが正規化した入力を `SurfaceContext`、Channel Log、`ScheduledTurn` に変換する |
-| **Turn Output Observer** | `runtime/turn/observer.rs` | Local APIなどのtransport adapterへTurn eventとinteraction completionを配送する。live observerはメモリに保持し、durable TurnにはClient-ownedという配送ポリシーだけを保存する。terminalなTurnから複数のstaged follow-upを昇格する場合も、各Turnの入力・成功・失敗イベントを同じclient interactionへ順序付きで流し、全Turnの完了後にcompletionを返す |
+| **Turn Output Observer** | `runtime/turn/observer.rs` | Local API など transport adapter へ Turn event と interaction completion を配送する |
 | **Dependency Injection** | `runtime/` AppState | 全コンポーネントの依存を明示的に注入 |
 | **Optimistic Concurrency** | `storage/` sessions | セッション書き込みの競合を `updated_at` で解決 |
 | **Tool Registry** | `tools/mod.rs` | built-in / MCP の区別なくツールを動的登録 |
@@ -469,7 +469,11 @@ deadline 付きで停止する。
 | **Stop Condition Evaluator** | `runtime/turn/scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
 | **Turn Tracker** | `runtime/turn/scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
 | **Conversation Scope Routing** | `runtime/` / `agent_loop/turn/dependencies.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnDependencies::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
-| **Tool Progress Coordinator** | `runtime/turn/progress.rs` | `AgentEvent` ストリームを購読し A3 遅延型 × B2 編集式累積ログでチャネル進捗を駆動。sink（Discord/Telegram）は投稿・編集・残置のみ担い、状態機械・遅延タイマー・間引きは coordinator が一元管理 |
+| **Tool Progress Coordinator** | `runtime/turn/progress.rs` | `AgentEvent` ストリームを購読し、チャネル進捗表示の状態機械を一元管理する |
+
+Observer の配送ポリシー: live observer はメモリに保持し、durable Turn には Client-owned という配送ポリシーだけを保存する。terminal な Turn から複数の staged follow-up を昇格する場合も、各 Turn の入力・成功・失敗イベントを同じ client interaction へ順序付きで流し、全 Turn の完了後に completion を返す。
+
+進捗表示の sink（Discord / Telegram）は投稿・編集・残置のみを担い、遅延タイマー・編集間引きは coordinator が一元管理する（[channels.md §3](./channels.md#3-discord)）。
 
 ---
 
@@ -501,9 +505,9 @@ deadline 付きで停止する。
 
 ## 8. オブザーバビリティレイヤー
 
-3 層構造で運用時の可観測性を提供する。
+運用時の可観測性を提供する。
 
-### 8.1 3 層モデル
+### 8.1 経路
 
 | 層 | 形式 | 用途 |
 |---|---|---|
@@ -520,10 +524,9 @@ deadline 付きで停止する。
 
 エージェントターンのライフサイクル全体で `trace_id` が伝播する。
 
-1. `execute_scheduled_turn` で UUID v4 を生成し `SurfaceContext.trace_id` に設定
-2. `process_turn_inner` は空 `trace_id` を自動補完（UUID v4 を再生成）
-3. `tracing::info_span!` に `trace_id` フィールドとして注入
-4. `journalctl` などで `trace_id=<value>` を grep することで、特定ターンの全ログを抽出できる
+1. Turn 実行時に UUID v4 を生成し `SurfaceContext.trace_id` に設定する（空の場合は runtime 側で自動補完）
+2. `tracing::info_span!` に `trace_id` フィールドとして注入する
+3. `journalctl` などで `trace_id=<value>` を grep することで、特定ターンの全ログを抽出できる
 
 ### 8.4 エラーリングバッファ
 

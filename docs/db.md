@@ -315,7 +315,7 @@ LLM ツール/ファンクション呼び出しの実行記録。
 
 `turn_id + tool_call_id` で Tool Call を一意にし、成功結果を再利用する。NULL の `turn_id`（legacy 行）は index 対象外。
 
-read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に実行結果を `succeeded` / `failed` の終端状態で直接 INSERT する。JSON 解析で実行前に拒否された要求は read-only / non-read-only とも記録しない。replay 時に `(turn_id, id)` の行がすでにある場合は `input_hash` / `tool_name` / `idempotency_class` の一致を検証し、一致すれば既存行を維持、不一致なら conflict としてブロック全体を rollback する。保存する `tool_input` はサニタイズ済み JSON、`input_hash` は元の入力から計算される。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
+read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に実行結果を `succeeded` / `failed` の終端状態で直接 INSERT する。実行前に JSON 解析で拒否された要求は read-only / non-read-only とも記録しない。`tool_input` はサニタイズ済み JSON、`input_hash` は元の入力から計算される。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
 
 **操作**:
 - `store_tool_call(tool_call)` — INSERT
@@ -635,11 +635,9 @@ Turn 実行の状態機械。受付・入力保存・model iteration・Tool 実�
 | `uncertain` | 再開可否不明（crash 後の running Tool 等）。自動再開しない |
 
 **設計ポイント**:
-- 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する（`Database`（turn.rs））
-- `output_published` が真の Turn は原則自動 retry しない。ただし `tools_completed` は Tool Results が durable で、未commitの staged follow-upも先に反映できるため、完了済み Tool を再実行せず次の model iteration だけを resume する
-- `UNIQUE(chat_id, request_key)` により同一受付の重複を防止する。再受付時は既存 Turn を返し、`completed` なら保存済み結果を再利用する
-- `accepted` / `input_committed` / `tools_completed` の `scheduled_request_json` を復元できない場合は、`error_kind = durable_payload_invalid` で終端化する。`accepted` / `input_committed` は `failed`、`tools_completed` は `output_published` の状態に応じて `failed` または `uncertain` とする。`error_message` は固定の sanitized 文言とし、保存済み payload は調査用に変更しない。`origin_id` がある場合は Turn の失敗と origin の終了理由を同一 transaction で記録する
-- crash recovery は起動時に `recover_interrupted()` が未端末 Turn を処理する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state)
+- 状態遷移は Rust enum と中央定義した transition rule で管理し、許可されていない遷移は DB 更新前に拒否する
+- Turn の終端理由と `origin_id` の terminal reason は同一 transaction で記録する
+- 重複受付防止・retry 規則・crash recovery の詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照
 
 ---
 
@@ -810,7 +808,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 #### v16: agent_avatars table
 
-`agent_avatars` 表を新設し、WebUI 表示用の agent アイコン画像（BLOB）を保存する。詳細は [§2](#2-テーブル定義) の `agent_avatars` を参照。
+`agent_avatars` 表を新設し、WebUI 表示用の agent アイコン画像（BLOB）を保存する（§2）。
 
 #### v21: pulse_runs.attention_snapshot
 
@@ -858,9 +856,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 | `db_meta` | `egopulse.db.db_meta` と同 schema | `SECRET_SCHEMA_VERSION` を管理 |
 | `schema_migrations` | `egopulse.db.schema_migrations` と同 schema | |
 
-**`tool_calls` テーブルについて**: 秘密モードでも Tool 実行台帳を保持する。claim-before-execute・input hash 整合確認・成功結果の再利用・実行状態管理を通常 DB と同じく適用し、Secret Tool の入出力を通常 DB へ書き出さず Secret DB 内に閉じ込める。tool call block は `sessions.messages_json` にも包含されるため LLM context 復元には影響しない。
-
-**Sleep / Pulse 関連テーブル不在の理由**: Sleep Batch・PULSE は `secret.db` にアクセスしない（構造的保証）。秘匿内容が長期記憶（`episodic.md` 等）へ昇格したり、公開チャネルで発言されたりするのを防ぐ。
+**Sleep / Pulse 関連テーブル不在の理由**: Sleep Batch・PULSE は `secret.db` にアクセスしない（[security.md §5.2](./security.md#52-構造的保証)）。秘匿内容が長期記憶へ昇格したり、公開チャネルで発言されたりするのを防ぐ。
 
 ### 5.3 マイグレーション
 

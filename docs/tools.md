@@ -40,9 +40,7 @@
 
 ### Built-in tool
 
-registry に登録される tool は次の通り。`agent_send` は常に登録される。
-
-#### 常時登録（11個）
+次の 12 個を常に登録する。
 
 - `read`
 - `bash`
@@ -55,36 +53,13 @@ registry に登録される tool は次の通り。`agent_send` は常に登録�
 - `send_attachment`
 - `web_fetch`
 - `pulse`
-
-#### 条件付き登録
-
-- `agent_send` — 常時有効
+- `agent_send`
 
 登録箇所: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
 
 ### MCP tool
 
-MCP が有効な場合、`ToolRegistry::definitions_async()` が `McpManager::all_tool_definitions()` の結果を built-in の定義に追加する。実行は `mcp_` で始まる名前を `McpManager::execute_tool_by_name()` へ dispatch する。
-
-公開される MCP tool は Agent の `mcp_servers` 設定で絞られる（[config.md §3.11](./config.md#311-エージェント定義agentsid)）。built-in tool はこの制限を受けない。
-
-命名規則:
-
-- 英数字と `_` 以外の文字は `_` に置換される
-- 合計文字数が 64 文字を超える場合は `mcp_{sha256先頭8文字}` に短縮される
-- サニタイズ後の名前が衝突する場合は、server 名と tool 名から作るハッシュを suffix に付け、接続順に依存せず区別する
-
-例:
-
-- `mcp_filesystem_read_file` — 標準的な命名
-- `mcp_db_query_1_` — `query(1)` の `(` `)` が `_` に置換される
-- `mcp_a1b2c3d4` — server/tool 名の合計が 64 文字を超える場合のハッシュ短縮
-
-実装: [egopulse/src/tools/mcp.rs](../../egopulse/src/tools/mcp.rs)
-
-MCP の詳細は以下を参照。
-
-- [mcp.md](./mcp.md)
+MCP tool は built-in と同じ registry に `mcp_{server}_{tool}` の名前で登録され、Agent の `mcp_servers` 設定で公開範囲が絞られる。built-in tool はこの制限を受けない。命名規則と公開範囲の詳細は [mcp.md](./mcp.md) を参照。
 
 ### Tool 実行台帳
 
@@ -107,7 +82,7 @@ read-only ツール（`is_read_only: true`）は副作用がなく crash 後の�
 
 #### ガード拒否後の停止
 
-1 Run 内で `guard_denied` が 3 回に達すると、後続の Tool 実行をすべて停止する。Turn / Pulse の次の model request では Tool 定義を空にし、停止報告を促す runtime guard を共通処理で付与する。モデルが Tool 要求を返しても実行層で拒否し、未実行要求は台帳に記録しない。拒否回数には実際のポリシー拒否のみを含み、`invalid_input` / `not_found` / `upstream` / `timeout` は加算しない。Pulse が停止報告を生成できない場合や `PULSE_OK` を返す場合は、固定の Notify メッセージをホームチャネルへ送る。
+1 Run 内で `guard_denied` が 3 回に達した際の停止は [security.md §2](./security.md#2-事前検査) の通り。台帳側の規則として、拒否回数には実際のポリシー拒否のみを含み、`invalid_input` / `not_found` / `upstream` / `timeout` は加算しない。未実行要求は台帳に記録しない。
 
 #### error_kind 分類
 
@@ -159,8 +134,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
 - 挙動:
   - workspace 配下の path のみ読める
   - テキストに加えて `png` / `jpg` / `jpeg` / `gif` / `webp` を画像として判定する
-  - 画像ファイルは base64 data URL にエンコードし、`MessageContent::Parts` (InputText + InputImage) として LLM に渡す
-  - マルチモーダル tool result を含むメッセージ履歴は OpenAI Responses API に自動ルーティングされる
+  - 画像ファイルは base64 data URL にエンコードし、`MessageContent::Parts` (InputText + InputImage) として LLM に渡す（マルチモーダル tool result のルーティング・保存規則は §1 前提の通り）
   - テキスト出力は最大 `2000` 行または `100KB`
   - 続きがある場合は `offset=...` の continuation hint を返す
   - 先頭 1 行だけで `100KB` を超える場合は `bash` fallback を促す
@@ -346,8 +320,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
 - 入力:
   - `skill_name: string` 必須
 - 挙動:
-  - `SkillManager::load_skill_checked()` を呼ぶ
-  - 返り値には skill name、description、skill directory、instructions 本文を含む
+  - skills 配下から指定 skill をロードする。返り値には skill name、description、skill directory、instructions 本文を含む
   - SKILL.md の `required_env` に基づき環境変数の解決可否を確認し、結果（✓/✗）を返す。環境変数自体は `bash` 実行時に自動注入されるため、`activate_skill` の呼び出しは注入の前提条件ではない
 - 主な失敗:
   - `Missing required parameter: skill_name`
@@ -473,8 +446,8 @@ Environment variables:
   - Secret 会話からは呼び出せない（エラーを返す）。Pulse の実行・配送は通常スコープで行われるため
   - 操作対象は常に実行中の自エージェント（他エージェントの PULSE.yaml は操作しない）
   - 書き込みは serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は発生しない。load → 変更 → save は排他ゲート内で実行され、並行操作でも更新消失はしない。バリデーションエラー（時刻形式・id 重複・`once` 過去日・DST で存在しない時刻等）はツールエラーとして返り、エージェントが会話内で自己修正できる
-  - `list` は各 intention の schedule・enabled・次回発火判定を返す。判定は scheduler と同一（カレンダー候補 + `pulse_runs` 実行履歴）で、時刻到達かつ未実行は `due now (pending next scan)`、実行済み期間は `already attempted for current period`、`once` 実行済みは `already attempted (no automatic retry)`。無効な agent・intention には発火見込みを表示しない。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す。PULSE.yaml が手編集で破損している場合はパースエラーを報告する
-  - `once` は `date + at` が過去の add / update を拒否する。発火が成功すると、実行時点の内容が現在の定義と一致する場合にのみ自動アーカイブ（ファイルから除去）される。失敗・skipped、activation 中の変更があった場合はファイルに残る（自動リトライなし）
+  - `list` は各 intention の schedule・enabled・次回発火判定を返す。判定と表示語は scheduler と同一（[pulse.md §3.3](./pulse.md#33-agent-による-pulse-操作pulse-ツール)）。実行履歴の参照に失敗した場合は該当行に `error` を表示し、`list` 全体をツールエラーとして返す。PULSE.yaml が手編集で破損している場合はパースエラーを報告する
+  - `once` は過去日・存在しない時刻の add / update を拒否する。成功時の自動アーカイブと失敗時の扱いは [pulse.md §4.4](./pulse.md#44-once)
 - 成功時: 操作結果のテキスト（`add` は id と次回発火見積もりを含む）
 - 主な失敗:
   - `"pulse: missing required parameter ..."` — 必須引数の欠落
