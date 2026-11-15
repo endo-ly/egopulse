@@ -6,10 +6,9 @@ SQLite データベースのスキーマ・テーブル定義・マイグレー�
 
 1. [全体構成と ER 図](#1-全体構成と-er-図)
 2. [テーブル定義](#2-テーブル定義)
-3. [Rust 構造体マッピング](#3-rust-構造体マッピング)
-4. [設計上の注意点](#4-設計上の注意点)
-5. [secret.db（秘匿会話用データベース）](#5-secretdb秘匿会話用データベース)
-6. [バックアップ・復元](#6-バックアップ復元)
+3. [設計上の注意点](#3-設計上の注意点)
+4. [secret.db（秘匿会話用データベース）](#4-secretdb秘匿会話用データベース)
+5. [バックアップ・復元](#5-バックアップ復元)
 
 ---
 
@@ -38,7 +37,7 @@ egopulse.db (SQLite / WAL mode) — ConversationScope::Normal のストレージ
 
 | 項目 | 値 |
 |------|----|
-| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数）。詳細は [§4](#4-設計上の注意点) |
+| スキーマバージョン管理 | バージョンベース（`SCHEMA_VERSION` 定数）。詳細は [§3](#3-設計上の注意点) |
 | DBファイル | `{state_root}/runtime/egopulse.db` |
 
 ---
@@ -188,14 +187,7 @@ DDL の正本は `src/storage/migration.rs`。本節は各テーブルのカラ�
 
 **制約**:
 - `(channel, external_chat_id)` の UNIQUE インデックス。channel 横断で同じ外部チャットを二重登録しない
-
-**操作**:
-- `resolve_chat_id(channel, external_chat_id)` — 既存チャットの検索
-- `resolve_or_create_chat_id(channel, external_chat_id, chat_type, agent_id)` — セッション識別子の Upsert（`ON CONFLICT DO UPDATE`）。表示名は変更しない
-- `update_chat_display_meta(chat_id, name, archived, pinned)` — 表示名・アーカイブ・ピンの更新。表示名の唯一の書き込み経路
-- `get_chat_by_id(chat_id)` — chat_id からチャンネル情報を逆引き
-
-セッション一覧（`list_sessions`）は `pinned` 降順 → `last_message_time` 降順 → `chat_id` 降順で返す。`surface_thread` は `external_chat_id` から導出し、表示名の変更では変わらない。
+ `pinned` 降順 → `last_message_time` 降順 → `chat_id` 降順で返す。`surface_thread` は `external_chat_id` から導出し、表示名の変更では変わらない。
 
 #### Channel Log (Multi-Agent Room)
 
@@ -205,9 +197,7 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 - `chat_type`: `channel_log`
 - `agent_id`: `""`（空文字）
 - `session` 行は持たない（`messages` テーブルのみ使用）
-- `resolve_channel_log_chat_id(channel_id)` で作成・取得
-- `get_recent_messages(chat_id, limit)` で直近 N 件を取得
-- `get_channel_log_messages_for_agent(chat_id, agent_id, limit)` で対象エージェント向けの公開会話コンテキストを取得（ユーザー発言、最終 assistant 応答、`agent_send` のみ）
+- 対象エージェント向けの参照は公開会話（ユーザー発言、最終 assistant 応答、`agent_send`）に絞る
 
 ---
 
@@ -235,15 +225,16 @@ Multi-Agent Room では共有の Channel Log チャットが作成される。
 
 NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未割当行が複数存在しても衝突しない。
 
-`seq IS NOT NULL` が committed conversation history の境界である。`seq IS NULL` の user/message 行は Tool phase 中に durable staging された未消費の follow-up であり、履歴・session preview・Sleep source には含めない。staged row は `turn_id` に current `tools_pending` または `tools_completed` Turn を持ち、Tool phase 完了後に FIFO で seq を割り当て、session snapshot、`chats.revision`、`chats.next_message_seq` と同一トランザクションで commit する。`tools_completed` recovery は、このcommitが中断された場合も同じ操作を再実行する。
+`seq IS NOT NULL` が committed conversation history の境界である。
 
-**操作**:
-- `store_message(msg)` — `INSERT OR REPLACE`
-- `store_message_only(msg)` — セッションを更新せずメッセージのみ保存。Channel Log (agent_send, system_event) 向け
-- `get_recent_messages(chat_id, limit)` — 最新N件（DESC→reverse）
-- `get_messages_before(chat_id, before_seq, limit)` — `seq` カーソルより古いN件（DESC→reverse）。`before_seq = None` は最新ページ
-- `has_messages_before(chat_id, before_seq)` — カーソルより古い committed message が存在するか
-- `get_all_messages(chat_id)` — 全件（ASC）
+| 行 | 意味と扱い |
+|---|---|
+| `seq` あり | committed conversation history。append-only かつ immutable |
+| `seq` なし（NULL） | Tool phase 中に durable staging された未消費の follow-up。履歴・session preview・Sleep source の対象外。`turn_id` に current `tools_pending` / `tools_completed` Turn を持つ |
+
+staged row は Tool phase 完了後に FIFO で seq を割り当て、session snapshot・`chats.revision`・`chats.next_message_seq` と同一トランザクションで commit する。`tools_completed` recovery は、この commit が中断された場合も同じ操作を再実行する。
+
+履歴ページングは `seq` カーソルベースで、Channel Log（`agent_send` / `system_event`）向けに snapshot を更新しない保存経路を持つ。
 
 #### `message_kind` の種類
 
@@ -268,14 +259,8 @@ NULL の `seq` は index 対象外（SQLite の `NULL ≠ NULL` 仕様）。未�
 | updated_at | TEXT | NOT NULL | 監査時刻（RFC3339）。競合判定には使用せず整数 `chats.revision` を使用 |
 | snapshot_through_seq | INTEGER | NOT NULL DEFAULT 0 | `messages_json` へ反映済みの最終 message seq。`base + seq>snapshot_through` でLLM contextを構築 |
 
-**操作**:
-- `replace_session_snapshot(chat_id, messages_json, expected_revision)` — `chats.revision` の CAS つき Upsert。`/compact` が使用
-- `truncate_session_messages(chat_id, expected_revision, messages_json)` — Sleep Batch の切り詰め
-- `load_session(chat_id)` — JSON と updated_at を取得
-- `load_session_snapshot(chat_id, limit)` — JSON + 最新メッセージレコードをトランザクションで取得
-- `store_message_with_session(msg, json, expected_updated_at)` — メッセージ保存 + セッション更新をトランザクションで楽観排他実行
-
 **設計ポイント**:
+- snapshot の交換（`/compact`）と切り詰め（Sleep Batch）は `chats.revision` の CAS 付きで行う
 - 楽観排他: `expected_updated_at` と実際の `updated_at` を比較し、競合時は `SessionSnapshotConflict` エラー
 - `messages_json` にはツール呼び出しブロックも含まれるため、セッション再開時に完全なコンテキストを復元可能
 - 出力上限で打ち切られた final message は `finish_reason` を保持し、通常完了と区別できる。復旧不能な打ち切り Tool Call は失敗結果として同じ snapshot に保存され、次の Turn で実行対象にならない
@@ -317,14 +302,6 @@ LLM ツール/ファンクション呼び出しの実行記録。
 
 read-only ツール（`idempotency_class = read_only`）は claim を経ず、並列ブロック完了後に実行結果を `succeeded` / `failed` の終端状態で直接 INSERT する。実行前に JSON 解析で拒否された要求は read-only / non-read-only とも記録しない。`tool_input` はサニタイズ済み JSON、`input_hash` は元の入力から計算される。方針の詳細は [tools.md §Tool 実行台帳](./tools.md#tool-実行台帳) を参照。
 
-**操作**:
-- `store_tool_call(tool_call)` — INSERT
-- `update_tool_call_output(id, output)` — 出力の事後更新
-- `update_tool_call_output_for_message(chat_id, message_id, id, output)` — assistant メッセージ単位でスコープした出力更新
-- `get_tool_calls_for_message(chat_id, message_id)` — メッセージ単位の呼び出し履歴
-- `get_tool_calls_for_chat(chat_id)` — チャット単位の全呼び出し履歴
-- `get_tool_calls_for_messages(chat_id, message_ids)` — 履歴ページに含まれるメッセージの呼び出しのみを取得
-
 **設計ポイント**:
 - `id` は OpenAI/Codex などのプロバイダが返す call id であり、永続化上のグローバルIDではない
 - 同じプロバイダ call id が別 assistant メッセージで再利用されても履歴を保持できるよう、主キーは `(id, chat_id, message_id)`
@@ -352,12 +329,6 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 | cached_input_tokens | INTEGER | NULL | `input_tokens` のうち prompt cache から供給された分。Provider が報告しない場合は NULL、報告して 0 の場合は 0 |
 | created_at | TEXT | NOT NULL | RFC3339 タイムスタンプ |
 
-**操作**:
-- `log_llm_usage(chat_id, caller_channel, provider, model, input_tokens, output_tokens, request_kind, estimated_tokens, has_tools, cached_input_tokens)` — INSERT（total_tokens は自動計算）
-- `load_calibration_observations(limit_per_key)` — 補正係数再構築用の観測を最近 N 件/キー取得（oldest-first）
-- `get_llm_usage_summary(chat_id, since)` — 集計サマリ（requests, input/output/total tokens, last_request_at）
-- `get_llm_usage_by_model(chat_id, since)` — モデル別集計（total_tokens 降順）
-
 ---
 
 ### sleep_runs
@@ -379,18 +350,9 @@ LLM API の使用量ログ。トークン消費の追跡とコスト管理に使
 | total_tokens | INTEGER | NOT NULL DEFAULT 0 | 合計トークン数 |
 | error_message | TEXT | nullable | `failed` のエラー、`skipped` のスキップ理由 |
 
-**操作**:
-- `create_sleep_run(agent_id, trigger)` — INSERT（status=running, id/started_at 自動生成）
-- `try_create_sleep_run(agent_id, trigger)` — 同一 agent の running run を transaction 内で確認し、存在しなければ INSERT
-- `update_sleep_run_success(id, source_chats_json, source_digest_md, input_tokens, output_tokens)` — status=success 更新
-- `update_sleep_run_failed(id, error_message)` — status=failed 更新
-- `record_skipped_sleep_run(agent_id, trigger, reason)` — 実行しないと判定した Sleep を、理由付きの終了済み `skipped` run として INSERT（ステップは作らない）
-- `get_sleep_run(id)` — id で取得
-- `list_sleep_runs(agent_id, statuses, limit)` — agent_id と status（空ならすべて）で絞り込み + started_at 降順
-- `count_agent_pending_sleep_messages(agent_id)` — `event_extraction` checkpoint より新しい `messages` を pending とみなし、`COUNT(DISTINCT m.id)` で重複除外して計数（Sleep 候補判定の cursor として `finished_at` ではなく checkpoint を使用）
-- `get_agent_sessions_with_pending_sleep_messages(agent_id, limit)` — 同じ pending 条件でセッションを「最古の pending message が古い順、同値なら `chat_id` 順」で取得（hot session による backlog 飢餖防止）
-
 **設計ポイント**:
+- 実行しないと判定した Sleep は、理由付きの終了済み `skipped` run として記録する（ステップ・スナップショットは作らない）
+- pending 判定の cursor は `finished_at` ではなく `event_extraction` checkpoint
 - `trigger` は SQLite 予約語のため `trigger_type` にリネーム
 - `status` は step 結果から `finalize_sleep_run` で派生する集約値（running/success/partial_failure/failed/skipped）
 - `input_tokens`/`output_tokens`/`total_tokens` は `sleep_run_steps` の SUM から `finalize_sleep_run` で更新
@@ -413,13 +375,6 @@ Sleep Batch の step 別実行 log。run 内の各処理工程（event_extractio
 | error_message | TEXT | nullable | エラーメッセージ |
 | metadata_json | TEXT | nullable | step固有の監査情報（JSON） |
 
-**操作**:
-- `start_sleep_step(sleep_run_id, step_name)` — pending→running へ遷移
-- `finish_sleep_step(sleep_run_id, step_name, result)` — running→success/failed/skipped へ遷移
-- `list_sleep_run_steps(sleep_run_id)` — run の全 step を取得
-- `get_sleep_run_step(sleep_run_id, step_name)` — 単一 step を取得
-- `finalize_sleep_run(sleep_run_id)` — step 結果から run status/token を集約
-
 ---
 
 ### sleep_step_checkpoints
@@ -435,11 +390,6 @@ agent×step×source 単位の処理 checkpoint。各 step が次回どこから�
 | cursor_at | TEXT | NOT NULL | 最後に成功処理した行の時刻 |
 | cursor_id | TEXT | NOT NULL | 同一時刻内の順序を確定する ID（tie-breaker） |
 | updated_at | TEXT | NOT NULL | checkpoint の最終更新時刻 |
-
-**操作**:
-- `get_sleep_checkpoint(agent_id, step_name, source_kind, source_id)` — 単一 checkpoint を取得
-- `upsert_sleep_checkpoint(checkpoint)` — checkpoint を挿入または更新
-- `list_sleep_checkpoints(agent_id, step_name, source_kind)` — step/source 種の全 checkpoint を取得
 
 **設計ポイント**:
 - `episodic_update` は派生データから再計算するため checkpoint を持たない
@@ -470,16 +420,6 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 
 *UNIQUE 制約は `(agent_id, intention_id, due_key)` の複合。同一 intention の同一 due の二重実行を防ぐ。
 
-**操作**:
-- `try_create_pulse_run(id, agent_id, intention_id, due_key, attention)` — INSERT（status=running, started_at 自動生成、attention を `attention_snapshot` に保存）
-- `has_pulse_due_run(agent_id, intention_id, due_key)` — 重複チェック
-- `get_pulse_run(id)` — id で取得
-- `list_pulse_runs(agent_id, intention_id, statuses, limit)` — agent と、任意の intention・status（空ならすべて）で絞り込み + started_at 降順
-- `update_pulse_run_success(id, output_kind, output_text, chat_id, message_id)` — status=success 更新
-- `update_pulse_run_failed(id, error_message)` — status=failed 更新
-- `update_pulse_run_skipped(id, reason)` — status=skipped 更新
-- `reap_orphaned_pulse_runs()` — 全 `status='running'` 行を `failed` 化（起動時の孤立行回収）。戻り値は更新行数
-
 ---
 
 ### memory_snapshots
@@ -498,19 +438,10 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 
 *UNIQUE 制約は `(run_id, file)` の複合。
 
-**操作**:
-- `create_memory_snapshot(run_id, agent_id, file, content_before, content_after)` — INSERT
-- `get_snapshots_for_run(run_id)` — run_id 絞り込み + created_at 昇順
-- `list_memory_changes(agent_id, limit)` — 公開済みの変更履歴（全ファイル）。所属 run が `success` / `partial_failure` かつ `content_before != content_after` の行を created_at 降順で返す
-- `changed_memory_files(run_ids)` — run ごとの変更のあった記憶ファイル。`list_memory_changes` と同じ公開済み条件で、`episodic` → `semantic` の順に返す
-- `get_latest_snapshot_for_file(agent_id, file)` — agent+file の最新1件
-- `ensure_memory_snapshots_complete(run_id, agent_id, base)` — 欠落 file に `content_before == content_after == base` の snapshot を補完する
-- `list_running_sleep_runs()` — `status = 'running'` の Run を開始順に取得（スタートアップリカバリ用）
-
 **設計ポイント**:
 - **Aggregate snapshot 方針**: 1回 LLM 呼び出し前提のため、phase ごとではなく run 単位で1ファイルにつき1件の snapshot を保存する
-- **完全な2ファイルセット**: finalize 前に2種類の snapshot が揃うことを publication bundle の整合性条件とする。各 Step は成功時に担当 file の snapshot を commit し、未実行・未変更の file は `ensure_memory_snapshots_complete()` が `before == after == base` で補完する。`content_before` は常に Run 開始時の bundle（base）を使用する
-- **Publication / Recovery**: `publish_bundle()` は `content_before` を precondition とし、`content_after` を原子的に公開する。スタートアップリカバリは `content_after` から再公開し、現状が `before` / `after` のいずれにも一致しない場合は startup を停止する
+- **完全な2ファイルセット**: finalize 前に2種類の snapshot が揃うことを publication bundle の整合性条件とする。各 Step は成功時に担当 file の snapshot を commit し、未実行・未変更の file は `before == after == base` で補完する。`content_before` は常に Run 開始時の bundle（base）を使用する
+- **Publication / Recovery**: 公開処理は `content_before` を precondition とし、`content_after` を原子的に公開する。スタートアップリカバリは `content_after` から再公開し、現状が `before` / `after` のいずれにも一致しない場合は startup を停止する
 
 ---
 
@@ -541,12 +472,6 @@ Pulse（注意活性化）の実行履歴。due 判定・重複防止・通知�
 | ripple_strength | 1 以上 5 以下 |
 | certainty | `'stated'`, `'derived'`, `'tentative'` のいずれか |
 
-**操作**:
-- `insert_episode_events(run_id, events)` — batch INSERT（同一 run_id の既存レコードを先に DELETE）
-- `list_episode_events(agent_id, kind, min_ripple, limit)` — kind / ripple_strength でフィルタリングし experienced_at 降順
-- `count_episode_events(agent_id)` — agent の総 event 数
-- `list_episode_events_by_run(run_id)` — run 単位の全 event を experienced_at 昇順
-
 **設計ポイント**:
 - **append-only 台帳**: 同一 run_id での再抽出時のみ全削除→再挿入（冪等性担保）。それ以外は追記専用で不変性を維持
 - **4 つの複合インデックス**: agent_id 起点 + kind/ripple_strength のフィルタリングと experienced_at ソートをカバー
@@ -575,16 +500,6 @@ episodic_update の rollup で生成される週次・月次の派生要約。
 | updated_at | TEXT | NOT NULL | 更新時刻 |
 
 *UNIQUE 制約は `(agent_id, granularity, period_key)` の複合。
-
-**Rust 構造体**: `EpisodeRollup`, `RollupGranularity`
-
-**クエリ関数**:
-- `upsert_episode_rollup(rollup)` — INSERT ... ON CONFLICT DO UPDATE
-- `list_episode_rollups(agent_id, granularity, limit)` — granularity フィルタ + period_start DESC
-- `get_episode_rollup(agent_id, granularity, period_key)` — 複合キーで1件取得
-- `list_episode_rollups_in_range(agent_id, granularity, start, end_exclusive)` — 期間範囲
-- `list_background_episode_rollups(agent_id, min_ripple, before_period_start)` — Background Months 用
-- `list_episode_events_in_range(agent_id, start, end_exclusive)` — Event 期間範囲取得
 
 ---
 
@@ -692,11 +607,6 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 | `schema_version` | スキーマバージョン番号の文字列表現 |
 | `installation_id` | この DB を作成したインストールを表す UUID。初回参照時に生成し、以後は同じ値を返す。値なし provider ヘッダの識別子導出に使い、そのヘッダを設定していない構成では参照も生成もされない |
 
-**操作**:
-- `schema_version(conn)` — `db_meta.schema_version` を読み取り。未設定時は `0` を返す
-- `set_schema_version(conn, version, note)` — Upsert（`ON CONFLICT DO UPDATE`）+ `schema_migrations` への履歴記録
-- `installation_id()` — `db_meta.installation_id` を読み取り、未設定なら UUID を生成して保存する。値はプロセス内でキャッシュされる
-
 ---
 
 ### schema_migrations
@@ -715,37 +625,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 
 ---
 
-## 3. Rust 構造体マッピング
-
-| 構造体 | テーブル | フィールド |
-|--------|----------|-----------|
-| `StoredMessage` | messages | id, chat_id, sender_id, content, sender_kind, timestamp, message_kind, recipient_agent_id, seq, turn_id, parent_message_id |
-| `ChatInfo` | chats（一部） | chat_id, channel, external_chat_id, chat_type, agent_id |
-| `SessionSummary` | chats + messages（JOIN） | chat_id, channel, surface_thread, chat_title, last_message_time, last_message_preview, agent_id |
-| `SessionSnapshot` | sessions + messages | messages_json, updated_at, recent_messages: Vec\<StoredMessage\>（`messages_json` は `ContextSnapshot`） |
-| `AgentSessionInfo` | chats + sessions（JOIN） | chat_id, channel, external_chat_id, updated_at, message_count, estimated_tokens |
-| `ToolCall` | tool_calls | id, chat_id, message_id, tool_name, tool_input, tool_output, timestamp |
-| `LlmUsageSummary` | llm_usage_logs（集計） | requests, input_tokens, output_tokens, total_tokens, last_request_at |
-| `LlmModelUsageSummary` | llm_usage_logs（モデル別集計） | model, requests, input_tokens, output_tokens, total_tokens |
-| `SleepRun` | sleep_runs | id, agent_id, status, trigger, started_at, finished_at, source_chats_json, source_digest_md, input_tokens, output_tokens, total_tokens, error_message |
-| `SleepRunStep` | sleep_run_steps | sleep_run_id, step_name, status, started_at, finished_at, input_tokens, output_tokens, error_message, metadata_json |
-| `SleepStepCheckpoint` | sleep_step_checkpoints | agent_id, step_name, source_kind, source_id, cursor_at, cursor_id, updated_at |
-| `SleepRunStatus` | — | 5種の enum: `Running`, `Success`, `PartialFailure`, `Failed`, `Skipped`（SQL: `running`, `success`, `partial_failure`, `failed`, `skipped`） |
-| `SleepStepName` | — | 3種の enum: `EventExtraction`, `EpisodicUpdate`, `SemanticUpdate`（SQL: `event_extraction`, `episodic_update`, `semantic_update`） |
-| `SleepStepStatus` | — | 5種の enum: `Pending`, `Running`, `Success`, `Failed`, `Skipped`（SQL: `pending`, `running`, `success`, `failed`, `skipped`） |
-| `CheckpointSourceKind` | — | 2種の enum: `Messages`, `EpisodeEvents`（SQL: `messages`, `episode_events`） |
-| `PulseRun` | pulse_runs | id, agent_id, intention_id, due_key, chat_id, message_id, status, started_at, finished_at, output_kind, output_text, error_message, attention_snapshot |
-| `MemorySnapshot` | memory_snapshots | id, run_id, agent_id, file, content_before, content_after, created_at |
-| `EpisodeEvent` | episode_events | id, agent_id, experienced_at, encoded_at, kind, title, body_md, ripple_strength, certainty, sleep_run_id, source_refs_json, created_at, updated_at |
-| `EpisodeEventKind` | — | 8種の enum: `Self_`, `Relationship`, `World`, `Feat`, `Anomaly`, `Decision`, `Insight`, `Rhythm`（SQL: `self`, `relationship`, `world`, `feat`, `anomaly`, `decision`, `insight`, `rhythm`） |
-| `EpisodeEventCertainty` | — | 3種の enum: `Stated`, `Derived`, `Tentative`（SQL: `stated`, `derived`, `tentative`） |
-| `EpisodeRollup` | episode_rollups | id, agent_id, granularity, period_key, period_start, period_end_exclusive, summary_md, max_ripple, event_count, generated_run_id, created_at, updated_at |
-| Turn 状態（`turn_runs.state`） | — | 10種: `accepted`, `input_committed`, `model_pending`, `model_completed`, `tools_pending`, `tools_completed`, `completed`, `failed`, `cancelled`, `uncertain` |
-| Tool 実行状態（`tool_calls.state`） | — | 5種: `pending`, `running`, `succeeded`, `failed`, `uncertain` |
-
----
-
-## 4. 設計上の注意点
+## 3. 設計上の注意点
 
 ### マイグレーション機構
 
@@ -828,11 +708,11 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 ---
 
-## 5. secret.db（秘匿会話用データベース）
+## 4. secret.db（秘匿会話用データベース）
 
 `ConversationScope::Secret` スコープの会話（YAML 設定で `secret: true` が設定されたチャネル）を `ConversationScope::Normal` 用の `egopulse.db` から物理的に隔離するための別データベース。スコープの概要は [architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) を参照。
 
-### 5.1 概要
+### 4.1 概要
 
 | 項目 | 値 |
 |------|----|
@@ -840,7 +720,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 | 初期化条件 | `channels.discord.channels.*` または `channels.telegram.telegram_channels.*` に `secret: true` エントリが1件以上ある場合 |
 | スキーマバージョン管理 | `SECRET_SCHEMA_VERSION` 定数。`egopulse.db` の `SCHEMA_VERSION` とは独立 |
 
-### 5.2 テーブル構成
+### 4.2 テーブル構成
 
 `secret.db` は `egopulse.db` の会話・Turn・Tool 台帳を担うサブセット。通常 DB に存在する `sleep_runs`, `sleep_run_steps`, `sleep_step_checkpoints`, `pulse_runs`, `episode_events`, `episode_rollups`, `memory_snapshots` は含まない。秘匿会話も同一の会話順序・競合制御・Turn lifecycle・Tool 実行台帳を持つため、`chats`/`messages`/`sessions` 拡張カラム、`turn_runs`、`tool_calls` を配置する。Secret スコープの Tool claim・結果保存はすべてこの DB で行われ、通常 DB へは書き込まれない。
 
@@ -858,13 +738,13 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 **Sleep / Pulse 関連テーブル不在の理由**: Sleep Batch・PULSE は `secret.db` にアクセスしない（[security.md §5.2](./security.md#52-構造的保証)）。秘匿内容が長期記憶へ昇格したり、公開チャネルで発言されたりするのを防ぐ。
 
-### 5.3 マイグレーション
+### 4.3 マイグレーション
 
 `run_migrations()` とは別に `run_secret_migrations()` を使用。`Database::new_secret()` 経由で起動時に呼ばれる。
 
 `egopulse.db` 側の `SCHEMA_VERSION` と衝突しないよう、別定数・別関数で管理する。
 
-### 5.4 バックアップ
+### 4.4 バックアップ
 
 `secret.db` は `egopulse.db` と同一スケジュールでバックアップされる。
 
@@ -879,26 +759,26 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 ---
 
-## 6. バックアップ・復元
+## 5. バックアップ・復元
 
-### 6.1 バックアップ方式
+### 5.1 バックアップ方式
 
 EgoPulse は SQLite の `VACUUM INTO` コマンドで一貫性スナップショットを取得する。WAL モード稼働中でも schema lock を一瞬取得するだけであり、夜間実行なら書き込みブロックは無視できる。バックアップファイルはパーミッション `0600`（所有者のみ読み書き可）で作成される。
 
-### 6.2 バックアップのタイミング
+### 5.2 バックアップのタイミング
 
 - **起動時バックアップ**: マイグレーション前に1回だけ実行（既存 DB が存在する場合のみ）。最も危険な瞬間（スキーマ変更前）の保険。
 - **定期バックアップ**: デフォルトで 7 日ごと 03:00（タイムゾーンは `Config.timezone`）。設定で間隔と時刻を変更可能。
 
 詳細は [config.md §3.9](./config.md#39-db-バックアップ設定dbbackup) を参照。
 
-### 6.3 保存先と命名規則
+### 5.3 保存先と命名規則
 
 - **保存先**: `~/.egopulse/runtime/backups/`（本番 DB と同階層）
 - **ファイル名**: `egopulse-YYYYMMDD-HHMMSS.db`（タイムゾーンは `Config.timezone`）
 - **世代管理**: 直近 `max_generations` 件（デフォルト 12）を保持。超過分は古い順に削除。
 
-### 6.4 復元手順
+### 5.4 復元手順
 
 バックアップからの復元は手動で行う。稼働中のプロセスが DB を置き換えることは安全でないため、CLI は提供しない。
 
@@ -916,7 +796,7 @@ rm -f ~/.egopulse/runtime/egopulse.db-wal \
 systemctl --user start egopulse
 ```
 
-### 6.5 ディスク故障対策
+### 5.5 ディスク故障対策
 
 バックアップは本番 DB と同じディスクに保存される。ディスク故障に備えるには、別物理ディスクへ定期的に同期する運用をユーザー責任で行う。
 

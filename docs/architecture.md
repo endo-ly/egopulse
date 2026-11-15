@@ -113,42 +113,33 @@ impl AppState {
 
 ### TurnDependencies
 
-Turn 実行の中心処理は巨大な `AppState` を直接参照せず、`TurnDependencies` を経由する。`TurnDependencies` は Turn 実行に必要な依存だけを束ね、scheduler・channel dispatch・runtime observability から Agent Loop を分離する。
+Turn 実行の中心処理は AppState を直接参照せず、`TurnDependencies` を経由する。Turn 実行に必要な依存だけを束ね、scheduler・channel dispatch・runtime observability から Agent Loop を分離する。
 
-```text
-TurnDependencies
-├── ConfigManager          — immutable Config snapshot、更新境界、変更通知（revision / fingerprint）
-├── Database
-│   ├── chat.rs            — chats / messages / sessions の原子的更新（revision CAS）
-│   ├── turn.rs            — turn_runs / turn_origins の作成・重複受付防止・状態遷移
-│   └── tool.rs            — tool_calls の claim・状態更新・結果再利用
-├── llm_cache              — Config snapshot と会話に対応する Provider 解決と cache（resolve_llm_for_agent_channel）
-└── ToolRegistry           — Tool 定義・Tool Policy・idempotency 分類
-```
+| 依存 | 内容 |
+|---|---|
+| 設定 | 不変の Config snapshot、更新境界、変更通知（revision / fingerprint） |
+| Database | chats / messages / sessions の原子的更新（revision CAS）、turn_runs / turn_origins の作成と状態遷移、tool_calls の claim と結果再利用 |
+| llm cache | Config snapshot と会話に対応する Provider 解決 |
+| ToolRegistry | Tool 定義・Tool Policy・idempotency 分類 |
 
-Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / agent_send）は同じ `TurnDependencies` へ到達する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state) を参照。
+Turn 開始時に Config snapshot を取得し、Turn 完了まで固定する。各 Ingress（CLI / Web / Discord / Telegram / Webhook / `agent_send`）は同じ `TurnDependencies` へ到達する。詳細は [session-lifecycle.md §10](./session-lifecycle.md#10-durable-turn-state)。
 
 ### SurfaceContext
 
 メッセージの送信元を識別する型。チャネル・ユーザー・スレッドの組み合わせで一意になる。
 
-```rust
-pub(crate) struct SurfaceContext {
-    pub channel: String,         // "discord" | "telegram" | "web" | "tui" | "cli"
-    pub surface_user: String,    // プラットフォーム固有のユーザー ID
-    pub surface_thread: String,  // プラットフォームの会話スレッド ID
-    pub chat_type: String,       // 永続化用チャット種別
-    pub agent_id: String,        // 使用するエージェント定義のキー
-    pub channel_log_chat_id: Option<i64>, // Multi-Agent Room の Channel Log
-    pub chain_depth: usize,      // agent_send のチェーン深度 (0 = ユーザー発信)
-    pub origin_id: String,       // ヒューマン入力起点の UUID (暴走防止用)
-    pub trace_id: String,        // オブザーバビリティ用トレース ID (ターン相関)
-    pub scope: ConversationScope,// ストレージ境界。turn 全体の DB・archive ルーティングを決定
-    pub request_key: String,   // 同一受付の重複防止 key。UNIQUE(chat_id, request_key)
-}
-```
-
-`channel` フィールドはモデル解決の profile lookup キーとしても機能する。`resolve_llm_for_agent_channel` は `agent.profiles[channel]` を参照し、チャネル別のプロバイダー/モデルオーバーライドを解決する（詳細は [config.md §4](./config.md#4-モデル解決チェーン)）。
+| フィールド | 意味 |
+|---|---|
+| `channel` | 送信元チャネル（`discord` / `telegram` / `web` / `tui` / `cli`）。モデル解決の profile lookup キーとしても機能し、チャネル別オーバーライドを解決する（[config.md §4](./config.md#4-モデル解決チェーン)） |
+| `surface_user` / `surface_thread` | プラットフォーム固有のユーザー ID / 会話スレッド ID |
+| `chat_type` | 永続化用チャット種別 |
+| `agent_id` | 使用するエージェント定義のキー |
+| `channel_log_chat_id` | Multi-Agent Room の Channel Log（該当時のみ） |
+| `chain_depth` | `agent_send` のチェーン深度（0 = ユーザー発信） |
+| `origin_id` | ヒューマン入力起点の UUID（暴走防止用） |
+| `trace_id` | オブザーバビリティ用トレース ID（ターン相関） |
+| `scope` | ストレージ境界。turn 全体の DB・archive ルーティングを決定（§6.1） |
+| `request_key` | 同一受付の重複防止 key。`UNIQUE(chat_id, request_key)` |
 
 ### Agent Loop と durable Turn の境界
 
@@ -156,19 +147,19 @@ pub(crate) struct SurfaceContext {
 
 ```text
 TurnExecutor
-  ├─ TurnLifecycle::accept / resume validation
-  ├─ Turn preparation
-  ├─ TurnPersistence::persist_user_input
-  ├─ AgentLoop::run
-  │    ├─ compaction decision for the request about to be sent
-  │    ├─ checkpoint persistence (CAS) before the model call
-  │    ├─ ModelRunner::run_with_retry
-  │    ├─ TurnPersistence::persist_tool_call
-  │    ├─ ToolExecutor::execute
-  │    ├─ TurnPersistence::persist_tool_results
-  │    └─ next iteration
-  ├─ TurnPersistence::persist_final
-  └─ TurnLifecycle::complete
+  ├─ accept / resume 検証
+  ├─ Turn 準備
+  ├─ user input の永続化
+  ├─ AgentLoop
+  │    ├─ 送信直前の compaction 判定
+  │    ├─ model 呼び出し前の checkpoint 保存（CAS）
+  │    ├─ model step（retry 込み）
+  │    ├─ tool call の永続化
+  │    ├─ tool 実行
+  │    ├─ tool result の永続化
+  │    └─ 次の iteration
+  ├─ final message の永続化
+  └─ Turn 完了
 ```
 
 `AgentLoop` は `AgentLoopResult` を返し、final message の保存と `completed` 遷移は `TurnExecutor` が行う。compaction の判定と checkpoint の永続化は `AgentLoop` が model 送信直前に行う。これにより、LLM の 1 step、Tool の実行、Turn の durable state、Session snapshot の保存がそれぞれの責務へ閉じる。
@@ -229,11 +220,11 @@ TurnExecutor
       │
 2. Config YAML をロード (~/.egopulse/egopulse.config.yaml)
       │
-3. build_app_state()
+3. AppState の構築
        │
        ├─ InstanceGuard 取得 (state root の排他ロック)
        ├─ Database 初期化 (SQLite WAL, マイグレーション)
-       ├─ secret_db 初期化 (Config::needs_secret_db() が true の場合のみ)
+       ├─ secret_db 初期化（secret チャネル設定がある場合のみ）
        ├─ SkillManager 構築
       ├─ McpManager 初期化 (MCP server 接続)
       ├─ ToolRegistry 構築 (built-in + MCP tools)
@@ -244,7 +235,7 @@ TurnExecutor
       ├─ **Memory publication recovery** (running Sleep Run の bundle を再公開・整合)
       └─ Turn dispatcher / Agent turn worker / MCP reconnect loop 起動 (supervisor 経由)
       │
-4. start_channels()
+4. チャネルの起動
        │
        ├─ Local API Unix socket bind (`<state_root>/runtime/egopulse.sock`, supervisor 経由)
        ├─ Web server 起動 (supervisor 経由)
@@ -304,7 +295,7 @@ deadline 付きで停止する。
 | **Graceful Shutdown** | `runtime/supervisor.rs` | 長寿命 task と Turn を所有し、deadline 付きで順序停止 |
 | **LLM Provider Cache** | `runtime/` AppState | 同一 ResolvedLlmConfig の LLM クライアントを再利用 |
 | **Codex Auth Cache** | `llm/codex_auth.rs` | 5 分 TTL で codex auth 解決結果をキャッシュ |
-| **Read-only Parallel** | `agent_loop/tool_execution.rs` | `is_read_only()` が真のツールは並列実行 |
+| **Read-only Parallel** | `agent_loop/tool_execution.rs` | 読み取り専用のツールは並列実行する |
 | **Sleep Batch** | `sleep/orchestrator.rs` | 手動 sleep batch の排他実行と長期記憶昇格 |
 | **Sleep Scheduler** | `sleep/scheduler.rs` | 自動 scheduler による定期 sleep batch 実行 |
 | **Active Turn Tracker** | `runtime/turn/scheduler.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
@@ -342,7 +333,7 @@ Observer の配送ポリシー: live observer はメモリに保持し、durable
 - Sleep Batch・PULSE は `ConversationScope::Normal` の DB（`egopulse.db`）のみ参照し、`secret.db` には接続しない
 - スコープはコンテキスト構築時に決定され、turn 中に変更されることはない
 
-詳細は [security.md §5](./security.md#5-secret-mode-隔離戦略)、[db.md §5](./db.md#5-secretdb秘匿会話用データベース) を参照。
+詳細は [security.md §5](./security.md#5-secret-mode-隔離戦略)、[db.md §4](./db.md#4-secretdb秘匿会話用データベース) を参照。
 
 ---
 

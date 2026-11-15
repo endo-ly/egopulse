@@ -27,7 +27,7 @@
 9. [セットアップウィザード](#9-セットアップウィザード)
 10. [設定の変更インターフェース](#10-設定の変更インターフェース)
 11. [再起動要否と秘匿フィールド](#11-再起動要否と秘匿フィールド)
-12. [ConfigManager と immutable Snapshot](#12-configmanager-と-immutable-snapshot)
+12. [設定スナップショットと更新境界](#12-設定スナップショットと更新境界)
 
 ---
 
@@ -451,7 +451,7 @@ Pulse（注意活性化）のスケジューラ設定。Pulse の有効 / 無効
 
 ### 3.9 DB バックアップ設定（`db.backup`）
 
-SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md#6-バックアップ復元) も参照。
+SQLite DB のバックアップ・世代管理設定。詳細は [db.md](./db.md#5-バックアップ復元) も参照。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -821,7 +821,7 @@ Agent-First 設計に基づき、エージェント名を最初に問い、LLM �
 
 ## 10. 設定の変更インターフェース
 
-設定の更新は `ConfigManager` の単一の更新境界を通る。YAML、Web API、スラッシュコマンドは同じ検証・永続化・スナップショット交換・通知の経路を共有する。
+設定の更新は単一の更新境界を通る。YAML、Web API、スラッシュコマンドは同じ検証・永続化・スナップショット交換・通知の経路を共有する。
 
 | インターフェース | 読み取り | 書き込み | 対象 |
 |---------|:---:|:---:|------|
@@ -897,13 +897,13 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 ---
 
-## 12. ConfigManager と immutable Snapshot
+## 12. 設定スナップショットと更新境界
 
-`ConfigManager` は validated `Config` を `Arc<ConfigSnapshot>` として保持する。インメモリ snapshot の交換と通知は直列化され、設定ソースの読み書きはプロセス内およびファイルのロックで保護される。Turn は開始時に取得した snapshot を完了まで保持するため、設定更新の途中で世代が混在しない。
+ランタイムは validated `Config` を不変の snapshot として保持する。インメモリ snapshot の交換と通知は直列化され、設定ソースの読み書きはプロセス内およびファイルのロックで保護される。Turn は開始時に取得した snapshot を完了まで保持するため、設定更新の途中で世代が混在しない。
 
-### 12.1 ConfigSnapshot
+### 12.1 設定スナップショット
 
-`ConfigSnapshot` はある時点の validated config を不変オブジェクトとして保持する。
+snapshot はある時点の validated config を不変オブジェクトとして保持する。
 
 | フィールド | 役割 |
 |---|---|
@@ -925,7 +925,7 @@ Web API の `GET /api/config` は現在の `revision` と `fingerprint` を返�
 
 ### 12.3 Turn での固定
 
-Turn 開始時に `Arc<ConfigSnapshot>` を取得し、Turn 完了まで保持する。Turn 内部から Config ファイルを同期再読込しない。受付時（`accept_or_get_turn`）と実行準備（`prepare_turn`）は同じ snapshot を共有し、`turn_runs` に保存する `revision` / `fingerprint` と実際に使用する Provider・Prompt が同一世代に揃う。
+Turn 開始時に snapshot を取得し、Turn 完了まで保持する。Turn 内部から Config ファイルを同期再読込しない。受付時と実行準備は同じ snapshot を共有し、`turn_runs` に保存する `revision` / `fingerprint` と実際に使用する Provider・Prompt が同一世代に揃う。
 
 `turn_runs` には snapshot の `revision` と `fingerprint` を保存する。
 
@@ -949,5 +949,5 @@ Provider cache key に Config revision を含める。credential や base URL �
 | 概念 | 正本 | 役割 |
 |---|---|---|
 | DB schema version | `db_meta.schema_version`（[db.md](./db.md#db_meta)） | SQLite スキーマのマイグレーション版数。未対応版は起動を拒否 |
-| Config revision | `ConfigSnapshot.revision` | 設定世代の識別番号。同一 revision は同一 Config 内容を保証 |
+| Config revision | 設定スナップショットの `revision` | 設定世代の識別番号。同一 revision は同一 Config 内容を保証 |
 | Local API protocol version | handshake の `protocol`（[api.md](./api.md)） | TUI ↔ Runtime の WebSocket 接続版数。不一致時は接続を拒否 |

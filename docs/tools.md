@@ -120,7 +120,7 @@ Tool 定義に次のいずれかを明示する。未指定は `non_idempotent`�
 
 #### crash recovery
 
-起動時に `recover_running_tools()` が `running` の Tool を idempotency 分類に関わらずすべて `uncertain` へ移行する。Turn は起動時に fail-stop するため再開されず、`running` の Tool が再 claim されることはない。`pending`（実行開始前）の行はそのまま残す。
+起動時の crash recovery は、`running` の Tool を idempotency 分類に関わらずすべて `uncertain` へ移行する。Turn は起動時に fail-stop するため再開されず、`running` の Tool が再 claim されることはない。`pending`（実行開始前）の行はそのまま残す。
 
 Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行しない（`succeeded` の結果を再利用する）。
 
@@ -134,7 +134,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
 - 挙動:
   - workspace 配下の path のみ読める
   - テキストに加えて `png` / `jpg` / `jpeg` / `gif` / `webp` を画像として判定する
-  - 画像ファイルは base64 data URL にエンコードし、`MessageContent::Parts` (InputText + InputImage) として LLM に渡す（マルチモーダル tool result のルーティング・保存規則は §1 前提の通り）
+  - 画像ファイルは base64 data URL として LLM に渡す（マルチモーダル tool result のルーティング・保存規則は §1 前提の通り）
   - テキスト出力は最大 `2000` 行または `100KB`
   - 続きがある場合は `offset=...` の continuation hint を返す
   - 先頭 1 行だけで `100KB` を超える場合は `bash` fallback を促す
@@ -363,7 +363,7 @@ required_env: API_KEY
 | 注入先 | `bash` ツールのサブプロセスのみ（`grep` / `find` / `ls` / MCP には注入しない） |
 | Allowlist | インストール済み全 skill の `required_env` の和集合のみ。dotenv 全体は注入しない |
 | 秘密値の取り扱い | 解決済みの値は LLM 出力・ログ・ツール結果に一切含まれない。注入された値と redaction 対象は完全に一致する |
-| 未解決キー | `tracing::warn!` で警告し、activate_skill の戻り値にキー名（✗ マーク）を表示 |
+| 未解決キー | warn ログで警告し、activate_skill の戻り値にキー名（✗ マーク）を表示 |
 
 **返り値の環境変数表示例:**
 
@@ -462,8 +462,7 @@ Environment variables:
 
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
-- catalog 生成: [egopulse/src/skills.rs](../../egopulse/src/skills.rs) `build_skills_catalog()`
-- prompt への埋め込み: [egopulse/src/agent_loop/turn/mod.rs](../../egopulse/src/agent_loop/turn/mod.rs) と [egopulse/src/agent_loop/prompt/builder.rs](../../egopulse/src/agent_loop/prompt/builder.rs)
+- catalog の生成と system prompt への埋め込みは [skills.rs](../../egopulse/src/skills.rs) と prompt builder が担う
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 

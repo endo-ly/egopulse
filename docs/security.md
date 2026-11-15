@@ -134,19 +134,18 @@ Bash は `--noprofile --norc -c` で起動し、ログイン設定や起動フ�
 
 起動時に Config から収集したシークレット値と完全一致する文字列を `[REDACTED:<キー名>]` に置換する。
 
-- 収集対象（`ResolvedValue::value()` から取得）:
-  - `providers.<provider>.api_key`
-  - `channels.<channel>.auth_token`
-  - `channels.<channel>.bots.<bot_id>.token`（Discord）
-  - `channels.<channel>.telegram_bots.<bot_id>.token`（Telegram）
-  - `webhooks.receivers.<receiver_id>.token`
-  - `codex.bearer_token`（`openai-codex` プロバイダー使用時）
-  - `mcp.<server>.headers.<key>` / `mcp.<server>.env.<key>`（接続済み server の解決後の値と、`mcp.json` / `mcp.d` にある全 server 定義のリテラル値。リテラル値は接続に失敗した server や後続の定義に上書きされた server も含む。リテラル値の収集では秘密参照を解決せず、`exec` も実行しない。`Authorization: Bearer <token>` は値全体に加えて `<token>` 単体も登録する）
-  - `dotenv.<KEY>`（`.env` の全値。更新時刻でキャッシュし、変更はツール結果ごとに反映される）
-  - `skill_env.<KEY>`（Turn に注入された skill の `required_env` の値）
-- 秘密参照（`{ "source": "env" | "exec" }`）で宣言された値は、長さに関わらず登録する
-- 参照を経ないリテラル（MCP の平文値、`.env` の全値）は、12 文字以上かつ Shannon エントロピー 3.0 bit/文字以上のものだけ登録する。`PORT=8080` や `true` のようなありふれた値で出力が崩れることを防ぐ。キー名が秘密を示すのに条件を満たさない `.env` の値は、キー名のみを起動時に `warn` に出す
-- `file_token` / `file_auth_token` の YAML 表現は秘密値の正本として使わない
+| 登録対象 | 登録条件 |
+|---|---|
+| `providers.<provider>.api_key`、`channels.<channel>.auth_token`、`channels.<channel>.bots.<bot_id>.token`（Discord）、`channels.<channel>.telegram_bots.<bot_id>.token`（Telegram）、`webhooks.receivers.<receiver_id>.token`、`codex.bearer_token`（`openai-codex` 使用時） | 常に登録 |
+| `mcp.<server>.headers.<key>` / `mcp.<server>.env.<key>` | 接続済み server の解決後の値と、`mcp.json` / `mcp.d` にある全 server 定義のリテラル値（接続に失敗した server・後続の定義に上書きされた server を含む）。リテラル値の収集では秘密参照を解決せず `exec` も実行しない。`Authorization: Bearer <token>` は値全体に加えて `<token>` 単体も登録 |
+| `dotenv.<KEY>` | `.env` の全値。更新時刻でキャッシュし、変更はツール結果ごとに反映 |
+| `skill_env.<KEY>` | Turn に注入された skill の `required_env` の値 |
+| 秘密参照（`{ "source": "env" \| "exec" }`）で宣言された値 | 長さに関わらず登録 |
+| 参照を経ないリテラル（MCP の平文値、`.env` の全値） | 12 文字以上かつ Shannon エントロピー 3.0 bit/文字以上のみ。ありふれた値（`PORT=8080`、`true` 等）による出力崩れを防ぐ。キー名が秘密を示すのに条件を満たさない `.env` の値は、キー名のみを起動時に `warn` |
+
+登録の挙動:
+
+- `file_token` / `file_auth_token` の YAML 表現は秘密値の正本として扱わない
 - 空文字列は登録しない（誤検出防止）
 - 同じ値が複数経路に存在する場合は値で deduplicate し、置換結果を決定的にする
 - 長い値から順に置換（部分一致の誤検出防止）
@@ -304,9 +303,11 @@ Local API の Turn は Session の Channel identity を維持するが、TUI Cli
 
 ### 仕組み
 
-- ホストのファイルシステムはそのまま見せる。PID・ネットワーク・`/run` は分離しないため、`systemctl`、`journalctl`、tmux（呼び出しをまたいで残るセッションを含む）は通常どおり使える
-- Capability は、Docker が root のコンテナに既定で与える組から `CAP_MKNOD` を除いたものに絞る。パッケージ管理などの通常の root 作業は動く。マウント操作（`CAP_SYS_ADMIN`）、他プロセスの検査（`CAP_SYS_PTRACE`）、ファイルハンドル経由の読み取り（`CAP_DAC_READ_SEARCH`）は持たないため、隠したマウントの解除、`/proc/<pid>/root` や `/proc/<pid>/fd` を経由した読み取り、より多くの Capability を持つプロセス（root で動く通常のサービスなど）の環境変数の読み取りは拒否される
-- `bwrap` はシステムのディレクトリ（`/usr/bin`、`/usr/local/bin`、`/bin`）からだけ探す。`PATH` 上の偽の実行ファイルを掴まないため
+| 項目 | 挙動 |
+|---|---|
+| ファイルシステム | ホストのものをそのまま見せる。PID・ネットワーク・`/run` も分離しないため、`systemctl`・`journalctl`・tmux（呼び出しをまたいで残るセッションを含む）は通常どおり使える |
+| Capability | Docker が root のコンテナに既定で与える組から `CAP_MKNOD` を除いたものに絞る。パッケージ管理等の通常の root 作業は動く。一方で `CAP_SYS_ADMIN`（マウント）・`CAP_SYS_PTRACE`（他プロセスの検査）・`CAP_DAC_READ_SEARCH`（ファイルハンドル経由の読み取り）を持たないため、隠したマウントの解除、`/proc/<pid>/root` / `/proc/<pid>/fd` 経由の読み取り、より多くの Capability を持つプロセス（root で動く通常のサービス等）の環境変数の読み取りは拒否される |
+| `bwrap` の場所 | システムのディレクトリ（`/usr/bin`、`/usr/local/bin`、`/bin`）からだけ探し、`PATH` 上の偽の実行ファイルを掴まない |
 
 ### 隔離できない場合
 

@@ -80,7 +80,8 @@ Pulse run と Sleep run を新しい順に 1 本にまとめ、ローカル日�
 | 結果 | Pulse: `Notified` / `Silent` / `Failed` / `Not delivered` / `Running`。Sleep: status。status の色で示す |
 | 要約 | Pulse: 通知本文の先頭行（Markdown 記法を除く）/ `Nothing worth reporting` / エラー / skip 理由。Sleep: `Updated episodic, semantic` / `Memory unchanged` / エラー / skip 理由 |
 
-- **Quiet run**: 何も変えず注意も要らない run（報告することがなかった Pulse run と、実行しないと判定した Sleep run）。同じ日に 2 件以上続く quiet run は `{n} quiet runs`（時間帯と内訳 `Silent ×1 · Skipped ×1`）の 1 行にまとめ、選ぶとその場で展開する。`Show quiet runs` で全件を展開する。skip された Pulse run は通知が届かなかったことを意味するので quiet ではない
+- **Quiet run**: 注意が要らなかった run（Pulse run は報告対象が無く、Sleep run は実行を見送り）。同じ日に 2 件以上続く場合は `{n} quiet runs`（時間帯と内訳 `Silent ×1 · Skipped ×1`）の 1 行にまとめ、選ぶとその場で展開する。`Show quiet runs` で全件を展開する
+- skip された Pulse run は「通知が届かなかった」を意味するため quiet には含めない
 - 行を選ぶと右に run 詳細を開く（§5）。開いている run の行は active 表示にする
 - 最新 20 件を表示時に取得し、以降は可視時ポーリングで追従する
 - `Load earlier`：20 件ずつ遡って足していく（カーソルの仕様は [api.md §2.9](../api.md#29-sleep-batch)）。`has_more` が偽になったら履歴の先頭に到達したので、ボタンを消す

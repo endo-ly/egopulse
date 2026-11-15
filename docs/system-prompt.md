@@ -133,7 +133,7 @@ AGENTS.md セクション（③）の直後、Long-term Memory（④）の直前
 
 ## 4. 固定プロンプトの構成と記載場所
 
-プロンプト本文はコード内（`include_str!` またはハードコード）が正本。本節では各セクションの役割・注入順・正本位置を示す。
+プロンプト本文の正本はコード内に埋め込まれたテンプレート。本節では各セクションの役割・注入順を示す。
 
 > `{channel}`, `{session}`, `{chat_type}`, `{workspace}` は実行時に解決されるプレースホルダ。
 
@@ -173,7 +173,7 @@ Turn の解決済み provider / model（[config.md §4](./config.md#4-モデル�
 
 #### 排他制約
 
-`model_instructions`(インライン)と `model_instructions_file`(PATH)の両立は `Config::load()` 時に検出され、`ConfigError::ModelInstructionsConflict` で起動失敗する。
+`model_instructions`(インライン)と `model_instructions_file`(PATH)の両立は起動時に検出され、設定エラーで起動失敗する。
 
 #### IO エラー時のフォールバック
 
@@ -231,8 +231,6 @@ Pulse Activation の LLM 呼び出しは、通常 turn と**同じ system prompt
 #### user message（Pulse Capsule）
 
 Long-term Memory は system prompt 経由で既に注入されているため、Capsule には含めない。
-**コード**: [`src/pulse/capsule.rs`](../src/pulse/capsule.rs) `build_capsule()`
-
 Capsule の構造（`# Pulse Activation` ヘッダー、`## Core Contract` / `## Temporal Intention` / `## Pulse Notes` / `## Recent Visible Context` の各セクション）は [pulse.md §8.1](./pulse.md#81-構成) を参照。
 
 Core Contract 全文は [`src/pulse/pulse_core_contract.md`](../src/pulse/pulse_core_contract.md) を参照。
@@ -241,14 +239,14 @@ Core Contract 全文は [`src/pulse/pulse_core_contract.md`](../src/pulse/pulse_
 
 | 項目 | 通常 turn | Pulse Activation |
 |---|---|---|
-| system prompt | `build_system_prompt()` のみ | 同じ（完全一致） |
+| system prompt | 通常の構築手順 | 同じ（完全一致） |
 | user message | ユーザー発言 | Pulse Capsule |
 | Long-term Memory | system prompt に含む | 同じく system prompt に含む（Capsule には含めない） |
 | Tool 利用 | あり | あり（Core Contract が破壊的操作を禁止） |
 
 ### 4.6 Sleep Batch 用プロンプト（通常 turn とは別文脈）
 
-Sleep Batch の LLM 呼び出しは、`build_system_prompt()` を使わず `src/sleep/prompts/` 配下の専用プロンプト（`include_str!`）を使用するため、`model_instructions`(§4.1.5)は適用されない。
+Sleep Batch の LLM 呼び出しは、通常の system prompt を使わず `src/sleep/prompts/` 配下の専用プロンプトを使用するため、`model_instructions`(§4.1.5)は適用されない。
 
 | 用途 | パス |
 |---|---|
@@ -306,13 +304,13 @@ Long-term Memory は Memories（AGENTS.md）と Skills の間に挿入される�
 Tool 定義（名前・説明・パラメータスキーマ）は system prompt とは **別** に、LLM API リクエストの JSON body に注入される。
 
 ```text
-build_system_prompt()  ──→  system prompt（文字列）
-                               ↓
-process_turn()         ──→  LLM API リクエスト（system prompt + messages + tools）
-                               ↑
-               ToolRegistry → built-in tools + MCP tools（agent scope で絞り込み）
-                               ↓
-                         API body の "tools" フィールド
+system prompt の構築  ──→  system prompt（文字列）
+                              ↓
+Turn 実行             ──→  LLM API リクエスト（system prompt + messages + tools）
+                              ↑
+              ToolRegistry → built-in tools + MCP tools（agent scope で絞り込み）
+                              ↓
+                        API body の "tools" フィールド
 ```
 
 MCP tool の定義は Agent の `mcp_servers` 設定で絞られる（[mcp.md §5](./mcp.md#agent-別の公開範囲)）。built-in tool は常に公開される。
@@ -339,7 +337,7 @@ Compaction 時は `tools = None`（ツール定義なし）。
 
 ## 7. Compaction 用プロンプト
 
-compaction の LLM 呼び出しで使用する。`build_system_prompt()` とは別文脈で、Agent Loop の system prompt は使わない。
+compaction の LLM 呼び出しで使用する。Agent Loop の system prompt とは別文脈。
 
 ### 要約リクエストの形
 
@@ -419,7 +417,7 @@ Respond to the messages that follow this checkpoint.
 
 ## 8. Channel Context 注入（Multi-Agent Room）
 
-Multi-Agent Room で `process_turn` が実行される際、Channel Log の直近メッセージが **user メッセージ** として一時注入される。system prompt の一部ではない。
+Multi-Agent Room の turn 実行時に、Channel Log の直近メッセージが **user メッセージ** として一時注入される。system prompt の一部ではない。
 
 ### フォーマット
 
@@ -461,7 +459,7 @@ Channel Log に記録された `MessageKind::SystemEvent` メッセージは Cha
 
 ### 注入位置
 
-system prompt には含めず、`process_turn` で user message の先頭に挿入される。
+system prompt には含めず、user message の先頭に挿入される。
 これにより:
 
 - system prompt は完全静的に保たれ、prompt cache が最大効率で hit する

@@ -37,11 +37,11 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 
 `SurfaceContext` は `agent_id`（string）を保持し、各会話サーフェスにエージェントの識別情報を持たせる。
 
-- `session_key()` は agent を持つ会話では `channel:surface_thread:agent:agent_id` を返す
-- **Discord**: `surface_thread` はチャンネル ID。マルチボットでは同じチャンネルでも `session_key()` の `:agent:{agent_id}` 接尾辞によりエージェントごとに session が分かれる
+- エージェントを持つ会話の `session_key` は `channel:surface_thread:agent:agent_id` 形式
+- **Discord**: `surface_thread` はチャンネル ID。マルチボットでは同じチャンネルでも `:agent:{agent_id}` 接尾辞によりエージェントごとに session が分かれる
 - **Web**: 新規セッションはWebUIで選択中のagentを使用し、既存セッションは `chats.agent_id` を使用する
 - **Telegram / CLI / TUI**: 各チャネルの入力経路で解決されたagentを使用する
-- **保存済み session からの再構成**: Web の既存セッション再開や Pulse の Home Surface のように、保存済みの `external_chat_id`（session key 形式）から `SurfaceContext` を組み立てる経路は、`SurfaceContext::surface_thread_from_session_key()` で `{channel}:` 接頭辞と `:agent:{agent_id}` 接尾辞を除いた生の `surface_thread` を復元する。復元した context の `session_key()` は元の `external_chat_id` と一致する
+- **保存済み session からの再構成**: 保存済みの `external_chat_id`（session key 形式）から `SurfaceContext` を組み立てる場合は、`{channel}:` 接頭辞と `:agent:{agent_id}` 接尾辞を除いた生の `surface_thread` を復元する。復元した context の `session_key` は元の `external_chat_id` と一致する
 
 ### 1.3 Multi-Agent Room 二層アーキテクチャ
 
@@ -55,7 +55,7 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 **Single-Agent Channel**（`multi_agent: false`）は従来の一層構造のまま。
 
 **Channel Context 注入**:
-- Multi-Agent Room で mention されたエージェントが `process_turn` を実行する際、対象エージェントへの直接入力と対象エージェント自身の assistant/tool イベントを除外した、公開会話（ユーザー発言、他エージェントの最終応答、`agent_send`）の直近 30 件を一時的な user メッセージとして注入
+- Multi-Agent Room で mention されたエージェントが turn を実行する際、対象エージェントへの直接入力と対象エージェント自身の assistant/tool イベントを除外した、公開会話（ユーザー発言、他エージェントの最終応答、`agent_send`）の直近 30 件を一時的な user メッセージとして注入
 - system prompt、memory、tool の内部イベントは Shared Context に含めない
 - Channel Context は Agent Session の `messages_json` には保存しない（一時注入のみ）
 
@@ -66,8 +66,8 @@ session は `(channel, surface_thread)` から安定的に決まる。この sur
 1. **送信元エージェント**が `agent_send` ツールを呼び出し (`to`, `message`)
 2. **宛先ターンを受付**: 宛先の Turn を durable に受付し、スケジューラへ渡す。受付に失敗したターンは後続処理を行わない
 3. **送信メッセージを保存**: `MessageKind::AgentSend` と送信元・宛先を記録する。マルチエージェントルームでは Channel Log へ、それ以外のチャネルでは送信元セッションの chat へ保存する。`[From → To] message` 形式でのチャネル表示は Discord / Telegram で行う
-4. **宛先ターンを非同期実行**: `process_turn` が送信元情報を含む Direct Input を宛先 Agent Session に保存する
-5. **宛先エージェント応答**: `process_turn` の戻り値を `ChannelRegistry.send_text()` でチャネルに送信する。Web / TUI / CLI では応答は宛先 Agent Session への永続化のみで、チャネル送信は行われない
+4. **宛先ターンを非同期実行**: 送信元情報を含む Direct Input を宛先 Agent Session に保存する
+5. **宛先エージェント応答**: 宛先 Turn の応答をチャネルへ送信する。Web / TUI / CLI では宛先 Agent Session への永続化のみで、チャネル送信は行われない
 
 **制約**:
 - チェーン深度 (`chain_depth`) が `MAX_AGENT_CHAIN_DEPTH` (4) を超えるターンは破棄
@@ -87,25 +87,25 @@ Multi-Agent Room の Discord チャネルでは、`TurnScheduler` がセッシ�
   │
   ├─ origin_id (UUID) 発行
   ├─ ScheduledTurn 構築
-  └─ TurnScheduler.submit()
+  └─ スケジューラへ投入
        │
-       ├─ slot が idle → busy に設定し、execute_scheduled_turn() を即時実行 (Started)
+       ├─ slot が idle → busy に設定し、ターンを即時実行 (Started)
        ├─ slot が busy かつ容量内 → キューに積んで待機 (Queued)
        └─ 容量超過 → 拒否 (Rejected)
 
-execute_scheduled_turn():
+ターン実行():
   │
-  ├─ evaluate_stop_conditions()
+  ├─ 停止条件の評価（evaluate_stop_conditions）
   │    ├─ chain_depth > 4 → Channel Log に SystemEvent 記録 → 終了
   │    ├─ turn_count ≥ 12 → Channel Log に SystemEvent 記録 → 終了
-  │    └─ OK → ChannelAdapter::begin_turn_activity() → process_turn() 実行
+  │    └─ OK → 入力中表示を開始 → turn 処理を実行
   │
-  ├─ process_turn() 成功 → チャネルに応答送信
-  └─ process_turn() 失敗 → Channel Log に SystemEvent (LlmFailure) 記録
+  ├─ turn 処理 成功 → チャネルに応答送信
+  └─ turn 処理 失敗 → Channel Log に SystemEvent (LlmFailure) 記録
 
   ↓ 完了後
-  on_turn_completed()
-    ├─ キューに次のターンがあれば → execute_scheduled_turn() 再帰
+  完了処理:
+    ├─ キューに次のターンがあれば → 次のターンを実行
     └─ キューが空 → slot を削除
 ```
 
@@ -129,7 +129,7 @@ execute_scheduled_turn():
 
 - 役割: chat の論理 ID と surface との対応付け
 - 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`, `agent_id`, `archived`, `pinned`
-- `chat_title` はユーザーが付ける表示名。識別は `chat_id`（canonical key `chat:{id}`）と `external_chat_id` が担い、表示名の変更で `session_key()` や `surface_thread` は変わらない。表示名の更新は `update_chat_display_meta` に集約する
+- `chat_title` はユーザーが付ける表示名。識別は `chat_id`（canonical key `chat:{id}`）と `external_chat_id` が担い、表示名の変更で `session_key` や `surface_thread` は変わらない
 
 ### `messages`
 
@@ -139,7 +139,7 @@ execute_scheduled_turn():
 
 `seq IS NOT NULL` の committed conversation history は append-only かつ immutable であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。staged row は commit 時に `seq` が付与され、terminal Turn への promotion 時には削除される場合がある。
 
-Tool 実行中の human follow-up は staged message として保存され、`turn_id` に current Turn（`tools_pending` または `tools_completed`）を持つ。Tool Result の保存と `complete_tools()` が成功した直後に、staged rows を timestamp と message ID の FIFO で committed history と session snapshot へ同一トランザクションで反映する。プロセス停止でこの反映が中断された場合も、`tools_completed` の recovery が同じ処理を冪等に再実行する。
+Tool 実行中の human follow-up は staged message として保存され、`turn_id` に current Turn（`tools_pending` または `tools_completed`）を持つ。Tool Result の保存と Tool phase の完了が成功した直後に、staged rows を timestamp と message ID の FIFO で committed history と session snapshot へ同一トランザクションで反映する。プロセス停止でこの反映が中断された場合も、`tools_completed` の recovery が同じ処理を冪等に再実行する。
 
 ### セッションの整理状態
 
@@ -217,7 +217,16 @@ Runtime は、保存や Tool 実行を含む **Turn 全体** を自動で再実�
 
 ### Agent Loop の実行境界
 
-durable Turn の外側の順序は `agent_loop/turn/mod.rs` の `TurnExecutor` が管理し、LLM と Tool の反復は `agent_loop/loop_runner.rs` の `AgentLoop` が管理する。1 回の model step は `agent_loop/model_step.rs`、Tool の ledger claim・実行・結果生成は `agent_loop/tool_execution.rs`、Message と Session snapshot の保存は `agent_loop/turn/persistence.rs`、DB 上の Turn 状態遷移は `agent_loop/turn/lifecycle.rs` が担当する。
+durable Turn の外側の順序を `TurnExecutor` が、LLM と Tool の反復を `AgentLoop` が担い、役割は次のように分割される。
+
+| 処理 | 担当 |
+|---|---|
+| durable Turn の外側の順序 | `TurnExecutor` |
+| LLM と Tool の反復 | `AgentLoop` |
+| 1 回の model step（分類・retry・usage） | `model_step` |
+| Tool の ledger claim・実行・結果生成 | `tool_execution` |
+| Message と Session snapshot の保存 | `turn/persistence` |
+| DB 上の Turn 状態遷移 | `turn/lifecycle` |
 
 ```text
 accept / resume validation
@@ -242,7 +251,15 @@ AgentLoop は final response と最新の session snapshot を `AgentLoopResult`
 
 この無応答期限は HTTP client 共通で、Turn 以外の LLM 呼び出しにも適用される。本文が終端でしか届かない非ストリーム要求では、無応答期限がそのまま生成時間の上限になる。そのためナレーション先を持たない呼び出し（sleep batch、compaction、単発の ask）も本文をストリームで受け取って組み立て、無応答期限が上流の停止だけを検出するようにする。
 
-ストリーム内で provider が `error` / `response.failed` を通知した場合や、`finish_reason` が `error` の場合は、それまでに届いた本文があっても成功として扱わない。HTTP 200 の後に起きた失敗は、`error_type` があれば `code` より優先し、対応する HTTP status（一時的な失敗は 429/5xx、恒久的な失敗は 4xx）に写像する。未知の失敗は 502 とし、再試行可否は共通の判定に委ねる。完了イベントを受け取る前にストリームが終了した場合は `incomplete_stream` として再試行対象にする。終了イベントが `incomplete` を報告した場合や `response.status` が `failed`、Chat Completions の `finish_reason` が `length` / `content_filter` / 未知の理由の場合は、生成が打ち切られた確定的な失敗として `incomplete_response` を返し、再試行しない。`insufficient_system_resource` / `aborted` は推論側の中断として再試行対象にする。SSE の `data:` が JSON として不正な場合は欠落した本文を完成応答にせず失敗させる。
+provider から届く失敗は次の分類で扱う（HTTP 200 の後に起きた失敗は `error_type` → `code` の優先順で対応する HTTP status へ写像。未知の失敗は 502 とし、再試行可否は共通の判定に委ねる）。
+
+| provider 側の事象 | 分類 |
+|---|---|
+| ストリーム内の `error` / `response.failed`、`finish_reason: error` | 失敗。それまでに届いた本文があっても成功扱いにしない |
+| 完了イベント前にストリーム終了 | `incomplete_stream`。再試行対象 |
+| `insufficient_system_resource` / `aborted` | 推論側の中断。再試行対象 |
+| 終了イベントが `incomplete` を報告、`response.status: failed`、`finish_reason: length` / `content_filter` / 未知 | 確定的な打ち切り `incomplete_response`。再試行対象外 |
+| SSE の `data:` が JSON として不正 | 欠落した本文を完成応答にせず失敗 |
 
 1 リクエストの総時間には別に 600 秒の上限がある。Turn / Pulse は 300 秒の iteration deadline、compaction は 600 秒の予算、単発 ask は 300 秒の総予算で先に打ち切られるため、この上限が実効するのは Sleep の各試行だけである。Sleep は再試行と待機を含む 20 分の総予算も持つ。
 
@@ -259,7 +276,7 @@ Tool phase は途中で中断せず、保存順序は次の通りである。
 ```text
 assistant Tool Call
   → Tool Result 全件
-  → complete_tools()
+  → Tool phase 完了
   → staged human follow-up を FIFO で commit
   → 次の model iteration
 ```
@@ -281,7 +298,7 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 
 ### Trigger
 
-自動判定は Agent Loop の model 送信直前の 1 箇所に集約する。入力の保存（`TurnPersistence::persist_user_input`）は判定を行わない。どの経路でも「これから送るリクエスト」に対して判定し、判定に使う文脈と実送信の文脈を一致させる。
+自動判定は Agent Loop の model 送信直前の 1 箇所に集約する。入力の保存段階では判定を行わない。どの経路でも「これから送るリクエスト」に対して判定し、判定に使う文脈と実送信の文脈を一致させる。
 
 | 契機 | タイミング |
 |---|---|
@@ -364,14 +381,7 @@ Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕`
 
 ### 要約プロンプト
 
-`src/agent_loop/compaction.rs` 内に 3 種類の定数を置く。形式は日常会話・相談・技術作業・Tool 実行に共通で、Goal や Next Steps の捏造を促さない。
-
-| 用途 | 定数 |
-|---|---|
-| 要約システム | `SUMMARIZATION_SYSTEM_PROMPT` |
-| 初回 | `INITIAL_SUMMARY_PROMPT` |
-| 更新 | `UPDATE_SUMMARY_PROMPT` |
-| ターン前半 | `TURN_PREFIX_SUMMARY_PROMPT` |
+プロンプトの構成と本文は [system-prompt.md §7](./system-prompt.md#7-compaction-用プロンプト) に一元化する。形式は日常会話・相談・技術作業・Tool 実行に共通で、Goal や Next Steps を捏造させない。
 
 要約本文は `## 会話の経緯` / `## 共有された情報` / `## 重要な参照情報` の 3 節で、内容が無い節は省略する。会話の使用言語を引き継ぐ。
 
@@ -626,11 +636,23 @@ stateDiagram-v2
 
 #### TurnDispatcher による再実行
 
-`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査する。まず terminal Turn に紐づく `seq IS NULL` の human message を、target Turn の `scheduled_request_json` から復元した routing context に重ねて新しい root Turn へ promotion する。staged message の sender、本文、message ID、受信 timestamp は新しい `ScheduledTurn` に引き継ぐ。新しい Turn の durable acceptance 後にだけ元の staged row を削除するため、accept 後の再起動でも同じ request key の Turn を再利用できる。
+`TurnDispatcher` は起動後、定期的（既定 5s）に Normal / Secret 両 DB を走査し、次の順で処理する。
 
-続いて `accepted` / `input_committed` / `tools_completed` で残された Turn を検出して再投入する。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed` / `tools_completed → model_pending`）が重複実行を安全に排除する。`input_committed` / `tools_completed` で resume 検証（input message、session snapshot、保存済み Config fingerprint の整合性）に失敗した Turn は `failed` へ移行する。dispatcher の terminal staged promotion は通常 scan と startup recovery で同じ operation を使い、各 DB scope を独立して処理する。
+| ステップ | 処理 |
+|---|---|
+| 1. terminal staged promotion | terminal Turn に紐づく `seq IS NULL` の human message を、target Turn の `scheduled_request_json` から復元した routing context に重ねて新しい root Turn へ昇格。sender・本文・message ID・受信 timestamp は新しい `ScheduledTurn` に引き継ぎ、新しい Turn の durable acceptance 後にだけ元の staged row を削除する（accept 後の再起動でも同じ request key の Turn を再利用できる） |
+| 2. durable Turn 再投入 | `accepted` / `input_committed` / `tools_completed` の Turn を再投入。同じ `turn_id` は当プロセス内で1回だけ再投入し、executor 側の CAS（`accepted → input_committed`、`input_committed` / `tools_completed → model_pending`）が重複実行を排除する。resume 検証（input message・session snapshot・保存済み Config fingerprint の整合性）に失敗した Turn は `failed` へ移行 |
 
-Dispatcher が保存済み `scheduled_request_json` の JSON 構文、必須フィールド、型、または version を解釈できない場合は、決定的な復旧不能として Turn を終端化する。`accepted` / `input_committed` は `failed`、`tools_completed` は `output_published` の状態に応じて `failed` または `uncertain` へ移行する。このとき `error_kind` は `durable_payload_invalid`、`error_message` は固定の sanitized 文言とし、payload の内容や deserializer の詳細をログ・DBへ保存しない。`origin_id` がある場合は Turn の失敗と origin の terminal reason を同一 transaction で記録する。DB 読み取り失敗と scheduler の容量不足は一時障害として扱い、Turn を `accepted` / `input_committed` / `tools_completed` のまま次の tick で再試行する。
+terminal staged promotion は通常 scan と startup recovery で同じ operation を使い、各 DB scope を独立して処理する。
+
+保存済み `scheduled_request_json` の JSON 構文・必須フィールド・型・version を解釈できない場合は、決定的な復旧不能として Turn を終端化する。
+
+| Turn 状態 | 終端化 |
+|---|---|
+| `accepted` / `input_committed` | `failed` |
+| `tools_completed` | `output_published` に応じて `failed` / `uncertain` |
+
+`error_kind` は `durable_payload_invalid`、`error_message` は固定の sanitized 文言とし、payload の内容や deserializer の詳細をログ・DB へ保存しない。`origin_id` がある場合は Turn の失敗と origin の terminal reason を同一 transaction で記録する。DB 読み取り失敗と scheduler の容量不足は一時障害として扱い、Turn を元の状態のまま次の tick で再試行する。
 
 ### 10.4 安全停止の原則
 

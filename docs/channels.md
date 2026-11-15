@@ -67,7 +67,7 @@ WebSocket (`/ws`) と SSE (`/api/stream`) の 2 種類のストリーミング�
 | 経路 | 契約 |
 |---|---|
 | メッセージ受信 | HTTP POST `/api/send_stream` または WebSocket `chat.send`。通常メッセージは共通の Web 入力境界から durable Turn として `TurnScheduler` へ投入する |
-| ストリーミング | RunHub を介した publish/subscribe モデル |
+| ストリーミング | 接続ごとの subscriber へ publish/subscribe で配信 |
 | セッション更新通知 | durable な会話保存の完了後、WebSocket で `session_updated` を配信する。クライアントはセッション一覧と対象履歴を再取得し、取りこぼし検出時は `resync` で再同期を要求する。定期ポーリングはフォールバック |
 | 履歴のページング | `GET /api/history` は `messages.seq` をカーソルに 300 行ずつ返す。Web UI は最新ページを表示し、上端付近で古いページを追加取得する。prepend 時はスクロール位置を維持し、画面外の行は `content-visibility` で描画コストを抑える |
 | Pulse の表示 | Pulse 通知は配送先チャネルへ最終応答だけが届くのに対し、セッション履歴には Activation の経過（合成入力・途中発話・ツールカード）も保存される。履歴の `pulse`（`run_id` / `role`）が折りたたみ表示の根拠（表示の詳細は [webui/chat.md](./webui/chat.md)） |
@@ -95,7 +95,7 @@ Web UI はセッションを人間が読める単位で整理できる。
 - 認証トークン未設定時は `/api/*` へのアクセスができない
 - WebSocket 最大接続数: 64。最大メッセージサイズ: 64KB
 - ordinary message は REST / WebSocket どちらの入口でも共通 `TurnScheduler` に durable 投入され、同一 session は FIFO で直列化される
-- active run と同一 session の Tool 実行中の入力は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じ interaction へ引き継がれる。共有 observer interaction 内の途中 Turn の `done` / `error` は非終端として同じ RunHub へ流れ、最後の Turn の `terminal: true` でのみ購読を終了する
+- active run と同一 session の Tool 実行中の入力は接続元に依存せず follow-up として durable staging され、Tool Result 後に同じ interaction へ引き継がれる。共有 observer interaction 内の途中 Turn の `done` / `error` は非終端として同じ stream へ流れ、最後の Turn の `terminal: true` でのみ購読を終了する
 - ACK 不明な送信の明示的な再送は、未変更の同じ draft に限り同じ durable `request_id` / `request_key` を使い、WebSocket の RPC ID は attempt ごとに変える。draft 編集や別 session の送信は新しい identity を使い、別本文での同じ request identity 再利用は `409 Conflict` で拒否する
 - slash command は durable な未完了 Turn を持つ session では `busy` となり、busy 確認から command 完了まで通常入力と同じ session 排他を保持する
 
@@ -111,7 +111,7 @@ Web UI はセッションを人間が読める単位で整理できる。
 
 ### データフロー
 
-- **メッセージ受信**: `Handler::message()` がトリガー
+- **メッセージ受信**: Gateway のメッセージイベントで受信する
 - **添付ファイル**: `workspace/media/inbound/` に自動ダウンロード
 - **エージェント選択**:
 
@@ -128,7 +128,7 @@ Web UI はセッションを人間が読める単位で整理できる。
   - **自ボットのメッセージ**: 常に無視される
 - **ボット間チェーンガード**: チャンネル/スレッドごとにボット→ボットの連鎖を追跡。チェーン深度は内部上限（5）と TTL（300 秒）で管理され、ヒューマンメッセージの受信でリセットされる
 - **応答**: 2000 文字制限に合わせて自動分割送信。本文中の明示的なユーザー mention (`<@user_id>`) だけを Discord の `allowed_mentions.users` に指定し、role / everyone mention は許可しない。429 (Rate Limit) 時は Retry-After で 3 回リトライ
-- **入力中表示**: `execute_scheduled_turn()` が実行中の turn に対して `ChannelAdapter::begin_turn_activity()` を開始し、Discord では `/typing` を定期更新する。キュー待機中ではなく、実際に turn が処理されている間だけ表示される
+- **入力中表示**: turn の実行開始とともに有効化し、Discord では `/typing` を定期更新する。キュー待機中ではなく、実際に turn が処理されている間だけ表示される
 
 ### 制約
 
@@ -163,7 +163,7 @@ Web UI はセッションを人間が読める単位で整理できる。
 ユーザーメッセージ受信
   ├─ mention あり → 対応するエージェントを特定
   │   ├─ Channel Log に保存 + Agent Session に保存
-  │   └─ process_turn() 実行（Channel Context 注入あり）
+  │   └─ turn 実行（Channel Context 注入あり）
   └─ mention なし → Channel Log にのみ保存 → 応答なし
 ```
 
@@ -277,7 +277,7 @@ stackchan-bridge
   -> Voice 専用 Bearer 認証
   -> request validation
   -> surface + session_key を surface_thread へ正規化
-  -> process_turn()
+  -> turn 実行
   -> user / assistant 履歴を voice session へ保存
   -> HTTP response で応答テキストを返す
 ```
@@ -300,7 +300,7 @@ session identity の概念と正本は [session-lifecycle.md §1](./session-life
 
 ### ChannelAdapter
 
-`VoiceAdapter` は `("voice", Private)` を `ChannelRegistry` へ登録する。同期 HTTP response が応答返却の正規経路であり、`ChannelAdapter::send_text()` による outbound voice delivery はサポートしない。呼び出された場合は `outbound voice delivery is not supported` を返し、配送成功の no-op にはしない。
+Voice はチャネルアダプタとして登録されるが、応答の正規経路は同期 HTTP response。outbound voice delivery は非対応で、呼ばれた場合は `outbound voice delivery is not supported` を返す（配送成功の no-op にはしない）。
 
 ### 制約
 
@@ -328,7 +328,7 @@ Ratatui + crossterm の Inline viewport で動作する。TUI は Runtime が提
 
 - **入力**: crossterm `EventStream` から key / paste / resize を受信
 - **送信**: TUI が Local Runtime API の `ExecuteTurn` を呼び出し、Runtime が共通の durable Turn intake と `TurnScheduler` を経由して Agent Loop を実行し、Turn Event を逐次返す
-- **確定出力**: ユーザー発言、最終応答、確定ツールカード、エラーを `terminal.insert_before()` で一度だけスクロールバックへ出力
+- **確定出力**: ユーザー発言、最終応答、確定ツールカード、エラーを一度だけ端末スクロールバックへ出力
 - **再描画**: dirty フラグを 16ms 間隔で coalesce し、高頻度の Delta をまとめて表示
 - **同時実行**: ターンは 1 件。Tool 実行中の ordinary prompt は durable staged follow-up として FIFO で保留し、Tool Result 後に同じ Turn の履歴へ commit する。それ以外の busy 状態では既存の pending prompt 制御を使う
 - **端末ライフサイクル**: raw mode と bracketed paste mode を TUI の生成・破棄に合わせて有効化・解除する
@@ -389,16 +389,13 @@ HTTP POST `POST /api/webhooks/{receiver_id}`。認証・payload・エラーは [
 
 ### データフロー
 
-```text
-Webhook sender
-  → POST /api/webhooks/{receiver_id}
-  → receiver token 認証
-  → payload 整形 (EgoGraph / generic JSON)
-  → target channel / thread / agent から SurfaceContext を生成
-  → turn を turn_runs へ accepted commit（同一トランザクションで容量・chain 終端判定）
-  ├─ commit 成功 → 202 Accepted（turn は永続化済み。クラッシュ後は Dispatcher が再開）
-  └─ commit 前に拒否 → 429 Too Many Requests（理由コード付き）
-  → agent response は target channel adapter で送信
+```mermaid
+flowchart TD
+    S["Webhook sender"] --> P["POST /api/webhooks/{receiver_id}<br/>(receiver token 認証 → payload 整形)<br/>→ SurfaceContext 生成"]
+    P --> C{"turn_runs へ accepted commit<br/>(同一トランザクションで<br/>容量・chain 終端判定)"}
+    C -- "成功" --> A["202 Accepted<br/>(turn は永続化済み。<br/>クラッシュ後は Dispatcher が再開)"]
+    C -- "commit 前に拒否" --> R["429 Too Many Requests<br/>(理由コード付き)"]
+    A --> D["agent response を<br/>target channel adapter で送信"]
 ```
 
 `202` は in-memory scheduler への受付成功ではなく、`turn_runs` への accepted commit 完了を意味する。commit 後の in-memory 容量不足は拒否とは扱わず、dispatcher が deferred で再投入する。`429` の理由コードと recovery 範囲は [api.md §2.10](./api.md#210-webhook)。

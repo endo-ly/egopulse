@@ -197,7 +197,7 @@ step 名は DB の `step_name` 値を正式名称とする。
 
 - **Best-effort**: 失敗してもログを出して次に進む
 - **冪等**: 同一 `sleep_run_id` のイベントは全削除→再挿入（backfill 時）
-- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`EVENTS_RETRY_GUARD`）
+- **リトライ**: JSON パース失敗時は1回だけ修正リトライする
 
 ---
 
@@ -307,7 +307,7 @@ step 名は DB の `step_name` 値を正式名称とする。
 
 - **Best-effort**: 失敗しても既存ロールアップを維持
 - **冪等**: 同一 `(agent_id, granularity, period_key)` で upsert
-- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`ROLLUP_RETRY_GUARD`）
+- **リトライ**: JSON パース失敗時は1回だけ修正リトライする
 - **セキュリティ**: 入出力に secret redaction を適用
 
 ---
@@ -352,7 +352,7 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 
 - 1 event = 1 JSON オブジェクト。フィールドは `experienced_at`, `kind`, `title`, `body_md`, `ripple_strength`, `certainty` の 6 つで、`id` は含めない
 - events はバッチ単位で JSON 配列にする
-- `<memory-semantic>` / `<episode-events>` は生の XML タグだが、内部コンテンツは全て `escape_xml_content()` でエスケープされる
+- `<memory-semantic>` / `<episode-events>` の内部コンテンツは XML エスケープする
 
 ### バッチ処理
 
@@ -364,7 +364,7 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 バッチ N: 最新の events + バッチN-1の semantic → 最終 semantic
 ```
 
-バッチは `build_event_batches(events, max_chars)` で、直列化後 `max_chars` 文字以内になるよう順序を保って分割する。1 event 単体が上限を超える場合はその event だけのバッチになる（event は分割しない）。
+バッチは直列化後 `max_chars` 文字以内になるよう順序を保って分割する。1 event 単体が上限を超える場合はその event だけのバッチになる（event は分割しない）。
 
 ### 出力
 
@@ -383,7 +383,7 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 ### 動作特性
 
 - **Best-effort**: 失敗しても既存の記憶ファイルを維持
-- **リトライ**: JSON パース失敗時は1回だけ修正リトライ（`SEMANTIC_RETRY_GUARD`）
+- **リトライ**: JSON パース失敗時は1回だけ修正リトライする
 - **コンテキストオーバーフロー検出**: `semantic_tokens + events_tokens > context_window * 0.8` で事前拒否
 - **LLM 呼び出しの省略**: checkpoint 以降に events が無ければ LLM を呼ばず `skipped`
 
@@ -398,14 +398,14 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 1. 各 source session について `event_extraction` checkpoint のみを確認する
 2. checkpoint が無い、または最新 message が checkpoint より新しければアーカイブしない
 3. 最新 message が checkpoint 以下なら、そのセッションをアーカイブ対象とする
-4. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（checkpoint の参照メッセージ + 保持メッセージ）
+4. compaction モジュールの共有関数で会話を Markdown ファイルとして保存（checkpoint の参照メッセージ + 保持メッセージ）
 5. `sessions.messages_json` を直近4件の `user` / `assistant` テキスト発話に切り詰め、checkpoint と使用量アンカーをクリアする。`tool` role と `tool_calls` を持つ `assistant` は除外（`messages` テーブルは無傷）
 6. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップする。解析に失敗した snapshot はエラーとして扱い、run を `running` のまま残す
 7. アーカイブ失敗時は run を `running` のまま残し、次回の scheduler cycle または startup recovery で再試行する
 
 ### Run 状態集約
 
-`finalize_sleep_run()` で step 結果を集約：
+finalize で step 結果を集約：
 
 | 集約結果 | 条件 |
 |---|---|
@@ -556,30 +556,30 @@ run 作成時の排他チェックで同一 agent の同時実行を防止する
 
 ### メモリファイル公開（Publication）
 
-2つの記憶ファイル（`episodic.md` / `semantic.md`）は1つの **Memory bundle** として扱い、末尾の `publish_bundle()` でのみ公開する。各 Step は候補（candidate）をインメモリに更新するだけで、公開 Markdown を直接変更しない。
+2つの記憶ファイル（`episodic.md` / `semantic.md`）は1つの **Memory bundle** として扱い、末尾の公開処理でのみ公開する。各 Step は候補（candidate）をインメモリに更新するだけで、公開 Markdown を直接変更しない。
 
 #### Per-agent RwLock
 
-`MemoryLoader` は agent 単位の `RwLock` を持つ。
+記憶ファイルの参照は agent 単位の読み書きロックで保護する。
 
-- Turn 側（`load_bundle`）は **read lock** を取得し、in-memory cache から bundle を返す。cache は初回 load 時にのみ disk から構築され、以降の Turn hot path は `Arc` clone のみで disk I/O を伴わない。公開中は reader が入らず、常に完全公開済みの一貫した bundle が見える。
-- Sleep 公開側（`publish_bundle`）は **write lock** を取得し、検証〜 rename まで保持する。
+- Turn 側は **read lock** で in-memory cache から bundle を返す。cache は初回 load 時にのみ disk から構築され、以降の Turn は disk I/O を伴わない。公開中は reader が入らず、常に完全公開済みの一貫した bundle が見える。
+- Sleep 公開側は **write lock** を取得し、検証〜 rename まで保持する。
 - LLM 生成中は write lock を保持しない（候補構築中は Turn が現行 bundle を読める）。
 
 #### 公開プロトコル
 
-`publish_bundle(agent_id, run_id, base, candidate)` は write lock 保持下で次の順序で実行する。
+公開処理は write lock 保持下で次の順序で実行する。
 
 1. 現在の2ファイルを読み、各 `content_before`（`base`）と一致することを確認（precondition）
-   - 不一致は手動編集とみなし `MemoryError::Conflict` で中断。現行ファイルはそのまま
+   - 不一致は手動編集とみなし競合で中断。現行ファイルはそのまま
 2. 各ファイルを `<file>.md.<run_id>.tmp` に書き、`flush` / `sync_all`
 3. `episodic` → `semantic` の順で rename
 4. ディレクトリを `sync_all`
-5. `MemoryLoader` cache を candidate bundle に更新
+5. in-memory cache を candidate bundle に更新
 
 #### Snapshot 完全性
 
-finalize 前、同じ `run_id` について2種類（episodic / semantic）の `memory_snapshots` を揃える。更新が無かった file にも `content_before == content_after == base` の snapshot を `ensure_memory_snapshots_complete()` で補完する。これを publication bundle の整合性条件とする。
+finalize 前、同じ `run_id` について2種類（episodic / semantic）の `memory_snapshots` を揃える。更新が無かった file にも `content_before == content_after == base` の snapshot を補完する。これを publication bundle の整合性条件とする。
 
 #### prospective.md の扱い
 
@@ -615,7 +615,7 @@ LLM 入力前・出力後の両方で三層 redaction（値・prefix・文脈）
 
 ### Agent ID 検証
 
-ファイル書き込み前に `safe_agent_id()` で以下を拒否：
+ファイル書き込み前に agent ID を検証し、以下を拒否：
 - `..`（パストラバーサル）
 - `/`, `\`, `:`（パス区切り文字）
 

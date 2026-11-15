@@ -74,55 +74,16 @@ Pulse の本質は次の一文に集約される。
 
 ## 2. 最小フロー
 
-```text
-┌──────────────────────────────┐
-│         Pulse Scheduler       │
-│ tick_interval ごと / once 時刻 │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│      Load agents/*/PULSE.yaml │
-│   document 全体を読む          │
-│  （enabled: false は skip）    │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│        Temporal Due Resolver  │
-│ daily / weekly / interval /   │
-│ once 判定                     │
-└──────────────┬───────────────┘
-               │ due
-               ▼
-┌──────────────────────────────┐
-│          Pulse Gate v1        │
-│ duplicate / active_turn 判定   │
-└──────────────┬───────────────┘
-               │ pass
-               ▼
-┌──────────────────────────────┐
-│        Home Surface Resolver  │
-│ agent の最後の会話場所を探す    │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│        Pulse Capsule Builder  │
-│  contract + intention + ctx    │
-└──────────────┬───────────────┘
-               │
-               ▼
-┌──────────────────────────────┐
-│        Pulse Activation       │
-│ LLM を短く起こす               │
-└──────────────┬───────────────┘
-               │
-      ┌────────┴─────────┐
-      ▼                  ▼
-  PULSE_OK            message
-  silent              notify to Home Surface
-  no session save     save activation conversation
+```mermaid
+flowchart TD
+    A["Pulse Scheduler<br/>(tick_interval ごと / once 時刻)"] --> B["agents/*/PULSE.yaml をロード<br/>(enabled: false は skip)"]
+    B --> C["Temporal Due Resolver<br/>(daily / weekly / interval / once)"]
+    C -- "due" --> D["Pulse Gate v1<br/>(duplicate / active_turn 判定)"]
+    D -- "pass" --> E["Home Surface Resolver<br/>(agent の最後の会話場所)"]
+    E --> F["Pulse Capsule Builder<br/>(contract + intention + ctx)"]
+    F --> G["Pulse Activation<br/>(LLM を短く起こす)"]
+    G --> H["PULSE_OK<br/>silent / session 保存なし"]
+    G --> I["message<br/>notify to Home Surface /<br/>activation 会話を保存"]
 ```
 
 ---
@@ -400,29 +361,28 @@ Pulse は agent 単位で発火するが、結果はその agent が普段会話
 
 ### 7.2 解決ルール
 
-```text
-resolve_home_surface(agent_id, delivery):
-
-1. delivery が明示指定されていれば（intention.delivery → default_delivery）、
-   channel:external_chat_id を DB から検索
-   （channel が送信可能な discord / telegram / web の場合のみ）
-   - web は WebUI のセッション ID `chat:{id}` を get_chat_by_id() で解決する
-   - 見つからなければ自動解決へフォールバックしない。
-     その run は skipped（"explicit delivery could not be resolved"）。
-     ユーザーが指定した配送先を暗黙に変更しないため
-2. delivery が省略された場合のみ自動解決:
-   chats から agent_id に一致する最新 chat を探す
-3. channel adapter が存在し、送信可能なら採用
-4. どれも見つからなければ skipped（"no sendable home surface"）
+```mermaid
+flowchart TD
+    A["delivery の指定"] --> B["明示指定<br/>(intention.delivery → default_delivery)"]
+    A --> C["省略 → 自動解決"]
+    B --> D["channel:external_chat_id を DB 検索<br/>(discord / telegram / web)"]
+    D -- "見つかる" --> E["channel adapter が送信可能なら採用"]
+    D -- "見つからない" --> F["skipped<br/>'explicit delivery could not be resolved'<br/>ユーザー指定の配送先を<br/>自動解決に差し替えない"]
+    C --> G["chats から agent_id に一致する<br/>最新 chat を探す"]
+    G --> E
+    E -- "採用" --> H["通知を送信"]
+    E -- "見つからない" --> I["skipped<br/>“no sendable home surface”"]
 ```
 
-- 明示指定時、`web` 以外は `get_chat_by_channel_external_and_agent()` を使用する（ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合）
-- `web` の明示指定は `get_chat_by_id()` を使用し、解決した chat の `channel` が `web`、`agent_id` が対象 agent と一致することを検証する。`chat_id` は DB 全体で一意なため、この検証がないと他 agent のセッションへ配送できてしまう
-- 送信可能 channel は Discord / Telegram / Web。CLI / TUI / Voice は対象外
-- Web は `channels.web.enabled` が有効な runtime でのみ配送先になる。無効時は明示指定・自動解決とも `skipped` になる
-- Web の配送は通常 session への永続化そのものである。Web クライアントへのリアルタイム通知は永続化イベント（WebSocket `session_updated`）と履歴ポーリングで行う。ブラウザを開いていない間の通知は保存され、次に開いたときに表示される（OS レベルの push 通知は行わない）
-- Activation の `SurfaceContext` / Tool 実行コンテキストは、Home Surface の `external_chat_id`（session key 形式）から生の `surface_thread` を復元して構築する。これにより Activation 中の `agent_send` は宛先エージェントの通常 session key（`{channel}:{surface_thread}:agent:{to}`）を解決する
-- Home Surface が解決できない場合は、その run を `skipped` として記録する（LLM は呼ばない）
+| ケース | 動作 |
+|---|---|
+| 明示指定・`web` 以外 | ユーザー指定の生の external chat ID を session-key 形式 `{channel}:{external_chat_id}:agent:{agent_id}` に変換して照合する |
+| 明示指定・`web` | WebUI のセッション ID `chat:{id}` で解決し、`channel` が `web`・`agent_id` が対象 agent と一致することを検証する（`chat_id` は DB 全体で一意。検証がないと他 agent のセッションへ配送できる） |
+| 送信可能 channel | Discord / Telegram / Web。CLI / TUI / Voice は対象外 |
+| Web が無効な runtime | 明示指定・自動解決とも `skipped` |
+| Web への配送 | 通常 session への永続化そのもの。リアルタイム通知は `session_updated` と履歴ポーリング。未開封の通知は保存され、次に開いたときに表示される（OS push はしない） |
+| Activation のコンテキスト | Home Surface の `external_chat_id`（session key 形式）から生の `surface_thread` を復元して構築。Activation 中の `agent_send` は宛先の通常 session key（`{channel}:{surface_thread}:agent:{to}`）を解決できる |
+| どれも解決できない | run を `skipped` として記録（LLM は呼ばない） |
 
 ### 7.3 注意点
 
@@ -450,7 +410,7 @@ Pulse Capsule =
 
 LLM 呼び出しは以下の 2 つから構成される。
 
-- **system prompt**: `build_system_prompt()` で構築（SOUL / AGENTS / Memory / Skills）
+- **system prompt**: 通常セッションと同じ構成（SOUL / Core Instructions / AGENTS / Long-term Memory / Skills catalog）
 - **user message**: 以下の Pulse Capsule
 
 ```text
@@ -492,20 +452,10 @@ Core Contract は `include_str!` で `pulse_core_contract.md` をバイナリに
 
 ### 8.2 LLM 呼び出し構成
 
-Pulse Activation の LLM 呼び出しは、通常セッションと**同じ `build_system_prompt()` をそのまま** system prompt として使用する。
+Pulse Activation は、通常セッションと**同じ system prompt をそのまま**使用する。
 Pulse 固有の指示（Core Contract を含む）はすべて user message（Capsule）側に含まれる。
 
-```text
-system prompt = build_system_prompt() の出力
-  SOUL.md
-  + Core Instructions
-  + AGENTS.md
-  + Long-term Memory (episodic / semantic)
-  + Skills catalog
-```
-
-Capsule (user message) には long-term memory を含めない。
-理由: system prompt 経由で既に注入されているため、2重注入を避ける。
+system prompt の構成は SOUL.md → Core Instructions → AGENTS.md → Long-term Memory（episodic / semantic）→ Skills catalog。Capsule には long-term memory を含めず、system prompt からの注入に一本化する。
 
 この構成により:
 
@@ -683,7 +633,7 @@ src/
 | timezone helper | now / local date / due 判定補助 |
 | active_turn defer | agent active 中は defer |
 | shutdown 連動 | runtime 停止時に scheduler も止まる |
-| retry utility | `llm::retry` の共通判定で Turn / Pulse / Sleep / Compaction / ask の試行回数・バックオフ・`Retry-After` の扱いを揃える（Pulse は待機時間に上限あり） |
+| retry utility | Turn / Pulse / Sleep / Compaction / ask で試行回数・バックオフ・`Retry-After` の扱いを揃える（Pulse は待機時間に上限あり） |
 
 ### 11.3 分けるもの
 
@@ -699,22 +649,13 @@ src/
 
 ## 12. 将来の展望
 
-signal source は将来の拡張に備えて、pipeline の先頭へ接続する形を維持する。
+signal source は将来の拡張に備えて、pipeline の先頭へ接続する形を維持する。将来の signal source:
 
-```rust
-enum PulseSignalKind {
-    TemporalDue,
-
-    // Future:
-    ExternalEvent,
-    ProspectiveDue,
-    MemoryResurfaced,
-    StateShift,
-    AutonomousCuriosity,
-}
-```
-
-- State（agent のその時点の内的状態。Trait は静的な性格傾向）は未実装。`PulseSignalKind::StateShift` の接続点だけを残す
+- ExternalEvent（Webhook / GitHub / SwitchBot 等の外界 signal）
+- ProspectiveDue（意向ベースの due）
+- MemoryResurfaced（記憶の再浮上）
+- StateShift（agent の内的状態の変化。State は未実装。Trait は静的な性格傾向）
+- AutonomousCuriosity（内発的な探索 signal）
 - 通知は Home Surface への Inline Output のみ。将来の Notification Router（`silent` / `log_only` / `pulse_inbox` / `notify` / `urgent` / `approval_required`）と multi-agent 構成での inbox 調律は拡張方向として残す
 
 ---
