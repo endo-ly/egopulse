@@ -110,8 +110,8 @@ step 名は DB の `step_name` 値を正式名称とする。
 
 どちらも満たさない場合は Skip し、理由（件数と閾値）を `error_message` に持つ終了済みの `skipped` run を記録する。ステップとスナップショットは作らない。
 
-- **候補抽出**: pending メッセージが閾値を超えた場合のみセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。最新セッション優先にしないため、継続的に更新される hot session が古い backlog を処理待ちにし続けない。
-- **semantic backlog のみの run**: セッションを渡さないため event_extraction は `skipped` になり、episodic_update / semantic_update だけがイベント由来の更新を行う。閾値以下のメッセージは event_extraction の対象にしない。
+- **候補抽出**: pending メッセージが閾値を超えた場合のみセッションを取得する。順序は「最古の pending message が古い順、同値なら `chat_id` 順」。hot session より古い backlog を先に処理する。
+- **semantic backlog のみの run**: セッションを渡さないため event_extraction は `skipped` になり、episodic_update / semantic_update だけがイベント由来の更新を行う。閾値以下のメッセージは次回の pending 対象。
 - **1 run 上限**: `MAX_SOURCE_SESSIONS`（20）は 1 回の run の入力サイズ制限として維持する。上限から漏れたセッションは pending のまま残り、次回候補でも必ず見える。
 - **失敗時の再処理**: step が失敗した場合は該当 checkpoint が進まない。event_extraction の失敗は同じ message が、semantic_update の失敗は同じ event が pending として残り、次回の実行条件になる。
 - **`source_chats_json`**: 実際に選んだセッションだけを保存する。semantic backlog のみの run では空配列になる。
@@ -334,7 +334,7 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 - **海馬**役割：日中の経験を睡眠中に再活性化し、大脳皮質へ転送する
 - **意味記憶のみ**：エピソード記憶の整理は episodic_update が担う
 - **パターン抽出**：出来事の要約ではなく、1年後も有効な知識・原則を抽出する
-- **転送しないもの**：日付・進捗・件数、予定・TODO、一度きりの出来事
+- **転送対象**：1年後も有効な知識・原則（日付・進捗・件数・予定・TODO・一度きりの出来事は除く）
 
 ### 入力構造
 
@@ -400,8 +400,7 @@ checkpoint 以降のエピソードイベントから意味記憶（`semantic.md
 3. 最新 message が checkpoint 以下なら、そのセッションをアーカイブ対象とする
 4. `archive_conversation_blocking()` で会話を Markdown ファイルとして保存（checkpoint の参照メッセージ + 保持メッセージ）
 5. `sessions.messages_json` を直近4件の `user` / `assistant` テキスト発話に切り詰め、checkpoint と使用量アンカーをクリアする。`tool` role と `tool_calls` を持つ `assistant` は除外（`messages` テーブルは無傷）
-6. 解析に失敗した snapshot は空配列とみなさず、エラーとして run を `running` のまま残す
-6. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップ
+6. 切り詰めは `updated_at` 照合で同時実行衝突を検出し、変更があればスキップする。解析に失敗した snapshot はエラーとして扱い、run を `running` のまま残す
 7. アーカイブ失敗時は run を `running` のまま残し、次回の scheduler cycle または startup recovery で再試行する
 
 ### Run 状態集約

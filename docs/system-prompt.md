@@ -92,7 +92,7 @@ SOUL とは異なり、フォールバックではなく **2層の累積構造**
 
 ## 3.5 SECRET.md 読み込み
 
-`ConversationScope::Secret` がアクティブな turn にのみ読み込まれるユーザー編集可能な指示ファイル。AGENTS.md と同形式の Markdown 自由文。スコープの決定は [architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界)。
+`ConversationScope::Secret` がアクティブな turn にのみ読み込まれるユーザー編集可能な指示ファイル。AGENTS.md と同形式の Markdown 自由文。スコープの決定は [architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界)。
 
 ### パス
 
@@ -145,7 +145,7 @@ AGENTS.md セクション（③）の直後、Long-term Memory（④）の直前
 </soul>
 ```
 
-純粋に `<soul>` タグでラップするのみ。名前やチャネル情報は注入しない（それらは ② Core Instructions で与えられる）。
+純粋に `<soul>` タグでラップするのみ（名前やチャネル情報は ② Core Instructions が担う）。
 
 ### 4.1.5 Model Instructions セクション（注入順: ①.5、条件付き）
 
@@ -364,7 +364,7 @@ split turn のターン前半要約だけは次の形になる。
 [Additional focus: ...]
 ```
 
-要約リクエストは通常の model 呼び出しと同じ出力上限の扱いを共有する。compaction 専用の固定出力上限や切り詰めは設けず、モデルの出力上限に任せる。`finish_reason=length` などで要約が途中終了した場合は checkpoint として確定しない。
+要約リクエストの出力上限は通常の model 呼び出しと同じ扱い（モデルの設定値に従う）。`finish_reason=length` などで要約が途中終了した場合は checkpoint として確定しない。
 
 | 用途 | 定数 |
 |---|---|

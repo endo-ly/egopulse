@@ -49,26 +49,26 @@ Pulse の本質は次の一文に集約される。
 
 ### 1.3 Pulse の第一原則
 
-1. **LLM 定期呼び出しにしない**
-   due でない場合、重複済みの場合、active turn 中の場合、LLM は呼ばない。
+1. **Gate を通過したときだけ LLM を呼ぶ**
+   due 判定・重複排除・active turn defer を通過した Pulse が Activation の対象になる。
 
 2. **Cron ではなく Temporal Intention として扱う**
    「09:00 に X を実行する」ではなく、「09:00 に X へ注意を向ける」。
 
 3. **Pulse は agent 単位で動く**
-   Pulse は channel 単位ではなく agent 単位の機構である。
+   Pulse は agent 単位の機構であり、channel 単位ではない。
 
 4. **出力は普段の会話場所に出す**
    Pulse の結果は、その agent が普段会話している surface に出す。
 
 5. **実行は Pulse Capsule で行う**
-   Pulse の内部 prompt / contract / capsule は通常 session に混ぜない。
+   Pulse の内部 prompt / contract は Capsule 内に閉じる。
 
-6. **保存は通知経路の activation 会話だけ通常 session に残す**
-   `PULSE_OK` や内部 capsule は通常 session に保存しない。ユーザーに見えた通知本文とその実行文脈（synthetic input・tool phase）だけを残す。
+6. **保存は通知経路の activation 会話だけ**
+   ユーザーに見えた通知本文とその実行文脈（synthetic input・tool phase）を通常 session に残す。
 
 7. **State は将来構想として残す**
-   Trait は静的傾向、State は将来的な動的内的状態。現行では State に触れない。
+   Trait は静的傾向、State は将来的な動的内的状態。現行の signal source は Temporal Intention のみ（§12）。
 
 ---
 
@@ -145,7 +145,7 @@ Pulse は agent 配下の `PULSE.yaml` を使う。
             └── semantic.md
 ```
 
-ファイルは純粋な YAML ドキュメントである（front matter は使わない）。
+ファイルは純粋な YAML ドキュメントである。
 
 ```yaml
 enabled: true
@@ -177,14 +177,14 @@ intentions:
 | `default_delivery` / `intentions` | 非LLMで due 判定するための構造化 Temporal Intention |
 | binary embedded contract | Pulse の内部契約・安全制約・出力契約 |
 
-Pulse 定義に version フィールドは存在しない。形式の正本はこのドキュメントと runtime の実装であり、runtime が書き込むファイルは常に自力でパースできることが保証される（[§3.3](#33-agent-による-pulse-操作pulse-ツール)）。
+Pulse 定義に version フィールドは存在しない。runtime が書き込むファイルは常に自力でパースできることが保証される（[§3.3](#33-agent-による-pulse-操作pulse-ツール)）。
 
 `PULSE.yaml` に内部仕様を詰め込まない。
 Pulse の内部契約はバイナリ側に埋め込む。
 
 ### 3.2 Config
 
-`egopulse.config.yaml` には runtime 設定だけを置く。Pulse の有効 / 無効は agent 単位（`PULSE.yaml` の `enabled`）でのみ制御され、グローバルスイッチは存在しない。Pulse は常設の runtime 機能であり、scheduler の tick ループは常に回る。
+`egopulse.config.yaml` には runtime 設定だけを置く。Pulse の有効 / 無効は agent 単位（`PULSE.yaml` の `enabled`）でのみ制御する。Pulse は常設の runtime 機能であり、scheduler の tick ループは常に回る。
 
 ```yaml
 pulse:
@@ -193,9 +193,9 @@ pulse:
 
 | 設定 | 役割 |
 |---|---|
-| `pulse.tick_interval` | due scan の基本周期（Duration 形式: `30s`, `1m`, `1h`。デフォルト `1m`）。`once` の次回発火がこの周期内にある場合、scheduler はその時刻に起床する（発火は tick に依存しない） |
+| `pulse.tick_interval` | due scan の基本周期（Duration 形式: `30s`, `1m`, `1h`。デフォルト `1m`）。`once` の次回発火がこの周期内にある場合、scheduler はその時刻に起床する |
 
-due 判定の timezone は `pulse` 配下には設定しない。トップレベルの `timezone`（[config.md](./config.md)）を使用する。
+due 判定の timezone はトップレベルの `timezone`（[config.md](./config.md)）を使用する。
 
 Temporal Intention の中身は config に置かない。
 それは agent の注意方針なので、`agents/{agent_id}/PULSE.yaml` に置く。
@@ -222,7 +222,7 @@ Pulse の設定は built-in ツール `pulse` を通じてのみ行う。エー�
 | Secret 会話 | 呼び出しはエラー。Pulse の実行・配送は Normal スコープで行われるため、設定は通常の会話から行う |
 | 書き込み | serialize → parse round-trip → atomic rename。ツールが書いたファイルがパースできない状態は原理的に発生しない |
 | 並行書き込み | load → 変更 → save をプロセス共通の排他ゲート内で直列化。複数 turn や activation 後のアーカイブが同時に走っても更新消失・破損はしない |
-| `add` の配送先デフォルト | 現在の会話。送信可能チャネル以外（TUI / CLI）で頼まれた場合は intention を作らず、Discord / Telegram / Web の配送先を問い返す。Web はセッション ID `chat:{id}` |
+| `add` の配送先デフォルト | 現在の会話。送信可能チャネル以外（TUI / CLI）で頼まれた場合は、Discord / Telegram / Web の配送先を問い返してから intention を作成する。Web はセッション ID `chat:{id}` |
 | 同日の再発火 | daily の `due_key` は日付単位のため、発火済みの日に時刻を変更しても当日は再発火しない（§5.2）。再発火させたい場合は id を変える |
 | 発火見込みの表示 | scheduler と同じ判定。時刻到達かつ未実行は `due now (pending next scan)`、実行済み期間は `already attempted for current period`（`interval` は翌日の時刻を次回発火として示す）、`once` 実行済みは `already attempted (no automatic retry)`。無効な agent・intention には表示しない。実行履歴の参照に失敗した場合は該当行に `error`、`list` 全体はツールエラー |
 | `once` の自動アーカイブ | 成功時に PULSE.yaml から除去する。失敗・skipped・activation 中の変更時の扱いは §4.4 |
@@ -437,8 +437,7 @@ Web の自動解決は、WebUI でアーカイブされたセッションも候�
 
 ## 8. Pulse Capsule
 
-Pulse Activation は通常 session の messages をそのまま使わない。
-代わりに、Pulse 専用の **Pulse Capsule** を構築する。
+Pulse Activation は通常 session の messages の代わりに、専用の **Pulse Capsule** を構築する。
 
 ### 8.1 構成
 
@@ -489,8 +488,7 @@ now: 2026-05-10T09:00:00+09:00
 
 Core Contract は `include_str!` で `pulse_core_contract.md` をバイナリに埋め込む。内容は「注意活性化モードであること」「intention を目的として評価・充足すること」「通知する価値がなければ `PULSE_OK` を返すこと」「出力に Pulse や activation の話を書かないこと」で、作業範囲は bounded scope に限定される。
 
-通常 session の内部 snapshot は使わない。
-`Recent Visible Context` は、ユーザーに見えている直近文脈を補助的に渡すだけである。
+`Recent Visible Context` は、ユーザーに見えている直近文脈（最大10件）を補助的に渡す。内部 snapshot は投影しない。
 
 ### 8.2 LLM 呼び出し構成
 
@@ -520,7 +518,7 @@ Pulse の生成途中の delta は破棄し、外部公開済み出力として�
 
 ### 8.3 Tools
 
-Home Surface が Multi-Agent Room の場合、共有 Channel Log を解決または作成し、その ID を Tool 実行と `agent_send` の宛先 Turn へ引き継ぐ。`agent_send` の公開メッセージは共有 Log、宛先の直接入力と内部イベントは宛先 Agent Session に保存する。Single-Agent Channel では共有 Log を作成せず、Home の Agent Session を保存先とする。
+Home Surface が Multi-Agent Room の場合、共有 Channel Log を解決または作成し、その ID を Tool 実行と `agent_send` の宛先 Turn へ引き継ぐ。`agent_send` の公開メッセージは共有 Log、宛先の直接入力と内部イベントは宛先 Agent Session に保存する。Single-Agent Channel では Home の Agent Session を保存先とする。
 
 Pulse Activation は通常 turn と同じく built-in tools + MCP tools を使用可能。tool loop を最大 50 イテレーション回し、48回目に終了警告を付け、49〜50回目は最終回答を優先する指示を追加する。activation 全体は 30 分のタイムアウトで保護され、タイムアウト・パニック時は run を `failed` として記録する。
 

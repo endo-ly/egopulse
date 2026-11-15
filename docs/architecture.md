@@ -6,12 +6,11 @@
 
 1. [全体像](#1-全体像)
 2. [レイヤー構造](#2-レイヤー構造)
-3. [モジュール構成](#3-モジュール構成)
-4. [コア型](#4-コア型)
-5. [リクエストフロー](#5-リクエストフロー)
-6. [起動・停止シーケンス](#6-起動停止シーケンス)
-7. [設計パターン](#7-設計パターン)
-8. [オブザーバビリティレイヤー](#8-オブザーバビリティレイヤー)
+3. [コア型](#3-コア型)
+4. [リクエストフロー](#4-リクエストフロー)
+5. [起動・停止シーケンス](#5-起動停止シーケンス)
+6. [設計パターン](#6-設計パターン)
+7. [オブザーバビリティレイヤー](#7-オブザーバビリティレイヤー)
 
 ---
 
@@ -66,163 +65,7 @@ EgoPulse は単一バイナリの Rust (Tokio) 製 AI エージェントラン�
 
 ---
 
-## 3. モジュール構成
-
-```
-src/
-├── main.rs              # CLI エントリポイント (TUI / headless / run / setup / gateway / update / sleep / events)
-├── lib.rs               # 全モジュールの公開インターフェース
-├── conversation.rs       # ConversationScope / SurfaceContext
-├── assets.rs            # 埋め込みアセット（Web UI 用静的ファイル）
-├── assets/              # 組み込みスキル等のアセット実体
-├── builtin_skills.rs    # 組み込みスキル定義
-├── default_soul.md      # デフォルト SOUL.md テンプレート
-│
-├── runtime/             # AppState 構築、チャネル起動・監視
-│   ├── mod.rs           # AppState, InstanceGuard, build_app_state(), start_channels()
-│   ├── local_api/       # TUI向けUnix socket API (protocol / client / server / service)
-│   ├── channel_input.rs # チャネル入力から Channel Log / ScheduledTurn への変換
-│   ├── turn/            # Scheduled Turn subsystem
-│   │   ├── mod.rs       # Runtime Turn facade
-│   │   ├── scheduled.rs # durable ScheduledTurn の表現・hash・serialization
-│   │   ├── scheduler.rs # TurnScheduler, TurnTracker, StopReason, evaluate_stop_conditions
-│   │   ├── dispatch.rs  # durable turn の復旧・dispatch・scheduled turn 実行
-│   │   ├── observer.rs  # transport adapter向けTurn event/completion配信
-│   │   └── progress.rs  # ツール進捗表示コーディネータ
-│   ├── supervisor.rs    # RuntimeSupervisor (長寿命 task と Turn task の所有・順序付き shutdown)
-│   ├── backup_scheduler.rs # 定期 SQLite backup スケジューラ
-│   ├── config_reload.rs # Config ホットリロード（YAML + .env 監視）
-│   ├── gateway.rs       # systemd サービス管理
-│   ├── logging.rs       # ログ初期化
-│   ├── metrics.rs       # メトリクス初期化・ヘルパー（内部 Prometheus レコーダー）
-│   └── status.rs        # RuntimeStatus (インメモリヘルスサマリー)
-│
-├── agent_loop/          # エージェントループ
-│   ├── mod.rs           # module facade と process_turn() の公開入口
-│   ├── loop_runner.rs   # AgentLoop、LoopState、iteration policy
-│   ├── model_step.rs    # 1 回の LLM 呼び出し、分類、retry、usage
-│   ├── tool_execution.rs # Tool 実行、ledger、Tool Result 構築
-│   ├── compaction.rs    # コンテキスト圧縮（checkpoint 要約）+ アーカイブ
-│   ├── response_guard.rs # empty / declarative response guard
-│   ├── message_format.rs # Message / Tool Result の表現変換
-│   ├── event.rs         # AgentEvent 型
-│   ├── prompt/          # System Prompt の assembly と source
-│   │   ├── mod.rs       # Prompt module facade
-│   │   ├── builder.rs   # システムプロンプト構築
-│   │   ├── sources.rs   # SOUL.md / AGENTS.md / SECRET.md 読み込み
-│   │   └── templates/   # 静的プロンプトテンプレート
-│   ├── turn/            # durable な 1 Turn の orchestration
-│   │   ├── mod.rs       # TurnExecutor、準備、AgentLoop 呼び出し、final completion
-│   │   ├── lifecycle.rs # acceptance、state 遷移、resume 検証、failure
-│   │   ├── persistence.rs # Message / Session snapshot の Turn 単位保存
-│   │   └── dependencies.rs # Turn 実行に必要な依存境界
-│   ├── session.rs       # セッションロード・保存、競合解決
-│   ├── session_snapshot.rs # セッションスナップショット構築
-│   └── test_support.rs  # テスト用 Provider / fixture
-│
-├── channels/            # チャネル実装
-│   ├── mod.rs           # ChannelAdapter trait, ChannelRegistry
-│   ├── adapter.rs       # チャネルアダプター
-│   ├── cli.rs           # CLI チャネル
-│   ├── discord.rs       # Discord ボット
-│   ├── telegram.rs      # Telegram ボット
-│   ├── tui/              # TUI チャネル
-│   ├── voice.rs         # Voice チャネル (Bearer 認証 REST)
-│   ├── web/             # Web サーバー (Axum, SSE, WebSocket)
-│   └── utils/           # チャネル共通ユーティリティ
-│
-├── webhooks/            # Webhook Trigger
-│   ├── mod.rs           # モジュール公開
-│   ├── handler.rs       # Webhook 受付・request_key 導出・Turn 投入
-│   ├── formatter.rs     # 応答フォーマット
-│   └── error.rs         # エラー型
-│
-├── llm/                 # LLM プロバイダー抽象化
-│   ├── mod.rs           # LlmProvider trait
-│   ├── cache.rs         # Provider キャッシュ（上限付き・会話単位）
-│   ├── headers.rs       # 会話単位ヘッダ値の導出
-│   ├── openai.rs        # OpenAI 互換クライアント
-│   ├── responses.rs     # Responses API 呼び出し
-│   ├── messages.rs      # Messages API 呼び出し
-│   ├── sse.rs           # SSE ストリーム解析
-│   ├── tokens.rs        # UTF-16 文字数ベースの token 推定、出力上限の clamp
-│   ├── model_catalog.rs # 生成済みモデルカタログの読込（context window / 最大出力）
-│   ├── calibration.rs   # prompt token 推定補正 (EMA)
-│   └── codex_auth.rs    # Codex auth 解決、AUTH_CACHE
-│
-├── config/              # 設定管理
-│   ├── mod.rs           # 型定義、公開ファサード
-│   ├── types.rs         # Config 型定義
-│   ├── model_metadata.rs # 明示設定・カタログ・既定値からのモデル上限解決
-│   ├── manager.rs       # ConfigManager (snapshot + 更新境界)
-│   ├── loader.rs        # YAML 読み込み、正規化、検証
-│   ├── persist.rs       # YAML 書き出し、アトミック書込
-│   ├── resolve.rs       # モデル解決、チャネルアクセサ
-│   ├── web_fetch.rs     # Web Fetch 設定
-│   ├── secret_ref.rs    # SecretRef 型、.env 読み書き
-│   └── tests.rs         # 設定テスト
-│
-├── storage/             # SQLite 永続化
-│   ├── mod.rs           # Database struct, 型定義, new(), call_blocking()
-│   ├── migration.rs     # スキーマ DDL, バージョン管理マイグレーション
-│   ├── chat.rs          # chats / messages / sessions クエリ
-│   ├── turn.rs          # turn_runs / turn_origins クエリ
-│   ├── tool.rs          # tool_calls 実行台帳クエリ
-│   ├── sleep.rs         # sleep 系クエリ
-│   ├── pulse.rs         # pulse 系クエリ
-│   ├── episode.rs       # episode 系クエリ
-│   ├── llm_usage.rs     # LLM usage クエリ
-│   └── backup.rs        # VACUUM INTO バックアップ
-│
-├── tools/               # ツールシステム
-│   ├── mod.rs           # ToolRegistry, Tool trait, is_read_only()
-│   ├── mcp.rs           # MCP クライアント (外部ツールサーバー接続)
-│   ├── activate_skill.rs # スキル遅延読み込み
-│   ├── agent_send.rs    # エージェント間通信ツール
-│   ├── command_guard.rs # bash コマンド検閲
-│   ├── path_guard.rs    # 機密パスブロック
-│   ├── sanitizer.rs     # 出力リダクション
-│   ├── search.rs        # grep / find / ls ツール
-│   ├── send_attachment.rs # ファイル添付ツール
-│   ├── shell.rs         # bash 実行ツール
-│   ├── files.rs         # read / write / edit ツール
-│   ├── text.rs          # テキスト処理ツール
-│   └── web_fetch/       # web_fetch ツール (URL 検証・コンテンツ整形)
-│
-├── pulse/               # Pulse（注意活性化）
-│   ├── mod.rs           # モジュール公開
-│   ├── scheduler.rs     # 時間・due_key 判定の Scheduler
-│   ├── definition.rs    # PULSE.yaml パース・検証・保存
-│   ├── capsule.rs       # Pulse Capsule 構築・実行
-│   ├── runner.rs        # Activation 実行・PULSE_OK 判定
-│   ├── output.rs        # 出力・保存処理
-│   └── pulse_core_contract.md # Pulse Core Contract（LLM 用）
-│
-├── setup/               # 初回セットアップウィザード
-│
-├── sleep/               # Sleep Batch（長期記憶処理）
-│   ├── mod.rs           # エラー型（SleepBatchError）
-│   ├── orchestrator.rs  # Sleep batch 実行・排他制御
-│   ├── scheduler.rs     # 自動 scheduler による定期実行
-│   ├── event_extraction.rs # Step 1: イベント抽出
-│   ├── event_rollup.rs  # Step 2: 週次/月次ロールアップ
-│   ├── episodic_renderer.rs # エピソード記憶の描画
-│   ├── semantic_update.rs # Step 3: 長期記憶更新
-│   ├── llm_call.rs # Sleep の LLM 予算とリトライログ
-│   ├── prompt.rs        # プロンプト構築
-│   └── prompts/         # LLM 用プロンプト本文
-│
-├── memory.rs            # 長期記憶 bundle の読み込み・公開・クラッシュリカバリ
-├── skills.rs            # スキル管理 (発見・読み込み・カタログ生成)
-├── slash_commands.rs    # slash command dispatcher、LLM プロファイル管理
-├── error.rs             # エラー型
-├── test_env.rs          # テスト用 EnvVarGuard、ENV_MUTEX
-└── test_util.rs         # テストユーティリティ
-```
-
----
-
-## 4. コア型
+## 3. コア型
 
 ### AppState
 
@@ -332,7 +175,7 @@ TurnExecutor
 
 ---
 
-## 5. リクエストフロー
+## 4. リクエストフロー
 
 ```text
 1. チャネルがメッセージを受信、または TUI Client が Local API へ送信
@@ -377,7 +220,7 @@ TurnExecutor
 
 ---
 
-## 6. 起動・停止シーケンス
+## 5. 起動・停止シーケンス
 
 ### 起動
 
@@ -447,7 +290,7 @@ deadline 付きで停止する。
 
 ---
 
-## 7. 設計パターン
+## 6. 設計パターン
 
 | パターン | 適用箇所 | 目的 |
 |---------|---------|------|
@@ -467,8 +310,8 @@ deadline 付きで停止する。
 | **Active Turn Tracker** | `runtime/turn/scheduler.rs` | agent ごとのアクティブ turn 追跡（scheduler defer 用） |
 | **Turn Scheduler** | `runtime/turn/scheduler.rs` | per-session busy flag + 有界 input queue（セッション 32 / Runtime 全体 512）による同時実行制御。超過時は `Rejected` で受付拒否 |
 | **Stop Condition Evaluator** | `runtime/turn/scheduler.rs` | chain depth / turn count / agent 存在確認による暴走防止 |
-| **Turn Tracker** | `runtime/turn/scheduler.rs` | origin_id 単位の turn 数カウント・terminal reason・24h TTL・4096 上限による有界な暴走防止追跡 |
-| **Conversation Scope Routing** | `runtime/` / `agent_loop/turn/dependencies.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を一意に決定。`AppState::db_for(scope)` / `TurnDependencies::storage_for(scope)` でルーティング。チャネルアダプタが YAML `secret: true` を `ConversationScope::Secret` に変換 |
+| **Turn Tracker** | `runtime/turn/scheduler.rs` | origin_id 単位の turn 数と terminal reason を 24h TTL・4096 上限で追跡する |
+| **Conversation Scope Routing** | `runtime/` / `agent_loop/turn/dependencies.rs` | `ConversationScope`（`Normal` \| `Secret`）で DB・archive のストレージ境界を決定する（§6.1） |
 | **Tool Progress Coordinator** | `runtime/turn/progress.rs` | `AgentEvent` ストリームを購読し、チャネル進捗表示の状態機械を一元管理する |
 
 Observer の配送ポリシー: live observer はメモリに保持し、durable Turn には Client-owned という配送ポリシーだけを保存する。terminal な Turn から複数の staged follow-up を昇格する場合も、各 Turn の入力・成功・失敗イベントを同じ client interaction へ順序付きで流し、全 Turn の完了後に completion を返す。
@@ -477,7 +320,7 @@ Observer の配送ポリシー: live observer はメモリに保持し、durable
 
 ---
 
-### 7.1 ConversationScope（ストレージ境界）
+### 6.1 ConversationScope（ストレージ境界）
 
 `ConversationScope` は、turn 全体のストレージ境界を決定する内部抽象である。YAML 設定の `secret: true` はユーザー向け API であり、内部では `ConversationScope::Secret` に変換される。
 
@@ -503,11 +346,11 @@ Observer の配送ポリシー: live observer はメモリに保持し、durable
 
 ---
 
-## 8. オブザーバビリティレイヤー
+## 7. オブザーバビリティレイヤー
 
 運用時の可観測性を提供する。
 
-### 8.1 経路
+### 7.1 経路
 
 | 層 | 形式 | 用途 |
 |---|---|---|
@@ -516,11 +359,11 @@ Observer の配送ポリシー: live observer はメモリに保持し、durable
 | **詳細 status API** | `/api/status` | Bearer 認証付きの runtime 状態・オペレーション確認 |
 | **テレメトリー API** | `/telemetry` | Bearer 認証付きの JSON メトリクス・ターン履歴・エラー詳細 |
 
-### 8.2 RuntimeStatus
+### 7.2 RuntimeStatus
 
 `AppState` 上に保持されるインメモリのヘルスサマリー。各チャネル・MCP・DB の状態を集約し、公開 `/health` の liveness 判定と認証済み `/api/status` の詳細応答に使用される。プロセス起動時に初期化され、チャネルの起動・停止・MCP 接続状態の変化に応じてリアルタイムに更新される。
 
-### 8.3 trace_id 伝播
+### 7.3 trace_id 伝播
 
 エージェントターンのライフサイクル全体で `trace_id` が伝播する。
 
@@ -528,15 +371,15 @@ Observer の配送ポリシー: live observer はメモリに保持し、durable
 2. `tracing::info_span!` に `trace_id` フィールドとして注入する
 3. `journalctl` などで `trace_id=<value>` を grep することで、特定ターンの全ログを抽出できる
 
-### 8.4 エラーリングバッファ
+### 7.4 エラーリングバッファ
 
 直近のエラーをインメモリのリングバッファ（容量 100 件）に保持する。認証済み `/telemetry` エンドポイントの `recent_errors` フィールドから `trace_id` 付きで参照可能。プロセス再起動で消失するため、永続的なエラー追跡には外部ログ収集基盤（Loki 等）と組み合わせる必要がある。
 
-### 8.5 ターン履歴リングバッファ
+### 7.5 ターン履歴リングバッファ
 
 直近のターン実行結果をインメモリのリングバッファ（容量 100 件）に保持する。認証済み `/telemetry` エンドポイントの `recent_turns` フィールドから参照可能。各レコードには `trace_id`、`agent_id`、`channel`、`started_at`、`duration_secs`、`ok` が含まれる。
 
-### 8.6 メトリクス
+### 7.6 メトリクス
 
 認証済み `/telemetry` エンドポイントは JSON 形式でメトリクスを出力する。`egopulse_` プレフィックスのカウンター・ゲージをラベル付きで返す。
 

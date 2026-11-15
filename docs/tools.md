@@ -31,7 +31,7 @@
 - path 解決は workspace 配下に制限される
 - tool 実行結果は turn loop で `{"tool":"...","status":"success|error","result":"...","details":{...}}` の JSON に包まれて LLM に返る
 - `details` は tool によって `truncation`、`diff`、`firstChangedLine`、`fullOutputPath` などを含む
-- LLM が有効な JSON でない引数を返した tool call は実行せず、Tool 実行台帳にも記録しない。Turn / Pulse は失敗させず、パースエラーを含む `status: error` の tool result をモデルへ返して再送を促す。会話履歴にはその tool call の引数を `{}` として保存する
+- LLM が有効な JSON 以外の引数を返した tool call は、パースエラーを含む `status: error` の tool result をモデルへ返して再送を促す（Turn / Pulse を失敗させない）。引数は会話履歴に `{}` として保存し、実行と台帳記録の対象外
 - マルチモーダル画像対応: `read` tool で画像ファイルを検出した場合、base64 data URL として LLM に直接渡す。マルチモーダルメッセージが含まれる場合は OpenAI Responses API (`/responses`) に自動ルーティングされる（Chat Completions API はマルチモーダル tool result に非対応のため）。セッション永続化時は画像を SHA256 ハッシュで内容重複排除し、参照形式 (`input_image_ref`) で保存する
 
 ## 2. Tool Registry
@@ -75,10 +75,10 @@ MCP tool は built-in と同じ registry に `mcp_{server}_{tool}` の名前で�
 
 read-only ツール（`is_read_only: true`）は副作用がなく crash 後の再実行が安全なため、claim-before-execute をスキップし、並列実行の書き込み競合を避ける。代わりに、並列ブロックの実行完了後にブロック全体を 1 transaction で台帳へ記録する。
 
-- 行は `succeeded` / `failed` の終端状態で直接書き込まれ、`pending` / `running` を経由しない。crash recovery の `running` スキャンに影響しない
+- 行は `succeeded` / `failed` の終端状態で直接書き込まれ、crash recovery の `running` スキャンの対象外
 - `idempotency_class = read_only`。sanitize 済みの `tool_input` / `tool_output` と `error_kind` を非 read-only 行と同じ形式で保持する
 - 重複する `(turn_id, id)` は、`input_hash` / `tool_name` / `idempotency_class = read_only` の一致を確認してから既存行を維持する。不一致は conflict とし、並列ブロック全体を rollback する
-- Tool の実行前に JSON 解析で拒否された要求は、LLM へ `invalid_input` を返すが台帳へ記録しない。non-read-only Tool と同じ扱いとする。実際に実行された Tool の成功・失敗結果は記録する
+- Tool の実行前に JSON 解析で拒否された要求は、LLM へ `invalid_input` を返す。実際に実行された Tool の成功・失敗結果だけを台帳に記録する
 
 #### ガード拒否後の停止
 
@@ -209,7 +209,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `command: string` 必須
   - `timeout: integer` 任意。秒
 - 挙動:
-  - workspace を cwd にして、コマンド文字列を加工せず `bash --noprofile --norc -c` に渡して実行する。ログインシェルやユーザー起動ファイルは使用しない
+  - workspace を cwd にして、コマンド文字列を加工せず `bash --noprofile --norc -c` に渡して実行する（起動ファイルを読み込まない素のシェル）
   - Linux では bubblewrap の中で起動し、`.env` と `<state_root>/runtime/` を方針メッセージに差し替える。隔離できない環境では隔離せずに実行する（[security.md §7](./security.md#7-bash-の隔離)）
   - 親プロセスの環境変数は引き継がず、`PATH` / `HOME` / `LANG` / `TERM` と skill の `required_env` の解決値のみを渡す。skill の値は同名の継承キーより優先される。`BASH_ENV` / `ENV` / `SHELLOPTS` / `BASHOPTS` は skill の宣言からも除外する
   - stdout / stderr はプロセス起動時に同一の一時ファイルへ割り当て、1 つのログに結合する。bash 自身の構文エラーもこのログに含まれる

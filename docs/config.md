@@ -37,7 +37,7 @@
 
 - **単一ファイル管理**: すべての設定を `~/.egopulse/egopulse.config.yaml` に集約する。環境変数による部分的オーバーライドは可能だが、ファイルが真実の情報源（Single Source of Truth）。
 - **OpenAI 互換前提**: すべてのプロバイダーは OpenAI 互換 API エンドポイントとして扱う。ベンダー固有 SDK は使わず、`base_url` の切り替えで対応する。
-- **DeepSeek thinking 履歴**: DeepSeek 系プロバイダー（`provider` または `model` に `deepseek` を含む、または `base_url` のホストが `deepseek.com` 配下の場合）は、assistant 応答の `reasoning_content` をセッション内に保持し、次回 Chat Completions 履歴へ戻す。他プロバイダーにはこの追加フィールドを送信しない。
+- **DeepSeek thinking 履歴**: DeepSeek 系プロバイダー（`provider` または `model` に `deepseek` を含む、または `base_url` のホストが `deepseek.com` 配下の場合）は、assistant 応答の `reasoning_content` をセッション内に保持し、次回 Chat Completions 履歴へ戻す（この追加フィールドの送信は DeepSeek 系プロバイダーに限る）。
 - **エージェント単位のモデル指定**: プロバイダー・モデルはエージェント定義（`agents.<id>`）に設定する。チャネル単位のモデル指定は廃止。
 - **エージェントファースト**: API キーなどの秘匿値は、YAML では SecretRef として保持し、実値は `~/.egopulse/.env` に保存する。外部 API レスポンスでは設定の有無と参照名のみ返却し、値そのものは返さない（§11.3）。
 
@@ -262,7 +262,7 @@ web_fetch:
 | `compaction.enabled` | `bool` | 任意 | `true` | 自動 compaction の有効化。`false` では閾値・context overflow・実測超過・出力打ち切りの自動圧縮と復旧をすべて停止する。手動 `/compact` は実行できる |
 | `compaction.reserve_tokens` | `usize` | 任意 | `16384` | context window のうち出力・tool schema・安全マージンとして確保する token 数。0 以上の整数。context window 以上でも設定エラーにせず、実行時に使用可能量 0 として扱う |
 | `compaction.keep_recent_tokens` | `usize` | 任意 | `20000` | 原文のまま保持する直近履歴の下限 token 数。0 以上の整数 |
-| `compaction.model_overrides` | `map` | 任意 | `{}` | `provider/model` の完全一致をキーに、`reserve_tokens` / `keep_recent_tokens` を個別に上書きする。各フィールドは上書き値 → 全体値 → 既定値の順で解決し、`enabled` は上書きしない |
+| `compaction.model_overrides` | `map` | 任意 | `{}` | `provider/model` の完全一致をキーに、`reserve_tokens` / `keep_recent_tokens` を個別に上書きする。各フィールドは上書き値 → 全体値 → 既定値の順で解決し、`enabled` は全体設定の値を使う |
 
 ### 3.2 プロバイダー定義（`providers.<id>`）
 
@@ -294,28 +294,21 @@ context window と最大出力トークンは、次の順で解決する。
 2. バイナリに同梱したモデルカタログ（`provider/model` の完全一致）
 3. 未知モデル向けの既定値（context window `128000`、最大出力 `16384`）
 
-カタログは起動・通常の Turn・オフライン実行で同じ値を使えるよう、生成済み JSON をコンパイル時に埋め込む。モデル情報の取得にネットワークを使わず、Turn の同期処理へ外部問い合わせを入れない。
-
-カタログは参照実装（MIT）が公開するプロバイダーデータから生成する。モデルごとの数値を本リポジトリで手作業管理しない。更新は次の 1 コマンドで行い、生成された `src/llm/model_catalog.json` をコミットする。
+カタログは生成済み JSON をコンパイル時に埋め込み、ネットワークなしで全経路（起動・Turn・オフライン実行）で同じ値を使える。元データは参照実装（MIT）が公開するプロバイダーデータで、次のコマンドで再生成して `src/llm/model_catalog.json` をコミットする。スクリプトの `SOURCE_VERSION` と生成物の `source` フィールドでデータの版を追跡する。
 
 ```bash
 npm install -g @earendil-works/pi-coding-agent@1.5.0
 node scripts/import-model-catalog.mjs
 ```
 
-スクリプトはインポート元の `@earendil-works/pi-ai` のバージョンを固定値（現在は `1.5.0`）と照合し、異なる場合は生成を中止する。生成物の `source` フィールドには `@earendil-works/pi-ai@1.5.0` が記録されるため、どのバージョンのデータから作られたかを追跡できる。更新時はスクリプトの `SOURCE_VERSION`、この手順のインストール例、生成物を一緒に更新する。
-
-スクリプトは各プロバイダーの JSON から Chat モデルの `contextWindow` / `maxTokens` だけを取り出し、`provider/model` の組で重複を排除する。転送先が動的に変わるルーティングモデルは、provider とモデル ID の組（`openrouter` + `auto` / `openrouter/auto`）で判定して除外し、未知モデルの既定値として扱う。元データに無いモデル（提供終了したモデルなど）も同じ既定値になる。実際の上限が既定値と異なる場合は、モデル設定で明示的に上書きする。
-
-プロバイダー ID の別名（`azure` / `openai-codex` / `zhipu` / `aliyun-bailian` など）は解決層で吸収する。モデル ID だけで別プロバイダーのモデルへ一致させることはしない。
-
-カタログに無いモデルは「未知モデルの既定値」であり、カタログ照合の失敗としてログ（provider 生成時の debug）と Web UI の表示（`default`）で区別できる。モデルごとの数値を列挙しなくても動作するが、実際の上限が既定値と異なる場合は明示設定で上書きする。
+- カタログは Chat モデルの `contextWindow` / `maxTokens` を `provider/model` 組で重複排除して取り込む。ルーティングモデル（`openrouter` + `auto` / `openrouter/auto`）と提供終了モデルは未知モデルの既定値として扱う
+- 実際の上限が既定値と異なるモデルは、モデル設定で明示的に上書きする
+- プロバイダー ID の別名（`azure` / `openai-codex` / `zhipu` / `aliyun-bailian` など）は解決層で吸収する（一致判定は同一プロバイダー内に限る）
+- カタログに無いモデルは既定値で動作し、debug ログと Web UI の表示（`default`）で区別できる
 
 `max_output_tokens` はプロバイダーへ送る出力上限として使う。Chat Completions は接続先が公式 OpenAI / Azure の場合は `max_completion_tokens`、それ以外の OpenAI 互換 API は `max_tokens` を送る。Responses API は `max_output_tokens` を送る。フィールドは設定上のプロバイダー ID ではなく接続先で決める。
 
-入力と出力の合計が context window を超えないよう、リクエスト直前の推定値で `window - 推定入力 - 安全余裕` まで切り下げる。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API ごとの最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合はリクエストを送らず、容量不足として Agent Loop の 1 回の compaction・再送対象にする。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。切り下げ後も、出力打ち切りの早期判定には設定した意図値を使う。
-
-`max_output_tokens` の解決値（明示設定またはカタログ）が API の最小出力を下回る場合は、送信前に設定不整合として失敗する（`LlmError::OutputLimitBelowApiMinimum`）。この状態は compaction では解消しないため、自動圧縮・再送の対象にはしない。設定値を API の最小出力以上へ引き上げる必要がある。
+リクエスト直前の切り下げ（`window - 推定入力 - 安全余裕`）、API ごとの最小出力、容量不足と設定不整合（`LlmError::OutputLimitBelowApiMinimum`）の扱いは [session-lifecycle.md §5](./session-lifecycle.md#5-context-compaction)。
 
 `headers` はリクエストヘッダをプロバイダー単位で付与する。値は文字列で、SecretRef は使用できない。
 
@@ -377,7 +370,7 @@ EgoPulse が設定を書き出すと、値なしヘッダは `null` として保
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 | `agents` | `list<string>` | `[]`（正規化後は `[default_agent]`） | チャンネルで使用するエージェント ID のリスト。空の場合はグローバル `default_agent` が設定される |
 | `multi_agent` | `bool` | `false` | `true` の場合複数エージェントで応答。`agents` に 2 つ以上指定が必要 |
-| `secret` | `bool` | `false` | `true` の場合、このチャネルの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャネルの内容に触れない。Web / TUI では未対応。内部的には `ConversationScope::Secret` にマッピングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照） |
+| `secret` | `bool` | `false` | `true` の場合、このチャネルの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャネルの内容に触れない。Web / TUI では未対応。内部的には `ConversationScope::Secret` にマッピングされる（[architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) 参照） |
 | `tool_progress` | `bool` | `false` | `true` の場合、5 秒以上かかるターンでツール実行状況を編集式の累積ログとして投稿する（[channels.md §ツール進捗表示](./channels.md#3-discord) 参照） |
 
 ### 3.5 Telegram チャネル（`channels.telegram`）
@@ -407,7 +400,7 @@ Telegram は Discord と同一の Multi-Agent 仕様をサポートする。
 | `require_mention` | `bool` | `false` | `true` の場合 @mention なしでは応答しない |
 | `agents` | `[string]` | `["default"]` | チャットにバインドするエージェント ID リスト |
 | `multi_agent` | `bool` | `false` | `true` の場合 Multi-Agent ルームとして動作。`@mention` で Bot に紐づくエージェントが応答し、非メンション時は Channel Log のみ記録 |
-| `secret` | `bool` | `false` | `true` の場合、このチャットの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャットの内容に触れない。Web / TUI では未対応。内部的には `ConversationScope::Secret` にマッピングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照） |
+| `secret` | `bool` | `false` | `true` の場合、このチャットの会話を `secret.db` に隔離して保存。Sleep Batch・PULSE はこのチャットの内容に触れない。Web / TUI では未対応。内部的には `ConversationScope::Secret` にマッピングされる（[architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) 参照） |
 | `tool_progress` | `bool` | `false` | `true` の場合、5 秒以上かかるターンでツール実行状況を編集式の累積ログとして投稿する（[channels.md §ツール進捗表示](./channels.md#4-telegram) 参照） |
 
 ### 3.6 Voice チャネル（`channels.voice`）
@@ -450,7 +443,7 @@ Sleep Batch（長期記憶のバッチ処理）で使用する LLM のプロバ�
 
 ### 3.8 Pulse 設定（`pulse`）
 
-Pulse（注意活性化）のスケジューラ設定。Pulse の有効 / 無効は agent 単位（`agents/{agent_id}/PULSE.yaml` の `enabled`、[pulse.md §3.1](./pulse.md#31-pulyaml)）でのみ制御され、グローバルスイッチは存在しない。Pulse は常設の runtime 機能であり、tick ループは常に回る。
+Pulse（注意活性化）のスケジューラ設定。Pulse の有効 / 無効は agent 単位（`agents/{agent_id}/PULSE.yaml` の `enabled`、[pulse.md §3.1](./pulse.md#31-pulyaml)）でのみ制御する。Pulse は常設の runtime 機能であり、tick ループは常に回る。
 
 | フィールド | 型 | 必須 | デフォルト | 説明 |
 |---|---|---|---|---|
@@ -655,7 +648,7 @@ SecretRef 解決は以下の 2 層で構成される。
 1. **Layer 1: YAML SecretRef 解決** — `{ source: env, id: X }` をプロセス環境変数 → `.env` ファイルの順で解決
 2. **Layer 2: プロセス環境変数オーバーライド** — `WEB_AUTH_TOKEN` 等が Layer 1 の結果を上書き（§6 参照）
 
-解決元は保持される。プロセス環境変数から解決した値は Egopulse の管理外として扱い、設定保存時に `.env` へコピーしない。`.env` から解決した値、および setup / WebUI が新たに保存する値だけを `.env` に書き込む。
+解決元は保持される。`.env` に書き込むのは `.env` 由来の値と setup / WebUI が新たに保存する値だけで、プロセス環境変数から解決した値は Egopulse の管理外として扱う。
 
 同じ `env` の `id` を複数の SecretRef が参照する場合、それらの解決値は一致していなければならない。異なる値のまま保存しようとすると `config_secret_conflict` で拒否する。WebUI から共有参照の API key を置換した場合は、その provider 専用の参照名へ切り替える。
 

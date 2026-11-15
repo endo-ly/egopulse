@@ -222,7 +222,7 @@ prefix を持たない値や Config に登録されていない値も、周囲�
 
 ## 5. Secret Mode 隔離戦略
 
-秘匿会話（`secret: true` のチャネル）を通常の会話経路から物理的に隔離する多層防御。各層で独立に秘匿内容を排除する。内部では `ConversationScope::Secret` としてスコープ全体に伝播し、コンテキスト構築から turn 終了まで一貫した境界を保証する（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照）。
+秘匿会話（`secret: true` のチャネル）を通常の会話経路から物理的に隔離する多層防御。各層で独立に秘匿内容を排除する。内部では `ConversationScope::Secret` としてスコープ全体に伝播し、コンテキスト構築から turn 終了まで一貫した境界を保証する（[architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) 参照）。
 
 ### 5.1 物理ファイル分離
 

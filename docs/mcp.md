@@ -99,7 +99,7 @@ REMOTE_MCP_AUTHORIZATION=Bearer <token>
 - `source: "exec"` は `command` の標準出力を値にする
 - `Bearer <token>` のような認証スキーム付きの値は、参照先の値に `Bearer ` を含めて保存する
 - 解決は接続のたびに行う。再接続時には `.env` の更新が反映される
-- 参照が解決できない server は接続せず、`failed` として扱う。リテラルへのフォールバックはしない
+- 参照が解決できない server は `failed` として扱い、リテラル値へフォールバックしない
 - 解決後の値はツール出力・ツール入力の記録から `[REDACTED:mcp.<server>.<headers|env>.<key>]` として伏せられる（[security.md](./security.md#値ベースリダクション)）
 
 平文のリテラルは動作するが、`mcp.json` を読むだけで秘密が見えるため、秘密は参照で指定する。

@@ -830,7 +830,7 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 
 ## 5. secret.db（秘匿会話用データベース）
 
-`ConversationScope::Secret` スコープの会話（YAML 設定で `secret: true` が設定されたチャネル）を `ConversationScope::Normal` 用の `egopulse.db` から物理的に隔離するための別データベース。スコープの概要は [architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) を参照。
+`ConversationScope::Secret` スコープの会話（YAML 設定で `secret: true` が設定されたチャネル）を `ConversationScope::Normal` 用の `egopulse.db` から物理的に隔離するための別データベース。スコープの概要は [architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) を参照。
 
 ### 5.1 概要
 

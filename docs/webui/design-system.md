@@ -275,7 +275,7 @@ Sleep run / Pulse run / Session 等のリスト項目で使う汎用カード。
 
 ## 11. アイコン戦略
 
-SVG をコンポーネントとして内製する。外部 icon library は導入しない。
+アイコンは 24×24 viewBox の SVG コンポーネントとして内製する（外部 icon library を導入しない）。
 
 - 各アイコンは 24×24 viewBox・`stroke="currentColor"`・`stroke-width="2"`・`stroke-linecap="round"` を基本とする
 - 必須アイコン種：hamburger・close・send・refresh・settings・sleep・pulse・metrics・command・agent・tool・copy・check・error・warning・lock・search

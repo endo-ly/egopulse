@@ -109,7 +109,7 @@ execute_scheduled_turn():
     └─ キューが空 → slot を削除
 ```
 
-**バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、ターンは実行されない。拒否は呼出元・構造化ログ・metric で観測可能で、silent drop しない。
+**バックプレッシャー**: `TurnScheduler` のキューは有限容量を持つ。セッション単位で 32 turn、Runtime 全体で 512 turn までキュー可能。超過時は `submit` が `Rejected(SessionQueueFull | GlobalQueueFull)` を返し、拒否は呼出元・構造化ログ・metric で観測される。
 
 - Webhook: 受付拒否は理由コード違いで一律 `429`（`session_queue_full` / `global_queue_full` / `tracker_full` / `chain_terminated` / `shutdown`）。Web の同一 `request_key` への異なる本文は `409 Conflict` で拒否する。`202` / `429` の契約詳細は [api.md §2.10](./api.md#210-webhook) と [channels.md §8](./channels.md#8-webhook-trigger)
 - Discord / Telegram: 即時応答可能なため、拒否時にユーザーへ busy 通知を送る。
@@ -129,13 +129,13 @@ execute_scheduled_turn():
 
 - 役割: chat の論理 ID と surface との対応付け
 - 主な列: `chat_id`, `channel`, `external_chat_id`, `chat_title`, `chat_type`, `last_message_time`, `agent_id`, `archived`, `pinned`
-- `chat_title` はユーザーが付ける表示名で、セッションの識別には使わない。識別は `chat_id`（canonical key `chat:{id}`）と `external_chat_id` が担い、表示名の変更で `session_key()` や `surface_thread` は変わらない。`resolve_or_create_chat_id` は表示名を書き換えず、表示名の更新は `update_chat_display_meta` に集約する
+- `chat_title` はユーザーが付ける表示名。識別は `chat_id`（canonical key `chat:{id}`）と `external_chat_id` が担い、表示名の変更で `session_key()` や `surface_thread` は変わらない。表示名の更新は `update_chat_display_meta` に集約する
 
 ### `messages`
 
 - 役割: 表示用・一覧用の message レコード
 - 主な列: `id`, `chat_id`, `sender_id`, `sender_kind`, `content`, `timestamp`, `message_kind`, `recipient_agent_id`, `seq`, `turn_id`
-- `/new` や compaction では削除されない。`/new` は `sessions.messages_json` を空の `ContextSnapshot` エンベロープ（`messages: []`）へ置き換える
+- `/new` や compaction でも messages レコードは保持する。`/new` は `sessions.messages_json` を空の `ContextSnapshot` エンベロープ（`messages: []`）へ置き換えるだけ
 
 `seq IS NOT NULL` の committed conversation history は append-only かつ immutable であり、履歴、セッション一覧の preview、session fallback、Channel Log projection、Sleep の message source に含まれる。`seq IS NULL` は durable に受理済みだが、まだ因果履歴へ commit されていない staged message である。staged row は commit 時に `seq` が付与され、terminal Turn への promotion 時には削除される場合がある。
 
@@ -143,7 +143,7 @@ Tool 実行中の human follow-up は staged message として保存され、`tu
 
 ### セッションの整理状態
 
-`archived` と `pinned` は一覧の見え方を制御するメタデータで、会話の内容には影響しない。
+`archived` と `pinned` は一覧の見え方だけを制御するメタデータ。
 
 - `pinned = 1` のセッションは一覧の先頭に固定される（`pinned` 降順 → `last_message_time` 降順 → `chat_id` 降順）
 - `archived = 1` のセッションはアーカイブ扱いになる。履歴・記憶・Turn は保持され、開いて送信することもできる
@@ -161,7 +161,7 @@ Tool 実行中の human follow-up は staged message として保存され、`tu
 - `checkpoint`: 畳んだ履歴の要約とファイル一覧。`null` なら未圧縮
 - `last_usage`: 直近の実測 usage と、それがどのメッセージまでを覆うかのアンカー
 
-`messages_json` には checkpoint をメッセージとして重複保存しない。checkpoint はリクエスト構築時に参照用メッセージへ投影する。`/new` も同じエンベロープで空の snapshot を保存し、次の Turn はそのまま復元できる。
+checkpoint はリクエスト構築時に参照用メッセージへ投影する。`/new` も同じエンベロープで空の snapshot を保存し、次の Turn はそのまま復元できる。
 
 ### `tool_calls`
 
@@ -180,7 +180,7 @@ turn 開始時は次の順で session を復元する。
 4. image は `input_image_ref` から asset store 経由で hydrate する
 5. assistant tool call に対応する tool output が欠けている場合は synthetic error tool output を補う（補った場合は usage anchor を破棄する）
 6. snapshot が無い（`messages_json = None`）場合だけ `messages` テーブルから recent history を組み立てる
-7. snapshot が存在するのに解析できない場合は、データ欠落を隠さず明示的な保存データエラーとして扱う
+7. snapshot が存在するのに解析できない場合は、明示的な保存データエラーとして扱う
 
 ### 原則
 
@@ -238,7 +238,7 @@ AgentLoop は final response と最新の session snapshot を `AgentLoopResult`
 
 ### 待ち時間の上限
 
-1 回の model iteration は全体で 300 秒、1 リクエストは 90 秒の無応答で打ち切る。1 回目の試行は全量を使えるため、正常に進行する長い生成は許容し、リトライは残り時間しか使えない。無応答の期限は read のたびにリセットされるので、進行中の生成を落とさず、接続後に何も返らない状態だけを早く検出できる。
+1 回の model iteration は全体で 300 秒、1 リクエストは 90 秒の無応答で打ち切る。1 回目の試行は全量を使えるため、正常に進行する長い生成は許容し、リトライは残り時間しか使えない。無応答の期限は read のたびにリセットし、生成の進行は維持しつつ接続直後の無応答だけを早く検出する。
 
 この無応答期限は HTTP client 共通で、Turn 以外の LLM 呼び出しにも適用される。本文が終端でしか届かない非ストリーム要求では、無応答期限がそのまま生成時間の上限になる。そのためナレーション先を持たない呼び出し（sleep batch、compaction、単発の ask）も本文をストリームで受け取って組み立て、無応答期限が上流の停止だけを検出するようにする。
 
@@ -302,21 +302,21 @@ commit 後に `UserInputInjected` event を発行するため、ライブ表示�
 should_compact = enabled && context_tokens > context_window - reserve_tokens
 ```
 
-- `context_window` は、明示された `context_window_tokens` → 同梱モデルカタログの `contextWindow` → 未知モデルの既定値 `128000` の順で解決する。カタログは参照実装が公開するプロバイダーデータから生成し、全モデル共通の値をユーザーが設定しないと動かない設計にはしない
+- `context_window` は、明示された `context_window_tokens` → 同梱モデルカタログの `contextWindow` → 未知モデルの既定値 `128000` の順で解決する。カタログは参照実装（MIT）が公開するプロバイダーデータから生成し、カタログが無い環境でも既定値で動作する
 - `reserve_tokens` / `keep_recent_tokens` は、対象モデルの `compaction.model_overrides["provider/model"]` → 全体値 → 既定値の順で解決する。`enabled` は全体設定のみ
 - `context_tokens` は推定値。直近の正常な model 応答の実測 usage（input + output）に、計測時からの request overhead の差分と、その後に追加されたメッセージの推定値を足す
 - 実測 usage が無い、または request shape（system prompt / tool 定義 / model）が計測時と変わった場合はリクエスト全体を推定する
 - 判定に使う request-only メッセージは、実際に送るリクエストと同じものを使う
-- `reserve_tokens` は 0 を含む非負整数を受け付ける。`context_window <= reserve_tokens` でも設定エラーにしない。その場合 `context_window - reserve_tokens` は 0 として扱う
-- Provider が正常終了しても、報告された `input_tokens` が `context_window` を超えていれば、閾値判定を待たずに圧縮する。最終応答なら応答を確定した直後、Tool 呼び出しなら次の model 呼び出しの直前に行い、その応答を作り直すことはしない。圧縮に失敗しても応答は破棄しない
+- `reserve_tokens` は 0 を含む非負整数を受け付ける。`context_window <= reserve_tokens` の場合は `context_window - reserve_tokens` を 0 として扱う
+- Provider が正常終了しても、報告された `input_tokens` が `context_window` を超えていれば、閾値判定を待たずに圧縮する。最終応答なら応答を確定した直後、Tool 呼び出しなら次の model 呼び出しの直前に行い、確定済みの応答をそのまま使う。圧縮に失敗しても応答を保持する
 
 ### Token 推定
 
-外部 tokenizer は使わない。メッセージ 1 件の文字数（content / reasoning / tool call 名・引数。画像は 1 枚 4,800 文字相当）を `CHARS_PER_TOKEN_ESTIMATE = 4` で割り、切り上げる。role 名は数えない。文字数は UTF-16 コード単位で数える（絵文字などの補助平面文字を 1 文字として扱う）。
+トークンは文字数から推定する。メッセージ 1 件の文字数（content / reasoning / tool call 名・引数。画像は 1 枚 4,800 文字相当）を `CHARS_PER_TOKEN_ESTIMATE = 4` で割り、切り上げる。role 名は数えず、文字数は UTF-16 コード単位で数える（絵文字などの補助平面文字を 1 文字として扱う）。
 
 system prompt と tool 定義はメッセージの外側にあるため `estimate_request_overhead` で同じ係数を使って加算する。要約リクエストの推定も同じ係数を使う。
 
-Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。Codex Backend は `max_output_tokens` に対応しないため送信しない。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。OpenRouter の最小値は接続先 URL またはプロバイダー ID で判定し、他の OpenAI 互換 API には適用しない。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足ではなく設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として扱い、compaction・再送しない。
+Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕` の範囲に収める。Codex Backend では `max_output_tokens` を省略する。安全余裕は最大 4,096 トークンで、残量の半分を上限にする。API の最小出力（Chat Completions は 1、OpenRouter は 16、Responses API は 16）を確保できない場合は `LlmError::OutputCapacityExceeded` を返し、リクエストを送らない。OpenRouter の最小値判定は接続先 URL またはプロバイダー ID に限る。設定した `max_output_tokens` 自体が API の最小出力を下回る場合は、容量不足として compaction・再送の対象にせず、設定不整合（`LlmError::OutputLimitBelowApiMinimum`）として即座に失敗にする。
 
 補正は `(provider, model, request_kind, has_tools)` 単位で、provider が返す実測 `input_tokens` との比を EMA（α = 0.3、0.5〜3.0 に clamp）で学習する。実測が返らない間は `DEFAULT_FACTOR = 1.3`。観測は `llm_usage_logs` に `estimated_tokens` として残し、再起動時に最近の観測から再構築する。
 
@@ -326,7 +326,7 @@ Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕`
 
 新しい側から 1 件ずつ推定 token を積み上げ、`keep_recent_tokens`（既定 20000）に達した位置を境界候補にする。
 
-1. 境界は `user` または `assistant` のメッセージに限る。`tool` 結果を先頭とする分割は禁止する
+1. 境界は `user` または `assistant` のメッセージに限る
 2. 積み上げが境界に達したら、その位置以降で最初の候補を境界にする
 3. 末尾の tool 結果だけで予算を超える場合は、手前の assistant tool call を境界にする（先頭へは戻さない）
 4. 履歴全体が予算内なら境界は先頭になり、要約対象が無いので No-op
@@ -341,9 +341,9 @@ Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕`
 | ターン前半 | split turn のとき、そのターン開始 `user` から境界までのメッセージ |
 | 保持 | 境界以降のメッセージ。tool call / tool result は対応を保ったまま原文で残す |
 
-- 履歴は初回なら新規要約、前回 checkpoint があれば `<previous-summary>` として別入力に渡し更新する。前回要約を会話の 1 件目として再利用しない
-- split turn では履歴要約とターン前半要約を別リクエストで生成し、`\n\n---\n\n**Turn Context (split turn):**\n\n` で連結する。片方でも失敗したら何も commit しない
-- 要約入力は role ごとにタグ付けしたプレーンテキスト（`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` / `[Tool result]:` / `[Tool error]:`）。reasoning は含めない
+- 履歴は初回なら新規要約、前回 checkpoint があれば `<previous-summary>` として別入力に渡し更新する
+- split turn では履歴要約とターン前半要約を別リクエストで生成し、`\n\n---\n\n**Turn Context (split turn):**\n\n` で連結する。両方が成功したときだけ commit する
+- 要約入力は role ごとにタグ付けしたプレーンテキスト（`[User]:` / `[Assistant]:` / `[Assistant tool calls]:` / `[Tool result]:` / `[Tool error]:`）。reasoning は対象外
 - Tool Result は各件の先頭 2,000 文字と省略文字数を要約対象にする
 - 要約対象が入力上限を超える場合はメッセージ境界で古い部分から分割する。単一メッセージが収まらない場合は役割と継続を明示して分割し、各段階の要約を次の入力に引き継ぐ。全範囲の要約に成功した場合だけ checkpoint を作成する
 - 要約リクエストを組み立てる前に、会話・前回 checkpoint・追加指示を Config 由来の秘密値と既知パターンでサニタイズする。LLM が生成した要約の保存前サニタイズとは別に、送信入力そのものを保護する
@@ -373,13 +373,13 @@ Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕`
 | 更新 | `UPDATE_SUMMARY_PROMPT` |
 | ターン前半 | `TURN_PREFIX_SUMMARY_PROMPT` |
 
-要約本文は `## 会話の経緯` / `## 共有された情報` / `## 重要な参照情報` の 3 節。該当が無い節は省略し、空の箇条書きを作らない。会話の使用言語を引き継ぐ。
+要約本文は `## 会話の経緯` / `## 共有された情報` / `## 重要な参照情報` の 3 節で、内容が無い節は省略する。会話の使用言語を引き継ぐ。
 
 `/compact` の追加指示は各プロンプトの末尾へ `Additional focus: ...` として付与する。
 
 ### Tool ファイル操作の追跡
 
-要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。`write` と `edit` は、Tool Result がエラーでも書き込み途中でファイルが変わった可能性があるため modified にする。実行前に拒否された呼び出し（`invalid_arguments` あり）はファイルへ触れていないため除外する。`read` は成功した Tool Result があるものだけを read-only にする。modified に含まれるファイルは read-only に重複計上しない。前回 checkpoint の一覧を引き継ぎ、リクエスト時に要約末尾へ `<read-files>` / `<modified-files>` として付ける。該当が無ければ何も付けない。
+要約対象の `read` / `write` / `edit` tool call から `path` 引数を集める。各ファイルは modified と read-only のどちらか一方に分類する。`write` と `edit` は、Tool Result がエラーでも書き込み途中でファイルが変わった可能性があるため modified にする。実行前に拒否された呼び出し（`invalid_arguments` あり）は対象外とする。`read` は成功した Tool Result があるものだけを read-only にする。前回 checkpoint の一覧を引き継ぎ、リクエスト時に要約末尾へ `<read-files>` / `<modified-files>` を付け、該当が無いタグは省略する。
 
 ### Checkpoint と保持メッセージ
 
@@ -389,8 +389,8 @@ Codex Backend を除き、出力上限は `window - 推定入力 - 安全余裕`
 - snapshot が同時更新されていた場合は上書きせず、Turn を競合として終了する。Tool を再実行する自動リトライは行わない
 - 次のリクエストでは checkpoint を参照用の 1 メッセージへ投影し、その後ろに保持メッセージを連結する
 - 投影メッセージの先頭には `[CONTEXT CHECKPOINT — REFERENCE ONLY]` ヘッダーを付け、過去の指示を現在の指示へ昇格させない
-- 保持メッセージの結合・並べ替え・末尾 assistant の削除は行わない
-- 要約の長さ調整は行わない。長さはプロンプトで誘導し、事後の切り詰めをしない
+- 保持メッセージは原文のまま連結する（結合・並べ替え・末尾 assistant の削除は行わない）
+- 要約の長さはプロンプトで誘導し、生成された要約をそのまま checkpoint とする
 
 ### 使用量アンカー
 
@@ -404,11 +404,11 @@ projected = measured + calibrated(trailing + current_overhead - measured_overhea
 
 `current_overhead - measured_overhead` は負になり得るため、符号付きで計算し、最終値だけ 0 で clamp する。channel context や retry 修正が計測後に増減しても、その差分が判定へ反映される。
 
-空応答の再試行で runtime guard を足して再送した場合、usage はその再送リクエストのものになる。`ModelRunner` は実際に送った追加メッセージを呼び出し元へ返し、その分を `request_overhead_tokens` に含める。対応が取れない usage はアンカーとして採用しない。
+空応答の再試行で runtime guard を足して再送した場合、usage はその再送リクエストのものになる。`ModelRunner` は実際に送った追加メッセージを呼び出し元へ返し、その分を `request_overhead_tokens` に含める。対応が取れない usage は無視する。
 
-provider が返した usage の `input_tokens` と `output_tokens` がどちらも 0 の場合は、計測値として採用しない。既存の有効なアンカーがあれば維持し、保存済み snapshot に全ゼロのアンカーが残っている場合も投影時に無効として扱い、リクエスト全体の推定へ戻す。
+provider が返した usage の `input_tokens` と `output_tokens` がどちらも 0 の場合は計測値から除外する。既存の有効なアンカーを維持し、保存済み snapshot に全ゼロのアンカーが残っていても投影時に無効として扱い、リクエスト全体の推定へ戻す。
 
-`request_shape_hash` は system prompt / tool 定義 / model だけを対象にし、channel context などの一時メッセージは含めない。これらの増減は `request_overhead_tokens` の差で扱うため、hash に含めると毎回アンカーが無効になる。
+`request_shape_hash` の対象は system prompt / tool 定義 / model。channel context などの一時メッセージは含めず、その増減は `request_overhead_tokens` の差で扱う。
 
 次の場合に破棄し、全体推定へ戻す。
 
@@ -425,7 +425,7 @@ provider が返した usage の `input_tokens` と `output_tokens` がどちら�
 
 | 障害パターン | 動作 |
 |---|---|
-| 要約対象なし | No-op。checkpoint と保持メッセージを変更しない |
+| 要約対象なし | No-op。現在の checkpoint と保持メッセージを維持する |
 | 要約リクエスト失敗（retry 枯渇を含む） | 呼び出し元へエラーを返す。自動 compaction は warn を残して元の context のまま続行し、`/compact` は失敗を応答する |
 | 要約が空 | 同上（`LlmError::InvalidResponse`） |
 | 要約が tool call を返した | 同上（`LlmError::InvalidResponse`） |
@@ -437,15 +437,15 @@ provider が返した usage の `input_tokens` と `output_tokens` がどちら�
 
 ### Context Overflow と容量不足からの復旧
 
-Provider の 400 を一律に context 超過とはみなさない。Provider 境界（`src/llm/api_error.rs`）で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。rate limit・throttling・`too many requests` は、token に言及していても除外する。Agent Loop はこの variant だけを復旧対象にし、provider 固有の文言を知らない。
+Provider の 400 は、Provider 境界で status・構造化された `code` / `type`・本文を突き合わせ、context 上限を示す場合（`context_length_exceeded`、`maximum context length`、`prompt is too long` 等）だけ `LlmError::ContextOverflow` へ分類する。Agent Loop はこの variant だけを復旧対象にする。
 
 1. 出力を公開していない場合に限り、`CompactionReason::Overflow` で圧縮する
 2. 圧縮できたら checkpoint を CAS で保存し、`turn_runs.model_request_hash` を新しいリクエストの hash へ更新して、同じ model iteration を 1 回だけ再送する（Turn は開始し直さない）
-3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（無限に繰り返さない）
+3. 圧縮が No-op または失敗、あるいは再送も overflow なら、エラーをそのまま返す（1 回限りの復旧）
 
 送信前の容量不足（`LlmError::OutputCapacityExceeded`）も同じ 1 回の復旧対象にする。推定入力が窓を埋めているため、API の最小出力を確保できないリクエストは送らず、compaction 後の再送で解消を試みる。解消できなければ容量不足として終了する。
 
-HTTP 413 は本文が空、`Payload Too Large` の HTML、JSON でないプロキシ応答でも context 超過として扱う。400 / 422 は構造化 `code` / `type` か明確な context 超過表現がある場合だけ分類し、任意の 400 を context 超過にしない。429 と rate limit / throttling は token に言及していても除外する。
+HTTP 413 は本文が空、`Payload Too Large` の HTML、JSON でないプロキシ応答でも context 超過として扱う。400 / 422 は構造化 `code` / `type` か明確な context 超過表現がある場合だけ分類する。
 
 ### 出力打ち切り（`length`）からの復旧
 
@@ -455,7 +455,7 @@ Provider の出力上限で生成が終わった場合、`finish_reason=length` 
 
 1. `compaction.enabled = true` かつ復旧未実施で、実測 `output_tokens < max_output_tokens` なら、`CompactionReason::Overflow` で圧縮し、checkpoint を CAS で保存してから同じ model iteration を 1 回だけ再送する
 2. 意図した上限まで生成し切った `length`、usage が無い場合、`enabled = false`、2 回目の打ち切りでは再送しない
-3. 要約に失敗した場合も含め、復旧しない場合は生成済みの通常テキストは破棄せず final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
+3. 要約に失敗した場合も含め、復旧しない場合は生成済みの通常テキストを final message として保存し、`finish_reason = max_output_tokens` を残して正常完了と区別する。本文が 1 文字も無い場合は復旧不能としてエラーを返す
 4. `finish_reason` は Session snapshot と `messages` テーブルの両方に保存する。`GET /api/history`、SSE / WebSocket の最終応答、TUI の完了通知、Discord / Telegram の配送本文は同じ値を使い、再受付・再接続・再読み込みでも打ち切り状態が失われない。テキストのみのチャネルには回答の後ろに注意文を付ける
 5. Tool Call を含む打ち切りは、未完成の呼び出しを実行しない。復旧する場合は圧縮後のリクエストを送り直し、Tool の副作用は発生させない。復旧しない場合は、既存の Tool 結果経路で各呼び出しを失敗結果として保存し、Tool Call と結果の対応を保ったまま次の model step へ渡す。同じターンで 2 回目の打ち切り Tool Call が発生した場合は失敗結果を追加せず、本文があれば final として保存する
 6. 復旧して再送する場合は、途中出力を公開済みのときだけ `AssistantMessageDiscarded` を 1 回通知する。復旧せず部分応答を保持する場合は破棄通知を送らない
@@ -495,7 +495,7 @@ Sleep Batch も session クリア前に compaction モジュールの共有関�
 
 ## 8. Conversation Scope による DB Routing
 
-`SurfaceContext.scope`（`ConversationScope::Normal` | `ConversationScope::Secret`）が turn 全体のストレージ境界を決定する。スコープはコンテキスト構築時にチャネル設定の `secret: true` から `ConversationScope::Secret` へとマッピングされ、turn 中の全永続化操作が同じスコープの DB にルーティングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照）。
+`SurfaceContext.scope`（`ConversationScope::Normal` | `ConversationScope::Secret`）が turn 全体のストレージ境界を決定する。スコープはコンテキスト構築時にチャネル設定の `secret: true` から `ConversationScope::Secret` へとマッピングされ、turn 中の全永続化操作が同じスコープの DB にルーティングされる（[architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) 参照）。
 
 | 操作 | ルーティング |
 |---|---|
@@ -509,7 +509,7 @@ Sleep Batch も session クリア前に compaction モジュールの共有関�
 
 ### tool_call 永続化のルーティング
 
-`ConversationScope::Secret` では、Tool 実行台帳（claim・input hash・状態遷移・結果保存）も `secret.db` 側の `tool_calls` へ書かれる。Secret Tool の入出力が通常 DB へ漏れないよう、Tool 実行開始時の claim と結果保存の両方が `state.db_for(ctx.scope)` 経由で Secret DB にルーティングされる（[architecture.md §7.1](./architecture.md#71-conversationscopeストレージ境界) 参照）。tool call block は `sessions.messages_json` に包含されており、LLM context 復元には影響しない。
+`ConversationScope::Secret` では、Tool 実行台帳（claim・input hash・状態遷移・結果保存）も `secret.db` 側の `tool_calls` へ書かれる。Secret Tool の入出力が通常 DB へ漏れないよう、Tool 実行開始時の claim と結果保存の両方が `state.db_for(ctx.scope)` 経由で Secret DB にルーティングされる（[architecture.md §6.1](./architecture.md#61-conversationscopeストレージ境界) 参照）。tool call block は `sessions.messages_json` に包含されており、LLM context 復元には影響しない。
 
 ### Compaction Archive の出力先分離
 
