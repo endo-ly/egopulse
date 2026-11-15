@@ -4,7 +4,7 @@ WebUI を Android / iOS のホーム画面からアプリのように使うた�
 
 ## 1. 構成
 
-Service Worker は使わない（オフライン動作が不要なため）。ランタイムへの常時接続（SSE / WebSocket）が前提のアプリであり、PWA に必要なのは manifest とアイコンのみ。
+Service Worker は使わない。ランタイムへの常時接続（WebSocket）が前提のため、PWA に必要なのは manifest とアイコンのみ。
 
 | ファイル | 役割 |
 |---|---|
@@ -41,4 +41,4 @@ npm run dev:mock:https -- --host 0.0.0.0 --port 5173
 
 - standalone 表示ではアドレスバー・ブラウザ UI が消え、ステータスバーは `theme_color` に寄せる
 - スプラッシュは `background_color` + アイコンから自動生成される
-- オフライン時は接続できないため、そのままエラーになる（Service Worker によるキャッシュは意図的に提供しない）
+- オフライン時は接続できないため、そのままエラーになる

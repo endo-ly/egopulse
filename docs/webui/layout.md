@@ -29,14 +29,13 @@ Desktop は Sidebar と Main の2領域、Mobile は Top Bar と Main に Sideba
 ### 2.2 Nav
 
 - agent 画面（Chat / Agent / Schedule）を1行のミニタブバーに並べる。各セルはアイコン + 小ラベル
-- 現在位置は `aria-current="page"` と背景チントで示す
+- 現在位置は `aria-current="page"` と背景色で示す
 
 ### 2.3 Agents
 
-- 設定済みの全 agent を並べる（`/api/agents`）。選択中 agent は背景チントで強調し、`default` タグを添える
+- 設定済みの全 agent を並べる（`/api/agents`）。選択中 agent は背景色で強調し、`default` タグを添える
 - agent アイコン：ユーザーが画像をアップロード・トリミングして設定できる（[api.md §2.11](../api.md#211-agent-avatar)）。Chat の assistant アバターにも使う
 - StatusDot は未読の返事を持つセッションがある agent を示す。未読判定はフロントのみで行い、既読時刻は localStorage に保存する
-- グローバル画面表示中に agent を選ぶと、その agent の Agent 画面へ遷移する
 
 ### 2.4 Footer
 
@@ -45,15 +44,15 @@ Desktop は Sidebar と Main の2領域、Mobile は Top Bar と Main に Sideba
 
 ### 2.5 Context Section
 
-Agents と Footer の間の領域。表示中の画面に応じて内容を切り替える。
+Agents と Footer の間の領域。表示中の画面に応じて内容を切り替える。各行は SESSIONS と同じ「アイコン + 名前 + 1 行の要約」で、要約はそのセクションの実効値を示し、クリックでそのセクションへ移動する。
 
-| 画面 | 内容 |
+| 画面 | SECTIONS |
 |---|---|
 | Chat | SESSIONS（§2.6） |
-| Agent | SECTIONS（Overview / Soul / Rules / Secret / Memory / Skills）。SESSIONS と同じ「アイコン + 名前 + 1 行の要約」の行で並べる |
-| Schedule | SECTIONS（Activity / Pulse / Sleep）。各行は名前と 1 行の要約（[schedule.md §1](./schedule.md#1-構成)） |
-| Metrics | SECTIONS（Health / Usage / Reliability / Agents）。各行は名前と 1 行の要約で、クリックでそのセクションへスクロールする |
-| Config | SECTIONS（General〜MCP と YAML file）。各行は名前と 1 行の要約。クリックで1ページ内のそのセクションへスクロールし、スクロール位置に追従して強調する（[config.md §1](./config.md#1-構成)） |
+| Agent | Overview / Soul / Rules / Secret / Memory / Skills |
+| Schedule | Activity / Pulse / Sleep |
+| Metrics | Health / Usage / Reliability / Agents |
+| Config | General〜MCP と YAML file |
 
 ### 2.6 SESSIONS
 
@@ -62,7 +61,7 @@ Agents と Footer の間の領域。表示中の画面に応じて内容を切�
 - 行末の `⋯` / 右クリックで Rename / Pin / Archive / Copy session ID
 - ヘッダーに channel フィルタ（`All` / `Web` / `Discord` / `Telegram` / `CLI` / `TUI` / `Voice`）と New Session（`+`）
 - New Session は名前（任意）を入力して draft セッションを作り Chat へ遷移する。chat レコードは初回送信時に作成され、名前もその ACK で保存する
-- 一覧は WS の `session_updated` で再取得し、60 秒ポーリングをフォールバックとする
+- リアルタイム更新（`session_updated` 受信時の再取得と 60 秒ポーリングのフォールバック）は [chat.md §7.2](./chat.md#72-リアルタイム更新) に従う
 
 ### 2.7 Collapse
 
@@ -81,7 +80,7 @@ Mobile（< 640px）のみ表示する高さ 44px のバー。
 | StatusDot | 接続状態 |
 | 検索 | Command Palette を開く |
 
-画面切替は Sidebar overlay の Nav / Footer で行う。Sidebar は左右スワイプでも開閉できる（水平移動が垂直移動を上回る場合のみ判定）。
+画面切替は Sidebar overlay の Nav / Footer で行う。
 
 ---
 
@@ -107,14 +106,14 @@ Mobile（< 640px）のみ表示する高さ 44px のバー。
 | `md` | 640–1023px | 常時表示 | 1ペイン。同上 |
 | `lg` | ≥ 1024px | 常時表示（collapse 可） | 一覧 + 詳細の2ペイン |
 
-- Mobile の overlay は backdrop / 項目選択 / ESC / route 変更 / 左スワイプで閉じる。開閉状態は URL に乗せない
+- Mobile の overlay は左右スワイプでも開閉できる（水平移動が垂直移動を上回る場合のみ判定）。閉じるのは backdrop / 項目選択 / ESC / route 変更。開閉状態は URL に乗せない
 - diff の既定表示は `lg` で split、それ以下で unified
 
 ---
 
 ## 6. フォーカス・ロード・エラー
 
-- 起動時は既定 agent の Chat を表示する。認証未設定なら AuthModal を最優先で表示する
+- 認証未設定なら起動時に AuthModal を最優先で表示する（初期表示は §4 の `/`）
 - 画面切替時はその画面の最初のインタラクティブ要素へフォーカスする。Modal / Palette は focus trap を持ち、閉じたら呼び出し元へ戻す
 - データロードは、初回は領域中央の spinner、再取得は既存内容を残して小 spinner、失敗は EmptyState + Retry、空は EmptyState で次アクションを示す
 

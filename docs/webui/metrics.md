@@ -35,13 +35,11 @@ AGENTS
 
 - 期間（`24h` / `7d` / `30d`、既定 `7d`）と agent フィルタは Usage と Reliability に効く。Health は現在値、Agents は比較のため常に全 agent を表示し、フィルタ中の agent を強調する
 - 期間と agent は URL の query（`/metrics?range=30d&agent=lyre`）で保持する。既定値は省略する
-- Sidebar の文脈領域には 4 セクションを並べ、各行の 2 行目に要約（`All normal` / `2 issues`、`142M tokens in 7d`、`3 failures`、`5 agents`）を出す。クリックでそのセクションへスクロールする
+- Sidebar の文脈領域には 4 セクションを並べ、各行の 2 行目に要約（`All normal` / `2 issues`、`142M tokens in 7d`、`3 failures`、`5 agents`）を出す
 
 ## 2. セクション
 
 ### 2.1 Health
-
-`GET /api/status` を可視時 10 秒間隔でポーリングする。
 
 - 判定行：問題がなければ `All systems normal`、あれば件数と一覧。問題の定義は下表
 - 判定行の右に Version / Uptime / Running turns
@@ -56,11 +54,16 @@ AGENTS
 
 | 要素 | 内容 |
 |---|---|
-| KPI | Tokens（前期間比）/ LLM calls / Cache hit（cached tokens を報告した呼び出しの入力に対する割合。報告がなければ `—`）/ Per call（Sleep を除く呼び出しあたりの平均入力。`by_model` の input_tokens ÷ `llm_calls`） |
-| 推移 | `24h` は UTC の時単位、それ以外は `Config.timezone` のローカル日単位の積み上げ棒。ラベルは `Config.timezone` で表示する。DST のフォールバックで同じローカル時刻が2回現れても別バケットになる。`By agent` と `By use` を切り替える。hover で内訳を表示 |
+| KPI | Tokens（前期間比）/ LLM calls / Cache hit / Per call |
+| 推移 | `24h` は UTC の時単位、それ以外は `Config.timezone` のローカル日単位の積み上げ棒（バケットの詳細は [api.md §2.14](../api.md#214-metrics)）。ラベルは `Config.timezone` で表示する。`By agent` と `By use` を切り替える。hover で内訳を表示 |
 | By use | Conversation（`agent_loop`）/ Pulse / Sleep / Compaction の割合 |
 | By model | provider・model ごとの calls / tokens / cache hit |
 | Pulse intentions | intention ごとの runs / run あたりトークン / 合計 / Pulse 全体に占める割合。どの run にも入らない Pulse 利用は `Unattributed` |
+
+KPI の定義：
+
+- Cache hit：cached tokens を報告した呼び出しの入力に対する割合。報告がなければ `—`
+- Per call：Sleep を除く呼び出しあたりの平均入力（`by_model` の input_tokens ÷ `llm_calls`）
 
 色は agent が Sidebar の並び順、用途が固定順に割り当てる（フィルタで系列が減っても色は変わらない）。9 番目以降の agent は `Other` 色になる。
 
@@ -68,10 +71,15 @@ AGENTS
 
 | 要素 | 内容 |
 |---|---|
-| KPI | Turns（前期間比）/ Turn failures（`failed` + `uncertain` の割合）/ Turn duration（完了 turn の中央値と 95 パーセンタイル）/ Tool failures / Pulse and Sleep の失敗数 |
+| KPI | Turns（前期間比）/ Turn failures / Turn duration / Tool failures / Pulse and Sleep の失敗数 |
 | Failure kinds | turn の `error_kind` 別、tool の `error_kind` 別の件数 |
 | Tools with failures | 失敗のある tool を失敗数の多い順に最大 10 件 |
 | Recent failures | 失敗 turn・失敗 Pulse run・失敗 / 部分失敗 Sleep run を新しい順に最大 20 件。turn は Chat のセッション、run は Schedule の run 詳細を開く |
+
+KPI の定義：
+
+- Turn failures：`failed` + `uncertain` の割合
+- Turn duration：完了 turn の中央値と 95 パーセンタイル
 
 ### 2.4 Agents
 
@@ -90,21 +98,14 @@ AGENTS
 
 | セクション | API | ポーリング |
 |---|---|---|
-| Health | `GET /api/status` | 10 秒 |
-| Usage / Reliability / Agents | `GET /api/metrics?range=&agent=` | 60 秒 |
+| Health | `GET /api/status` | 可視時 10 秒 |
+| Usage / Reliability / Agents | `GET /api/metrics?range=&agent=` | 可視時 60 秒 |
 
-集計は既存テーブルを読むだけで行う（[api.md §2.14](../api.md#214-metrics)）。
+集計の詳細は [api.md §2.14](../api.md#214-metrics)。UI が前提とする点のみ記す。
 
-| 値 | ソース |
-|---|---|
-| LLM 利用量 | `llm_usage_logs`（`chats.agent_id` で agent に帰属） |
-| Sleep のトークン | `sleep_runs`（Sleep は `llm_usage_logs` に記録しない） |
-| Pulse intention 別トークン | `llm_usage_logs(request_kind = 'pulse')` を、同じ agent の `pulse_runs` のうち `[started_at, finished_at]` に入る run へ帰属。Pulse は agent を逐次スキャンするため run の時間窓は重ならない |
-| Turn | `turn_runs` |
-| Tool | `tool_calls`（`succeeded` / `failed` / `uncertain`） |
-| 失敗一覧 | `turn_runs` / `pulse_runs` / `sleep_runs` |
-
-Secret スコープ（`secret.db`）は集計しない。WebUI は Secret 会話を表出しない。
+- Sleep のトークンは `sleep_runs` から取る（Sleep は `llm_usage_logs` に記録されない）。§2.2 の Per call が Sleep を除くのはこのため
+- Pulse intention 別トークンの帰属は、同じ agent の `pulse_runs` の時間窓 `[started_at, finished_at]` が重ならないことを前提とする（Pulse は agent を逐次スキャンする）
+- Secret スコープ（`secret.db`）は集計しない。WebUI は Secret 会話を表出しない
 
 ---
 

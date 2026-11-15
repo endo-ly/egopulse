@@ -24,10 +24,10 @@
 └──────────────────────┴──────────────────────────────────────────────────────┘
 ```
 
-- Sidebar の文脈領域にセクション一覧（Overview / Soul / Rules / Secret / Memory / Skills）を表示する（[layout.md §2.5](./layout.md#25-context-section)）。各行は SESSIONS と同じ「アイコン + 名前 + 1 行の要約」で、要約はそのセクションの実効値（使われているパス、文字数など）
+- Sidebar の文脈領域にセクション一覧（Overview / Soul / Rules / Secret / Memory / Skills）を表示する（[layout.md §2.5](./layout.md#25-context-section)）
 - 画面ヘッダーはセクション名と、そのファイルが system prompt にどう入るかの説明を示す
 - ファイルはすべて共通のカード（パス・適用状態・Markdown 表示 / 原文表示の切替）で表示する
-- 表示のたびにキャッシュを即時表示しつつ裏で再取得する（Sleep や手動編集で UI 外から変わるため）。手動の再読み込みボタンは置かない
+- 表示のたびにキャッシュを即時表示しつつ裏で再取得する。Sleep や手動編集など UI 外からの変更に追従するためで、手動の再読み込みボタンは置かない
 
 ---
 
@@ -51,18 +51,15 @@ agent の現在の姿を一望するページ。各要素から詳細セクシ�
 
 - agent 別 `agents/{agent_id}/SOUL.md` とグローバル `SOUL.md` を優先順に並べ、どちらが適用されているかを示す（[system-prompt.md §2](../system-prompt.md#2-soulmd-読み込み)）
 - 各層の状態を `Applied` / `Not used`（内容はあるが適用されていない）/ `Empty`（空ファイル）/ `Not created` で示す
-- `Edit` で本文を編集し、`Save` で保存する。グローバル `SOUL.md` は複数の agent が共有するため、編集中にその旨を表示する
 
 ### 2.3 Rules
 
 - グローバル `AGENTS.md` と agent 別 `AGENTS.md` を、system prompt への注入順に並べる（[system-prompt.md §3](../system-prompt.md#3-agentsmd-読み込み)）
 - 存在しない層は「未作成」として表示する
-- `Edit` で本文を編集し、`Save` で保存する。グローバル `AGENTS.md` は全 agent に注入されるため、編集中にその旨を表示する
 
 ### 2.4 Secret
 
 - `agents/{agent_id}/SECRET.md` の本文は `Reveal` 操作を行ったときにのみ取得・表示する。画面を開いただけで秘密モードの指示が出ることはない
-- `Edit` は `Reveal` の後にのみ表示する
 
 ### 2.5 Memory
 
@@ -94,35 +91,32 @@ agent を切り替えた場合はセクションを維持する。
 
 ## 4. 編集
 
-Soul / Rules / Secret は WebUI から編集できる。流れは共通：
+Soul / Rules / Secret（system prompt に注入されるファイル）を編集できる。Memory と Skills は閲覧のみ。流れは 3 セクションで共通。
+
+### 4.1 流れ
 
 1. `Edit` でエディタに切り替える
-2. `Write` / `Preview` を切り替えて本文を確認する。`Changes` を開くと現在内容との差分（増減行数）を確認できる
-3. `Save` で楽観的同時実行制御付きで書き込む
+2. `Write` / `Preview` で本文を確認し、`Changes` で現在内容との差分（増減行数）を確認する
+3. `Save` で書き込む。保存は楽観的同時実行制御に従う
+   - 取得時の内容ハッシュを `expected_hash` として送り、現在内容と不一致なら `409` で拒否して最新内容の再取得を促す。基準は常に編集開始時の内容で、編集中の再取得には左右されない
+   - 編集中の draft は保持し、`Reload` で破棄して最新内容を表示する
 
-- 取得時に内容ハッシュを返し、更新時に編集開始時の `expected_hash` を送る。編集中に再取得があっても、保存は編集開始時の内容を基準に競合を検出する。不一致は `409` とし、最新内容を再取得させる。編集中の draft は保持し、`Reload` で破棄して最新内容を表示する
-- 保存する内容は trim 済みの本文で、空で保存すると空ファイルになる（レイヤーは無効化される）
-- グローバル `SOUL.md` / `AGENTS.md` は複数の agent が共有する。編集は他の agent のプロンプトにも影響するため、編集中にその旨を表示する
+### 4.2 ルール
+
+- 保存する本文は trim 済み。空で保存すると空ファイルになり、その層は無効化される
+- グローバル `SOUL.md` / `AGENTS.md` は複数 agent で共有される。編集は他の agent の system prompt にも影響するため、編集中にその旨を表示する
 - `SECRET.md` は `Reveal` 後でのみ編集できる
 - 未保存の編集がある状態でセクション・タブ・agent を切り替える、新規セッションを作成する、または画面を離れる場合は確認する
-- 読み取り不能な既存ファイル（権限・不正 UTF-8）やシンボリックリンク（親ディレクトリを含む）は、データ消失を避けるため保存を拒否する
-- 編集対象は system prompt に注入されるファイルのみ。Skills は閲覧のみとする
+- 既存ファイルが読み取れない（権限・不正 UTF-8）場合や、保存先がシンボリックリンク（親ディレクトリを含む）の場合は、データ消失を避けるため保存を拒否する
 
 ---
 
 ## 5. バックエンド API
 
-API の詳細は [api.md §2.12](../api.md#212-agent-画面)。
+プロフィール・prompt ファイル（`soul` / `rules` / `secret`）・長期記憶とその変更履歴・Recent activity の Sleep run は、[api.md §2.12](../api.md#212-agent-画面)・[§2.9](../api.md#29-sleep-batch) の API で提供される。
 
-| API | 用途 |
-|---|---|
-| `GET /api/agents/:agentId/profile` | 実効モデルと解決元、bindings、prompt に注入されるファイルのパス・サイズ |
-| `GET /api/agents/:agentId/files/:kind` | `soul` / `rules` / `secret` の各層（パス・内容・適用有無・存在・ハッシュ） |
-| `GET /api/agents/:agentId/memory` | 現在の長期記憶 2 ファイル |
-| `GET /api/agents/:agentId/memory/history` | 2 種をまたいだ公開済みの変更履歴 |
-| `GET /api/sleep/runs?agent_id=&status=` | Recent activity の Sleep run |
-| `GET /api/skills` / `GET /api/skills/:name` / `GET /api/skills/:name/files/*` | スキル一覧・詳細・同梱ファイル。スキルは agent 非依存のためグローバルなパスに置く |
-| `PUT /api/agents/:agentId/files/:kind` | 編集（`expected_hash` 必須） |
+- スキルは agent 非依存のため、スキル API は agent に紐づかないグローバルなパスに置く
+- §4.1 の保存は `expected_hash` 必須の `PUT` で行う
 
 ---
 

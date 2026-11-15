@@ -26,7 +26,7 @@
 - Header に設定ファイルのパスと revision を表示する
 - 本文上部の sticky なセクションバーと Sidebar の SECTIONS が目次になる。どちらもクリックでそのセクションへスクロールし、スクロール位置に追従して現在地を強調する
 - 各セクションの見出しは「名前 + 説明 + 現在の状態」で始まる。注意が必要な状態（API key 未設定、MCP 接続失敗、Backup 無効）は warning / danger 色にし、セクションバーにも色付きのドットを出す
-- `/config` が General、`/config/:section` がそのセクションへのスクロール先。直リンクと戻る / 進むでその位置から開く。ページをスクロールしただけでは URL を書き換えない
+- URL（`/config`、`/config/:section`）の扱いは [layout.md §4](./layout.md#4-url-構造) に従う
 - モバイルではセクションバーを横スクロールし、横に広い表はカード内で横スクロールする
 
 ---
@@ -50,12 +50,16 @@
 
 ### 2.1 値の表示
 
-| 状況 | 表示 |
-|---|---|
-| 環境変数で上書きされている | 値に `env NAME` タグ（hover で説明） |
-| 既定値と同じ（General の数値・timezone、Pulse の tick interval） | 値に `default` タグ |
-| 未指定で継承している（agent / Sleep の provider・model） | 解決後の値と、2 行目に解決元（`Provider inherited from the global default` / `the provider's default model` など） |
-| 秘密（API key・token） | `Set from OPENROUTER_API_KEY in .env` / `Set from OPENAI_API_KEY in the process environment` / `Set from a command` / `Set written in the YAML file` / `Not set`。key が不要な provider は `Not needed` 。環境変数で上書きされた token は `Set from the WEB_AUTH_TOKEN environment variable` |
+- 環境変数で上書きされている：値に `env NAME` タグ（hover で説明）
+- 既定値と同じ（General の数値・timezone、Pulse の tick interval）：値に `default` タグ
+- 未指定で継承している（agent / Sleep の provider・model）：解決後の値と、2 行目に解決元（`Provider inherited from the global default` / `the provider's default model` など）
+- 秘密（API key・token）：値そのものは返さず、設定元だけを示す
+  - `.env` の変数：`Set from {VARIABLE} in .env`
+  - プロセス環境変数：`Set from {VARIABLE} in the process environment`
+  - `exec`：`Set from a command`
+  - YAML 直書き：`Set written in the YAML file`
+  - 未設定：`Not set`。key が不要な provider は `Not needed`
+  - token が環境変数で上書きされている：`Set from the {VARIABLE} environment variable`
 
 値そのもの、`exec` のコマンド、provider の追加ヘッダ値、MCP の args・env と header の値・endpoint のパスと query は返さない。
 
@@ -75,7 +79,7 @@
 | `400` | サーバーのメッセージをフォーム上部に表示する |
 | 未保存の変更がある | 画面・agent の切替、ブラウザの戻る / 進む、ページ離脱で確認ダイアログ |
 
-- 更新は `ConfigManager` の単一の更新境界を通る（[config.md §10](../config.md#10-設定の変更インターフェース)）。YAML 全体を書き込む経路は設けない
+- 更新はすべてランタイムの設定変更インターフェース（[config.md §10](../config.md#10-設定の変更インターフェース)）を通る。YAML 全体を書き込む経路は設けない
 - API key の新しい値は `.env` に保存され、YAML には SecretRef として記録される
 - API key がプロセス環境変数から解決されている場合、その値は読み取り専用。変更するにはプロセス環境変数を変更する
 - API key が必須の provider では Remove を無効化する。キーを変更する場合は Replace を使う

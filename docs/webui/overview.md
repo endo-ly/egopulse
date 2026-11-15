@@ -4,21 +4,12 @@ WebUI は EgoPulse ランタイムの運転席である。agent との対話、a
 
 ## 1. 設計思想
 
-### 1.1 Agent-First
-
-画面は agent を主体として編成する。対話・人格・記憶・自律動作はすべて agent に従属し、Sidebar で選んだ agent がそれらの画面の文脈になる。agent に従属しないランタイム全体の関心事（監視・設定）だけをグローバルな画面として分ける。
-
-### 1.2 Observe, then Act
-
-Discord / Telegram / CLI / TUI / Voice で進行する会話は観測専用として扱い、WebUI から書き込めるのは Web 起源のセッションのみとする。ファイル・設定の編集は、必ず楽観的同時実行制御と差分確認を経由する。
-
-### 1.3 URL as Source of Truth
-
-選択 agent・画面・セクション・選択中の run などの UI 状態は URL にエンコードする。React の in-memory state は入力ドラフト・モーダル開閉などの一時的な状態に限る。
-
-### 1.4 Streaming First
-
-LLM 応答・ツール実行・Pulse / Sleep の進行は、完了後ではなく進行中に UI へ反映する。
+| 原則 | 内容 |
+|---|---|
+| Agent-First | agent 画面は Sidebar で選択中の agent を文脈にする。agent に従属しない関心事（監視・設定）だけをグローバル画面に分ける |
+| Observe, then Act | Discord / Telegram / CLI / TUI / Voice の会話は観測専用で、書き込めるのは Web 起源のセッションのみ。ファイル・設定の編集は楽観的同時実行制御と差分確認を経る |
+| URL as Source of Truth | 選択 agent・画面・セクション・run などの UI 状態は URL にエンコードし、in-memory state はドラフト・モーダル開閉などの一時状態に限る |
+| Streaming First | LLM 応答・ツール実行・Pulse / Sleep の進行は、完了後ではなく進行中に UI へ反映する |
 
 ---
 
@@ -47,10 +38,6 @@ LLM 応答・ツール実行・Pulse / Sleep の進行は、完了後ではな�
 │ ● ok          [📈] [⚙]       │                                 │
 └──────────────────────────────┴─────────────────────────────────┘
 ```
-
-- agent 画面（Chat / Agent / Schedule）は Sidebar 上部の Nav に置く
-- グローバル画面（Metrics / Config）は Sidebar フッターに置く
-- Sidebar 中段の文脈領域は画面ごとに内容が変わる
 
 詳細は [layout.md](./layout.md)。
 
@@ -90,7 +77,7 @@ LLM 応答・ツール実行・Pulse / Sleep の進行は、完了後ではな�
 | Pulse / Sleep の開始・終了 | Schedule 関連・Agent の Memory |
 | ファイル・設定の保存成功 | 当該ファイル / 設定 |
 
-無効化されたキーが画面に表示中なら、その内容を保持したままバックグラウンドで再取得する。画面に表示していないキーのキャッシュは破棄し、次にその画面を開いたときに取得する。
+無効化キーのうち画面に表示中のものは内容を保持したまま再取得し、それ以外は破棄して次に開いたときに取得する。
 
 楽観的更新はチャット送信時のユーザーメッセージ挿入のみとし、それ以外の更新はサーバー応答を待って反映する。
 
@@ -104,5 +91,4 @@ LLM 応答・ツール実行・Pulse / Sleep の進行は、完了後ではな�
 | レイアウト（Sidebar / Mobile / レスポンシブ） | [layout.md](./layout.md) |
 | PWA | [pwa.md](./pwa.md) |
 | Command Palette | [command-palette.md](./command-palette.md) |
-| 各画面 | [chat.md](./chat.md) / [agent.md](./agent.md) / [schedule.md](./schedule.md) / [metrics.md](./metrics.md) / [config.md](./config.md) |
 | HTTP / WS API | [../api.md](../api.md) |
