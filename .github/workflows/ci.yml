@@ -70,12 +70,6 @@ jobs:
       - name: Run tests
         run: cargo test
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Print coverage summary
-        run: cargo llvm-cov --summary-only
-
       - name: Install cargo-audit
         uses: taiki-e/install-action@cargo-audit
 
