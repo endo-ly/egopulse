@@ -51,7 +51,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 ### コマンド検閲
 
 **対象**: `bash` ツール  
-**実装**: [command_guard.rs](../../egopulse/src/tools/command_guard.rs)
+**実装**: [command_guard.rs](../src/tools/command_guard.rs)
 
 コマンド文字列を実行前に検査し、シークレット露出の原因となるコマンドをブロックする。
 
@@ -75,7 +75,7 @@ LLM エージェントによるシークレット窃取を防ぐ多層防御。
 ### パス検閲
 
 **対象**: `bash`, `read`, `write`, `edit`, `grep`, `find`, `ls`  
-**実装**: [path_guard.rs](../../egopulse/src/tools/path_guard.rs)
+**実装**: [path_guard.rs](../src/tools/path_guard.rs)
 
 ファイルツールと bash ツールの両方で、機密パスへのアクセスをブロックする。
 
@@ -126,7 +126,7 @@ Bash は `--noprofile --norc -c` で起動し、ログイン設定や起動フ�
 ### 出力リダクション
 
 **対象**: 全ツール（MCP ツール含む）  
-**実装**: [mod.rs](../../egopulse/src/tools/mod.rs)
+**実装**: [mod.rs](../src/tools/mod.rs)
 
 ツール実行結果にシークレットが含まれる場合、自動的にマスクして返却する。事前検査をすり抜けた場合の最終防衛線。
 
@@ -282,7 +282,7 @@ Local API の Turn は Session の Channel identity を維持するが、TUI Cli
 ## 7. Bash の隔離
 
 **対象**: `bash`（Linux）  
-**実装**: [bash_sandbox.rs](../../egopulse/src/tools/bash_sandbox.rs)
+**実装**: [bash_sandbox.rs](../src/tools/bash_sandbox.rs)
 
 字句検査（§2）はスクリプトの作成や動的なパス組み立てで迂回できる。bash の子プロセスは bubblewrap (`bwrap`) の中で起動し、EgoPulse の私有データと秘密を OS レベルで見えなくする。
 

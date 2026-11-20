@@ -25,7 +25,7 @@
 
 ## 1. 前提
 
-- 実装本体: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
+- 実装本体: [egopulse/src/tools/mod.rs](../src/tools/mod.rs)
 - workspace ルート: `~/.egopulse/workspace`
 - skills ルート: `~/.egopulse/workspace/skills`
 - path 解決は workspace 配下に制限される
@@ -55,7 +55,7 @@
 - `pulse`
 - `agent_send`
 
-登録箇所: [egopulse/src/tools/mod.rs](../../egopulse/src/tools/mod.rs)
+登録箇所: [egopulse/src/tools/mod.rs](../src/tools/mod.rs)
 
 ### MCP tool
 
@@ -146,7 +146,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Offset ... is beyond end of file`
   - `Failed to read file: file is not valid UTF-8 text or a supported image.`
 
-実装: [egopulse/src/tools/files.rs](../../egopulse/src/tools/files.rs)
+実装: [egopulse/src/tools/files.rs](../src/tools/files.rs)
 
 ## 4. `write`
 
@@ -166,7 +166,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Failed to create directories: ...`
   - `Failed to write file: ...`
 
-実装: [egopulse/src/tools/files.rs](../../egopulse/src/tools/files.rs)
+実装: [egopulse/src/tools/files.rs](../src/tools/files.rs)
 
 ## 5. `edit`
 
@@ -200,7 +200,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `edits[i] and edits[j] overlap in <path>. Merge them into one edit or target disjoint regions.`
   - `No changes made to <path>. ...`
 
-実装: [egopulse/src/tools/files.rs](../../egopulse/src/tools/files.rs)
+実装: [egopulse/src/tools/files.rs](../src/tools/files.rs)
 
 ## 6. `bash`
 
@@ -229,7 +229,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Command timed out after N seconds`
   - `Command exited with code N`
 
-実装: [egopulse/src/tools/shell.rs](../../egopulse/src/tools/shell.rs)
+実装: [egopulse/src/tools/shell.rs](../src/tools/shell.rs)
 
 ## 7. `grep`
 
@@ -261,7 +261,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Failed to run ripgrep: ...`
   - `ripgrep exited with code N`
 
-実装: [egopulse/src/tools/search.rs](../../egopulse/src/tools/search.rs)
+実装: [egopulse/src/tools/search.rs](../src/tools/search.rs)
 
 ## 8. `find`
 
@@ -288,7 +288,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Failed to run fd: ...`
   - `fd exited with code N`
 
-実装: [egopulse/src/tools/search.rs](../../egopulse/src/tools/search.rs)
+実装: [egopulse/src/tools/search.rs](../src/tools/search.rs)
 
 ## 9. `ls`
 
@@ -312,7 +312,7 @@ Tool 成功後に LLM が失敗しても、同一 Turn 内で Tool を再実行�
   - `Not a directory: ...`
   - `Cannot read directory: ...`
 
-実装: [egopulse/src/tools/search.rs](../../egopulse/src/tools/search.rs)
+実装: [egopulse/src/tools/search.rs](../src/tools/search.rs)
 
 ## 10. `activate_skill`
 
@@ -373,7 +373,7 @@ Environment variables:
   ✗ API_SECRET (not found in env or dotenv)
 ```
 
-実装: [egopulse/src/tools/activate_skill.rs](../../egopulse/src/tools/activate_skill.rs) · [egopulse/src/skills.rs](../../egopulse/src/skills.rs)
+実装: [egopulse/src/tools/activate_skill.rs](../src/tools/activate_skill.rs) · [egopulse/src/skills.rs](../src/skills.rs)
 
 ## 11. `send_attachment`
 
@@ -409,7 +409,7 @@ Environment variables:
   - `"Failed to send attachment: <reason>"`（Web の上限超過・書き込み失敗を含む）
     - 例: `"Failed to send attachment: attachment exceeds the 50 MiB Web limit"`
 
-実装: [egopulse/src/tools/send_attachment.rs](../../egopulse/src/tools/send_attachment.rs)
+実装: [egopulse/src/tools/send_attachment.rs](../src/tools/send_attachment.rs)
 
 ## 12. `agent_send`
 
@@ -431,7 +431,7 @@ Environment variables:
   - `"agent '<id>' not found"` — 存在しないエージェント ID
   - `"cannot send a message to yourself"` — 自己送信
 
-実装: [egopulse/src/tools/agent_send.rs](../../egopulse/src/tools/agent_send.rs)
+実装: [egopulse/src/tools/agent_send.rs](../src/tools/agent_send.rs)
 
 ## 13. `pulse`
 
@@ -456,13 +456,13 @@ Environment variables:
   - `"pulse: the pulse tool is not available in secret conversations ..."` — Secret 会話からの呼び出し
   - `"pulse: PULSE.yaml could not be parsed ..."` — 手編集によるファイル破損
 
-実装: [egopulse/src/tools/pulse.rs](../../egopulse/src/tools/pulse.rs)
+実装: [egopulse/src/tools/pulse.rs](../src/tools/pulse.rs)
 
 ## 14. Skill Catalog
 
 `activate_skill` とは別に、各 turn の system prompt には skill の概要一覧が入る。
 
-- catalog の生成と system prompt への埋め込みは [skills.rs](../../egopulse/src/skills.rs) と prompt builder が担う
+- catalog の生成と system prompt への埋め込みは [skills.rs](../src/skills.rs) と prompt builder が担う
 
 つまり skill 本文は初期ロードされず、最初に入るのは概要一覧だけ。
 
@@ -509,7 +509,7 @@ Environment variables:
   - `content blocked: ...`
   - `response body is not valid UTF-8`
 
-実装: [egopulse/src/tools/web_fetch/mod.rs](../../egopulse/src/tools/web_fetch/mod.rs)
+実装: [egopulse/src/tools/web_fetch/mod.rs](../src/tools/web_fetch/mod.rs)
 
 ## 16. セキュリティガード
 
