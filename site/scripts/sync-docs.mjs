@@ -48,12 +48,14 @@ function splitFragment(target) {
 }
 
 /** 本文中のリポジトリ相対リンクを GitHub の絶対 URL へ書き換える。 */
-function rewriteSourceLinks(body, page) {
+function rewriteSourceLinks(body, page, lineOffset) {
   return body
     .split("\n")
     .map((line, index) =>
       line.replace(MARKDOWN_LINK, (link, imageFlag, text, target) =>
-        imageFlag === "!" ? link : `[${text}](${toSourceUrl(target, page, index + 1)})`,
+        imageFlag === "!"
+          ? link
+          : `[${text}](${toSourceUrl(target, page, index + 1 + lineOffset)})`,
       ),
     )
     .join("\n");
@@ -64,10 +66,10 @@ const REPO_RELATIVE_TARGET = /\](?:\(|:)\s*\.\.\//;
 
 // 画像・タイトル付きリンク・参照定義など、上の書き換え対象外の形で追加された相対リンクは
 // 公開物で 404 になるため、同期自体を失敗させる。
-function assertNoRepoRelativeLinks(body, page) {
+function assertNoRepoRelativeLinks(body, page, lineOffset) {
   const offenders = body
     .split("\n")
-    .map((line, index) => [index + 1, line.trim()])
+    .map((line, index) => [index + 1 + lineOffset, line.trim()])
     .filter(([, line]) => REPO_RELATIVE_TARGET.test(line))
     .map(([lineNumber, line]) => `  ${page}:${lineNumber}: ${line}`);
   if (offenders.length > 0) {
@@ -83,8 +85,11 @@ for (const entry of readdirSync(REPO_DOCS, { withFileTypes: true })) {
   if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
   const source = readFileSync(path.join(REPO_DOCS, entry.name), "utf8");
   // 先頭の H1 は frontmatter の title と重複するため落とす
-  const body = rewriteSourceLinks(source.replace(/^# .+\n+/, ""), entry.name);
-  assertNoRepoRelativeLinks(body, entry.name);
+  const h1 = source.match(/^# .+\n+/)?.[0] ?? "";
+  // エラーで報告する行番号は、生成後ではなく元の docs/*.md の行に合わせる
+  const lineOffset = h1.split("\n").length - 1;
+  const body = rewriteSourceLinks(source.slice(h1.length), entry.name, lineOffset);
+  assertNoRepoRelativeLinks(body, entry.name, lineOffset);
   const frontmatter = meta[entry.name] ?? {
     title: entry.name.replace(/\.md$/, ""),
     description: entry.name.replace(/\.md$/, ""),
