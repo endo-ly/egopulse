@@ -69,6 +69,7 @@ feature-depth = 1
 #db-urls = ["https://github.com/rustsec/advisory-db"]
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
+# The advisory policy lives only here: CI checks advisories with cargo deny.
 ignore = [
     # serenity 0.12.x pins rustls 0.22 → rustls-webpki 0.102.8
     "RUSTSEC-2026-0049",
