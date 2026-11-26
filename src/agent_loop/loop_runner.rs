@@ -413,11 +413,32 @@ impl<'a> AgentLoop<'a> {
                             response.reasoning_content.as_deref(),
                             &mut loop_state.declarative_retry_attempted,
                         )?,
-                        ModelStep::MalformedToolCalls(response) => evaluate_malformed_response(
-                            &response.content,
-                            response.reasoning_content.as_deref(),
-                            &mut loop_state.declarative_retry_attempted,
-                        )?,
+                        ModelStep::MalformedToolCalls(response) => {
+                            // Retry on a fresh upstream assignment without
+                            // changing the conversation identity.
+                            if strip_thinking(response.content.trim()).trim().is_empty() {
+                                if let Err(error) = self
+                                    .state
+                                    .rotate_upstream_session(
+                                        self.context,
+                                        self.prepared.chat_id,
+                                        &self.prepared.config_snapshot,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        error = %error,
+                                        chat_id = self.prepared.chat_id,
+                                        "failed to rotate upstream session after malformed tool calls"
+                                    );
+                                }
+                            }
+                            evaluate_malformed_response(
+                                &response.content,
+                                response.reasoning_content.as_deref(),
+                                &mut loop_state.declarative_retry_attempted,
+                            )?
+                        }
                         _ => unreachable!(),
                     };
                     match action {
@@ -2815,5 +2836,67 @@ mod tests {
             format!("turn:{turn_id}:assistant:1"),
             "tool phase keeps the pre-assigned iteration id"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_tool_calls_rotate_the_upstream_session_for_the_next_turn() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = crate::test_util::test_config(dir.path().to_str().expect("utf8"));
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("test provider")
+            .headers
+            .insert(
+                "x-session".to_string(),
+                crate::config::ProviderHeaderValue::Generated,
+            );
+        let provider = crate::agent_loop::test_support::FakeProvider {
+            responses: std::sync::Mutex::new(vec![
+                MessagesResponse {
+                    content: String::new(),
+                    reasoning_content: Some("thinking".to_string()),
+                    tool_calls: vec![ToolCall {
+                        id: "call_bad".to_string(),
+                        name: String::new(),
+                        arguments: serde_json::json!({}),
+                        invalid_arguments: None,
+                    }],
+                    usage: None,
+                },
+                final_response("recovered"),
+            ]),
+        };
+        let state = build_state(config, Box::new(provider));
+        let context = cli_context("malformed-rotation");
+        let runtime = state.turn_dependencies();
+
+        // Act
+        let first = process_turn(&runtime, &context, "first question").await;
+
+        // Assert
+        assert!(matches!(
+            first,
+            Err(crate::error::EgoPulseError::Llm(
+                crate::error::LlmError::InvalidResponse(_)
+            ))
+        ));
+        let stored = state
+            .db
+            .upstream_session_id(&context.channel, &context.session_key())
+            .expect("read rotated session id");
+        let stored = stored.expect("malformed response must rotate the session id");
+        assert!(
+            uuid::Uuid::parse_str(&stored).is_ok(),
+            "stored override must be a UUID: {stored}"
+        );
+
+        // Act
+        let second = process_turn(&runtime, &context, "second question").await;
+
+        // Assert
+        assert_eq!(second.expect("second turn should recover"), "recovered");
     }
 }

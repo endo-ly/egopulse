@@ -8,7 +8,7 @@ use crate::error::StorageError;
 ///
 /// スキーマを変更する際はこの値をインクリメントし、
 /// `run_migrations` に対応する `if version < N` ブロックを追加する。
-pub(super) const SCHEMA_VERSION: i64 = 24;
+pub(super) const SCHEMA_VERSION: i64 = 25;
 
 /// `db_meta` に格納されたスキーマバージョンを読み取る。
 ///
@@ -1216,6 +1216,20 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         version = 24;
     }
 
+    if version < 25 {
+        let tx = conn.unchecked_transaction()?;
+        // The override changes only the upstream assignment, not the
+        // conversation identity or history.
+        add_column_if_missing(&tx, "chats", "upstream_session_id", "TEXT")?;
+        set_schema_version_in_tx(
+            &tx,
+            25,
+            "add chats.upstream_session_id for upstream session rotation",
+        )?;
+        tx.commit()?;
+        version = 25;
+    }
+
     debug_assert_eq!(version, SCHEMA_VERSION, "all migrations applied");
     Ok(())
 }
@@ -1271,7 +1285,7 @@ fn migrate_session_snapshots_to_envelope(
 /// Secret DB のスキーマバージョン。
 ///
 /// `egopulse.db` とは独立して管理する。
-pub(super) const SECRET_SCHEMA_VERSION: i64 = 10;
+pub(super) const SECRET_SCHEMA_VERSION: i64 = 11;
 
 /// Secret DB のマイグレーションを実行する。
 ///
@@ -1637,6 +1651,15 @@ pub(super) fn run_secret_migrations(conn: &Connection) -> Result<(), StorageErro
         )?;
         tx.commit()?;
         version = 10;
+    }
+
+    if version < 11 {
+        let tx = conn.unchecked_transaction()?;
+        // Mirrored from the primary DB for scope-agnostic storage.
+        add_column_if_missing(&tx, "chats", "upstream_session_id", "TEXT")?;
+        set_schema_version_in_tx(&tx, 11, "add chats.upstream_session_id (secret db)")?;
+        tx.commit()?;
+        version = 11;
     }
 
     debug_assert_eq!(version, SECRET_SCHEMA_VERSION);

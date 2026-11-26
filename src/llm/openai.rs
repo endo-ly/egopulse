@@ -4,7 +4,7 @@ use crate::config::ModelMetadata;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use reqwest::header::HeaderName;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -514,6 +514,7 @@ struct ChatCompletionAccumulator {
     tool_calls: BTreeMap<usize, StreamingToolCall>,
     usage: Option<LlmUsage>,
     has_finish: bool,
+    finish_reason: Option<String>,
     truncation: Option<TruncationReason>,
 }
 
@@ -525,6 +526,7 @@ impl ChatCompletionAccumulator {
             tool_calls: BTreeMap::new(),
             usage: None,
             has_finish: false,
+            finish_reason: None,
             truncation: None,
         }
     }
@@ -574,6 +576,7 @@ impl ChatCompletionAccumulator {
             .and_then(|v| v.as_str())
             && !finish_reason.is_empty()
         {
+            self.finish_reason = Some(finish_reason.to_string());
             match finish_reason {
                 "stop" | "tool_calls" | "tool_use" | "function_call" | "end_turn"
                 | "stop_sequence" | "eos" => {
@@ -637,9 +640,15 @@ impl ChatCompletionAccumulator {
 
     fn ingest_tool_call_delta(&mut self, entry: &serde_json::Value) {
         let Some(index) = entry.get("index").and_then(|v| v.as_u64()) else {
+            tracing::warn!(
+                id = entry.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                keys = ?tool_call_delta_keys(entry),
+                "chat completions tool call delta is missing index; dropping it"
+            );
             return;
         };
         let slot = self.tool_calls.entry(index as usize).or_default();
+        slot.observed_keys.extend(tool_call_delta_keys(entry));
         if let Some(id) = entry.get("id").and_then(|v| v.as_str()) {
             slot.id = Some(id.to_string());
         }
@@ -666,15 +675,30 @@ impl ChatCompletionAccumulator {
     }
 
     fn assemble(self, require_content: bool) -> Result<MessagesResponse, LlmError> {
+        let finish_reason = self.finish_reason.clone();
         let tool_calls = self
             .tool_calls
-            .into_values()
-            .map(|slot| {
-                ToolCall::from_raw_arguments(
-                    slot.id.unwrap_or_default(),
-                    slot.name.unwrap_or_default(),
-                    &slot.arguments,
-                )
+            .into_iter()
+            .map(|(index, slot)| {
+                let StreamingToolCall {
+                    id,
+                    name,
+                    arguments,
+                    observed_keys,
+                } = slot;
+                let name = name.unwrap_or_default();
+                if name.trim().is_empty() {
+                    // Log the completed shape, not intermediate deltas.
+                    tracing::warn!(
+                        index,
+                        id = id.as_deref().unwrap_or(""),
+                        arguments_len = arguments.len(),
+                        observed_keys = ?observed_keys,
+                        finish_reason = ?finish_reason,
+                        "chat completions tool call finished without a function name"
+                    );
+                }
+                ToolCall::from_raw_arguments(id.unwrap_or_default(), name, &arguments)
             })
             .collect::<Vec<_>>();
         assemble_response_with_required_content(
@@ -692,6 +716,21 @@ struct StreamingToolCall {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    observed_keys: BTreeSet<String>,
+}
+
+/// Returns the field names present in a streaming tool-call delta.
+fn tool_call_delta_keys(entry: &serde_json::Value) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(object) = entry.as_object() {
+        keys.extend(object.keys().cloned());
+    }
+    if let Some(function) = entry.get("function").and_then(|value| value.as_object()) {
+        keys.extend(function.keys().map(|key| format!("function.{key}")));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 async fn consume_chat_completion_stream(
@@ -770,7 +809,7 @@ mod tests {
         OPENAI_COMPLETIONS_MIN_OUTPUT_TOKENS, OPENAI_RESPONSES_MIN_OUTPUT_TOKENS,
         OPENROUTER_MIN_OUTPUT_TOKENS, OpenAiProvider, consume_chat_completion_stream,
         consume_responses_stream, max_output_tokens_field, parse_chat_completion_usage,
-        request_stream_usage,
+        request_stream_usage, tool_call_delta_keys,
     };
 
     fn config(model: &str, base_url: String, api_key: Option<&str>) -> ResolvedLlmConfig {
@@ -1109,6 +1148,31 @@ mod tests {
         assert!(failure.error.expect("provider error").is_retryable());
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), crate::llm::MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn tool_call_delta_keys_records_only_field_names() {
+        // Arrange
+        let entry = serde_json::json!({
+            "index": 0,
+            "id": "call_1",
+            "function": {"name": "", "arguments": "{\"path\":\"secret\"}"}
+        });
+
+        // Act
+        let keys = tool_call_delta_keys(&entry);
+
+        // Assert
+        assert_eq!(
+            keys,
+            vec![
+                "function",
+                "function.arguments",
+                "function.name",
+                "id",
+                "index"
+            ]
+        );
     }
 
     #[tokio::test]

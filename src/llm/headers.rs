@@ -3,9 +3,9 @@
 //! A `providers.<id>.headers` entry written without a value names a header
 //! whose value must identify one conversation: upstream gateways use such a
 //! header for routing and prompt caching, so sharing one value across every
-//! conversation pins all traffic to a single upstream assignment. The value is
-//! a digest of the scope key, which keeps it stable across restarts without
-//! storing anything.
+//! conversation pins all traffic to a single upstream assignment. The default
+//! value is a digest of the scope key; a conversation can replace it with a
+//! stored override to move to a different upstream assignment.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -16,7 +16,8 @@ use uuid::Uuid;
 use crate::config::{ProviderHeaderValue, ResolvedLlmConfig};
 use crate::conversation::SurfaceContext;
 
-/// Scope identity used to derive valueless header values.
+/// Scope identity used to derive valueless header values, with an optional
+/// per-conversation override.
 ///
 /// The scope key combines the installation identity, the storage scope, and the
 /// conversation (or a coarser unit for work without one), so two installations
@@ -24,17 +25,29 @@ use crate::conversation::SurfaceContext;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HeaderContext {
     scope_key: String,
+    /// Replaces the derived value for generated headers when present.
+    override_value: Option<String>,
 }
 
 impl HeaderContext {
-    /// Uses the conversation identified by `context` on `installation_id`.
-    pub(crate) fn for_surface(installation_id: &str, context: &SurfaceContext) -> Self {
+    /// Uses the conversation identity with an explicit upstream session value.
+    ///
+    /// `None` keeps the deterministic value.
+    pub(crate) fn for_surface_with_override(
+        installation_id: &str,
+        context: &SurfaceContext,
+        override_value: Option<&str>,
+    ) -> Self {
         Self {
             scope_key: format!(
                 "{installation_id}:{}:{}",
                 context.scope,
                 context.session_key()
             ),
+            override_value: override_value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
         }
     }
 
@@ -42,6 +55,7 @@ impl HeaderContext {
     pub(crate) fn for_agent(installation_id: &str, agent_id: &str) -> Self {
         Self {
             scope_key: format!("{installation_id}:agent:{agent_id}"),
+            override_value: None,
         }
     }
 
@@ -52,6 +66,7 @@ impl HeaderContext {
             scope_key: PROCESS_NONCE
                 .get_or_init(|| Uuid::new_v4().to_string())
                 .clone(),
+            override_value: None,
         }
     }
 }
@@ -82,7 +97,12 @@ pub(crate) fn render_headers(
             let value = match value {
                 ProviderHeaderValue::Literal(value) => value.clone(),
                 ProviderHeaderValue::Generated => derived
-                    .get_or_insert_with(|| derive_session_value(&context.scope_key))
+                    .get_or_insert_with(|| {
+                        context
+                            .override_value
+                            .clone()
+                            .unwrap_or_else(|| derive_session_value(&context.scope_key))
+                    })
                     .clone(),
             };
             (name.clone(), value)
@@ -160,8 +180,11 @@ mod tests {
     #[test]
     fn valueless_header_becomes_a_uuid_shaped_value() {
         // Arrange
-        let context =
-            HeaderContext::for_surface(INSTALLATION, &crate::test_util::cli_context("uuid"));
+        let context = HeaderContext::for_surface_with_override(
+            INSTALLATION,
+            &crate::test_util::cli_context("uuid"),
+            None,
+        );
 
         // Act
         let rendered = render_headers(&headers(&[("x-session", None)]), &context);
@@ -173,8 +196,11 @@ mod tests {
     #[test]
     fn same_conversation_renders_the_same_value() {
         // Arrange
-        let context =
-            HeaderContext::for_surface(INSTALLATION, &crate::test_util::cli_context("stable"));
+        let context = HeaderContext::for_surface_with_override(
+            INSTALLATION,
+            &crate::test_util::cli_context("stable"),
+            None,
+        );
 
         // Act
         let first = render_headers(&headers(&[("x-session", None)]), &context);
@@ -182,6 +208,43 @@ mod tests {
 
         // Assert
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn override_value_replaces_the_derived_session_header() {
+        // Arrange
+        let override_value = "11111111-2222-4333-8444-555555555555";
+        let context = HeaderContext::for_surface_with_override(
+            INSTALLATION,
+            &crate::test_util::cli_context("rotated"),
+            Some(override_value),
+        );
+
+        // Act
+        let rendered = render_headers(
+            &headers(&[("x-session", None), ("x-fixed", Some("fixed"))]),
+            &context,
+        );
+
+        // Assert
+        assert_eq!(rendered["x-session"], override_value);
+        assert_eq!(rendered["x-fixed"], "fixed");
+    }
+
+    #[test]
+    fn blank_override_falls_back_to_the_derived_value() {
+        // Arrange
+        let context = HeaderContext::for_surface_with_override(
+            INSTALLATION,
+            &crate::test_util::cli_context("blank-override"),
+            Some("   "),
+        );
+
+        // Act
+        let rendered = render_headers(&headers(&[("x-session", None)]), &context);
+
+        // Assert
+        assert_uuid_shaped(&rendered["x-session"]);
     }
 
     #[test]
@@ -194,11 +257,11 @@ mod tests {
         // Act
         let first = render_headers(
             &headers(&[("x-session", None)]),
-            &HeaderContext::for_surface(INSTALLATION, &first),
+            &HeaderContext::for_surface_with_override(INSTALLATION, &first, None),
         );
         let second = render_headers(
             &headers(&[("x-session", None)]),
-            &HeaderContext::for_surface(INSTALLATION, &second),
+            &HeaderContext::for_surface_with_override(INSTALLATION, &second, None),
         );
 
         // Assert
@@ -216,11 +279,11 @@ mod tests {
         // Act
         let first = render_headers(
             &headers(&[("x-session", None)]),
-            &HeaderContext::for_surface(INSTALLATION, &first),
+            &HeaderContext::for_surface_with_override(INSTALLATION, &first, None),
         );
         let second = render_headers(
             &headers(&[("x-session", None)]),
-            &HeaderContext::for_surface(INSTALLATION, &second),
+            &HeaderContext::for_surface_with_override(INSTALLATION, &second, None),
         );
 
         // Assert
@@ -250,8 +313,8 @@ mod tests {
         secret.scope = crate::conversation::ConversationScope::Secret;
 
         // Act
-        let normal = HeaderContext::for_surface(INSTALLATION, &normal);
-        let secret = HeaderContext::for_surface(INSTALLATION, &secret);
+        let normal = HeaderContext::for_surface_with_override(INSTALLATION, &normal, None);
+        let secret = HeaderContext::for_surface_with_override(INSTALLATION, &secret, None);
 
         // Assert
         let first = render_headers(&headers(&[("x-session", None)]), &normal);

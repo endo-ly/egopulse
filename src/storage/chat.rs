@@ -70,6 +70,45 @@ impl Database {
         }
     }
 
+    /// Returns the provider session override stored on a chat.
+    ///
+    /// `None` means the conversation still uses the derived value.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when the database cannot be read.
+    pub(crate) fn upstream_session_id(
+        &self,
+        channel: &str,
+        external_chat_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let conn = self.get_conn()?;
+        let value = conn
+            .query_row(
+                "SELECT upstream_session_id FROM chats WHERE channel = ?1 AND external_chat_id = ?2 LIMIT 1",
+                params![channel, external_chat_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(value.flatten())
+    }
+
+    /// Replaces the provider session override for one chat.
+    ///
+    /// # Errors
+    /// Returns [`StorageError`] when the database cannot be written.
+    pub(crate) fn set_upstream_session_id(
+        &self,
+        chat_id: i64,
+        session_id: &str,
+    ) -> Result<(), StorageError> {
+        let conn = self.get_conn()?;
+        conn.execute(
+            "UPDATE chats SET upstream_session_id = ?1 WHERE chat_id = ?2",
+            params![session_id, chat_id],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn get_chat_by_channel_external_and_agent(
         &self,
         channel: &str,
@@ -2381,6 +2420,30 @@ mod tests {
             .expect("chat should exist");
 
         assert_eq!(info.agent_id, "mybot");
+    }
+
+    #[test]
+    fn upstream_session_override_is_null_by_default_and_can_be_replaced() {
+        // Arrange
+        let (db, _dir) = test_db();
+        let chat_id = db
+            .resolve_or_create_chat_id("cli", "cli:upstream", "cli", "default")
+            .expect("create chat");
+
+        // Act
+        let initial = db
+            .upstream_session_id("cli", "cli:upstream")
+            .expect("read initial override");
+        db.set_upstream_session_id(chat_id, "11111111-2222-4333-8444-555555555555")
+            .expect("set override");
+
+        // Assert
+        assert_eq!(initial, None);
+        assert_eq!(
+            db.upstream_session_id("cli", "cli:upstream")
+                .expect("read override"),
+            Some("11111111-2222-4333-8444-555555555555".to_string())
+        );
     }
 
     #[test]

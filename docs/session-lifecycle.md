@@ -261,6 +261,15 @@ provider から届く失敗は次の分類で扱う（HTTP 200 の後に起き�
 | 終了イベントが `incomplete` を報告、`response.status: failed`、`finish_reason: length` / `content_filter` / 未知 | 確定的な打ち切り `incomplete_response`。再試行対象外 |
 | SSE の `data:` が JSON として不正 | 欠落した本文を完成応答にせず失敗 |
 
+### malformed tool call と upstream session の切り替え
+
+provider が tool call を返したが有効な呼び出しが 1 つもなく、可視本文も無い場合、Turn / Pulse は provider の応答形式障害として扱う。
+
+- **Turn**: 会話を新しい上流割り当てへ切り替えてから `failed`（出力公開済みなら `uncertain`）にする。次の Turn は新しい割り当てを使う。会話履歴・session key・Web UI の `chat:{id}` は変えない
+- **Pulse**: 同じく切り替えたうえで、`success/silent` ではなく `failed` として記録する。次の activation は新しい割り当てを使う
+- 切り替えは生成ヘッダを使う provider だけに適用される。リテラル値のヘッダは変更しない
+- 切り替えで prompt cache は一度冷えるが、会話を恒久的に失うより優先する。通常時は値が変わらないためキャッシュ効率に影響しない
+
 1 リクエストの総時間には別に 600 秒の上限がある。Turn / Pulse は 300 秒の iteration deadline、compaction は 600 秒の予算、単発 ask は 300 秒の総予算で先に打ち切られるため、この上限が実効するのは Sleep の各試行だけである。Sleep は再試行と待機を含む 20 分の総予算も持つ。
 
 試行回数の記録とバックオフ待機も同じ期限の内側で行う。これらは provider から見えない処理であり、外に置くと DB 待ちが長い場合に上限を超える。期限に到達した場合は、その時点までの実際のエラーをそのまま返す。

@@ -133,10 +133,63 @@ impl TurnDependencies {
             return Ok(None);
         }
         let installation_id = self.db.installation_id()?;
-        Ok(Some(crate::llm::HeaderContext::for_surface(
+        let session_key = context.session_key();
+        let override_value = match context.scope {
+            ConversationScope::Normal => self
+                .db
+                .upstream_session_id(&context.channel, &session_key)?,
+            ConversationScope::Secret => match self.secret_db.as_ref() {
+                Some(db) => db.upstream_session_id(&context.channel, &session_key)?,
+                None => None,
+            },
+        };
+        Ok(Some(crate::llm::HeaderContext::for_surface_with_override(
             installation_id,
             context,
+            override_value.as_deref(),
         )))
+    }
+
+    /// Moves one conversation to a fresh upstream session identity.
+    ///
+    /// The provider session header is only a routing and prompt-cache hint, so
+    /// the conversation keeps its history, session key, and tool state. The
+    /// override applies only to generated headers.
+    ///
+    /// # Errors
+    /// Returns [`EgoPulseError`] when the provider configuration cannot be
+    /// resolved or the override cannot be persisted.
+    pub(crate) async fn rotate_upstream_session(
+        &self,
+        context: &crate::conversation::SurfaceContext,
+        chat_id: i64,
+        snapshot: &crate::config::manager::ConfigSnapshot,
+    ) -> Result<(), EgoPulseError> {
+        let agent_id = crate::config::AgentId::new(&context.agent_id);
+        let resolved = snapshot
+            .config
+            .resolve_llm_for_agent_channel(&agent_id, &context.channel)?;
+        if !resolved.has_generated_headers() {
+            return Ok(());
+        }
+
+        let new_session_id = uuid::Uuid::new_v4().to_string();
+        let db = self.db_for(context.scope);
+        let stored_session_id = new_session_id.clone();
+        crate::storage::call_blocking(db, move |db| {
+            db.set_upstream_session_id(chat_id, &stored_session_id)
+        })
+        .await?;
+
+        tracing::warn!(
+            agent_id = %context.agent_id,
+            channel = %context.channel,
+            chat_id,
+            session = %context.surface_thread,
+            new_session_id = %new_session_id,
+            "rotated upstream session after malformed tool calls"
+        );
+        Ok(())
     }
 
     /// Builds the request scope of an agent for work without a conversation.

@@ -184,6 +184,7 @@ DDL の正本は `src/storage/migration.rs`。本節は各テーブルのカラ�
 | next_message_seq | INTEGER | NOT NULL DEFAULT 1 | 次に発行する chat 内 message sequence |
 | archived | INTEGER | NOT NULL DEFAULT 0 | 1 のとき Web UI のセッション一覧でアーカイブ扱い（履歴・記憶・Turn は保持） |
 | pinned | INTEGER | NOT NULL DEFAULT 0 | 1 のときセッション一覧の先頭に固定 |
+| upstream_session_id | TEXT | nullable | 生成ヘッダに使う上流セッションIDの上書き。NULL は会話IDからの導出値 |
 
 **制約**:
 - `(channel, external_chat_id)` の UNIQUE インデックス。channel 横断で同じ外部チャットを二重登録しない
@@ -636,7 +637,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 2. `schema_version(conn)` で `db_meta` テーブルから現在のバージョンを取得（未設定時は `0`）
 3. `if version < N` ブロックで未適用のマイグレーションを逐次実行
 4. 各マイグレーション適用後に `set_schema_version(conn, N, "note")` でバージョンを更新し `schema_migrations` に履歴を記録
-5. `SCHEMA_VERSION` 定数（現行 `22`）に到達したら完了。`debug_assert_eq!` で検証
+5. `SCHEMA_VERSION` 定数（現行 `25`）に到達したら完了。`debug_assert_eq!` で検証
 
 起動時には、DDL/DMLの前に既存の `schema_version` を読み取る。検出した版が対応する `SCHEMA_VERSION` より新しい場合は、DB種別・検出版・対応版を含む `storage_unsupported_schema_version` で起動を拒否し、既存データや版番号を書き換えない。
 
@@ -647,7 +648,7 @@ WebUI で表示する agent アイコン画像。ユーザーがデバイスか�
 4. 破壊的 DDL や複数ステートメントを伴う場合は transaction 内で実行する
 5. `set_schema_version(conn, 6, "description")` または transaction 用 helper を呼び出し
 
-> **Note**: 現行のコードラインでは v1 から v22 までを順に適用する。以下は主要なマイグレーションの履歴。
+> **Note**: 現行のコードラインでは v1 から v25 までを順に適用する。以下は主要なマイグレーションの履歴。
 
 #### v3: add episode_events table + 4 indexes
 
@@ -697,6 +698,10 @@ Turn 永続化の導入。新規 `turn_runs` テーブル（CHECK 制約付き s
 #### v22: drop prospective memory from the sleep schema
 
 `sleep_run_steps` / `sleep_step_checkpoints` / `memory_snapshots` を再構築し、`prospective_update` step と `prospective` snapshot を CHECK 制約から外す。既存の prospective 行は削除し、episodic / semantic の行と sleep run は保持する。`sleep_run_steps` は `step_name IN ('event_extraction', 'episodic_update', 'semantic_update')`、`sleep_step_checkpoints` は `event_extraction`（messages）と `semantic_update`（episode_events）の組合せのみ、`memory_snapshots` は `file IN ('episodic', 'semantic')` を許可する。
+
+#### v25: chats.upstream_session_id
+
+`chats` に `upstream_session_id`（nullable）を追加する。生成ヘッダに使う上流セッションIDの上書きを保持する。NULL は会話IDからの導出値を使う。Secret DB にも同じ列を追加する（secret schema 11）。
 
 ### 外部キー制約が最小限
 

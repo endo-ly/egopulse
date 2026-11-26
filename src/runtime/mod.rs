@@ -1406,6 +1406,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn header_context_uses_the_stored_upstream_session_override() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = test_config_for_runtime(dir.path().to_str().expect("utf8").to_string());
+        let state = build_app_state(config).await.expect("build state");
+        let context = crate::test_util::cli_context("override-test");
+        let mut resolved = resolved_config("openai", "gpt-4o", "https://api.openai.com/v1");
+        resolved.headers.insert(
+            "x-session".to_string(),
+            crate::config::ProviderHeaderValue::Generated,
+        );
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id(
+                &context.channel,
+                &context.session_key(),
+                &context.chat_type,
+                &context.agent_id,
+            )
+            .expect("create chat");
+        let override_value = "11111111-2222-4333-8444-555555555555";
+        state
+            .db
+            .set_upstream_session_id(chat_id, override_value)
+            .expect("set override");
+        let runtime = state.turn_dependencies();
+
+        // Act
+        let header_context = runtime
+            .header_context_for_surface(&resolved, &context)
+            .expect("header context")
+            .expect("generated header context");
+        let rendered = crate::llm::rendered_config(&resolved, &header_context);
+
+        // Assert
+        assert_eq!(
+            rendered.headers.get("x-session"),
+            Some(&crate::config::ProviderHeaderValue::Literal(
+                override_value.to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
     async fn llm_cache_shares_a_provider_across_conversations_without_auto_headers() {
         // Arrange
         let dir = tempfile::tempdir().expect("tempdir");

@@ -12,6 +12,7 @@ use crate::agent_loop::tool_execution::{
 use crate::conversation::ConversationScope;
 use crate::conversation::SurfaceContext;
 use crate::error::EgoPulseError;
+use crate::error::LlmError;
 use crate::llm::Message;
 use crate::pulse::capsule::HomeSurface;
 use crate::pulse::capsule::PulseCapsule;
@@ -228,6 +229,27 @@ pub(crate) async fn run_activation_with_snapshot(
             }
             ModelStep::MalformedToolCalls(response) => {
                 let output_text = response.content.trim().to_string();
+                if output_text.is_empty() {
+                    // Malformed tool calls are a provider format fault, not a
+                    // silent Pulse. Preserve the guard-denial fallback when the
+                    // security limit was reached.
+                    if let Err(error) = turn_dependencies
+                        .rotate_upstream_session(&context, home_surface.chat_id, &config_snapshot)
+                        .await
+                    {
+                        warn!(
+                            error = %error,
+                            chat_id = home_surface.chat_id,
+                            "failed to rotate upstream session after malformed pulse tool calls"
+                        );
+                    }
+                    if guard_tracker.limit_reached() {
+                        return Ok(guard_denial_fallback(tool_phases));
+                    }
+                    return Err(EgoPulseError::Llm(LlmError::InvalidResponse(
+                        "all tool calls were malformed (empty names)".to_string(),
+                    )));
+                }
                 return Ok(activation_result(
                     output_text,
                     tool_phases,
@@ -1173,6 +1195,87 @@ mod tests {
                 .content
                 .as_text_lossy()
                 .contains("no user-visible text")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn malformed_pulse_tool_calls_fail_the_activation_and_rotate_the_session() {
+        // Arrange
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_root = dir.path().to_str().expect("utf8").to_string();
+        let mut config = crate::test_util::test_config(&state_root);
+        config
+            .providers
+            .get_mut(&crate::config::ProviderId::new("openai"))
+            .expect("test provider")
+            .headers
+            .insert(
+                "x-session".to_string(),
+                crate::config::ProviderHeaderValue::Generated,
+            );
+        let provider = crate::agent_loop::test_support::FakeProvider {
+            responses: std::sync::Mutex::new(vec![crate::llm::MessagesResponse {
+                content: String::new(),
+                reasoning_content: Some("thinking".to_string()),
+                tool_calls: vec![crate::llm::ToolCall {
+                    id: "call_bad".to_string(),
+                    name: String::new(),
+                    arguments: serde_json::json!({}),
+                    invalid_arguments: None,
+                }],
+                usage: None,
+            }]),
+        };
+        let state = crate::test_util::build_state_with_config(
+            config,
+            Some(std::sync::Arc::new(provider)),
+            None,
+            None,
+            None,
+        );
+        let external_chat_id = "cli:test-pulse-malformed:agent:default";
+        let chat_id = state
+            .db
+            .resolve_or_create_chat_id("cli", external_chat_id, "cli", "default")
+            .expect("create chat");
+        let surface = HomeSurface {
+            chat_id,
+            channel: "cli".to_string(),
+            external_chat_id: external_chat_id.to_string(),
+            chat_type: "cli".to_string(),
+        };
+        let capsule = build_capsule(
+            "default",
+            &test_intention(),
+            &[],
+            &surface,
+            "2026-05-10T09:00:00+09:00",
+        );
+
+        // Act
+        let result = run_activation_with_snapshot(
+            &state,
+            "default",
+            &capsule,
+            &surface,
+            "run-malformed",
+            state.config_manager.current_blocking(),
+        )
+        .await;
+
+        // Assert
+        assert!(matches!(
+            result,
+            Err(EgoPulseError::Llm(LlmError::InvalidResponse(_)))
+        ));
+        let stored = state
+            .db
+            .upstream_session_id("cli", external_chat_id)
+            .expect("read rotated session id");
+        assert!(
+            stored.is_some_and(|value| uuid::Uuid::parse_str(&value).is_ok()),
+            "malformed pulse must rotate to a UUID-shaped session id"
         );
     }
 }
