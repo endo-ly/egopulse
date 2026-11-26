@@ -85,6 +85,10 @@ ignore = [
     # syntect 5.3.0 requires bincode for its bundled syntax assets;
     # upstream currently has no maintained upgrade path
     "RUSTSEC-2025-0141",
+    # chrono / chrono-tz are unmaintained; Egopulse uses chrono for time
+    # handling and no maintained drop-in upgrade is available
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
