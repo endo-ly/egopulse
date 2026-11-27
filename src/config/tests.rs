@@ -687,6 +687,21 @@ channels:
 
 #[test]
 #[serial]
+fn shipped_example_config_loads() {
+    // Load a temp copy so the repository's adjacent .env is not consulted.
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
+    let example_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("egopulse.config.example.yaml");
+    assert!(example_path.is_file(), "example config missing");
+    let file_path = temp_dir.path().join("egopulse.config.yaml");
+    std::fs::copy(&example_path, &file_path).expect("copy example config");
+
+    Config::load_allow_missing_api_key(Some(&file_path)).expect("load example config");
+}
+
+#[test]
+#[serial]
 fn default_model_in_yaml_overrides_provider_default() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let _home = EnvVarGuard::set("HOME", temp_dir.path());
