@@ -690,8 +690,7 @@ channels:
 fn shipped_example_config_loads() {
     // Load a temp copy so the repository's adjacent .env is not consulted.
     let temp_dir = tempfile::tempdir().expect("tempdir");
-    let _env = EnvVarGuard::set("HOME", temp_dir.path())
-        .also_set("EGOPULSE_VOICE_AUTH_TOKEN", "test-token");
+    let _home = EnvVarGuard::set("HOME", temp_dir.path());
     let example_path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("egopulse.config.example.yaml");
     assert!(example_path.is_file(), "example config missing");

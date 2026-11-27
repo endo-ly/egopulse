@@ -56,9 +56,7 @@ channels:
 
   voice:
     enabled: false
-    auth_token:
-      source: env
-      id: EGOPULSE_VOICE_AUTH_TOKEN
+    auth_token: replace-me
     default_surface: stackchan
     default_session: main
     allowed_surfaces:
