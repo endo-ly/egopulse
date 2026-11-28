@@ -697,7 +697,10 @@ fn shipped_example_config_loads() {
     let file_path = temp_dir.path().join("egopulse.config.yaml");
     std::fs::copy(&example_path, &file_path).expect("copy example config");
 
-    Config::load_allow_missing_api_key(Some(&file_path)).expect("load example config");
+    // CLI subcommands and hot reload use Config::load, so the example must satisfy both loaders.
+    Config::load_allow_missing_api_key(Some(&file_path))
+        .expect("lenient loader must load example config");
+    Config::load(Some(&file_path)).expect("strict loader must load example config");
 }
 
 #[test]
